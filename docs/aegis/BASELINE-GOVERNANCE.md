@@ -2,17 +2,16 @@
 
 ## 1. Baseline Roles
 
-- **Product / Requirement Baseline**: `AGENTS.md` (project identity, in-scope
-  protocols, critical design decisions), `TUI_MANUAL.md` (screens, keys,
-  workflows), `NATIVE_CORE.md` (native core and TLS engine scope and
-  verification tiers), `docs/protocols.md`, approved specs under
+- **Product / Requirement Baseline**: `docs/aegis/baseline/2026-10-12-leas-repositioning.md`
+  (project identity, north star, scope), `docs/INDEX.md` and the pages under
+  `docs/{architecture,guides,reference}/`, `docs/guides/tui-manual.md` (screens, keys,
+  workflows), `docs/reference/native-core.md` (native core and TLS engine scope and
+  verification tiers), `docs/reference/protocols.md`, approved specs under
   `docs/aegis/specs/`.
-- **Architecture / Runtime Boundary Baseline**: `AGENTS.md` decisions 1-20
-  (dual backend, one core at a time, typed 7-table schema and schema-tag
-  policy, identity/uid scheme, enrichment pipeline, row model, test-priority
-  ordering, transport composition, secret wiping, native-core-at-connect-time),
-  `docs/routing-engine-decision.md`, `docs/native-core-integration.md`, ADRs
-  under `docs/aegis/adr/`.
+- **Architecture / Runtime Boundary Baseline**: `docs/architecture/decisions.md` (durable
+  design decisions), `docs/architecture/architecture.md` (crate graph and owners),
+  `docs/architecture/native-core-integration.md`,
+  `docs/history/routing-engine-decision.md`, ADRs under `docs/aegis/adr/`.
 
 ## 2. Design Defect
 

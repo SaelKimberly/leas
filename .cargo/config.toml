@@ -7,4 +7,4 @@ linker = "clang"
 rustflags = ["-Clink-arg=-fuse-ld=mold", "-Ctarget-cpu=native"]
 
 [env]
-XRAY_TUI_CORE_BIN_DIR = "/tmp/core-bin"
+LEAS_CORE_BIN_DIR = "/tmp/core-bin"

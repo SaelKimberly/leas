@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed the xray-tui database with 36 groups of subscription profiles."""
+"""Seed the leas database with 36 groups of subscription profiles."""
 
 import hashlib
 import json
@@ -13,11 +13,11 @@ from pathlib import Path
 from urllib.parse import unquote
 
 CONFIG_DIR = (
-    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "xray-tui"
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "leas"
 )
 DB_PATH = CONFIG_DIR / "data.db"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
-BINARY = Path(__file__).resolve().parent.parent / "target/release/xray-tui"
+BINARY = Path(__file__).resolve().parent.parent / "target/release/leas"
 
 CONFIG_TYPE = {
     "vmess": 1,

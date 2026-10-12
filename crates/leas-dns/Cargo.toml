@@ -1,0 +1,40 @@
+[package]
+name = "leas-dns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Secure DNS resolution for leas via DNSCrypt stamps (DoH/DoT/DoQ)"
+readme.workspace = true
+keywords = ["dns", "dnscrypt", "doh"]
+categories = ["network-programming"]
+rust-version.workspace = true
+
+[dependencies]
+# ============ DNS ============
+hickory-resolver = { version = "0.26.3", features = ["tls-ring", "https-ring", "quic-ring", "webpki-roots"] }
+dns-stamp-parser = "3.0.1"
+
+# ============ Async Runtime & I/O ============
+tokio = { workspace = true, features = ["sync", "fs", "io-util"] }
+
+# ============ Networking ============
+reqwest.workspace = true
+url.workspace = true
+# ring provider install before reqwest Client::build (rustls-no-provider)
+rustls = { workspace = true, features = ["ring"] }
+
+# ============ Error Handling ============
+anyhow.workspace = true
+
+# ============ Observability ============
+tracing.workspace = true
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

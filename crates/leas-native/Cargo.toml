@@ -1,0 +1,179 @@
+[package]
+name = "leas-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "In-process proxy core for leas — VLESS/VMess/Trojan/Hysteria2/Shadowsocks tunnels with SOCKS5 and HTTP inbounds"
+readme.workspace = true
+keywords = ["proxy", "vpn", "vless", "vmess", "shadowsocks"]
+categories = ["network-programming"]
+rust-version.workspace = true
+
+[dependencies]
+# source of truth for all protocol/transport/security configs (MIT, workspace)
+leas-proto.workspace = true
+
+# TLS 1.3 fingerprint-mimicry engine (custom `TlsConnector` + REALITY provisioners)
+leas-tls.workspace = true
+
+# routing engine for the SOCKS5 inbound (RuleSet → Decision; tag-based outbound dispatch)
+leas-route = { version = "0.1", path = "../leas-route" }
+
+# async runtime
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
+
+# TLS (workspace standard: ring backend). The client path is the engine
+# (leas-tls), but the xhttp h3 arm builds quinn's QUIC TLS config from
+# rustls directly (spec §5.2 — quinn/rustls is internal to QUIC, the engine
+# TLS never wraps it), and the e2e module + unit tests use rustls as the
+# server double.
+rustls = { workspace = true, features = ["ring"] }
+# Root store for the QUIC TLS client config (same trust source as the
+# engine's `WebPkiVerifier::webpki_roots`).
+webpki-roots.workspace = true
+
+# VMess wire crypto (mandatory for any VMess client — not feature-gated).
+# `zeroize` is NOT in any of these crates' default features: without it the
+# expanded AES round keys, the ChaCha state, and the HMAC/hasher blocks
+# (which hold the VMess cmd key and every KDF subkey) are dropped unwiped.
+aes = { workspace = true, features = ["zeroize"] }
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+ctr = { version = "0.10.1", features = ["zeroize"] }
+hmac = { version = "0.13.0", features = ["zeroize"] }
+sha2 = { workspace = true, features = ["zeroize"] }
+crc32fast = "1.5.2"
+md-5 = { workspace = true, features = ["zeroize"] }
+blake2 = { version = "0.11.0", features = ["zeroize"] }
+# Classic-AEAD subkey KDF: HKDF-SHA1(psk, salt, b"ss-subkey").
+sha1 = { version = "0.11.0", features = ["zeroize"] }
+hkdf = "0.13.0"
+# 2022-blake3 session subkey: blake3::derive_key("shadowsocks 2022 session subkey",
+# psk || salt). Promoted from dev-dependency (b3.rs cross-validation uses it too).
+blake3 = { version = "1.8.7", features = ["zeroize"] }
+wide = "1.7.1"
+inout = "0.2.2"
+
+# Secret wiping for the key material we own ourselves: VMess cmd/session
+# keys, VLESS UUIDs, Shadowsocks subkeys, the mlkem768x25519plus state.
+zeroize.workspace = true
+
+# CSPRNG for per-connection VMess session material (same provider rustls uses)
+ring.workspace = true
+
+# WebSocket transport framing (RFC 6455) over the engine stream — no TLS
+tokio-tungstenite = "0.30.0"
+futures-core = "0.3.34"
+futures-sink = "0.3.34"
+bytes.workspace = true
+
+# gRPC transport framing (HTTP/2, RFC 7540) over the engine stream
+h2 = "0.4.19"
+http = "1.5.0"
+
+# HTTP/1.1 + HTTP/2 client framing (hyper) — minimal features, latest minor.
+# We own the stream + timeouts; hyper owns request/response/chunked/101 framing.
+hyper = { version = "1.11.1", default-features = false, features = ["client", "http1", "http2"] }
+# tokio↔hyper IO bridge: hyper's own rt::Read/Write traits take a different
+# buffer type than tokio's, so BoxStream goes through TokioIo (hyper-util's
+# standard adapter). TokioExecutor spawns hyper's h2 driver tasks.
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body = "1.1.0"
+# Channel (live request-body pipe) is feature-gated in http-body-util.
+http-body-util = { version = "0.1.5", features = ["channel"] }
+
+# QUIC + HTTP/3 — the xhttp h3 client arm (SP5). quinn TLS is rustls-ring
+# (workspace standard); h3-quinn brings quinn's futures-io feature via
+# feature unification.
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+
+# X25519 keypair generation for REALITY e2e configs (feature `native-e2e`
+# only): ring 0.17 cannot serialize the private half of a generated
+# `EphemeralPrivateKey` (its `bytes()` is test-gated), and the server inbound
+# needs the raw private key — x25519-dalek derives the public half from
+# arbitrary 32-byte seeds. The runtime tunnel never needs keygen: the client
+# only ECDHs with the server's `pbk`.
+x25519-dalek = { workspace = true, optional = true }
+
+# errors
+thiserror.workspace = true
+
+# infallible sync locks (project rule rs-parking-lot; workspace already uses 0.12)
+parking_lot.workspace = true
+
+# observability (debug diagnostics in transports)
+tracing.workspace = true
+
+# pinSHA256 (base64) decode for the fingerprint connector's SPKI pin
+base64.workspace = true
+
+# misc
+uuid.workspace = true
+
+# e2e pipeline (crate-side module -> real deps, optional behind the feature)
+serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+tiny_http = { version = "0.12.0", optional = true }
+# inner-TLS echo target for the vision e2e rows (spec §7.4): a tokio TLS
+# server completing a real TLS 1.3 session through the tunnel. Ring backend
+# only (workspace TLS standard — tokio-rustls 0.26 defaults to aws_lc_rs;
+# see the workspace rustls pin / leas-core's transitive override).
+tokio-rustls = { workspace = true, optional = true }
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[lints]
+workspace = true
+
+[features]
+native-e2e = ["dep:serde_json", "dep:tempfile", "dep:rcgen", "dep:tiny_http", "dep:x25519-dalek", "dep:tokio-rustls"]
+
+# [[bench]] target: `harness = false` — criterion owns `main`. The bench
+# file itself is `#![cfg(feature = "native-e2e")]`-gated and
+# `required-features` keeps cargo from building it without the feature.
+[[bench]]
+name = "throughput"
+harness = false
+required-features = ["native-e2e"]
+
+# `relay` benches the SOCKS5 inbound + Direct outbound path. The feature is
+# only for the in-process sink/source/udp-echo harness targets — the bench
+# never resolves a core binary, so it always measures instead of skipping.
+[[bench]]
+name = "relay"
+harness = false
+required-features = ["native-e2e"]
+
+# `dispatch` measures the `Box<dyn Stream>` seam against a monomorphized
+# stack of the same depth over `tokio::io::duplex`: no feature gate, no
+# network, no external binary.
+[[bench]]
+name = "dispatch"
+harness = false
+
+# `ss_codec` measures the Shadowsocks codecs the client runs per chunk and
+# per datagram (classic AEAD + 2022-blake3, TCP framing and UDP codec) plus
+# the per-connection subkey KDFs: no feature gate, no core binary, no socket.
+[[bench]]
+name = "ss_codec"
+harness = false
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# serde_json/rcgen are used by unit tests in security/transport/context/chain,
+# which compile without the `native-e2e` feature — dev-deps make them available
+# to lib unit tests regardless of feature selection (normal optional deps stay
+# for the feature-gated e2e module).
+serde_json.workspace = true
+rcgen.workspace = true
+rstest.workspace = true
+# (rustls is a normal dependency now — the h3 arm's QUIC TLS config; the
+# server double reuses the same dep.)
+# Throughput benches (`benches/throughput.rs`, Task 2): criterion harness +
+# tempdir for the spawned core's on-disk config.
+criterion = { workspace = true, features = ["async_tokio"] }
+tempfile.workspace = true

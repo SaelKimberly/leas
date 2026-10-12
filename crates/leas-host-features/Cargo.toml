@@ -1,0 +1,41 @@
+[package]
+name = "leas-host-features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SNI / exact-IP / CIDR whitelist membership checks for leas"
+readme.workspace = true
+keywords = ["whitelist", "networking", "bloom-filter"]
+categories = ["network-programming"]
+rust-version.workspace = true
+
+[dependencies]
+# ============ Whitelist ============
+# Single-crate dependency → crate-local per dependency policy; minor bound at latest.
+# `serde` feature of the source is dropped: bloom filters are never serialized here.
+fastbloom = "0.17.0"
+
+# ============ TLS ============
+rustls = { workspace = true, features = ["ring"] }   # pki_types::ServerName + provider install before reqwest Client::build (rustls-no-provider)
+
+# ============ Networking ============
+reqwest.workspace = true  # download-if-missing of whitelist files
+
+# ============ Async Runtime & I/O ============
+tokio = { workspace = true, features = ["fs", "io-util"] }
+
+# ============ Error Handling ============
+anyhow.workspace = true
+
+# ============ Logging ============
+tracing.workspace = true
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

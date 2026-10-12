@@ -1,0 +1,56 @@
+[package]
+name = "leas-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Typed persistence for leas — SQLite via toasty over Turso: schema, migrations, page query, write-behind"
+readme.workspace = true
+keywords = ["database", "sqlite", "orm"]
+categories = ["database"]
+
+[dependencies]
+# ============ ORM ============
+# `turso` here is the DRIVER only: the vendored local-only fork
+# (`src/driver/`) replaces `toasty-driver-turso`, so the `turso` feature is
+# deliberately NOT enabled on `toasty` (else upstream's driver would return
+# via the feature flag and dual-resolve its own turso pin).
+toasty = { workspace = true, features = ["serde", "jiff"] }
+toasty-core = "0.11"
+toasty-sql = "0.11"
+turso = "0.8"
+async-trait = "0.1"
+
+# ============ Time ============
+jiff = { workspace = true }
+
+# ============ JSON (the projection decodes the stored JSON-array columns) ============
+serde_json.workspace = true
+
+# ============ Typed proto configs ============
+leas-proto = { path = "../leas-proto", version = "0.1.0" }
+
+# ============ Error Handling ============
+	thiserror.workspace = true
+
+# ============ Logging ============
+tracing.workspace = true
+
+# ============ Text / Search / Hash ============
+uuid.workspace = true
+
+# ============ Async Runtime & I/O ============
+tokio.workspace = true
+dashmap = "6.2.1"
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+toasty = { workspace = true, features = ["serde", "jiff"] }
+jiff = { workspace = true }
+leas-proto = { path = "../leas-proto", version = "0.1.0" }
+tempfile.workspace = true

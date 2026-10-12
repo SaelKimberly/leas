@@ -11,6 +11,8 @@ rust-version = "1.98.0"
 
 readme = "README.md"
 license = "MIT"
+repository = "https://github.com/SaelKimberly/leas"
+authors = ["Peter <sael.kimberly@yandex.ru>"]
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -86,14 +88,14 @@ criterion = { version = "0.8.2" }
 # Workspace TLS standard is RING ONLY — aws-lc-rs is denied. Every rustls
 # consumer must use default-features = false (rustls 0.23 defaults to
 # aws_lc_rs). Watch: tokio-rustls 0.26's DEFAULT features include
-# aws_lc_rs (xray-tui-core pins it default-features = false + ring/tls12 —
+# aws_lc_rs (leas-core pins it default-features = false + ring/tls12 —
 # that pin is the reason aws-lc-rs stays out of the lockfile; check with
 # `cargo tree -i aws-lc-rs` after any dependency change).
 rustls = { version = "0.23.45", default-features = false }
 
 # ============ Crypto ============
-# Shared by xray-tui-tls / xray-tui-native / xray-tui-route (ring) and
-# xray-tui-native / xray-tui-route (aes). Single-crate crypto deps stay in
+# Shared by leas-tls / leas-native / leas-route (ring) and
+# leas-native / leas-route (aes). Single-crate crypto deps stay in
 # the crate manifest; these crossed the 2-crate threshold.
 ring = "0.17.14"
 aes = "0.9.3"
@@ -101,17 +103,17 @@ aes = "0.9.3"
 # Secret wiping (`Zeroizing<T>` / `#[derive(ZeroizeOnDrop)]`). Already in the
 # lockfile transitively (curve25519-dalek, the RustCrypto ciphers), so a
 # direct dep adds no tree entry. `derive` brings the `ZeroizeOnDrop` macro.
-# Shared by xray-tui-tls (key schedule, ML-KEM, REALITY auth) and
-# xray-tui-native (protocol key material).
+# Shared by leas-tls (key schedule, ML-KEM, REALITY auth) and
+# leas-native (protocol key material).
 zeroize = { version = "1.9.0", features = ["derive"] }
 
 # ============ TUI ============
 ratatui-themes = "0.3"
 
 # ============ Proto crate ============
-xray-tui-proto = { path = "crates/xray-tui-proto", version = "0.1.0" }
+leas-proto = { path = "crates/leas-proto", version = "0.1.0" }
 # ============ TLS engine crate ============
-xray-tui-tls = { path = "crates/xray-tui-tls", version = "0.1.0" }
+leas-tls = { path = "crates/leas-tls", version = "0.1.0" }
 
 # ============ Logging ============
 tracing = { version = "0.1.44" }
@@ -125,13 +127,13 @@ jiff = "0.2.37"
 toasty = { version = "0.11", default-features = false }
 
 # ============ Shared archive/encoding/crypto edges (2+ crates) ============
-# base64: xray-tui-proto (URL credentials) + xray-tui-native (pinSHA256).
+# base64: leas-proto (URL credentials) + leas-native (pinSHA256).
 base64 = "0.23.1"
-# base64-simd: xray-tui-config (fast decode) + xray-tui (dev).
+# base64-simd: leas-config (fast decode) + leas (dev).
 base64-simd = "0.8.0"
 # bytes: payload buffers shared by the route engine, the native datapath and the TUI.
 bytes = "1.12.1"
-# flate2: RFC 8879 cert decompression (xray-tui-tls) + core binary archives.
+# flate2: RFC 8879 cert decompression (leas-tls) + core binary archives.
 flate2 = "1.1.10"
 # lru: bounded caches in the TUI, geoip and the routing engine.
 lru = "0.18.5"
@@ -145,7 +147,7 @@ rcgen = "0.14.10"
 # tempfile: every crate's test scratch dirs.
 tempfile = "3.27.0"
 # tokio-rustls: the ring-only pin (see the rustls note above) lives here now.
-# The entry carries ONLY the two features every consumer wants; xray-tui-core
+# The entry carries ONLY the two features every consumer wants; leas-core
 # adds `logging` on its own edge, so the hoisted entry does not widen the
 # native e2e build.
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
@@ -156,4 +158,4 @@ x25519-dalek = { version = "3.0.0", default-features = false, features = ["stati
 [workspace.metadata.cargo-machete]
 # The hakari (feature-unification) crate's dependencies are never referenced
 # from code by design; its own manifest carries the full per-crate ignore list.
-ignored = ["xray-tui-hakari"]
+ignored = ["leas-hakari"]

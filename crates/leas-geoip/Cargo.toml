@@ -1,0 +1,45 @@
+[package]
+name = "leas-geoip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GeoLite2-City country/city lookup for leas"
+readme.workspace = true
+keywords = ["geoip", "geolocation", "maxmind"]
+categories = ["network-programming"]
+rust-version.workspace = true
+
+[dependencies]
+# ============ Geo ============
+# 0.32 REMOVED the `simdutf8` feature outright (upstream measured no win on
+# production GeoIP2 databases), so the whole feature list is deleted rather
+# than renamed. Every read API this crate uses is source-identical.
+maxminddb = "0.32"
+
+# ============ Async Runtime & I/O ============
+tokio = { workspace = true, features = ["sync", "fs", "io-util", "rt"] }
+
+# ============ Networking ============
+reqwest.workspace = true
+# ring provider install before reqwest Client::build (rustls-no-provider)
+rustls = { workspace = true, features = ["ring"] }
+
+# ============ Error Handling ============
+anyhow.workspace = true
+
+# ============ Logging ============
+tracing.workspace = true
+
+# ============ Bounded caches ============
+# Memory-diet Task 6 (B-slice gate): per-IP location micro-cache LRU bound.
+lru.workspace = true
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

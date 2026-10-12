@@ -1,0 +1,80 @@
+[package]
+name = "leas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "A feature-rich terminal client for modern VPN and proxy protocols"
+readme.workspace = true
+keywords = ["vpn", "proxy", "tui", "terminal"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+leas-core = { path = "../leas-core", version = "0.1.0" }
+leas-db = { path = "../leas-db", version = "0.1.0" }
+leas-config = { path = "../leas-config", version = "0.1.0" }
+leas-proto = { path = "../leas-proto", version = "0.1.0" }
+leas-route = { path = "../leas-route", version = "0.1" }
+leas-geoip = { path = "../leas-geoip", version = "0.1.0" }
+leas-dns = { path = "../leas-dns", version = "0.1.0" }
+leas-host-features = { path = "../leas-host-features", version = "0.1.0" }
+leas-native = { path = "../leas-native", version = "0.1.0" }
+toasty = { workspace = true, features = ["serde"] }
+jiff.workspace = true
+
+# ============ Async Runtime & I/O ============
+tokio.workspace = true
+tokio.features = ["fs", "io-util", "rt-multi-thread", "macros", "signal", "sync"]
+futures-util.workspace = true
+dashmap = "6.2.1"
+
+# ============ Serialization ============
+serde.workspace = true
+serde_json.workspace = true
+
+# ============ Networking ============
+reqwest.workspace = true
+reqwest.features = ["gzip"]
+bytes.workspace = true
+# rustls ring: process-level CryptoProvider::install_default() at startup
+# (main.rs install_tls_provider) — reqwest 0.13 rustls-no-provider requires it.
+rustls = { workspace = true, features = ["ring"] }
+
+# ============ Config & Filesystem ============
+dirs.workspace = true
+
+# ============ TUI Framework ============
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+unicode-width = "0.2.2"
+ratatui-themes.workspace = true
+ratatui-cheese = "0.7.0"
+tui-popup = "0.7.7"
+tui-scrollbar = "0.2.8"
+arboard = "3.6.1"
+
+# ============ Error Handling ============
+	anyhow.workspace = true
+
+# ============ Text / Search / Hash ============
+uuid.workspace = true
+
+# ============ Logging ============
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry", "json"] }
+chrono = { version = "0.4.45" }
+humantime.workspace = true
+url.workspace = true
+parking_lot.workspace = true
+# Memory-diet Task 6 (B-slice gate): the ONLY new-dep allowance. `lru 0.18`
+# is already in Cargo.lock (toasty's transitive dep), so no new crates enter
+# the tree — direct edges only for the TUI's bounded caches.
+lru.workspace = true
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[lints]
+workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+base64-simd.workspace = true

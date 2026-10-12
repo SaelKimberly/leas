@@ -1,0 +1,96 @@
+[package]
+name = "leas-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Ring-based TLS client with browser fingerprint mimicry and REALITY support"
+readme.workspace = true
+keywords = ["tls", "reality", "fingerprint", "utls"]
+categories = ["cryptography", "network-programming"]
+rust-version.workspace = true
+
+[dependencies]
+# crypto (workspace standard: ring)
+ring.workspace = true
+# Secret wiping: key-schedule PRKs/traffic secrets, ML-KEM decapsulation
+# keys, the REALITY auth key. ring's `LessSafeKey`/`Prk` are opaque — what
+# we can wipe is every buffer we own on the way in and out of them.
+zeroize.workspace = true
+# Constant-time comparison for the REALITY certificate HMAC
+# (`reality::verify`). `subtle` is the audited primitive; the previous
+# hand-rolled XOR fold is gone.
+subtle = { version = "2.6.1", default-features = false }
+# REALITY's ephemeral keypair must agree TWICE (auth with the static pbk,
+# TLS with the server's ephemeral keyshare) — ring 0.17's
+# EphemeralPrivateKey is single-use and cannot be serialized, so the
+# multi-agreement pair lives in x25519-dalek (same X25519 math as both cores).
+# `zeroize` is in dalek's DEFAULT feature set — `default-features = false`
+# turns it off, so without listing it here the REALITY scalar and every
+# `SharedSecret` would be dropped unwiped.
+x25519-dalek.workspace = true
+# async I/O seam
+tokio = { workspace = true, features = ["io-util", "time", "rt", "sync"] }
+# cert verification
+rustls-webpki = { version = "0.103.15", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.15.1"
+webpki-roots.workspace = true
+# JA3 hash
+md-5.workspace = true
+# JA4 hash segments (sha256 truncated)
+sha2.workspace = true
+# JSON parsing for the tls.peet.ws grader (example + ignored network test)
+serde_json.workspace = true
+# Fingerprint selection persistence (TUI settings)
+serde.workspace = true
+# errors
+thiserror.workspace = true
+# ML-KEM-768 (FIPS 203) — RustCrypto, pure Rust. Replaces liboqs/`oqs`, whose
+# vendored build required CMake, bindgen/libclang and a C/C++ toolchain — the
+# `x86_64-pc-windows-gnu` target this workspace builds for cannot assume them.
+# `zeroize` wipes the decapsulation key on drop; `default-features = false`
+# keeps ciphertexts and shared secrets inline (no heap), which the
+# allocation-free `encapsulate_into` path depends on.
+ml-kem = { version = "0.3.2", default-features = false, features = ["zeroize"] }
+# RNG trait for the adapter in `crypto::mlkem`: `RingRng` bridges ring's CSPRNG
+# into `encapsulate_with_rng`, so ML-KEM key material keeps the workspace's one
+# RNG provider instead of a second OS-RNG path.
+rand_core = { version = "0.10.1", default-features = false }
+# Certificate decompression (RFC 8879) — the engine advertises
+# `compress_certificate` in its fingerprints (Chrome offers brotli+zstd), so
+# a real server (e.g. Cloudflare) may return a compressed Certificate
+# message; the client must decompress the offered algorithms. flate2/zstd
+# are already in the workspace lockfile; brotli is new.
+flate2.workspace = true
+brotli = "9.0.0"
+zstd = "0.14.0"
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }
+# Inf. locks for the recording http2 test server (workspace already uses 0.12).
+parking_lot.workspace = true
+rcgen.workspace = true
+rstest.workspace = true
+# Interop proof: our client handshakes against a real rustls server. The
+# workspace dep pins default-features = false (ring is the workspace's
+# single crypto provider); we enable exactly ring + std so rustls's
+# process-level provider selection is unambiguous.
+rustls = { workspace = true, features = ["ring", "std"] }
+# Record-layer benches (`benches/record.rs`): criterion harness only — the
+# bench drives its async work through `rt.block_on`, so no `async_tokio`.
+criterion = { workspace = true }
+
+# [[bench]] target: `harness = false` — criterion owns `main`. No
+# `required-features`: the record rows need neither a core binary nor a
+# network, so they build and run on a bare checkout.
+[[bench]]
+name = "record"
+harness = false
+
+[[example]]
+name = "grader"
+path = "examples/grader.rs"

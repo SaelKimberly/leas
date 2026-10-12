@@ -1,0 +1,81 @@
+[package]
+name = "leas-route"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "First-match routing engine with TLS/HTTP/QUIC sniffing"
+readme.workspace = true
+keywords = ["routing", "proxy", "sniffing"]
+categories = ["network-programming"]
+
+[dependencies]
+# ============ Serialization ============
+serde.workspace = true
+serde_json.workspace = true
+
+# ============ Error Handling ============
+thiserror.workspace = true
+
+# ============ Text / Search / Hash ============
+aho-corasick.workspace = true
+regex = "1.13.1"
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+# ============ Sniffing (QUIC Initial packet decryption) ============
+aes.workspace = true
+ring.workspace = true
+
+# ============ Time / Duration Parsing ============
+jiff.workspace = true
+
+# ============ Bounded caches ============
+# Memory-diet Task 6 (B-slice gate): `ResolvedCache` LRU bound.
+lru.workspace = true
+
+# ============ Payload Buffers ============
+# Task 2 relay convention: the datapath carries payload bytes as `Bytes`
+# (zero-copy slices); `ConnMeta.payload_prefix` shares that buffer instead
+# of owning a `Vec` copy.
+bytes.workspace = true
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[features]
+default = []
+dns = ["dep:leas-dns"]
+geoip = ["dep:leas-geoip"]
+
+[dependencies.leas-dns]
+version = "0.1"
+path = "../leas-dns"
+optional = true
+
+[dependencies.leas-geoip]
+version = "0.1"
+path = "../leas-geoip"
+optional = true
+
+# [[bench]] target: `harness = false` — criterion owns `main`. No
+# `required-features`: `Engine::decide` is pure and the bench needs nothing
+# beyond the crate's default features.
+[[bench]]
+name = "decide"
+harness = false
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+leas-tls.workspace = true
+# Routing decision benches (`benches/decide.rs`): criterion harness only —
+# the engine's decide path is synchronous, so no async feature is needed.
+criterion = { workspace = true }
+
+[package.metadata.cargo-machete]
+# `leas-geoip` is wired by the `geoip` feature only, and geo matching is
+# not implemented yet — the IR already carries `geo_country` fields, but no
+# matcher consults the crate, so machete cannot see the dependency.
+ignored = ["leas-geoip"]
+
+[lints]
+workspace = true

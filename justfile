@@ -24,7 +24,7 @@ fmt-check mode='report':
 
 # cargo-hakari workspace-hack verification (.config/hakari.toml).
 # Three distinct checks; `verify` alone does NOT catch staleness or a member
-# missing the workspace-hack dep (why xray-tui-route drifted):
+# missing the workspace-hack dep (why leas-route drifted):
 #   generate --diff        workspace-hack Cargo.toml is up-to-date
 #   manage-deps --dry-run  every workspace crate depends on the workspace-hack
 #   verify                 each crate resolves to a single feature set
@@ -55,7 +55,7 @@ machete mode='report':
 # ratatui-themes 0.3, dirs 7, base64 0.23, sha2 0.11 are applied with breakage
 # fixes — all landed as manifest-only edits). The residual entries are
 # transitive-only, graph-inherent dual-major pins in the generated
-# xray-tui-hakari, e.g. base64 0.22 via dns-stamp-parser/tantivy/tonic,
+# leas-hakari, e.g. base64 0.22 via dns-stamp-parser/tantivy/tonic,
 # compact_str 0.9 via ratatui-core 0.1.2, hashbrown 0.16 via lru 0.16 (NOT
 # yaml-rust2, which moved to hashlink 0.12.2), nom 7 via tantivy-query-grammar,
 # unicode-truncate 2 via ratatui-core, constant_time_eq 0.4 via blake3 + zip,
@@ -112,19 +112,19 @@ _gate mode target:
 # ─── Benchmarks ───────────────────────────────────────────────────
 #
 # `just bench`       — every criterion target (`throughput` needs real cores at
-#                      $XRAY_TUI_CORE_BIN_DIR, see .cargo/config.toml)
+#                      $LEAS_CORE_BIN_DIR, see .cargo/config.toml)
 # `just bench micro` — only the targets that need no external binaries
 #
-# Results land in ./.benchmarks (criterion.toml). `XRAY_TUI_BENCH_MB` sets the
+# Results land in ./.benchmarks (criterion.toml). `LEAS_BENCH_MB` sets the
 # per-row transfer size (default 64) and is inherited from the environment.
 
 # Run the criterion benchmarks. `target` selects the group: micro | all (default).
 #
-# XRAY_TUI_BENCH_MB defaults to 4 here, NOT to the harness default of 64:
+# LEAS_BENCH_MB defaults to 4 here, NOT to the harness default of 64:
 # benches/baseline.md was captured at 4, and the recorded medians are only
 # comparable at the same transfer size.
 #
-# XRAY_TUI_CORE_BIN_DIR is exported explicitly: `cargo criterion` launches the
+# LEAS_CORE_BIN_DIR is exported explicitly: `cargo criterion` launches the
 # bench executable itself and does NOT apply `[env]` from .cargo/config.toml,
 # so the throughput rows would silently print "SKIP ... is not set" and the run
 # would still exit 0.
@@ -138,25 +138,25 @@ bench target='all':
             exit 2
             ;;
     esac
-    : "${XRAY_TUI_BENCH_MB:=4}"
-    : "${XRAY_TUI_CORE_BIN_DIR:=/tmp/core-bin}"
-    export XRAY_TUI_BENCH_MB XRAY_TUI_CORE_BIN_DIR
-    echo "XRAY_TUI_BENCH_MB=$XRAY_TUI_BENCH_MB XRAY_TUI_CORE_BIN_DIR=$XRAY_TUI_CORE_BIN_DIR"
-    if [ "{{target}}" = all ] && { [ ! -x "$XRAY_TUI_CORE_BIN_DIR/xray" ] || [ ! -x "$XRAY_TUI_CORE_BIN_DIR/sing-box" ]; }; then
-        echo "missing xray/sing-box in $XRAY_TUI_CORE_BIN_DIR — the throughput rows would skip silently" >&2
+    : "${LEAS_BENCH_MB:=4}"
+    : "${LEAS_CORE_BIN_DIR:=/tmp/core-bin}"
+    export LEAS_BENCH_MB LEAS_CORE_BIN_DIR
+    echo "LEAS_BENCH_MB=$LEAS_BENCH_MB LEAS_CORE_BIN_DIR=$LEAS_CORE_BIN_DIR"
+    if [ "{{target}}" = all ] && { [ ! -x "$LEAS_CORE_BIN_DIR/xray" ] || [ ! -x "$LEAS_CORE_BIN_DIR/sing-box" ]; }; then
+        echo "missing xray/sing-box in $LEAS_CORE_BIN_DIR — the throughput rows would skip silently" >&2
         echo "install the pinned versions or run 'just bench micro'" >&2
         exit 2
     fi
-    cargo criterion -p xray-tui-tls    --bench record
-    cargo criterion -p xray-tui-route  --bench decide
-    cargo criterion -p xray-tui-native --bench dispatch
+    cargo criterion -p leas-tls    --bench record
+    cargo criterion -p leas-route  --bench decide
+    cargo criterion -p leas-native --bench dispatch
     # Hermetic Shadowsocks codec/KDF rows — no cores, no sockets, so micro-safe.
-    cargo criterion -p xray-tui-native --bench ss_codec
+    cargo criterion -p leas-native --bench ss_codec
     # Per-kind ProtocolId identity traversal — hermetic, micro-safe.
-    cargo criterion -p xray-tui-proto  --bench identity
-    cargo criterion -p xray-tui-native --features native-e2e --bench relay
+    cargo criterion -p leas-proto  --bench identity
+    cargo criterion -p leas-native --features native-e2e --bench relay
     if [ "{{target}}" = all ]; then
-        cargo criterion -p xray-tui-native --features native-e2e --bench throughput
+        cargo criterion -p leas-native --features native-e2e --bench throughput
     fi
 
 # ─── Tier-3b test oracle: pinned SIP003 plugin binaries ────────────
@@ -166,7 +166,7 @@ bench target='all':
 # sing-box's SS *inbound* has no plugin field (only its outbound does, and
 # in-process). So the server side is a real plugin binary.
 #
-#   $XRAY_TUI_PLUGIN_BIN_DIR   install target (default /tmp/plugin-bin)
+#   $LEAS_PLUGIN_BIN_DIR   install target (default /tmp/plugin-bin)
 #
 # Two pins, both deliberate:
 #   * v2ray-plugin — a PREBUILT release asset, sha256-verified. Its own
@@ -194,7 +194,7 @@ PLUGIN_LIBEV_VERSION := '4.33'
 plugin-bins:
     #!/usr/bin/env bash
     set -euo pipefail
-    dir="${XRAY_TUI_PLUGIN_BIN_DIR:-/tmp/plugin-bin}"
+    dir="${LEAS_PLUGIN_BIN_DIR:-/tmp/plugin-bin}"
     mkdir -p "$dir"
 
     # ── v2ray-plugin: prebuilt, checksum-verified ──
@@ -308,8 +308,8 @@ plugin-bins:
     fi
     echo
     echo "run the plugin rows with:"
-    echo "  XRAY_TUI_PLUGIN_BIN_DIR=$dir \\"
-    echo "    cargo test -p xray-tui-native --features native-e2e --test plugin_sip003 -- --ignored"
+    echo "  LEAS_PLUGIN_BIN_DIR=$dir \\"
+    echo "    cargo test -p leas-native --features native-e2e --test plugin_sip003 -- --ignored"
     echo
     echo "(--ignored matters: the plugin rows live in an #[ignore]d test. Set"
-    echo "XRAY_TUI_SSSERVER_BIN if the vendored thirdparty build is not present."
+    echo "LEAS_SSSERVER_BIN if the vendored thirdparty build is not present."
