@@ -635,6 +635,7 @@ mod tests {
     use super::TrojanConfig;
     use crate::proto_spec::common::TransportConfig;
     use crate::urlx::{RawUrlX, SchemeX};
+    use rstest::rstest;
 
     fn parse(url: &str) -> ParsedProto {
         TrojanConfig::try_parse_proto(&RawUrlX::from(url))
@@ -993,12 +994,14 @@ mod tests {
         assert_eq!(conf["streamSettings"]["tlsSettings"]["allowInsecure"], true);
     }
 
-    #[test]
-    fn xray_inject_without_endpoint_is_rejected() {
+    #[rstest]
+    #[case::xray(CoreType::Xray)]
+    #[case::singbox(CoreType::SingBox)]
+    fn inject_without_endpoint_is_rejected(#[case] core: CoreType) {
         let cfg = trojan_ws_tls();
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .inject_to(&mut conf, core, None, InjectOptions::default())
             .expect_err("orphan trojan must be rejected");
         assert!(matches!(
             err,
@@ -1063,18 +1066,5 @@ mod tests {
             conf.get("transport").is_none(),
             "tcp must not emit a transport key: {conf}"
         );
-    }
-
-    #[test]
-    fn singbox_inject_without_endpoint_is_rejected() {
-        let cfg = trojan_ws_tls();
-        let mut conf = serde_json::json!({});
-        let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
-            .expect_err("orphan trojan must be rejected");
-        assert!(matches!(
-            err,
-            SupportError::MissingField("server", "trojan")
-        ));
     }
 }

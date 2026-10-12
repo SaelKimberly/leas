@@ -45,18 +45,6 @@ pub struct ConnMeta {
     pub resolved_host_ips: Vec<IpAddr>,
 }
 
-impl ConnMeta {
-    /// Candidate destination IPs contributed by prior resolution passes.
-    ///
-    /// A literal-IP [`NetHost`] is considered separately at evaluation time
-    /// and does not appear here; pass-based enrichment appends to the same
-    /// backing vector.
-    #[must_use]
-    pub fn target_ips(&self) -> &[IpAddr] {
-        &self.resolved_host_ips
-    }
-}
-
 /// Terminal outcome of evaluating a connection against the rule set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -1095,14 +1083,6 @@ mod tests {
             !e2.decide(&meta("h", 1, NetworkMask::TCP))
                 .is_routed_to("out")
         );
-    }
-
-    #[test]
-    fn target_ips_exposes_pass_resolution_results() {
-        let mut m = meta("mixed.example", 443, NetworkMask::TCP);
-        assert!(m.target_ips().is_empty());
-        m.resolved_host_ips.push(IpAddr::from([203u8, 0, 113, 7]));
-        assert_eq!(m.target_ips().len(), 1);
     }
 
     #[test]

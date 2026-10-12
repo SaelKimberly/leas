@@ -57,7 +57,7 @@ fn value_row(i: usize) -> String {
     // is not constant (a constant column cannot mask a missing term, but a
     // spread one makes a wrong column ORDER show up in the plan).
     let stab = (i % 8) as i64;
-    let proven = i64::from(i % 4 == 0);
+    let proven = i64::from(i.is_multiple_of(4));
     format!("({i},{band},{bin},{weight},'{domain}','{sub}',{addr},{seen},{stab},{proven})")
 }
 
@@ -78,7 +78,8 @@ async fn plan(conn: &turso::Connection, sql: &str) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "turso planner gate (db-rewamp T2); prints plans, not an assertion suite"]
+#[cfg(feature = "perf-lab")]
+#[ignore = "turso planner gate (db-rewamp T2); prints plans, not an assertion suite (run with --features perf-lab -- --ignored)"]
 async fn turso_planner_gate() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("planner.db");

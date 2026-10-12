@@ -216,7 +216,7 @@ mod tests {
         assert_eq!(parsed.session_id, vec![0x42; 32]);
         assert_eq!(parsed.cipher_suites, vec![0x1301, 0x1302]);
         assert_eq!(parsed.compression_methods, vec![0x00]);
-        assert!(parsed.extensions.is_empty());
+        assert_eq!(parsed.extensions.len(), 0);
         assert!(parsed.extension(0x000d).is_none());
     }
 

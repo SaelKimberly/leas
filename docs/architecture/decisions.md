@@ -34,7 +34,7 @@ The invariants a change must respect. Detail lives in the sibling `reference/` p
 - **Xray composition order:** `dial → security → transport upgrade → protocol → tunnel`. TLS is outermost; ws/grpc framing runs inside it. `LinkContext` is the per-link policy surface every phase reads.
 - **TLS fingerprint engine is ring-only** (`leas-tls`): TLS 1.3 + a 1.2 fallback, declarative browser-hello profiles, WebPKI verification (`insecure`/`pin_sha256` trust modes only — never a blanket skip). REALITY reuses the same hello machinery. Both crypto crates are `#![forbid(unsafe_code)]`.
 - **Secrets are wiped** (`zeroize` on owned key buffers; the `zeroize` *feature* must stay listed on every crypto dep that touches keys). Non-default crypto sites and advisories: [`reference/crypto-dependencies.md`](../reference/crypto-dependencies.md), ADR 0007.
-- **Verification tiers:** tier 1 offline (hermetic, the CI gate); tier 2 live grader; tier 3 real-core e2e (feature + `LEAS_CORE_BIN_DIR`). No implicit network in the usual test run.
+- **Verification tiers:** tier 1 offline (hermetic, the CI gate); tier 2 live grader; tier 3 real-core e2e (feature + `LEAS_CORE_BIN_DIR`); plus a manual perf-lab tier — the timing/planner probes behind `--features perf-lab`, `#[ignore]`d and never in the gate. No implicit network in the usual test run.
 
 ## Reference repositories (read-only)
 

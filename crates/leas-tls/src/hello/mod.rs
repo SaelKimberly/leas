@@ -638,7 +638,7 @@ mod tests {
         // The exact padding length follows from the 512-byte target (and
         // shifts with any hello change); the invariants are the record size
         // above and a zero-filled padding body.
-        assert!(!padding.is_empty());
+        assert_ne!(padding.len(), 0);
         assert!(padding.iter().all(|&b| b == 0));
 
         // An unpadded record already >= 512 bytes → no padding extension.

@@ -16,6 +16,7 @@ pub const API_PORT: u16 = 62789;
 pub const CLASH_API_PORT: u16 = 9090;
 /// Parameters extracted from app config for building backend configs.
 /// Avoids a circular dependency on `leas-config`.
+#[allow(clippy::struct_excessive_bools)] // these bools are the builder's public API
 #[derive(Debug, Clone)]
 pub struct BuildParams {
     pub v2ray_api_enabled: bool,
@@ -40,6 +41,7 @@ pub struct BuildParams {
 /// included) so cipher-aware core resolution falls back to the default; the
 /// config builders themselves refuse unloaded configs with a
 /// [`BuildError::InvalidProfile`] instead of panicking.
+#[must_use]
 pub fn shadowsocks_method(protocol: &Protocol) -> Option<String> {
     use leas_proto::proto_spec::ProtocolKind;
     if !matches!(

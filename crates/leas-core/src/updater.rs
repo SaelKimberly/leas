@@ -17,6 +17,7 @@ static UPDATE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock
 /// A fetch whose response is adopted (an update, a geo file, a subscription
 /// feed) must not be movable onto a loopback/LAN/metadata endpoint by the
 /// origin that answers it (findings f10/f11).
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // `lower` is already ASCII-lowercased, so this comparison is case-insensitive
 fn redirect_target_is_local(url: &reqwest::Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
@@ -51,7 +52,9 @@ fn redirect_target_is_local(url: &reqwest::Url) -> bool {
 }
 
 /// Redirect policy for fetch clients whose body is adopted (updates, geo
-/// files, subscription feeds). Rejects a plaintext downgrade, refuses to land
+/// files, subscription feeds).
+///
+/// Rejects a plaintext downgrade, refuses to land
 /// on a local-use host, and caps the chain. `require_https` forces every hop
 /// to HTTPS (pass `false` for feeds whose provider may legitimately be http —
 /// a downgrade from https is still always refused).
@@ -191,7 +194,7 @@ pub async fn get_latest_version(core_type: CoreType) -> Option<String> {
 
 /// Download the release asset for the current platform.
 /// Download the release asset for the current platform.
-/// `progress` is an optional callback invoked with (downloaded_bytes, total_bytes).
+/// `progress` is an optional callback invoked with (`downloaded_bytes`, `total_bytes`).
 pub async fn download_release<F: Fn(u64, u64) + Send + 'static>(
     client: &reqwest::Client,
     core_type: CoreType,
@@ -237,7 +240,7 @@ pub async fn download_release<F: Fn(u64, u64) + Send + 'static>(
     Ok(dest)
 }
 
-/// Download a geo file (geoip.dat or geosite.dat) from URL to dest_dir.
+/// Download a geo file (geoip.dat or geosite.dat) from URL to `dest_dir`.
 pub async fn download_geo_file(
     client: &reqwest::Client,
     url: &str,
@@ -270,7 +273,7 @@ pub async fn download_geo_file(
     Ok(dest)
 }
 /// Extract archive, verify binary, install all files to `bin_dir`.
-/// Uses spawn_blocking for synchronous archive extraction and file copy.
+/// Uses `spawn_blocking` for synchronous archive extraction and file copy.
 pub async fn install_binary(
     archive: &Path,
     core_type: CoreType,
@@ -496,6 +499,7 @@ fn find_binary_in_dir(dir: &Path, exe_name: &str) -> Result<PathBuf, UpdateError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn test_parse_version() {
@@ -596,70 +600,63 @@ mod tests {
         ));
     }
 
-    #[test]
     #[cfg(unix)]
-    fn get_current_version_finds_managed_binary() {
-        let tmp = std::env::temp_dir().join("leas-test-updater-managed");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("xray")).unwrap();
-
-        // Create a fake xray binary that outputs version info
-        let binary = tmp.join("xray").join("xray");
-        std::fs::write(&binary, "#!/bin/sh\necho \"xray 1.8.4\"\n").unwrap();
+    #[rstest]
+    #[case::xray_managed_binary(
+        CoreType::Xray,
+        "leas-test-updater-xray",
+        "xray 1.8.4",
+        "1.8.4",
+        false
+    )]
+    #[case::singbox_managed_binary(
+        CoreType::SingBox,
+        "leas-test-updater-singbox",
+        "sing-box 1.10.3",
+        "1.10.3",
+        false
+    )]
+    #[case::find_binary_and_version_combined(
+        CoreType::Xray,
+        "leas-test-updater-combined",
+        "xray 2.0.0",
+        "2.0.0",
+        true
+    )]
+    fn get_current_version_from_managed_binary(
+        #[case] core_type: CoreType,
+        #[case] tmp_name: &str,
+        #[case] script_body: &str,
+        #[case] expected: &str,
+        #[case] assert_find_binary: bool,
+    ) {
         use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(tmp_name);
+        let _ = std::fs::remove_dir_all(&tmp);
+        let core_subdir = core_type.to_string();
+        std::fs::create_dir_all(tmp.join(&core_subdir)).unwrap();
+
+        let binary = tmp.join(&core_subdir).join(&core_subdir);
+        std::fs::write(&binary, format!("#!/bin/sh\necho \"{script_body}\"\n")).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let version = rt.block_on(get_current_version(CoreType::Xray, &tmp));
-        assert_eq!(version, Some("1.8.4".to_string()));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn get_current_version_with_singbox_managed_binary() {
-        let tmp = std::env::temp_dir().join("leas-test-updater-singbox");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("sing-box")).unwrap();
-
-        let binary = tmp.join("sing-box").join("sing-box");
-        std::fs::write(&binary, "#!/bin/sh\necho \"sing-box 1.10.3\"\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if assert_find_binary {
+            let found = crate::bin_manager::find_binary(core_type, &tmp);
+            assert!(
+                found.is_some(),
+                "find_binary should find managed {core_subdir}"
+            );
+            assert_eq!(
+                found.unwrap(),
+                binary,
+                "find_binary should return the managed path"
+            );
+        }
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let version = rt.block_on(get_current_version(CoreType::SingBox, &tmp));
-        assert_eq!(version, Some("1.10.3".to_string()));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn find_binary_and_get_current_version_combined() {
-        let tmp = std::env::temp_dir().join("leas-test-updater-combined");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("xray")).unwrap();
-
-        let binary = tmp.join("xray").join("xray");
-        std::fs::write(&binary, "#!/bin/sh\necho \"xray 2.0.0\"\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // find_binary should find the managed binary
-        let found = crate::bin_manager::find_binary(CoreType::Xray, &tmp);
-        assert!(found.is_some(), "find_binary should find managed xray");
-        assert_eq!(
-            found.unwrap(),
-            binary,
-            "find_binary should return the managed path"
-        );
-
-        // get_current_version should parse the version from the same binary
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let version = rt.block_on(get_current_version(CoreType::Xray, &tmp));
-        assert_eq!(version, Some("2.0.0".to_string()));
+        let version = rt.block_on(get_current_version(core_type, &tmp));
+        assert_eq!(version, Some(expected.to_string()));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

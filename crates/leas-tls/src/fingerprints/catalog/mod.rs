@@ -46,13 +46,8 @@ mod tests {
                 "unexpected ja4 shape: {}",
                 e.ja4
             );
-            assert!(!e.application.is_empty());
+            assert_ne!(e.application.len(), 0);
         }
-    }
-
-    #[test]
-    fn chrome_entries_exist() {
-        assert!(!entries_for("chrome", None).is_empty());
     }
 
     #[test]

@@ -45,6 +45,13 @@ tokio.workspace = true
 dashmap = "6.2.1"
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
+[features]
+# Measurement probes (`geo_under_mvcc_probe`, `mvcc_load_probe`, the turso
+# planner gate): they print tables of numbers and assert nothing, so they are
+# not tests. Off by default to keep them out of the test list; run with
+# `cargo test -p leas-db --release --features perf-lab -- --ignored --nocapture`.
+perf-lab = []
+
 [lints]
 workspace = true
 
@@ -54,3 +61,4 @@ toasty = { workspace = true, features = ["serde", "jiff"] }
 jiff = { workspace = true }
 leas-proto = { path = "../leas-proto", version = "0.1.0" }
 tempfile.workspace = true
+rstest.workspace = true

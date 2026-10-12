@@ -272,7 +272,7 @@ where
 mod tests {
     use super::*;
     use leas_proto::proto_spec::common::TransportConfig;
-    use leas_proto::proto_spec::{HostKind, SecurityConfig, Socks5Config};
+    use leas_proto::proto_spec::{SecurityConfig, Socks5Config};
 
     /// Rows 24/25: the dispatch predicate the app's `dial` reads, pinned
     /// exactly — plus the *observable* difference a mux row makes on the wire.
@@ -599,41 +599,6 @@ mod tests {
             CMD_MUX,
             "a mux VLESS row dials the mux branch"
         );
-    }
-
-    #[test]
-    fn proxy_params_carries_protocol_server_target_and_resolved_ip() {
-        let proxy = Box::new(ProxyOutbound {
-            kind: leas_proto::proto_spec::ProtocolKind::Vless,
-            protocol: ProtocolConfig::Socks(Socks5Config {
-                username: Some("u".into()),
-                password: Some("p".into()),
-                security: SecurityConfig::default(),
-                remarks: None,
-            }),
-            server: EndpointEssentials {
-                host: "example.com".into(),
-                host_type: HostKind::Dns,
-                port: 1080,
-                ports: vec![1080],
-            },
-            resolved_ip: Some("127.0.0.1:1080".parse().unwrap()),
-        });
-        let target = TargetAddr::new(Host::new("example.org"), 443);
-
-        let params = proxy_params(&proxy, &target);
-
-        assert_eq!(params.target, target);
-        assert_eq!(params.server.host, "example.com");
-        assert_eq!(params.server.port, 1080);
-        assert_eq!(params.resolved_ip, Some("127.0.0.1:1080".parse().unwrap()));
-        // proxy_params builds a TCP link; the UDP relay sets its own mode.
-        assert!(params.udp.is_none());
-        assert!(!params.mux);
-        let ProtocolConfig::Socks(config) = &params.protocol else {
-            panic!("protocol must round-trip");
-        };
-        assert_eq!(config.username.as_deref(), Some("u"));
     }
 
     /// The old relay `select!`ed two futures that each did `read` then

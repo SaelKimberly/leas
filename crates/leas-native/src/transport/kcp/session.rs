@@ -1942,7 +1942,7 @@ mod tests {
         l.clear(6); // drops 5 → dirty, empty
         let out = l.flush(1000, 100);
         assert_eq!(out.len(), 1);
-        assert!(out[0].numbers.is_empty());
+        assert_eq!(out[0].numbers.len(), 0);
     }
 
     #[test]

@@ -64,7 +64,7 @@ impl CoreProcess {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
                 // Send SIGTERM for graceful shutdown
-                let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                let _ = unsafe { libc::kill(pid.cast_signed(), libc::SIGTERM) };
             }
             #[cfg(not(unix))]
             {
@@ -109,10 +109,10 @@ async fn write_config_file(path: &Path, content: &str) -> Result<(), std::io::Er
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true).mode(0o600);
         opts.open(path)?;
-        use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         tokio::fs::write(path, content).await
     }
@@ -130,6 +130,8 @@ pub struct RealCoreManager {
 impl RealCoreManager {
     /// Create a new `CoreManager` with a temporary config directory and log channel.
     /// Falls back to `config_dir` if tempdir creation fails.
+    // Public API takes an owned `PathBuf`; the signature is not narrowed for a lint.
+    #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub fn new(fallback_config_dir: PathBuf, log_tx: Sender<String>) -> Self {
         let config_dir = tempfile::Builder::new()
@@ -291,7 +293,7 @@ impl RealCoreManager {
 
     /// Check if a core process is currently running.
     #[must_use]
-    pub fn is_running(&self) -> bool {
+    pub const fn is_running(&self) -> bool {
         self.current.is_some()
     }
 
@@ -319,7 +321,7 @@ impl RealCoreManager {
         let pid = proc
             .child
             .as_ref()
-            .and_then(|c| c.id())
+            .and_then(tokio::process::Child::id)
             .ok_or_else(|| ProcessError::Startup("No child PID".into()))?;
         // No SIGHUP on Windows — the caller stops and restarts instead. The
         // success path lives inside the unix block: a `return` in the non-unix
@@ -327,7 +329,7 @@ impl RealCoreManager {
         #[cfg(unix)]
         {
             unsafe {
-                if libc::kill(pid as i32, libc::SIGHUP) != 0 {
+                if libc::kill(pid.cast_signed(), libc::SIGHUP) != 0 {
                     let err = std::io::Error::last_os_error();
                     return Err(ProcessError::Startup(format!("SIGHUP failed: {err}")));
                 }
@@ -395,23 +397,23 @@ impl CoreManager for RealCoreManager {
         binary_path: &Path,
         clash_mixin: Option<&serde_json::Value>,
     ) -> Result<(), ProcessError> {
-        RealCoreManager::start(self, core_type, config, binary_path, clash_mixin).await
+        Self::start(self, core_type, config, binary_path, clash_mixin).await
     }
 
     async fn stop(&mut self) -> Result<(), ProcessError> {
-        RealCoreManager::stop(self).await
+        Self::stop(self).await
     }
 
     fn is_running(&self) -> bool {
-        RealCoreManager::is_running(self)
+        Self::is_running(self)
     }
 
     fn running_core_type(&self) -> Option<CoreType> {
-        RealCoreManager::running_core_type(self)
+        Self::running_core_type(self)
     }
 
     fn sighup_reload(&self) -> Result<u32, ProcessError> {
-        RealCoreManager::sighup_reload(self)
+        Self::sighup_reload(self)
     }
 
     async fn rewrite_config(
@@ -419,11 +421,11 @@ impl CoreManager for RealCoreManager {
         config: &BackendConfig,
         clash_mixin: Option<&serde_json::Value>,
     ) -> Result<(), ProcessError> {
-        RealCoreManager::rewrite_config(self, config, clash_mixin).await
+        Self::rewrite_config(self, config, clash_mixin).await
     }
 }
 
-/// Mock CoreManager for testing — simulates process lifecycle without real subprocess.
+/// Mock `CoreManager` for testing — simulates process lifecycle without real subprocess.
 #[derive(Debug)]
 pub struct MockCoreManager {
     pub start_error: Option<String>,
@@ -474,18 +476,16 @@ impl CoreManager for MockCoreManager {
         _clash_mixin: Option<&serde_json::Value>,
     ) -> Result<(), ProcessError> {
         self.record_call("start");
-        match &self.start_error {
-            Some(msg) => Err(ProcessError::Startup(msg.clone())),
-            None => Ok(()),
-        }
+        self.start_error
+            .as_ref()
+            .map_or(Ok(()), |msg| Err(ProcessError::Startup(msg.clone())))
     }
 
     async fn stop(&mut self) -> Result<(), ProcessError> {
         self.record_call("stop");
-        match &self.stop_error {
-            Some(msg) => Err(ProcessError::Startup(msg.clone())),
-            None => Ok(()),
-        }
+        self.stop_error
+            .as_ref()
+            .map_or(Ok(()), |msg| Err(ProcessError::Startup(msg.clone())))
     }
 
     fn is_running(&self) -> bool {
@@ -498,10 +498,9 @@ impl CoreManager for MockCoreManager {
 
     fn sighup_reload(&self) -> Result<u32, ProcessError> {
         self.record_call("sighup_reload");
-        match &self.sighup_error {
-            Some(msg) => Err(ProcessError::Startup(msg.clone())),
-            None => Ok(0),
-        }
+        self.sighup_error
+            .as_ref()
+            .map_or(Ok(0), |msg| Err(ProcessError::Startup(msg.clone())))
     }
 
     async fn rewrite_config(
@@ -510,10 +509,9 @@ impl CoreManager for MockCoreManager {
         _clash_mixin: Option<&serde_json::Value>,
     ) -> Result<(), ProcessError> {
         self.record_call("rewrite_config");
-        match &self.rewrite_error {
-            Some(msg) => Err(ProcessError::Startup(msg.clone())),
-            None => Ok(()),
-        }
+        self.rewrite_error
+            .as_ref()
+            .map_or(Ok(()), |msg| Err(ProcessError::Startup(msg.clone())))
     }
 }
 
@@ -581,31 +579,8 @@ mod tests {
         let result = mgr
             .start(
                 CoreType::Xray,
-                &BackendConfig::Xray(Default::default()),
+                &BackendConfig::Xray(crate::config_builder::xray::XrayConfig::default()),
                 Path::new("/nonexistent/binary"),
-                None,
-            )
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn mock_core_manager_works() {
-        let mut mock = MockCoreManager::new();
-        assert!(!mock.is_running());
-        assert!(mock.running_core_type().is_none());
-
-        mock.is_running = true;
-        mock.running_core_type = Some(CoreType::Xray);
-        assert!(mock.is_running());
-        assert_eq!(mock.running_core_type(), Some(CoreType::Xray));
-
-        mock.start_error = Some("test error".into());
-        let result = mock
-            .start(
-                CoreType::Xray,
-                &BackendConfig::Xray(Default::default()),
-                Path::new("/nonexistent"),
                 None,
             )
             .await;

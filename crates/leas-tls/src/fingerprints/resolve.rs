@@ -352,7 +352,7 @@ mod tests {
             .with_device(Device::Desktop);
         let r = fp.resolve().unwrap();
         assert_eq!(r.name, "chrome_143_windows_desktop");
-        assert!(!r.spec.cipher_suites.is_empty());
+        assert_ne!(r.spec.cipher_suites.len(), 0);
     }
 
     #[test]
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn hand_band_absorbs_old_versions_generated_refuses_below_oldest() {
+    fn hand_band_absorbs_old_versions() {
         // Chrome/Windows 93 sits inside the hand chrome_130 band (0, 130]:
         // the wire-exact row answers, never the generated single-major band.
         let hand = Fingerprint::new(Browser::Chrome)
@@ -483,6 +483,10 @@ mod tests {
             .unwrap();
         assert_eq!(hand.name, "chrome_130");
         assert_eq!(hand.fingerprint.version, Some(93));
+    }
+
+    #[test]
+    fn generated_refuses_below_oldest() {
         // Firefox has no hand rows; 50 sits below its oldest kept desktop
         // major (125): era mismatch, strict error.
         let err = Fingerprint::new(Browser::Firefox)
@@ -520,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn mobile_versions_below_oldest_refuse_and_between_majors_go_next_modern() {
+    fn mobile_versions_below_oldest_refuse() {
         // The oldest kept chrome phone major is 133 (iOS phone); 100 is
         // below it: era mismatch even through the os-drop pass.
         let err = Fingerprint::new(Browser::Chrome)
@@ -530,6 +534,10 @@ mod tests {
             .resolve()
             .unwrap_err();
         assert!(matches!(err, FingerprintError::Unknown { .. }));
+    }
+
+    #[test]
+    fn mobile_between_majors_go_next_modern() {
         // 140 sits between the kept phone majors 133 and 143: next-modern
         // serves the smallest kept major >= 140, cross-triple (os dropped).
         let modern = Fingerprint::new(Browser::Chrome)

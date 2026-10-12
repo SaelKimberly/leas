@@ -1848,7 +1848,7 @@ mod tests {
         let parsed = read_server_hs_messages(&mut client_stream, &key, &[])
             .await
             .unwrap();
-        assert!(parsed.cert_verify_body.is_empty());
+        assert_eq!(parsed.cert_verify_body.len(), 0);
         assert!(
             parsed.cert_verify_body.get(4..).is_none(),
             "the caller must find no signature instead of panicking on [4..]"

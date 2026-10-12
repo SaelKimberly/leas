@@ -73,8 +73,17 @@ parking_lot.workspace = true
 lru.workspace = true
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
+[features]
+# Cost-lab probes (`ops::ping::flow_cost`): measurement harnesses that print
+# tables and assert nothing, so they are not tests. Off by default to keep them
+# out of the test list; run with
+# `cargo test -p leas --release --lib --features perf-lab -- --ignored --nocapture`.
+perf-lab = []
+
 [lints]
 workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 base64-simd.workspace = true
+rstest.workspace = true

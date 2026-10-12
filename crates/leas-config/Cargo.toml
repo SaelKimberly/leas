@@ -48,3 +48,6 @@ leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

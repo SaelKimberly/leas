@@ -2274,6 +2274,7 @@ mod tests {
 
     use super::*;
     use leas_proto::proto_spec::CoreType;
+    use rstest::rstest;
 
     /// Row 31's form half, and the guard for the arm that was unreachable:
     /// `vless_from_form` read `mux`/`mux_concurrency` while NO field emitted
@@ -3173,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tor_ssh_tailscale() {
+    fn build_tor() {
         let tor = built(
             ProtocolKind::Tor,
             &producer_settings(&[
@@ -3187,7 +3188,10 @@ mod tests {
             panic!("expected Tor config");
         };
         assert_eq!(c.data_directory.as_deref(), Some("/tmp/tor"));
+    }
 
+    #[test]
+    fn build_ssh() {
         let ssh = built(
             ProtocolKind::Ssh,
             &producer_settings(&[
@@ -3203,7 +3207,10 @@ mod tests {
         };
         assert_eq!(c.user.as_deref(), Some("root"));
         assert_eq!(c.private_key.as_deref(), Some("key"));
+    }
 
+    #[test]
+    fn build_tailscale() {
         let ts = built(
             ProtocolKind::Tailscale,
             &producer_settings(&[
@@ -3434,48 +3441,35 @@ mod tests {
         assert_eq!(config_json(parsed), config_json(&reparsed));
     }
 
-    #[test]
-    fn reconstruct_roundtrip_vless_ws_tls() {
-        let parsed = built(
-            ProtocolKind::Vless,
-            &producer_settings(&[
-                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                ("flow", "xtls-rprx-vision"),
-                ("tls.enable", "true"),
-                ("sni", "real.example.com"),
-                ("fingerprint", "chrome"),
-                ("ws.path", "/ws"),
-                ("ws.host", "cdn.example.com"),
-            ]),
-        );
-        assert_reconstruct_roundtrip(&parsed);
-    }
-
-    #[test]
-    fn reconstruct_roundtrip_trojan() {
-        let parsed = built(
-            ProtocolKind::Trojan,
-            &producer_settings(&[
-                ("user_id", "humanity"),
-                ("sni", "real.example.com"),
-                ("alpn", "h2"),
-                ("fingerprint", "chrome"),
-            ]),
-        );
-        assert_reconstruct_roundtrip(&parsed);
-    }
-
-    #[test]
-    fn reconstruct_roundtrip_shadowsocks() {
-        let parsed = built(
-            ProtocolKind::Shadowsocks,
-            &producer_settings(&[
-                ("user_id", "passw0rd"),
-                ("method", "aes-256-gcm"),
-                ("plugin", "obfs-local"),
-                ("plugin_opts", "obfs=http;obfs-host=example.com"),
-            ]),
-        );
+    #[rstest]
+    #[case::vless_ws_tls(ProtocolKind::Vless, &[
+        ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+        ("flow", "xtls-rprx-vision"),
+        ("tls.enable", "true"),
+        ("sni", "real.example.com"),
+        ("fingerprint", "chrome"),
+        ("ws.path", "/ws"),
+        ("ws.host", "cdn.example.com"),
+    ])]
+    #[case::trojan(ProtocolKind::Trojan, &[
+        ("user_id", "humanity"),
+        ("sni", "real.example.com"),
+        ("alpn", "h2"),
+        ("fingerprint", "chrome"),
+    ])]
+    #[case::shadowsocks(ProtocolKind::Shadowsocks, &[
+        ("user_id", "passw0rd"),
+        ("method", "aes-256-gcm"),
+        ("plugin", "obfs-local"),
+        ("plugin_opts", "obfs=http;obfs-host=example.com"),
+    ])]
+    #[case::shadowsocks2022(ProtocolKind::Shadowsocks2022, &[
+        ("user_id", "0123456789abcdef0123456789abcdef"),
+        ("method", "2022-blake3-aes-128-gcm"),
+    ])]
+    fn reconstruct_roundtrip_cases(#[case] kind: ProtocolKind, #[case] settings: &[(&str, &str)]) {
+        let parsed = built(kind, &producer_settings(settings));
+        assert_eq!(parsed.protocol.proto_kind, kind);
         assert_reconstruct_roundtrip(&parsed);
     }
 
@@ -3502,19 +3496,6 @@ mod tests {
         );
         ProtocolConfig::try_parse_proto(&leas_proto::urlx::RawUrlX::from(url.as_str()))
             .expect("re-parse reconstructed URL");
-    }
-
-    #[test]
-    fn reconstruct_roundtrip_shadowsocks2022() {
-        let parsed = built(
-            ProtocolKind::Shadowsocks2022,
-            &producer_settings(&[
-                ("user_id", "0123456789abcdef0123456789abcdef"),
-                ("method", "2022-blake3-aes-128-gcm"),
-            ]),
-        );
-        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks2022);
-        assert_reconstruct_roundtrip(&parsed);
     }
 
     #[test]

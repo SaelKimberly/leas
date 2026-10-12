@@ -84,8 +84,12 @@ leas-hakari = { version = "0.1", path = "../leas-hakari" }
 	[build-dependencies]
 	tonic-prost-build = "0.14.6"
 
+	[lints]
+	workspace = true
+
 	[dev-dependencies]
 	toasty = { workspace = true, features = ["serde"] }
+	rstest.workspace = true
 
 	[package.metadata.cargo-machete]
 	# Deps used only by build.rs / OUT_DIR-generated code (invisible to

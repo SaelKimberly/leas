@@ -138,86 +138,74 @@ fn core_for_protocol(kind: ProtocolKind, ss_method: Option<&str>) -> CoreType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn singbox_only_kinds_resolve_to_singbox() {
-        for kind in SINGBOX_ONLY_KINDS {
-            assert_eq!(
-                resolve_core(*kind, None, None),
-                CoreType::SingBox,
-                "{kind:?} should resolve to SingBox"
-            );
-        }
+    #[rstest]
+    #[case::tuic(ProtocolKind::Tuic, CoreType::SingBox)]
+    #[case::hysteria(ProtocolKind::Hysteria, CoreType::SingBox)]
+    #[case::naive(ProtocolKind::Naive, CoreType::SingBox)]
+    #[case::anytls(ProtocolKind::AnyTls, CoreType::SingBox)]
+    #[case::shadowtls(ProtocolKind::ShadowTls, CoreType::SingBox)]
+    #[case::tor(ProtocolKind::Tor, CoreType::SingBox)]
+    #[case::ssh(ProtocolKind::Ssh, CoreType::SingBox)]
+    #[case::tailscale(ProtocolKind::Tailscale, CoreType::SingBox)]
+    #[case::shadowsocksr(ProtocolKind::ShadowsocksR, CoreType::SingBox)]
+    #[case::redirect(ProtocolKind::Redirect, CoreType::SingBox)]
+    #[case::tproxy(ProtocolKind::TProxy, CoreType::SingBox)]
+    #[case::mixed(ProtocolKind::Mixed, CoreType::SingBox)]
+    #[case::vmess(ProtocolKind::Vmess, CoreType::Xray)]
+    #[case::vless(ProtocolKind::Vless, CoreType::Xray)]
+    #[case::socks(ProtocolKind::Socks, CoreType::Xray)]
+    #[case::http(ProtocolKind::Http, CoreType::Xray)]
+    #[case::trojan(ProtocolKind::Trojan, CoreType::Xray)]
+    #[case::wireguard(ProtocolKind::WireGuard, CoreType::Xray)]
+    #[case::hysteria2(ProtocolKind::Hysteria2, CoreType::Xray)]
+    #[case::dokodemodoor(ProtocolKind::DokodemoDoor, CoreType::Xray)]
+    #[case::freedom(ProtocolKind::Freedom, CoreType::Xray)]
+    #[case::blackhole(ProtocolKind::Blackhole, CoreType::Xray)]
+    #[case::dns(ProtocolKind::Dns, CoreType::Xray)]
+    #[case::loopback(ProtocolKind::Loopback, CoreType::Xray)]
+    #[case::custom(ProtocolKind::Custom, CoreType::Xray)]
+    fn kind_resolves_to_expected_core(#[case] kind: ProtocolKind, #[case] expected: CoreType) {
+        assert_eq!(
+            resolve_core(kind, None, None),
+            expected,
+            "{kind:?} should resolve to {expected:?}"
+        );
     }
 
-    #[test]
-    fn xray_kinds_resolve_to_xray() {
-        for kind in [
-            ProtocolKind::Vmess,
-            ProtocolKind::Vless,
-            ProtocolKind::Socks,
-            ProtocolKind::Http,
-            ProtocolKind::Trojan,
-            ProtocolKind::WireGuard,
-            ProtocolKind::Hysteria2,
-            ProtocolKind::DokodemoDoor,
-            ProtocolKind::Freedom,
-            ProtocolKind::Blackhole,
-            ProtocolKind::Dns,
-            ProtocolKind::Loopback,
-            ProtocolKind::Custom,
-        ] {
-            assert_eq!(
-                resolve_core(kind, None, None),
-                CoreType::Xray,
-                "{kind:?} should resolve to Xray"
-            );
-        }
-    }
-
-    #[test]
-    fn shadowsocks_aead_ciphers_resolve_to_xray() {
-        for method in [
-            "aes-128-gcm",
-            "aes-256-gcm",
-            "chacha20-poly1305",
-            "chacha20-ietf-poly1305",
-            "xchacha20-poly1305",
-            "xchacha20-ietf-poly1305",
-            "AES-256-GCM", // case-insensitive, like xray's cipherFromString
-            "2022-blake3-aes-128-gcm",
-            "2022-blake3-aes-256-gcm",
-            "2022-blake3-chacha20-poly1305",
-        ] {
-            assert_eq!(
-                resolve_core(ProtocolKind::Shadowsocks, None, Some(method)),
-                CoreType::Xray,
-                "method {method} should resolve to Xray"
-            );
-        }
-    }
-
-    #[test]
-    fn shadowsocks_legacy_ciphers_resolve_to_singbox() {
-        // xray-core's CipherType enum has no CFB/CTR/rc4/none — sing-box does.
-        for method in [
-            "aes-128-cfb",
-            "aes-192-cfb",
-            "aes-256-cfb",
-            "aes-128-ctr",
-            "aes-192-ctr",
-            "aes-256-ctr",
-            "rc4-md5",
-            "chacha20-ietf",
-            "xchacha20",
-            "none",
-        ] {
-            assert_eq!(
-                resolve_core(ProtocolKind::Shadowsocks, None, Some(method)),
-                CoreType::SingBox,
-                "method {method} should resolve to SingBox"
-            );
-        }
+    #[rstest]
+    #[case::aead_aes_128_gcm("aes-128-gcm", CoreType::Xray)]
+    #[case::aead_aes_256_gcm("aes-256-gcm", CoreType::Xray)]
+    #[case::aead_chacha20_poly1305("chacha20-poly1305", CoreType::Xray)]
+    #[case::aead_chacha20_ietf_poly1305("chacha20-ietf-poly1305", CoreType::Xray)]
+    #[case::aead_xchacha20_poly1305("xchacha20-poly1305", CoreType::Xray)]
+    #[case::aead_xchacha20_ietf_poly1305("xchacha20-ietf-poly1305", CoreType::Xray)]
+    // case-insensitive, like xray's cipherFromString
+    #[case::aead_uppercase("AES-256-GCM", CoreType::Xray)]
+    #[case::aead_2022_blake3_aes_128_gcm("2022-blake3-aes-128-gcm", CoreType::Xray)]
+    #[case::aead_2022_blake3_aes_256_gcm("2022-blake3-aes-256-gcm", CoreType::Xray)]
+    #[case::aead_2022_blake3_chacha20_poly1305("2022-blake3-chacha20-poly1305", CoreType::Xray)]
+    // xray-core's CipherType enum has no CFB/CTR/rc4/none — sing-box does.
+    #[case::legacy_aes_128_cfb("aes-128-cfb", CoreType::SingBox)]
+    #[case::legacy_aes_192_cfb("aes-192-cfb", CoreType::SingBox)]
+    #[case::legacy_aes_256_cfb("aes-256-cfb", CoreType::SingBox)]
+    #[case::legacy_aes_128_ctr("aes-128-ctr", CoreType::SingBox)]
+    #[case::legacy_aes_192_ctr("aes-192-ctr", CoreType::SingBox)]
+    #[case::legacy_aes_256_ctr("aes-256-ctr", CoreType::SingBox)]
+    #[case::legacy_rc4_md5("rc4-md5", CoreType::SingBox)]
+    #[case::legacy_chacha20_ietf("chacha20-ietf", CoreType::SingBox)]
+    #[case::legacy_xchacha20("xchacha20", CoreType::SingBox)]
+    #[case::legacy_none("none", CoreType::SingBox)]
+    fn shadowsocks_cipher_resolves_to_expected_core(
+        #[case] method: &str,
+        #[case] expected: CoreType,
+    ) {
+        assert_eq!(
+            resolve_core(ProtocolKind::Shadowsocks, None, Some(method)),
+            expected,
+            "method {method} should resolve to {expected:?}"
+        );
     }
 
     #[test]

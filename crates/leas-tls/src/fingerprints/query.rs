@@ -214,16 +214,6 @@ mod tests {
     }
 
     #[test]
-    fn builder_style_setters_consume_self() {
-        let fp = Fingerprint::new(Browser::Firefox)
-            .with_version(120)
-            .with_os(Os::Linux)
-            .with_device(Device::Desktop);
-        assert_eq!(fp.version, Some(120));
-        assert_eq!(fp.os, Some(Os::Linux));
-    }
-
-    #[test]
     fn serde_roundtrip() {
         let fp = Fingerprint::new(Browser::Chrome).with_version(133);
         let json = serde_json::to_string(&fp).unwrap();

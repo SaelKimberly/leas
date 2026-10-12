@@ -733,6 +733,8 @@ mod tests {
 
     use super::*;
 
+    use rstest::rstest;
+
     /// A `Protocol` row whose config is a placeholder (`Redirect`): the
     /// `ConfigBuilder::build` outbound injection errors on BOTH cores, so a
     /// connect attempt fails deterministically at config build — before any
@@ -1054,142 +1056,80 @@ mod tests {
         })
     }
 
-    fn resolve_vless(
-        link_core: CoreType,
-        forced: Option<CoreType>,
-        config: Option<&ProtocolConfig>,
-        proxy_all_blocked: bool,
-    ) -> (CoreType, Option<&'static str>) {
-        resolve_runtime_core(
-            link_core,
-            ProtocolKind::Vless,
-            forced,
-            config,
-            proxy_all_blocked,
-        )
-    }
-
-    #[test]
-    fn xray_stamped_native_kind_selects_the_in_process_core() {
-        let cfg = vless_config(TransportConfig::Tcp);
-        assert_eq!(
-            resolve_vless(CoreType::Xray, None, Some(&cfg), false),
-            (CoreType::Native, None),
-            "an xray-stamped native kind whose config passes the gate runs native"
-        );
-    }
-
-    #[test]
-    fn routing_rules_demote_native_to_the_link_core() {
-        let cfg = vless_config(TransportConfig::Tcp);
-        assert_eq!(
-            resolve_vless(CoreType::Xray, None, Some(&cfg), true),
-            (CoreType::Xray, Some(REFUSED_PROXY_ALL)),
-            "native is proxy-all: routing rules / custom DNS keep xray-core"
-        );
-    }
-
-    #[test]
-    fn capability_deferred_config_demotes_native() {
-        let cfg = vless_config(TransportConfig::Quic);
-        assert_eq!(
-            resolve_vless(CoreType::Xray, None, Some(&cfg), false),
-            (CoreType::Xray, Some(REFUSED_CAPABILITY)),
-            "a config native serves worse falls back to xray-core, loudly"
-        );
-    }
-
-    #[test]
-    fn unloaded_config_never_reaches_native() {
-        assert_eq!(
-            resolve_vless(CoreType::Xray, None, None, false),
-            (CoreType::Xray, Some(REFUSED_UNLOADED)),
-            "the capability gate cannot run on a deferred config"
-        );
-    }
-
-    #[test]
-    fn forced_native_and_auto_go_through_the_capability_gate() {
-        let ok = vless_config(TransportConfig::Tcp);
-        let deferred = vless_config(TransportConfig::Quic);
-        for forced in [CoreType::Native, CoreType::Auto] {
-            assert_eq!(
-                resolve_vless(CoreType::Xray, Some(forced), Some(&ok), false),
-                (CoreType::Native, None),
-                "{forced} override selects native when the gate passes"
-            );
-            assert_eq!(
-                resolve_vless(CoreType::Xray, Some(forced), Some(&deferred), false),
-                (CoreType::Xray, Some(REFUSED_CAPABILITY)),
-                "{forced} override is refused by the gate, never silently native"
-            );
-        }
-    }
-
-    #[test]
-    fn forced_native_on_a_non_native_kind_reports_the_kind_gate() {
-        let got = resolve_runtime_core(
-            CoreType::Xray,
-            // SSR, not Shadowsocks: the plain-SS kind is native now, and SSR is
-            // its closest relative that still has no native implementation, so
-            // the kind gate — not the config gate — is what fires here.
-            ProtocolKind::ShadowsocksR,
-            Some(CoreType::Native),
-            None,
-            false,
-        );
-        assert_eq!(
-            got,
-            (CoreType::Xray, Some(REFUSED_KIND)),
-            "native cannot serve shadowsocks-r; the override is reported, not honored"
-        );
-    }
-
-    #[test]
-    fn forced_native_on_a_native_kind_still_needs_a_loaded_config() {
-        let got = resolve_runtime_core(
-            CoreType::Xray,
-            ProtocolKind::Shadowsocks,
-            Some(CoreType::Native),
-            None,
-            false,
-        );
-        assert_eq!(
-            got,
-            (CoreType::Xray, Some(REFUSED_UNLOADED)),
-            "a native kind is refused by the config gate, never silently native"
-        );
-    }
-
-    #[test]
-    fn forced_legacy_override_vetoes_native_and_keeps_the_stamp() {
-        let cfg = vless_config(TransportConfig::Tcp);
-        for forced in [CoreType::Xray, CoreType::SingBox] {
-            assert_eq!(
-                resolve_vless(CoreType::Xray, Some(forced), Some(&cfg), false),
-                (CoreType::Xray, None),
-                "{forced} override vetoes native; the stamp still builds the config"
-            );
-        }
-    }
-
-    #[test]
-    fn singbox_stamped_link_never_runs_native() {
-        let cfg = vless_config(TransportConfig::Tcp);
-        assert_eq!(
-            resolve_vless(CoreType::SingBox, None, Some(&cfg), false),
-            (CoreType::SingBox, None),
-            "a sing-box link stays on sing-box, native kind or not"
-        );
-    }
-
-    #[test]
-    fn non_native_kind_keeps_the_link_core_silently() {
-        let got = resolve_runtime_core(CoreType::Xray, ProtocolKind::Socks, None, None, false);
-        assert_eq!(
-            got,
-            (CoreType::Xray, None),
-            "kinds outside the native set resolve exactly as before, with no warn"
-        );
+    /// One (`link_core`, kind, forced, transport, `proxy_all_blocked`) → expected
+    /// resolution table: the ten connect-time native-selection tests, each
+    /// assertion kept as a named row. `transport: None` is the unloaded-config
+    /// case; a `Some` transport builds the VLESS config the gate inspects.
+    #[rstest]
+    #[case::xray_stamped_native_kind_selects_the_in_process_core(
+        CoreType::Xray, ProtocolKind::Vless, None, Some(TransportConfig::Tcp), false,
+        (CoreType::Native, None)
+    )]
+    #[case::routing_rules_demote_native_to_the_link_core(
+        CoreType::Xray, ProtocolKind::Vless, None, Some(TransportConfig::Tcp), true,
+        (CoreType::Xray, Some(REFUSED_PROXY_ALL))
+    )]
+    #[case::capability_deferred_config_demotes_native(
+        CoreType::Xray, ProtocolKind::Vless, None, Some(TransportConfig::Quic), false,
+        (CoreType::Xray, Some(REFUSED_CAPABILITY))
+    )]
+    #[case::unloaded_config_never_reaches_native(
+        CoreType::Xray, ProtocolKind::Vless, None, None, false,
+        (CoreType::Xray, Some(REFUSED_UNLOADED))
+    )]
+    #[case::forced_native_passes_the_capability_gate(
+        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Native), Some(TransportConfig::Tcp), false,
+        (CoreType::Native, None)
+    )]
+    #[case::forced_native_deferred_config_is_refused(
+        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Native), Some(TransportConfig::Quic), false,
+        (CoreType::Xray, Some(REFUSED_CAPABILITY))
+    )]
+    #[case::forced_auto_passes_the_capability_gate(
+        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Auto), Some(TransportConfig::Tcp), false,
+        (CoreType::Native, None)
+    )]
+    #[case::forced_auto_deferred_config_is_refused(
+        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Auto), Some(TransportConfig::Quic), false,
+        (CoreType::Xray, Some(REFUSED_CAPABILITY))
+    )]
+    // SSR, not Shadowsocks: the plain-SS kind is native now, and SSR is its
+    // closest relative that still has no native implementation, so the kind
+    // gate — not the config gate — is what fires here.
+    #[case::forced_native_on_a_non_native_kind_reports_the_kind_gate(
+        CoreType::Xray, ProtocolKind::ShadowsocksR, Some(CoreType::Native), None, false,
+        (CoreType::Xray, Some(REFUSED_KIND))
+    )]
+    #[case::forced_native_on_a_native_kind_still_needs_a_loaded_config(
+        CoreType::Xray, ProtocolKind::Shadowsocks, Some(CoreType::Native), None, false,
+        (CoreType::Xray, Some(REFUSED_UNLOADED))
+    )]
+    #[case::forced_legacy_xray_vetoes_native_and_keeps_the_stamp(
+        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Xray), Some(TransportConfig::Tcp), false,
+        (CoreType::Xray, None)
+    )]
+    #[case::forced_legacy_singbox_vetoes_native_and_keeps_the_stamp(
+        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::SingBox), Some(TransportConfig::Tcp), false,
+        (CoreType::Xray, None)
+    )]
+    #[case::singbox_stamped_link_never_runs_native(
+        CoreType::SingBox, ProtocolKind::Vless, None, Some(TransportConfig::Tcp), false,
+        (CoreType::SingBox, None)
+    )]
+    #[case::non_native_kind_keeps_the_link_core_silently(
+        CoreType::Xray, ProtocolKind::Socks, None, None, false,
+        (CoreType::Xray, None)
+    )]
+    fn resolve_runtime_core_over_inputs(
+        #[case] link_core: CoreType,
+        #[case] kind: ProtocolKind,
+        #[case] forced: Option<CoreType>,
+        #[case] transport: Option<TransportConfig>,
+        #[case] proxy_all_blocked: bool,
+        #[case] expected: (CoreType, Option<&'static str>),
+    ) {
+        let config = transport.map(vless_config);
+        let got = resolve_runtime_core(link_core, kind, forced, config.as_ref(), proxy_all_blocked);
+        assert_eq!(got, expected, "link_core {link_core:?}, kind {kind:?}");
     }
 }

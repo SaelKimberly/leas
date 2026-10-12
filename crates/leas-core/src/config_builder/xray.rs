@@ -40,7 +40,9 @@ pub struct Inbound {
     pub tag: String,
 }
 
-/// A proxy outbound. The protocol-specific block (settings + streamSettings)
+/// A proxy outbound.
+///
+/// The protocol-specific block (settings + streamSettings)
 /// is produced by `protocol.config.inject_to(...)` (Tasks 14/15) and
 /// deserialized here; `settings`/`stream_settings` tolerate absence so
 /// injectors may omit stream settings for plain-TCP outbounds.
@@ -672,7 +674,7 @@ mod tests {
             sort_order: None,
         };
         let routing = build_routing(&[rule], false);
-        assert!(routing.rules.is_empty());
+        assert_eq!(routing.rules.len(), 0);
     }
 
     #[test]

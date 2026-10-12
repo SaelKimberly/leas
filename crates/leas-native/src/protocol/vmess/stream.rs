@@ -733,6 +733,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for VmessWriteHalf<W> {
 mod tests {
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes128Gcm, KeyInit};
+    use rstest::rstest;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -804,8 +805,14 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn records_roundtrip_with_peel() {
+    /// Both record ciphers round-trip through `VmessClientStream` and the
+    /// response peels back to the plaintext. The response HEADER is always
+    /// AES-128-GCM (Go `OpenVMessAEADHeader`); only the body record uses the
+    /// session's cipher.
+    #[rstest]
+    #[case::aes128_gcm(None, b"hello")]
+    #[case::chacha20(Some(SECURITY_CHACHA20_POLY1305), b"chacha body")]
+    fn records_roundtrip_with_peel(#[case] cipher: Option<u8>, #[case] payload: &[u8]) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -813,6 +820,9 @@ mod tests {
         rt.block_on(async {
             let (client_side, mut server_side) = tokio::io::duplex(8192);
             let mut session = Session::new();
+            if let Some(cipher) = cipher {
+                session.security = cipher;
+            }
             session.request_body_iv = [0x11; 16];
             session.request_body_key = [0x22; 16];
             session.response_header = 0x99;
@@ -826,58 +836,29 @@ mod tests {
                 &session.response_body_iv,
                 &[0x99, 0, 0, 0],
             );
-            wire.extend_from_slice(&seal_record(
-                &session.response_body_key,
-                &session.response_body_iv,
-                0,
-                b"hello",
-            ));
+            let record = if cipher.is_some() {
+                seal_record_chacha(
+                    &session.response_body_key,
+                    &session.response_body_iv,
+                    0,
+                    payload,
+                )
+            } else {
+                seal_record(
+                    &session.response_body_key,
+                    &session.response_body_iv,
+                    0,
+                    payload,
+                )
+            };
+            wire.extend_from_slice(&record);
             server_side.write_all(&wire).await.unwrap();
             drop(server_side); // EOF after the data — read_to_end can finish
 
             let mut tunnel = VmessClientStream::new(Box::new(client_side), session);
             let mut got = Vec::new();
             tunnel.read_to_end(&mut got).await.unwrap();
-            assert_eq!(got, b"hello");
-        });
-    }
-
-    #[test]
-    fn chacha20_records_roundtrip_with_peel() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let (client_side, mut server_side) = tokio::io::duplex(8192);
-            let mut session = Session::new();
-            session.security = SECURITY_CHACHA20_POLY1305;
-            session.request_body_iv = [0x11; 16];
-            session.request_body_key = [0x22; 16];
-            session.response_header = 0x99;
-            session.response_body_key = sha256_first16(&session.request_body_key);
-            session.response_body_iv = sha256_first16(&session.request_body_iv);
-
-            // Response HEADER seal is always AES-128-GCM (Go OpenVMessAEADHeader);
-            // only the body record uses the chacha cipher.
-            let mut wire = seal_response_header(
-                &session.response_body_key,
-                &session.response_body_iv,
-                &[0x99, 0, 0, 0],
-            );
-            wire.extend_from_slice(&seal_record_chacha(
-                &session.response_body_key,
-                &session.response_body_iv,
-                0,
-                b"chacha body",
-            ));
-            server_side.write_all(&wire).await.unwrap();
-            drop(server_side);
-
-            let mut tunnel = VmessClientStream::new(Box::new(client_side), session);
-            let mut got = Vec::new();
-            tunnel.read_to_end(&mut got).await.unwrap();
-            assert_eq!(got, b"chacha body");
+            assert_eq!(got.as_slice(), payload);
         });
     }
 

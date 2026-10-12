@@ -24,7 +24,7 @@ impl fmt::Display for CoreType {
 
 impl CoreType {
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Xray => "xray",
             Self::SingBox => "sing-box",

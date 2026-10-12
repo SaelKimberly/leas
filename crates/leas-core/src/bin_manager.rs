@@ -295,29 +295,30 @@ pub enum BinError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn get_core_info_xray() {
-        let info = get_core_info(CoreType::Xray).unwrap();
-        assert!(info.exe_names.contains(&"xray"));
-        assert_eq!(info.args_template, "run -c {0}");
-    }
-
-    #[test]
-    fn get_core_info_singbox() {
-        let info = get_core_info(CoreType::SingBox).unwrap();
-        assert!(info.exe_names.contains(&"sing-box"));
-        assert_eq!(info.args_template, "run -c {0}");
-    }
-
-    #[test]
-    fn get_core_info_auto_is_none() {
-        assert!(get_core_info(CoreType::Auto).is_none());
-    }
-
-    #[test]
-    fn get_core_info_native_is_none() {
-        assert!(get_core_info(CoreType::Native).is_none());
+    #[rstest]
+    #[case::xray(CoreType::Xray, Some(&["xray"][..]))]
+    #[case::singbox(CoreType::SingBox, Some(&["sing-box"][..]))]
+    #[case::auto_is_none(CoreType::Auto, None)]
+    #[case::native_is_none(CoreType::Native, None)]
+    fn get_core_info_table(
+        #[case] core_type: CoreType,
+        #[case] expected_exe_names: Option<&[&str]>,
+    ) {
+        match (get_core_info(core_type), expected_exe_names) {
+            (Some(info), Some(names)) => {
+                for name in names {
+                    assert!(
+                        info.exe_names.contains(name),
+                        "{core_type:?} must expose {name}"
+                    );
+                }
+                assert_eq!(info.args_template, "run -c {0}");
+            }
+            (None, None) => {}
+            (info, names) => panic!("unexpected info for {core_type:?}: {info:?}/{names:?}"),
+        }
     }
 
     #[test]
@@ -513,44 +514,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn flatten_single_top_dir_noop_when_files_present() {
-        let tmp = std::env::temp_dir().join("leas-test-flatten-noop");
+    #[rstest]
+    #[case::files_present(
+        "leas-test-flatten-noop",
+        &[("subdir", true), ("top_file", false)],
+        &["subdir", "top_file"]
+    )]
+    #[case::multiple_dirs(
+        "leas-test-flatten-multi",
+        &[("dir1", true), ("dir2", true)],
+        &["dir1", "dir2"]
+    )]
+    fn flatten_single_top_dir_noop_unless_exactly_one_subdir(
+        #[case] tmp_name: &str,
+        #[case] entries: &[(&str, bool)],
+        #[case] expected_remaining: &[&str],
+    ) {
+        let tmp = std::env::temp_dir().join(tmp_name);
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("subdir")).unwrap();
-        std::fs::write(tmp.join("top_file"), "top").unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        for (name, is_dir) in entries {
+            if *is_dir {
+                std::fs::create_dir_all(tmp.join(name)).unwrap();
+            } else {
+                std::fs::write(tmp.join(name), "top").unwrap();
+            }
+        }
 
         flatten_single_top_dir(&tmp);
 
-        assert!(tmp.join("subdir").exists(), "subdir should remain");
-        assert!(tmp.join("top_file").exists(), "top file should remain");
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn flatten_single_top_dir_noop_multiple_dirs() {
-        let tmp = std::env::temp_dir().join("leas-test-flatten-multi");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("dir1")).unwrap();
-        std::fs::create_dir_all(tmp.join("dir2")).unwrap();
-
-        flatten_single_top_dir(&tmp);
-
-        assert!(tmp.join("dir1").exists(), "dir1 should remain");
-        assert!(tmp.join("dir2").exists(), "dir2 should remain");
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn flatten_single_top_dir_empty_dir() {
-        let tmp = std::env::temp_dir().join("leas-test-flatten-empty");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir(&tmp).unwrap();
-
-        flatten_single_top_dir(&tmp);
-        assert!(tmp.exists());
+        for name in expected_remaining {
+            assert!(tmp.join(name).exists(), "{name} should remain");
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

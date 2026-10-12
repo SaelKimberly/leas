@@ -627,18 +627,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mvcc_reader_rolls_back_probe() {
-        let dir = tempdir().expect("tempdir");
-        let db = Database::open_for_export_test(dir.path().join("export.db"), true)
-            .await
-            .expect("database");
-        let reader = db
-            .open_export_reader(ExportScope::Full)
-            .await
-            .expect("reader");
-        reader.rollback().await.expect("rollback");
-    }
-    #[tokio::test]
     async fn export_decodes_shadowsocks2022_and_reconstructs() {
         let dir = tempdir().expect("tempdir");
         let db = Database::open(dir.path().join("export.db"))

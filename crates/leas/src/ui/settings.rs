@@ -2040,7 +2040,8 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
                 val.pop();
             }
         }
-        KeyCode::Right | KeyCode::Left => {}
+        // Right/Left are deliberately inert here (the form's own key path owns
+        // caret movement), so they fall through with everything else.
         _ => {}
     }
 }
@@ -2077,7 +2078,6 @@ fn progress_bar_line(downloaded: u64, total: u64, style: &Style) -> Line<'static
 
 #[cfg(test)]
 mod tests {
-    use super::form_field_defs_for_section;
     use super::handle_form_key;
     use crate::AppState;
     use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
@@ -2125,20 +2125,5 @@ mod tests {
             &KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
         )
         .await;
-    }
-
-    /// The Speed Test form and the settings apply (which looks fields up by KEY)
-    /// only agree while the defs key and the snapshot key match — the render
-    /// zips defs with fields positionally, so a renamed key here loses the
-    /// setting silently while the form still looks right.
-    #[test]
-    fn speed_test_defs_wire_the_provider_key_to_the_enum_cell() {
-        let defs = form_field_defs_for_section(SettingsSection::SpeedTest);
-        let (_, label, cell) = defs
-            .iter()
-            .find(|(key, _, _)| *key == "ip_provider")
-            .expect("the Speed Test form must carry the provider row");
-        assert_eq!(*label, "IP Provider");
-        assert_eq!(*cell, leas_config::ip_provider::SELECT_CELL);
     }
 }

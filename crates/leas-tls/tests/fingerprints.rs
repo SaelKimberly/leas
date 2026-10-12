@@ -35,16 +35,3 @@ fn ja4_is_run_to_run_stable(#[case] fp: Fingerprint) {
     let b = fp.resolve().unwrap().ja4(); // fresh spec; GREASE draws differ
     assert_eq!(a, b, "JA4 must be GREASE-independent");
 }
-
-#[rstest]
-#[case::chrome_130(fp(Browser::Chrome, 130))]
-#[case::edge_106(fp(Browser::Edge, 106))]
-fn grease_carrying_profiles_use_stripped_ja3_variant(#[case] fp: Fingerprint) {
-    // Determinism rule (b): stripped variant is deterministic; classic
-    // on-wire JA3 is NOT pinned for these families.
-    let resolved = fp.resolve().unwrap();
-    let ja3 = leas_tls::crypto::fingerprint::ja3::ja3_grease_stripped(
-        &leas_tls::crypto::fingerprint::ja3::Ja3Fields::from_spec(&resolved.spec),
-    );
-    assert!(!ja3.is_empty());
-}

@@ -1111,6 +1111,7 @@ mod tests {
     use leas_proto::proto_spec::endpoint::EndpointEssentials;
     use leas_proto::proto_spec::{RealityOpts, TlsOpts};
     use leas_proto::urlx::TinyText;
+    use rstest::rstest;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
     use tokio::task::JoinHandle;
@@ -1574,49 +1575,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dispatch_no_security_is_http_1_1() {
-        assert_eq!(http_version(None), "1.1");
-        assert_eq!(http_version(Some(&SecurityConfig::default())), "1.1");
-    }
-
-    #[test]
-    fn dispatch_reality_is_http_2() {
-        // reality config present → "2", even with a single h3 ALPN
-        // (reality is h2-only in splithttp).
-        assert_eq!(http_version(Some(&reality())), "2");
-    }
-
-    #[test]
-    fn dispatch_single_http_1_1_alpn_is_http_1_1() {
-        assert_eq!(http_version(Some(&tls(Some("http/1.1")))), "1.1");
-        assert_eq!(http_version(Some(&tls(Some(" http/1.1 ")))), "1.1");
-    }
-
-    #[test]
-    fn dispatch_single_h3_alpn_is_http_3() {
-        assert_eq!(http_version(Some(&tls(Some("h3")))), "3");
-        assert_eq!(http_version(Some(&tls(Some(" h3 ")))), "3");
-    }
-
-    #[test]
-    fn dispatch_other_single_alpn_is_http_2() {
-        assert_eq!(http_version(Some(&tls(Some("h2")))), "2");
-        assert_eq!(http_version(Some(&tls(Some("silly")))), "2");
-    }
-
-    #[test]
-    fn dispatch_zero_alpn_is_http_2() {
-        assert_eq!(http_version(Some(&tls(None))), "2");
-        assert_eq!(http_version(Some(&tls(Some("")))), "2");
-        assert_eq!(http_version(Some(&tls(Some(" , ")))), "2");
-    }
-
-    #[test]
-    fn dispatch_two_plus_alpn_is_http_2() {
-        assert_eq!(http_version(Some(&tls(Some("h2,http/1.1")))), "2");
-        assert_eq!(http_version(Some(&tls(Some("h3,h2")))), "2");
-        assert_eq!(http_version(Some(&tls(Some("h2,http/1.1,h3")))), "2");
+    /// The `http_version` dispatch table (dialer.go `decideHTTPVersion`): one
+    /// case per decision class, every input asserted here.
+    #[rstest]
+    #[case::no_security_none(None, "1.1")]
+    #[case::no_security_default(Some(SecurityConfig::default()), "1.1")]
+    #[case::reality(Some(reality()), "2")]
+    #[case::http_1_1(Some(tls(Some("http/1.1"))), "1.1")]
+    #[case::http_1_1_padded(Some(tls(Some(" http/1.1 "))), "1.1")]
+    #[case::h3(Some(tls(Some("h3"))), "3")]
+    #[case::h3_padded(Some(tls(Some(" h3 "))), "3")]
+    #[case::other_single_h2(Some(tls(Some("h2"))), "2")]
+    #[case::other_single_silly(Some(tls(Some("silly"))), "2")]
+    #[case::zero_alpn_absent(Some(tls(None)), "2")]
+    #[case::zero_alpn_empty(Some(tls(Some(""))), "2")]
+    #[case::zero_alpn_commas(Some(tls(Some(" , "))), "2")]
+    #[case::two_plus_h2_http_1_1(Some(tls(Some("h2,http/1.1"))), "2")]
+    #[case::two_plus_h3_h2(Some(tls(Some("h3,h2"))), "2")]
+    #[case::two_plus_three(Some(tls(Some("h2,http/1.1,h3"))), "2")]
+    fn http_version_dispatch(#[case] security: Option<SecurityConfig>, #[case] expected: &str) {
+        assert_eq!(http_version(security.as_ref()), expected);
     }
 
     #[test]
@@ -1671,65 +1649,40 @@ mod tests {
         )
     }
 
-    #[test]
-    fn mode_explicit_values_are_honored() {
-        for m in ["packet-up", "stream-up", "stream-one"] {
-            assert_eq!(xhttp_mode(&ctx_mode(m, None, None)).unwrap(), m, "{m}");
-        }
-    }
-
-    #[test]
-    fn mode_auto_without_reality_is_packet_up() {
-        for m in ["auto", ""] {
-            assert_eq!(
-                xhttp_mode(&ctx_mode(m, None, None)).unwrap(),
-                "packet-up",
-                "{m}"
-            );
-        }
-    }
-
-    #[test]
-    fn mode_auto_with_plain_tls_is_packet_up() {
-        // TLS (not reality) does not change the auto rule — xray only
-        // checks `realityConfig != nil`.
-        for m in ["auto", ""] {
-            let ctx = ctx_mode(m, Some(serde_json::json!({"type": "tls"})), None);
-            assert_eq!(xhttp_mode(&ctx).unwrap(), "packet-up", "{m}");
-        }
-    }
-
-    #[test]
-    fn mode_auto_with_reality_is_stream_one() {
-        for m in ["auto", ""] {
-            let ctx = ctx_mode(m, Some(serde_json::json!({"type": "reality"})), None);
-            assert_eq!(xhttp_mode(&ctx).unwrap(), "stream-one", "{m}");
-        }
-    }
-
-    #[test]
-    fn mode_auto_with_reality_and_download_settings_is_stream_up() {
-        // `downloadSettings` present (config.pb.go:175) → stream-up,
-        // matching xray's rule (spec §4.1).
-        for m in ["auto", ""] {
-            let ctx = ctx_mode(
-                m,
-                Some(serde_json::json!({"type": "reality"})),
-                Some(serde_json::json!({"downloadSettings": {}})),
-            );
-            assert_eq!(xhttp_mode(&ctx).unwrap(), "stream-up", "{m}");
-        }
-    }
-
-    #[test]
-    fn mode_explicit_overrides_the_auto_rules() {
-        // Explicit modes are honored even with reality present.
-        let ctx = ctx_mode(
-            "packet-up",
-            Some(serde_json::json!({"type": "reality"})),
-            None,
+    /// Mode selection mirror (spec §4.1, dialer.go:362-371): explicit modes
+    /// pass through; `auto`/empty resolves by the reality config and download
+    /// settings. TLS (not reality) does NOT change the auto rule — xray only
+    /// checks `realityConfig != nil`.
+    #[rstest]
+    #[case::explicit_packet_up("packet-up", None, false, "packet-up")]
+    #[case::explicit_stream_up("stream-up", None, false, "stream-up")]
+    #[case::explicit_stream_one("stream-one", None, false, "stream-one")]
+    #[case::auto_without_reality("auto", None, false, "packet-up")]
+    #[case::empty_without_reality("", None, false, "packet-up")]
+    #[case::auto_with_plain_tls("auto", Some("tls"), false, "packet-up")]
+    #[case::empty_with_plain_tls("", Some("tls"), false, "packet-up")]
+    #[case::auto_with_reality("auto", Some("reality"), false, "stream-one")]
+    #[case::empty_with_reality("", Some("reality"), false, "stream-one")]
+    #[case::auto_with_reality_download("auto", Some("reality"), true, "stream-up")]
+    #[case::empty_with_reality_download("", Some("reality"), true, "stream-up")]
+    #[case::explicit_overrides_auto("packet-up", Some("reality"), false, "packet-up")]
+    fn xhttp_mode_selection(
+        #[case] mode: &str,
+        #[case] security: Option<&str>,
+        #[case] download: bool,
+        #[case] expected: &str,
+    ) {
+        let security = security.map(|kind| serde_json::json!({ "type": kind }));
+        let extra = if download {
+            Some(serde_json::json!({ "downloadSettings": {} }))
+        } else {
+            None
+        };
+        assert_eq!(
+            xhttp_mode(&ctx_mode(mode, security, extra)).unwrap(),
+            expected,
+            "{mode}"
         );
-        assert_eq!(xhttp_mode(&ctx).unwrap(), "packet-up");
     }
 
     #[test]

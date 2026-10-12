@@ -29,8 +29,10 @@ use crate::state::load_protocol_with_config;
 use crate::try_send_or_warn;
 use crate::types::CoreEvent;
 
-/// Perf lab for the fast + real flow (ignored tests; see the module docs).
-#[cfg(test)]
+/// Perf lab for the fast + real flow (the cost lab, not a test; see the module
+/// docs). `test` is part of the gate because the lab drives test-only helpers
+/// and the `tempfile` dev-dependency, so it can only exist in the test unit.
+#[cfg(all(test, feature = "perf-lab"))]
 mod flow_cost;
 
 /// Bound on concurrent single-test tasks (menu-triggered pings): the spawned
@@ -2745,132 +2747,137 @@ mod tests {
 
     use super::*;
 
-    /// The exact failures the 2026-09-27 Windows run produced, and the verdict
-    /// each one must get.
+    use rstest::rstest;
+    use std::io::ErrorKind;
+
+    /// The reachable/unreachable decision over the typed facts of an IO failure.
     ///
-    /// The strings are the ones the log carried and the kinds are what `std`
-    /// folds those WSA codes onto, so the decision is pinned on a machine that
-    /// has never produced a WSA error — exactly the gap that let the
-    /// English-text version pass CI and fail on a Russian Windows (`os error
-    /// 10060` × 314 and `os error 11001` × 18 both landed in the soft `Io`
-    /// class, sending 332 unreachable endpoints to the real level).
-    ///
-    /// `None` for the kind is how a code `std` does not classify arrives here:
-    /// `ErrorKind::Uncategorized` cannot be named on stable, so the classifier
-    /// takes the absence instead, and the two Windows codes that matter
-    /// (`11001`, `10040`) reach it exactly that way.
-    #[test]
-    fn connect_failures_are_hard_in_every_locale() {
-        use std::io::ErrorKind;
-        // (kind, raw code, message the OS actually rendered, expected class)
-        let cases = [
-            (
-                Some(ErrorKind::TimedOut),
-                Some(10060),
-                "Попытка установить соединение была безуспешной, т.к. от другого \
-                 компьютера за требуемое время не получен нужный отклик, или было разорвано \
-                 уже установленное соединение из-за неверного отклика уже подключенного \
-                 компьютера. (os error 10060)",
-                ProbeClass::Timeout,
-            ),
-            (
-                None,
-                Some(11001),
-                "Этот хост неизвестен. (os error 11001)",
-                ProbeClass::Dns,
-            ),
-            (
-                Some(ErrorKind::ConnectionRefused),
-                Some(10061),
-                "Отказано в соединении. (os error 10061)",
-                ProbeClass::Refused,
-            ),
-            (
-                Some(ErrorKind::HostUnreachable),
-                Some(10065),
-                "No route to host (os error 10065)",
-                ProbeClass::NoRoute,
-            ),
-            (
-                Some(ErrorKind::NetworkUnreachable),
-                Some(10051),
-                "Сеть недоступна (os error 10051)",
-                ProbeClass::Unreachable,
-            ),
-        ];
-        for (kind, code, text, want) in cases {
-            let (class, hard) = classify_io_failure(kind, code, text);
-            assert_eq!(class, want, "class for code {code:?}");
-            assert!(
-                hard,
-                "code {code:?} must be hard: the real probe cannot pass it"
-            );
-        }
-    }
-
-    /// A localized message must not change the verdict: the class comes from
-    /// the typed facts, and the text is read only when nothing typed stands
-    /// behind the failure.
-    #[test]
-    fn localized_text_cannot_soften_a_typed_failure() {
-        use std::io::ErrorKind;
-        // Same kind and code, English vs Russian rendering: identical verdict.
-        let en = classify_io_failure(
-            Some(ErrorKind::TimedOut),
-            Some(10060),
-            "Connection timed out (os error 10060)",
-        );
-        let ru = classify_io_failure(
-            Some(ErrorKind::TimedOut),
-            Some(10060),
-            "Попытка установить соединение была безуспешной (os error 10060)",
-        );
-        assert_eq!(en, ru);
-        assert_eq!(en, (ProbeClass::Timeout, true));
-    }
-
-    /// Failures that prove nothing about the endpoint stay soft, so the real
-    /// level still answers the different question it was dispatched to ask.
-    #[test]
-    fn local_and_ambiguous_io_failures_stay_soft() {
-        use std::io::ErrorKind;
-        for (kind, code) in [
-            // A firewall or AV block: something answered, it just said no.
-            (Some(ErrorKind::PermissionDenied), Some(10013)),
-            // A reset mid-exchange says something WAS there.
-            (Some(ErrorKind::ConnectionReset), Some(10054)),
-            // The QUIC send-path code from the same run (WSAEMSGSIZE).
-            (None, Some(10040)),
-            // fd exhaustion is a local resource problem.
-            (None, Some(10024)),
-        ] {
-            let (class, hard) = classify_io_failure(kind, code, "whatever the OS said");
-            assert_eq!(class, ProbeClass::Io, "code {code:?}");
-            assert!(!hard, "code {code:?} must stay soft");
-        }
-    }
-
-    /// An adapter message with no `io::Error` behind it still reaches the text
-    /// match, so the quic adapter's `DNS: …` wrapper keeps its class.
-    #[test]
-    fn adapter_message_without_a_code_falls_back_to_text() {
-        let (class, hard) = classify_io_failure(
-            None,
-            None,
-            "DNS: failed to lookup address information: Name or service not known",
-        );
-        assert_eq!((class, hard), (ProbeClass::Dns, true));
-    }
-
-    /// An error that DOES carry a code is never re-read as text: a message that
-    /// happens to contain an English-looking phrase must not reclassify a
-    /// failure the typed facts already decided. This is the arm the old code
-    /// took unconditionally.
-    #[test]
-    fn a_coded_failure_is_never_reclassified_by_its_text() {
-        let (class, hard) =
-            classify_io_failure(None, Some(10040), "Connection refused (os error 10040)");
-        assert_eq!((class, hard), (ProbeClass::Io, false));
+    /// The old individual cases pinned the exact failures the 2026-09-27 Windows
+    /// run produced (the strings the log carried and the kinds `std` folds the
+    /// WSA codes onto), the localization invariance, the soft local/ambiguous
+    /// set, the adapter-text fallback and the "a code is never re-read as text"
+    /// arm — folding them into one (kind, code, text) → (class, hard) table keeps
+    /// every one of those assertions as a named row. `None` for the kind is how
+    /// a code `std` does not classify arrives here: `ErrorKind::Uncategorized`
+    /// cannot be named on stable, so the classifier takes the absence instead,
+    /// and the two Windows codes that matter (`11001`, `10040`) reach it exactly
+    /// that way.
+    #[rstest]
+    #[case::timed_out_wsa_10060_rendered_in_russian(
+        Some(ErrorKind::TimedOut),
+        Some(10060),
+        "Попытка установить соединение была безуспешной, т.к. от другого \
+         компьютера за требуемое время не получен нужный отклик, или было разорвано \
+         уже установленное соединение из-за неверного отклика уже подключенного \
+         компьютера. (os error 10060)",
+        ProbeClass::Timeout,
+        true
+    )]
+    #[case::host_not_found_wsa_11001_uncategorized_by_std(
+        None,
+        Some(11001),
+        "Этот хост неизвестен. (os error 11001)",
+        ProbeClass::Dns,
+        true
+    )]
+    #[case::connection_refused_wsa_10061_rendered_in_russian(
+        Some(ErrorKind::ConnectionRefused),
+        Some(10061),
+        "Отказано в соединении. (os error 10061)",
+        ProbeClass::Refused,
+        true
+    )]
+    #[case::no_route_wsa_10065(
+        Some(ErrorKind::HostUnreachable),
+        Some(10065),
+        "No route to host (os error 10065)",
+        ProbeClass::NoRoute,
+        true
+    )]
+    #[case::network_unreachable_wsa_10051_rendered_in_russian(
+        Some(ErrorKind::NetworkUnreachable),
+        Some(10051),
+        "Сеть недоступна (os error 10051)",
+        ProbeClass::Unreachable,
+        true
+    )]
+    // Same kind and code, English rendering: identical verdict.
+    #[case::timed_out_10060_english_text_same_verdict(
+        Some(ErrorKind::TimedOut),
+        Some(10060),
+        "Connection timed out (os error 10060)",
+        ProbeClass::Timeout,
+        true
+    )]
+    // Same kind and code, Russian rendering: the text cannot soften it.
+    #[case::timed_out_10060_russian_text_same_verdict(
+        Some(ErrorKind::TimedOut),
+        Some(10060),
+        "Попытка установить соединение была безуспешной (os error 10060)",
+        ProbeClass::Timeout,
+        true
+    )]
+    // A firewall or AV block: something answered, it just said no.
+    #[case::permission_denied_stays_soft(
+        Some(ErrorKind::PermissionDenied),
+        Some(10013),
+        "whatever the OS said",
+        ProbeClass::Io,
+        false
+    )]
+    // A reset mid-exchange says something WAS there.
+    #[case::connection_reset_stays_soft(
+        Some(ErrorKind::ConnectionReset),
+        Some(10054),
+        "whatever the OS said",
+        ProbeClass::Io,
+        false
+    )]
+    // The QUIC send-path code from the same run (WSAEMSGSIZE).
+    #[case::quic_send_path_10040_stays_soft(
+        None,
+        Some(10040),
+        "whatever the OS said",
+        ProbeClass::Io,
+        false
+    )]
+    // fd exhaustion is a local resource problem.
+    #[case::fd_exhaustion_10024_stays_soft(
+        None,
+        Some(10024),
+        "whatever the OS said",
+        ProbeClass::Io,
+        false
+    )]
+    // An adapter message with no `io::Error` behind it still reaches the text
+    // match, so the quic adapter's `DNS: …` wrapper keeps its class.
+    #[case::adapter_dns_wrapper_without_a_code_falls_back_to_text(
+        None,
+        None,
+        "DNS: failed to lookup address information: Name or service not known",
+        ProbeClass::Dns,
+        true
+    )]
+    // An error that DOES carry a code is never re-read as text: a message that
+    // happens to contain an English-looking phrase must not reclassify a
+    // failure the typed facts already decided.
+    #[case::a_coded_failure_is_never_reclassified_by_its_text(
+        None,
+        Some(10040),
+        "Connection refused (os error 10040)",
+        ProbeClass::Io,
+        false
+    )]
+    fn classify_io_failure_over_typed_facts(
+        #[case] kind: Option<ErrorKind>,
+        #[case] code: Option<i32>,
+        #[case] text: &str,
+        #[case] want: ProbeClass,
+        #[case] hard: bool,
+    ) {
+        let (class, got_hard) = classify_io_failure(kind, code, text);
+        assert_eq!(class, want, "class for kind {kind:?} / code {code:?}");
+        assert_eq!(got_hard, hard, "hardness for kind {kind:?} / code {code:?}");
     }
 
     /// `std`'s WSA → `ErrorKind` folding is the assumption the whole typed path
@@ -2878,7 +2885,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn std_maps_the_wsa_codes_the_classifier_depends_on() {
-        use std::io::ErrorKind;
         for (code, want) in [
             (10060, ErrorKind::TimedOut),
             (10061, ErrorKind::ConnectionRefused),

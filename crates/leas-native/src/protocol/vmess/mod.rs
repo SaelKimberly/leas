@@ -115,6 +115,7 @@ pub async fn connect_udp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn vcfg(enc: &str) -> VmessConfig {
         serde_json::from_value(serde_json::json!({
@@ -137,30 +138,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn accepts_aes128_gcm_and_auto() {
-        assert!(check_security(&vcfg("aes-128-gcm")).is_ok());
-        assert!(check_security(&vcfg("auto")).is_ok());
-        assert!(check_security(&vcfg("")).is_ok()); // absent -> auto
-    }
-
-    #[test]
-    fn accepts_absent_security_key() {
-        let cfg: VmessConfig = serde_json::from_value(serde_json::json!({
+    /// The security gate accepts the AEAD names plus the `auto`/absent
+    /// spellings; chacha20 maps to its wire byte (AES is the default).
+    #[rstest]
+    #[case::aes128_gcm(Some("aes-128-gcm"), None)]
+    #[case::auto(Some("auto"), None)]
+    #[case::empty_enc(Some(""), None)]
+    #[case::absent_key(None, None)]
+    #[case::chacha20(Some("chacha20-poly1305"), Some(SECURITY_CHACHA20_POLY1305))]
+    fn security_acceptance(#[case] enc: Option<&str>, #[case] expected_byte: Option<u8>) {
+        let mut obj = serde_json::json!({
             "schema": "Vmess",
             "uuid": "00000000-0000-0000-0000-000000000000",
             "transport": { "type": "tcp" }
-        }))
-        .expect("vmess config without security key parses");
-        assert!(cfg.security.enc.is_none());
+        });
+        if let Some(enc) = enc {
+            obj["security"] = serde_json::json!({ "enc": enc });
+        }
+        let cfg: VmessConfig = serde_json::from_value(obj).expect("vmess config parses");
+        // The absent-key case parses to no `enc` at all, and every case is
+        // accepted by the gate.
+        if enc.is_none() {
+            assert!(cfg.security.enc.is_none());
+        }
         assert!(check_security(&cfg).is_ok());
-    }
-
-    #[test]
-    fn chacha20_security_accepted() {
-        let cfg = vcfg("chacha20-poly1305");
-        assert!(check_security(&cfg).is_ok());
-        assert_eq!(security_byte(&cfg).unwrap(), SECURITY_CHACHA20_POLY1305);
+        if let Some(byte) = expected_byte {
+            assert_eq!(security_byte(&cfg).unwrap(), byte);
+        }
     }
 
     #[test]

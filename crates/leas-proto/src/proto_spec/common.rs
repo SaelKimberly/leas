@@ -1994,8 +1994,8 @@ mod tests {
         );
         // Unknown names warn + skip (never error) — ParseCurveName mirror.
         assert_eq!(parse_curve_names("bogus,x25519,p521x"), vec![29]);
-        assert!(parse_curve_names("").is_empty());
-        assert!(parse_curve_names(" , ").is_empty());
+        assert_eq!(parse_curve_names("").len(), 0);
+        assert_eq!(parse_curve_names(" , ").len(), 0);
     }
 
     #[test]

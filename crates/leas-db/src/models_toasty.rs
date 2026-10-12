@@ -839,6 +839,7 @@ mod tests {
     use super::*;
     use leas_proto::proto_spec::SecurityConfig;
     use leas_proto::proto_spec::common::TransportConfig;
+    use rstest::rstest;
     use toasty::Deferred;
 
     /// Endpoint with links `(protocol_id, last_seen_at_secs, latency, error)`.
@@ -1404,21 +1405,22 @@ mod tests {
         assert_eq!(read.port, 443);
     }
 
-    #[test]
-    fn endpoint_id_accepts_nonzero() {
-        assert_eq!(EndpointId::new(42).get(), 42);
-        assert_eq!(ProtocolId::new(7).get(), 7);
-    }
-
-    #[test]
-    #[should_panic(expected = "EndpointId must be non-zero")]
-    fn endpoint_id_rejects_zero() {
+    fn endpoint_id_zero() {
         let _ = EndpointId::new(0);
     }
 
-    #[test]
-    #[should_panic(expected = "ProtocolId must be non-zero")]
-    fn protocol_id_rejects_zero() {
+    fn protocol_id_zero() {
         let _ = ProtocolId::new(0);
+    }
+
+    /// Both id newtypes reject zero in their constructor — the only way to
+    /// build one — each with its own message.
+    #[rstest]
+    #[should_panic(expected = "EndpointId must be non-zero")]
+    #[case::endpoint_id(endpoint_id_zero as fn())]
+    #[should_panic(expected = "ProtocolId must be non-zero")]
+    #[case::protocol_id(protocol_id_zero as fn())]
+    fn newtype_rejects_zero(#[case] make_id: fn()) {
+        make_id();
     }
 }

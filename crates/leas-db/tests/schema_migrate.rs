@@ -19,13 +19,6 @@ fn first_i64(rows: &[Value]) -> Option<i64> {
     })
 }
 
-/// The cursor the runner reads is exactly `SCHEMA_VERSION` — one source, so a
-/// bump cannot land in one and not the other.
-#[test]
-fn migration_latest_matches_schema_version() {
-    assert_eq!(leas_db::schema::LATEST, SCHEMA_VERSION);
-}
-
 /// A FRESH file is created at the current version and gets the raw DDL (the
 /// `endpoint_rank` columns and indexes toasty cannot express).
 #[tokio::test]

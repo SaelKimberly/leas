@@ -835,30 +835,28 @@ mod tests {
     use crate::AppState;
     use crate::types::SettingsSection;
     use crate::ui::settings::PROTOCOL_CORE_DEFS;
+    use rstest::rstest;
     use std::collections::HashMap;
 
     /// Regression: pressing Right on the Protocol Core form panicked
     /// ("index out of bounds: the len is 0 but the index is 0") because the
     /// fields vec was empty when no overrides were saved, while the field
-    /// defs (22 protocols) were not.
-    #[test]
-    fn protocol_core_fields_cover_all_defs_with_auto_default() {
-        let overrides = HashMap::from([("vless".to_string(), "Xray".to_string())]);
+    /// defs (22 protocols) were not. Both the populated and the empty override
+    /// map are rows of one table: every def key must appear exactly once, in
+    /// def order, and a key with no override must read "Auto".
+    #[rstest]
+    #[case::protocol_core_fields_cover_all_defs_with_auto_default(
+        HashMap::from([("vless".to_string(), "Xray".to_string())])
+    )]
+    #[case::protocol_core_fields_empty_overrides_all_auto(HashMap::new())]
+    fn protocol_core_form_fields_table(#[case] overrides: HashMap<String, String>) {
         let fields = protocol_core_form_fields(&overrides);
-
         assert_eq!(fields.len(), PROTOCOL_CORE_DEFS.len());
         for ((key, val), (def_key, _, _)) in fields.iter().zip(PROTOCOL_CORE_DEFS) {
             assert_eq!(key, def_key, "field order/keys must match the defs");
-            let expected = if key == "vless" { "Xray" } else { "Auto" };
+            let expected = overrides.get(key.as_str()).map_or("Auto", String::as_str);
             assert_eq!(val, expected, "unsaved protocols must default to Auto");
         }
-    }
-
-    #[test]
-    fn protocol_core_fields_empty_overrides_all_auto() {
-        let fields = protocol_core_form_fields(&HashMap::new());
-        assert_eq!(fields.len(), PROTOCOL_CORE_DEFS.len());
-        assert!(fields.iter().all(|(_, v)| v == "Auto"));
     }
 
     /// The exit-IP provider crosses three representations on one save: the

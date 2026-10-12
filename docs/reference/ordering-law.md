@@ -368,7 +368,7 @@ the index, not a re-sorted table.
 
 **Plans re-verified** at 74,723 rows on turso (`tests/turso_planner.rs`, the
 asserting `every_scope_plan_is_index_served_without_a_sorter` plus the print-only
-`turso_planner_gate`), with the shipped index:
+`turso_planner_gate`, which needs the crate's `perf-lab` feature), with the shipped index:
 
 | query | plan |
 | --- | --- |

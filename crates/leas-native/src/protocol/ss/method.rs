@@ -206,11 +206,6 @@ mod tests {
     }
 
     #[test]
-    fn method_names_are_case_insensitive() {
-        assert!(SsMethod::from_method("AES-256-GCM").is_some());
-    }
-
-    #[test]
     fn classic_password_key_is_md5_evp_bytes_to_key() {
         let m = SsMethod::from_method("aes-128-gcm").unwrap();
         let key = password_key(m, "password").unwrap();

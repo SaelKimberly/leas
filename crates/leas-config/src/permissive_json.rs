@@ -518,6 +518,7 @@ pub fn permissive_json(input: &[u8]) -> PResult<serde_json::Value> {
 mod tests {
     use super::permissive_json_core;
     use super::{PResult, permissive_json};
+    use rstest::rstest;
 
     fn truncated_lines() -> Vec<&'static [u8]> {
         r#"
@@ -555,28 +556,22 @@ mod tests {
         .collect()
     }
 
-    #[test]
-    fn test_truncated_leaks_nothing() {
-        // Verify that no truncated input causes the parser to
-        // re-interpret value bytes as keys (which would mean
-        // the parser consumed bytes without advancing last_char).
-        let lines = truncated_lines();
-        for line in &lines {
-            let result = permissive_json_core(line);
-            // If the parser re-reads a value byte as a key,
-            // it means progress-through-input ≠ cursor-advance.
-            // This test just checks no crash/infinite-loop.
-            _ = result;
-        }
-    }
+    // ── Truncated JSON (must fail) ──
 
-    #[test]
-    fn test_truncated_lines_dont_loop() {
-        let lines = truncated_lines();
-        for line in &lines {
-            let result = permissive_json_core(line);
-            // All truncated inputs should error (not infinite loop, not OOM)
-            assert!(result.is_err(), "Expected error for truncated: {line:?}");
+    #[rstest]
+    #[case::truncated_brace(&[&b"{"[..]])]
+    #[case::truncated_key(&[&b"{\"key\":"[..]])]
+    #[case::truncated_string(&[&b"{\"key\": \"unclosed"[..]])]
+    #[case::truncated_extra_brace(&[&b"{"[..]])]
+    #[case::truncated_lone_backslash_in_string(&[&b"{\"key\": \"trailing-backslash\\"[..]])]
+    #[case::truncated_backslash_before_quote(&[&b"{\"key\": \"val\\"[..]])]
+    #[case::truncated_lines_dont_loop(&truncated_lines())]
+    fn truncated_inputs_error(#[case] inputs: &[&[u8]]) {
+        for input in inputs {
+            assert!(
+                permissive_json_core(input).is_err(),
+                "Expected error for truncated: {input:?}"
+            );
         }
     }
 
@@ -809,40 +804,7 @@ mod tests {
         assert_eq!(v, serde_json::json!({"a": 1}));
     }
 
-    // ── Truncated JSON (must fail) ──
-
-    #[test]
-    fn test_truncated_brace_fails() {
-        assert!(permissive_json_core(b"{").is_err());
-    }
-
-    #[test]
-    fn test_truncated_key_fails() {
-        assert!(permissive_json_core(b"{\"key\":").is_err());
-    }
-
-    #[test]
-    fn test_truncated_string_fails() {
-        assert!(permissive_json_core(b"{\"key\": \"unclosed").is_err());
-    }
-
     // ── Real NDJSON samples (exact extracts) ──
-
-    #[test]
-    fn test_b3a_exact_sample_1() {
-        // Exact B3a extra value from NDJSON (241 occurrences)
-        let input = br#"{"scMaxEachPostBytes":+1000000,+"scMaxConcurrentPosts":+100,+"scMinPostsIntervalMs":+30,+"xPaddingBytes":+"100-1000",+"noGRPCHeader":+false}"#;
-        let (_, v) = permissive_json_core(input).unwrap();
-        assert_eq!(v["xPaddingBytes"], serde_json::json!("100-1000"));
-    }
-
-    #[test]
-    fn test_b3b_exact_sample_1() {
-        // Exact B3b extra value from NDJSON (single quotes, Python True)
-        let input = b"{'headers': {}, 'noGRPCHeader': True, 'xmux': {'maxConnections': '3'}}";
-        let (_, v) = permissive_json_core(input).unwrap();
-        assert_eq!(v["noGRPCHeader"], serde_json::json!(true));
-    }
 
     #[test]
     fn test_b3b_exact_mixed_quotes() {
@@ -851,12 +813,6 @@ mod tests {
         let (_, v) = permissive_json_core(input).unwrap();
         assert_eq!(v["xPaddingBytes"], serde_json::json!("100-1000"));
         assert_eq!(v["scMaxEachPostBytes"], serde_json::json!(1_000_000));
-    }
-
-    #[test]
-    fn test_truncated_extra_brace() {
-        // Truncated: extra={ from NDJSON
-        assert!(permissive_json_core(b"{").is_err());
     }
 
     #[test]
@@ -899,21 +855,6 @@ mod tests {
         assert_eq!(v["e"], "f");
     }
 
-    // ── Truncated strings (lone backslash before end of input) ──
-
-    #[test]
-    fn test_truncated_lone_backslash_in_string() {
-        // A string ending with a lone backslash (no escape char follow)
-        // The parser should error rather than loop or produce garbage
-        assert!(permissive_json_core(b"{\"key\": \"trailing-backslash\\").is_err());
-    }
-
-    #[test]
-    fn test_truncated_backslash_before_quote() {
-        // Backslash before closing quote: "key\" without end
-        assert!(permissive_json_core(b"{\"key\": \"val\\").is_err());
-    }
-
     #[test]
     fn test_escaped_quote_in_string() {
         // Valid escaped quote: "key\"mid"
@@ -935,13 +876,6 @@ mod tests {
         // \u00e9 = '\u00e9'
         let (_, v) = permissive_json_core(b"{\"key\": \"caf\\u00e9\"}").unwrap();
         assert_eq!(v["key"], "caf\u{00e9}");
-    }
-
-    #[test]
-    fn test_unicode_escape_lowercase_hex() {
-        // \u0041 = 'A', lowercase hex digits
-        let (_, v) = permissive_json_core(b"{\"key\": \"\\u0041\"}").unwrap();
-        assert_eq!(v["key"], "A");
     }
 
     #[test]

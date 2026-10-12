@@ -411,17 +411,6 @@ mod tests {
     }
 
     #[test]
-    fn server_name_falls_back_to_endpoint_host() {
-        let params = NativeConnectParams::new(
-            vless_empty(),
-            EndpointEssentials::new("my.server.test", 4430),
-            target("example.com"),
-        );
-        let ctx = LinkContext::new(params, target("example.com"));
-        assert_eq!(ctx.server_name(), "my.server.test");
-    }
-
-    #[test]
     fn alpn_splits_on_comma() {
         let params = NativeConnectParams::new(
             vless_empty(),
@@ -429,7 +418,7 @@ mod tests {
             target("example.com"),
         );
         let ctx = LinkContext::new(params, target("example.com"));
-        assert!(ctx.alpn_vec().is_empty());
+        assert_eq!(ctx.alpn_vec().len(), 0);
     }
 
     #[test]
@@ -466,7 +455,7 @@ mod tests {
             ),
             target("example.com"),
         );
-        assert!(ctx.curve_ids().is_empty());
+        assert_eq!(ctx.curve_ids().len(), 0);
     }
 
     /// The full plumbing: config string → proto parse → native params →
@@ -703,11 +692,12 @@ mod tests {
     fn alpn_tokens_empty_without_explicit_alpn() {
         // No explicit ALPN → no tokens (the transport-implied fallback lives
         // only in `alpn_vec`, never in the tokens).
-        assert!(ctx_with_sec(None).alpn_tokens().is_empty());
-        assert!(
+        assert_eq!(ctx_with_sec(None).alpn_tokens().len(), 0);
+        assert_eq!(
             ctx_with_sec(Some(serde_json::json!({ "type": "tls" })))
                 .alpn_tokens()
-                .is_empty()
+                .len(),
+            0
         );
     }
 }

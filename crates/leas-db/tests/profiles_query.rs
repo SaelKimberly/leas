@@ -934,7 +934,7 @@ async fn load_page_rows_preserves_page_and_link_order() {
 // display-preference rule as the rest of the codebase defines them. A mismatch
 // means the SQL is wrong — the oracle is never adjusted to match it.
 
-fn dns_unresolved(row: &leas_db::models::EndpointRow) -> bool {
+const fn dns_unresolved(row: &leas_db::models::EndpointRow) -> bool {
     row.endpoint.is_dns() && row.resolved_ips.is_empty()
 }
 

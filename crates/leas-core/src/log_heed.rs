@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Constants ──────────────────────────────────────────────────────────
 /// Default virtual map size: 1 GB virtual address reservation (not physical RAM).
-/// Increased from 256 MB to reduce MapFull occurrences under sustained log output.
+/// Increased from 256 MB to reduce `MapFull` occurrences under sustained log output.
 /// LMDB only uses physical pages for actually written data.
 const DEFAULT_MAP_SIZE: usize = 1_073_741_824;
 
@@ -18,8 +18,8 @@ const LOG_DB_NAME: &str = "logs";
 /// Database name for seen targets (set).
 const TARGETS_DB_NAME: &str = "targets";
 
-/// Maximum resize attempts when LMDB reports MapFull while a reader holds a txn
-/// (EBUSY). The TUI's spawn_blocking readers are brief, so backoff is short.
+/// Maximum resize attempts when LMDB reports `MapFull` while a reader holds a txn
+/// (EBUSY). The TUI's `spawn_blocking` readers are brief, so backoff is short.
 const RESIZE_MAX_ATTEMPTS: u32 = 5;
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -46,18 +46,18 @@ pub struct LogMessage {
 /// ## Architecture
 ///
 /// Two LMDB databases:
-/// - `logs`: key = `u64` big-endian timestamp_ns, value = postcard-encoded `LogMessage`
+/// - `logs`: key = `u64` big-endian `timestamp_ns`, value = postcard-encoded `LogMessage`
 /// - `targets`: key = target string, value = () — a set of seen targets
 ///
 /// All reads/writes are synchronous (heed uses mmap). Callers should wrap
 /// this in `Arc` for shared access across async tasks.
 pub struct HeedLogStorage {
     env: Env<WithoutTls>,
-    /// Key = u64 timestamp_ns (big-endian), Value = postcard(LogMessage)
+    /// Key = u64 `timestamp_ns` (big-endian), Value = postcard(LogMessage)
     logs: Database<U64BE, Bytes>,
     /// Key = target string, Value = () — a set of seen targets
     targets: Database<Str, Unit>,
-    /// Counter of MapFull events encountered (incremented instead of emitting tracing events).
+    /// Counter of `MapFull` events encountered (incremented instead of emitting tracing events).
     pub mapsize_full_count: AtomicU64,
 }
 
@@ -145,29 +145,26 @@ impl HeedLogStorage {
                 }
                 let mut attempt = 0u32;
                 loop {
-                    match resize_backoff(attempt) {
-                        Some(delay) => {
-                            // Readers are brief spawn_blocking reads; give them time to drop.
-                            std::thread::sleep(delay);
-                            // SAFETY: no active transactions at this point (the failed write_txn
-                            // was already dropped when `try_write_batch` returned the MapFull
-                            // error), and no other thread holds a write txn (write_log_batch is
-                            // only called from the single background writer task).
-                            match unsafe { self.env.resize(new_size) } {
-                                Ok(()) => break,
-                                Err(_e) => {
-                                    if attempt + 1 >= RESIZE_MAX_ATTEMPTS {
-                                        self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
-                                        return Ok(()); // swallow after exhaustion (see doc comment)
-                                    }
-                                    attempt += 1;
+                    if let Some(delay) = resize_backoff(attempt) {
+                        // Readers are brief spawn_blocking reads; give them time to drop.
+                        std::thread::sleep(delay);
+                        // SAFETY: no active transactions at this point (the failed write_txn
+                        // was already dropped when `try_write_batch` returned the MapFull
+                        // error), and no other thread holds a write txn (write_log_batch is
+                        // only called from the single background writer task).
+                        match unsafe { self.env.resize(new_size) } {
+                            Ok(()) => break,
+                            Err(_e) => {
+                                if attempt + 1 >= RESIZE_MAX_ATTEMPTS {
+                                    self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
+                                    return Ok(()); // swallow after exhaustion (see doc comment)
                                 }
+                                attempt += 1;
                             }
                         }
-                        None => {
-                            self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
-                            return Ok(());
-                        }
+                    } else {
+                        self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
                     }
                 }
                 // Retry once after resize; keep the batch if it still fails.
@@ -180,7 +177,7 @@ impl HeedLogStorage {
         }
     }
 
-    /// Internal: write a batch in one transaction. Returns [`HeedError::MapFull`] on MapFull.
+    /// Internal: write a batch in one transaction. Returns [`HeedError::MapFull`] on `MapFull`.
     fn try_write_batch(&self, messages: &[LogMessage]) -> Result<()> {
         let mut wtxn = self
             .env
@@ -196,14 +193,12 @@ impl HeedLogStorage {
             // vec for exactly one iteration (declared uninit, assigned only on
             // the overflow path, so the hot path pays no extra alloc).
             let fallback: Option<Vec<u8>>;
-            let encoded: &[u8] = match postcard::to_slice(msg, &mut scratch) {
-                Ok(used) => used,
-                Err(_) => {
-                    fallback = Some(
-                        postcard::to_allocvec(msg).map_err(|e| HeedError::Serde(e.to_string()))?,
-                    );
-                    fallback.as_deref().unwrap_or(&[])
-                }
+            let encoded: &[u8] = if let Ok(used) = postcard::to_slice(msg, &mut scratch) {
+                used
+            } else {
+                fallback =
+                    Some(postcard::to_allocvec(msg).map_err(|e| HeedError::Serde(e.to_string()))?);
+                fallback.as_deref().unwrap_or(&[])
             };
 
             if let Err(e) = self.logs.put(&mut wtxn, &msg.timestamp_nanos, encoded) {
@@ -507,8 +502,8 @@ mod tests {
     fn make_msg(ts: u64, i: usize) -> LogMessage {
         LogMessage {
             level: "info".to_string(),
-            target: format!("target_{}", i),
-            message: format!("message_{}", i),
+            target: format!("target_{i}"),
+            message: format!("message_{i}"),
             timestamp_nanos: ts,
         }
     }
@@ -602,7 +597,10 @@ mod tests {
         // 1,250 entries in 5 pages of 250 — deliberately NOT a page multiple.
         for i in 0..1_250u64 {
             store
-                .write_log_batch(&[make_msg(1_000 + i, i as usize)])
+                .write_log_batch(&[make_msg(
+                    1_000 + i,
+                    usize::try_from(i).expect("i fits usize"),
+                )])
                 .expect("write");
         }
         let all = store
@@ -637,7 +635,10 @@ mod tests {
         let store = HeedLogStorage::new(dir.path()).expect("new");
         for i in 0..600u64 {
             store
-                .write_log_batch(&[make_msg(1_000 + i, i as usize)])
+                .write_log_batch(&[make_msg(
+                    1_000 + i,
+                    usize::try_from(i).expect("i fits usize"),
+                )])
                 .expect("write");
         }
         let capped = store
@@ -769,8 +770,8 @@ mod tests {
                 LogMessage {
                     level: "info".to_string(),
                     target: format!("target_{}", i % 3), // 3 unique targets
-                    message: format!("msg_{}", i),
-                    timestamp_nanos: 1000 + i as u64,
+                    message: format!("msg_{i}"),
+                    timestamp_nanos: 1000 + u64::try_from(i).expect("i fits u64"),
                 }
             })
             .collect();

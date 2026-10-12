@@ -381,11 +381,13 @@ async fn invert_ip_rule_decides_first_pass_resolution_not_consumed() {
         matches!(d, Decision::Route { ref tag, .. } if &**tag == "not-lan"),
         "invert rule wins pass 1 against the empty resolved set: {d:?}"
     );
-    assert!(
-        sink.results.lock().is_empty(),
+    let results = sink.results.lock();
+    assert_eq!(
+        results.len(),
+        0,
         "pass-1 terminal decision consumes no resolution"
     );
-    assert!(m.resolved_host_ips.is_empty());
+    assert_eq!(m.resolved_host_ips.len(), 0);
 }
 
 #[tokio::test]

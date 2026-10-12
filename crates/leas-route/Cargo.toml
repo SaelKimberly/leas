@@ -70,6 +70,7 @@ leas-tls.workspace = true
 # Routing decision benches (`benches/decide.rs`): criterion harness only —
 # the engine's decide path is synchronous, so no async feature is needed.
 criterion = { workspace = true }
+rstest.workspace = true
 
 [package.metadata.cargo-machete]
 # `leas-geoip` is wired by the `geoip` feature only, and geo matching is

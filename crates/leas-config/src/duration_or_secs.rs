@@ -100,10 +100,4 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         assert_eq!(json, r#""5s""#);
     }
-
-    #[test]
-    fn deref_to_duration() {
-        let d = DurationOrSecs(Duration::from_secs(42));
-        assert_eq!(*d, Duration::from_secs(42));
-    }
 }

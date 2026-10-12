@@ -418,7 +418,7 @@ pub(crate) const PROFILES_PAGE_SIZE: usize = 200;
 /// the stored rank keys are computed with, so the comparator, the page SQL and
 /// the keys cannot disagree. `state.endpoint_info` is a display cache and is
 /// deliberately not consulted: it can lag the row.
-pub(crate) fn endpoint_dns_unresolved(_state: &AppState, row: &EndpointRow) -> bool {
+pub(crate) const fn endpoint_dns_unresolved(_state: &AppState, row: &EndpointRow) -> bool {
     leas_db::endpoint_rank::dns_unresolved(row)
 }
 
@@ -1291,11 +1291,9 @@ pub(crate) mod test_support {
         // and an IP-literal fixture carries its own literal — the exact shape
         // the import writes. Without either, the fixture would be a row whose
         // dial target and address columns are empty.
-        let resolved_ips = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            vec![ip]
-        } else {
-            vec!["10.0.0.1".parse().expect("addr")]
-        };
+        let resolved_ips = host
+            .parse::<std::net::IpAddr>()
+            .map_or_else(|_| vec!["10.0.0.1".parse().expect("addr")], |ip| vec![ip]);
         let endpoint = Endpoint {
             id: EndpointId::new(id),
             domain,

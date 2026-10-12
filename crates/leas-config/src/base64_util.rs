@@ -63,35 +63,23 @@ fn simple_percent_decode(s: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn test_standard_base64() {
-        let result = decode_base64("aGVsbG8=").unwrap();
-        assert_eq!(result, b"hello");
-    }
-
-    #[test]
-    fn test_url_safe_base64() {
-        let result = decode_base64("aGVsbG8").unwrap();
-        assert_eq!(result, b"hello");
-    }
-
-    #[test]
-    fn test_trailing_annotation() {
-        let result = decode_base64("aGVsbG8=Irancell").unwrap();
-        assert_eq!(result, b"hello");
-    }
-
-    #[test]
-    fn test_backtick_filtering() {
-        let result = decode_base64("aGVs`bG8=").unwrap();
-        assert_eq!(result, b"hello");
-    }
-
-    #[test]
-    fn test_url_safe_no_pad() {
-        let result = decode_base64("Pj4-Pj4-Pj4").unwrap();
-        assert!(!result.is_empty());
+    #[rstest]
+    #[case::standard_base64("aGVsbG8=", b"hello")]
+    #[case::url_safe_base64("aGVsbG8", b"hello")]
+    #[case::trailing_annotation("aGVsbG8=Irancell", b"hello")]
+    #[case::trailing_annotation_single_pad("aGVsbG8=Irancell", b"hello")]
+    #[case::backtick_filtering("aGVs`bG8=", b"hello")]
+    #[case::trailing_annotation_no_pad("aGVsbG8= annotation", b"hello")]
+    #[case::mixed_padding_single_eq("aGVsbG8=", b"hello")]
+    #[case::mixed_padding_double_eq("aA==", b"h")]
+    #[case::trailing_annotation_double_pad("aG1hYg==annotation", b"hmab")]
+    #[case::trailing_annotation_truncated_pad("aGVsbG8= foo=bar", b"hello")]
+    #[case::url_safe_vs_standard_auto_detect_ambiguous("aGVsbG8", b"hello")]
+    fn decode_cases(#[case] input: &str, #[case] expected: &[u8]) {
+        let result = decode_base64(input).unwrap();
+        assert_eq!(result.as_slice(), expected);
     }
 
     #[test]
@@ -113,13 +101,6 @@ mod tests {
         // aGVs/G8+ in standard = 3 bytes + 3 bytes = 6 bytes
         assert_eq!(result.len(), 6);
         assert!(result.starts_with(b"hel"));
-    }
-
-    #[test]
-    fn test_url_safe_vs_standard_auto_detect_ambiguous() {
-        // String valid in both URL-safe and standard: alphanumeric only
-        let result = decode_base64("aGVsbG8").unwrap(); // "hello" in both encodings
-        assert_eq!(result, b"hello");
     }
 
     #[test]
@@ -148,51 +129,6 @@ mod tests {
         let double_encoded = std_b64.replace('+', "%2B");
         let result = decode_base64(&double_encoded).unwrap();
         assert_eq!(result, data);
-    }
-
-    #[test]
-    fn test_trailing_annotation_single_pad() {
-        // String with single = padding and trailing annotation text
-        let result = decode_base64("aGVsbG8=Irancell").unwrap();
-        assert_eq!(result, b"hello");
-    }
-
-    #[test]
-    fn test_trailing_annotation_double_pad() {
-        // String with double == padding and trailing annotation
-        // "hm" base64 = "aG0=" (1 pad), "hma" base64 = "aG1h" (no pad), "hmab" base64 = "aG1hYg==" (2 pads)
-        let result = decode_base64("aG1hYg==annotation").unwrap();
-        assert_eq!(result, b"hmab");
-    }
-
-    #[test]
-    fn test_trailing_annotation_no_pad() {
-        // No padding, annotation separated by space (acts as delimiter)
-        let result = decode_base64("aGVsbG8= annotation").unwrap();
-        assert_eq!(result, b"hello");
-    }
-
-    #[test]
-    fn test_mixed_padding_single_eq() {
-        // Single = padding
-        let result = decode_base64("aGVsbG8=").unwrap();
-        assert_eq!(result, b"hello");
-    }
-
-    #[test]
-    fn test_mixed_padding_double_eq() {
-        // Double == padding — base64 of 1 byte = 2 base64 chars + "=="
-        // 'h' = 0x68 = 01101000 -> 011010 000000 -> aA==
-        let result = decode_base64("aA==").unwrap();
-        assert_eq!(result, b"h");
-    }
-
-    #[test]
-    fn test_trailing_annotation_truncated_pad() {
-        // Annotation containing '=' after padding — '=' in annotation doesn't break
-        // because the decoder stops at the first non-base64 delimiter after padding
-        let result = decode_base64("aGVsbG8= foo=bar").unwrap();
-        assert_eq!(result, b"hello");
     }
 
     #[test]

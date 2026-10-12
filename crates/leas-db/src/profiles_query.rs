@@ -198,7 +198,7 @@ impl Sql {
     /// return the ids/count as `Value::I64` — the page's id and count queries
     /// each select one INTEGER column. `self.params` (toasty `Value`s) are
     /// converted to turso values.
-    async fn exec_direct(&self, conn: &mut turso::Connection) -> Result<Vec<Value>> {
+    async fn exec_direct(&self, conn: &turso::Connection) -> Result<Vec<Value>> {
         let params: Vec<turso::Value> = self.params.iter().map(to_turso_value).collect();
         let mut rows = conn
             .query(self.text.clone(), turso::params_from_iter(params))
@@ -565,8 +565,8 @@ impl Database {
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn profiles_page(&self, req: &PageRequest) -> Result<PageMeta> {
         if let Some(direct) = &self.direct {
-            let mut conn = direct.lock().await;
-            return Self::page_ids_direct(&mut conn, req).await;
+            let conn = direct.lock().await;
+            return Self::page_ids_direct(&conn, req).await;
         }
         let mut conn = self.connection().await?;
         let total = self.profiles_count_with(&mut conn, req).await?;
@@ -630,7 +630,7 @@ impl Database {
 
     /// The page's ids + total over the long-lived direct connection (T13) —
     /// no toasty execution layer, which is the measured 80× gap.
-    async fn page_ids_direct(conn: &mut turso::Connection, req: &PageRequest) -> Result<PageMeta> {
+    async fn page_ids_direct(conn: &turso::Connection, req: &PageRequest) -> Result<PageMeta> {
         let mut count_sql = Sql::new();
         count_sql.push("SELECT COUNT(*)");
         base_from_where(

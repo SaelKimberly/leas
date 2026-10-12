@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn test_common_field_defaults() {
         let fields = common_field_defaults();
-        assert!(!fields.is_empty());
+        assert_ne!(fields.len(), 0);
         assert!(fields.iter().any(|(k, _)| k == "address"));
         assert!(fields.iter().any(|(k, _)| k == "port"));
         assert!(!fields.iter().any(|(k, _)| k == "remarks"));

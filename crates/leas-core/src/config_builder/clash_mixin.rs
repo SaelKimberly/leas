@@ -1,5 +1,6 @@
 /// Parse Clash mixin YAML/JSON string into a `serde_json::Value`.
 /// Tries JSON first (fast path), falls back to YAML via `yaml-rust2`.
+#[must_use]
 pub fn parse_clash_mixin(input: &str) -> Option<serde_json::Value> {
     if input.trim().is_empty() {
         return None;
@@ -18,13 +19,9 @@ pub fn parse_clash_mixin(input: &str) -> Option<serde_json::Value> {
 
 fn yaml_to_value(y: &yaml_rust2::Yaml) -> Option<serde_json::Value> {
     Some(match y {
-        yaml_rust2::Yaml::Real(s) => {
-            if let Ok(f) = s.parse::<f64>() {
-                serde_json::json!(f)
-            } else {
-                serde_json::json!(s)
-            }
-        }
+        yaml_rust2::Yaml::Real(s) => s
+            .parse::<f64>()
+            .map_or_else(|_| serde_json::json!(s), |f| serde_json::json!(f)),
         yaml_rust2::Yaml::Integer(i) => serde_json::json!(i),
         yaml_rust2::Yaml::String(s) => serde_json::json!(s),
         yaml_rust2::Yaml::Boolean(b) => serde_json::json!(b),

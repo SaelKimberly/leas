@@ -173,6 +173,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use rstest::rstest;
     use tokio::sync::mpsc;
 
     fn probes(list: &[&str]) -> Vec<String> {
@@ -250,46 +251,25 @@ mod tests {
         assert_eq!(events.len(), 3);
     }
 
+    // Every no-op input (untracked list, out-of-list probe, absent sink
+    // result) must leave the tracker silent.
+    #[rstest]
+    #[case::empty_list(&[], Some("p1"))]
+    #[case::probe_not_in_list(&["p1"], Some("other"))]
+    #[case::sink_no_result(&["p1"], None)]
     #[tokio::test]
-    async fn probe_list_empty_means_zero_events() {
+    async fn no_op_updates_emit_no_events(#[case] list: &[&str], #[case] probe: Option<&str>) {
         let mut tracker = ProbeTracker::default();
+        let list = probes(list);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        tracker.update(&[], true, Some((true, Some("p1"))), &Some(tx.clone()));
-        tracker.update(&[], false, Some((false, Some("p1"))), &Some(tx));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn probe_not_in_list_ignored() {
-        let mut tracker = ProbeTracker::default();
-        let list = probes(&["p1"]);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        tracker.update(&list, true, Some((true, Some("other"))), &Some(tx.clone()));
-        tracker.update(&list, false, Some((false, Some("other"))), &Some(tx));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn tx_none_transitions_without_panic() {
-        let mut tracker = ProbeTracker::default();
-        let list = probes(&["p1"]);
-
-        tracker.update(&list, true, Some((true, Some("p1"))), &None);
-        // Second failure: no duplicate breakdown was (or can be) observed, state OK.
-        tracker.update(&list, true, Some((true, Some("p1"))), &None);
-        tracker.update(&list, false, Some((false, Some("p1"))), &None);
-        tracker.update(&list, false, Some((false, Some("p1"))), &None);
-    }
-
-    #[tokio::test]
-    async fn sink_no_result_no_state_change() {
-        let mut tracker = ProbeTracker::default();
-        let list = probes(&["p1"]);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        tracker.update(&list, true, None, &Some(tx));
+        match probe {
+            Some(p) => {
+                tracker.update(&list, true, Some((true, Some(p))), &Some(tx.clone()));
+                tracker.update(&list, false, Some((false, Some(p))), &Some(tx));
+            }
+            None => tracker.update(&list, true, None, &Some(tx)),
+        }
         assert!(rx.try_recv().is_err());
     }
 }

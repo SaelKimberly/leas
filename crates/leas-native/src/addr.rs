@@ -305,7 +305,7 @@ mod tests {
             let encoded = encode_addr(&t).unwrap();
             let (decoded, tail) = decode_addr(&encoded).expect("decode");
             assert_eq!(decoded, t);
-            assert!(tail.is_empty());
+            assert_eq!(tail.len(), 0);
         }
     }
 
@@ -358,7 +358,7 @@ mod tests {
             let encoded = encode_addr_port_last(&t).unwrap();
             let (decoded, tail) = decode_addr_port_last(&encoded).expect("decode");
             assert_eq!(decoded, t);
-            assert!(tail.is_empty());
+            assert_eq!(tail.len(), 0);
         }
     }
 

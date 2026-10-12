@@ -464,6 +464,7 @@ mod tests {
     use super::super::{CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind};
     use super::HttpClientConfig;
     use crate::urlx::{RawUrlX, SchemeX};
+    use rstest::rstest;
 
     fn parse(url: &str) -> ParsedProto {
         HttpClientConfig::try_parse_proto(&RawUrlX::from(url))
@@ -726,12 +727,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn xray_inject_without_endpoint_is_rejected() {
+    #[rstest]
+    #[case::xray(CoreType::Xray)]
+    #[case::singbox(CoreType::SingBox)]
+    fn inject_without_endpoint_is_rejected(#[case] core: CoreType) {
         let cfg = http_auth();
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .inject_to(&mut conf, core, None, InjectOptions::default())
             .expect_err("orphan http must be rejected");
         assert!(matches!(err, SupportError::MissingField("server", "http")));
     }
@@ -775,15 +778,5 @@ mod tests {
         assert_eq!(conf["tls"]["enabled"], true);
         assert_eq!(conf["tls"]["server_name"], "cdn.example.com");
         assert_eq!(conf["tls"]["insecure"], true, "skip_cert_verify forces it");
-    }
-
-    #[test]
-    fn singbox_inject_without_endpoint_is_rejected() {
-        let cfg = http_auth();
-        let mut conf = serde_json::json!({});
-        let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
-            .expect_err("orphan http must be rejected");
-        assert!(matches!(err, SupportError::MissingField("server", "http")));
     }
 }

@@ -801,6 +801,7 @@ impl ProtoIdentity for PlaceholderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use serde_json::json;
 
     #[test]
@@ -815,7 +816,7 @@ mod tests {
 
         let redirect = PlaceholderConfig::new("redirect".into(), json.clone());
         let parsed = redirect.try_parse_proto();
-        assert!(parsed.endpoints.is_empty(), "orphan protocol: no endpoint");
+        assert_eq!(parsed.endpoints.len(), 0, "orphan protocol: no endpoint");
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Redirect);
         assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         assert_eq!(
@@ -825,14 +826,14 @@ mod tests {
 
         let tproxy = PlaceholderConfig::new("tproxy".into(), json.clone());
         let parsed = tproxy.try_parse_proto();
-        assert!(parsed.endpoints.is_empty());
+        assert_eq!(parsed.endpoints.len(), 0);
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::TProxy);
         assert_eq!(parsed.protocol.config, ProtocolConfig::TProxy(tproxy));
 
         // Unknown proto_name falls back to Mixed (legacy passthrough rule).
         let mixed = PlaceholderConfig::new("wireguard".into(), json);
         let parsed = mixed.try_parse_proto();
-        assert!(parsed.endpoints.is_empty());
+        assert_eq!(parsed.endpoints.len(), 0);
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Mixed);
         assert_eq!(parsed.protocol.config, ProtocolConfig::Mixed(mixed));
 
@@ -1266,9 +1267,9 @@ mod tests {
             "the 12 sing-box-only variants must report distinct kind strings"
         );
     }
-    #[test]
-    fn export_defaults_preserve_explicit_values() {
-        let mut config = ProtocolConfig::Vless(VlessConfig {
+    #[rstest]
+    #[case::explicit_values(
+        ProtocolConfig::Vless(VlessConfig {
             uuid: "00000000-0000-0000-0000-000000000001".into(),
             uuid_origin: None,
             security: SecurityConfig {
@@ -1288,21 +1289,11 @@ mod tests {
             splice: None,
             remarks: None,
             mux: None,
-        });
-        config.set_export_defaults("fallback.example");
-        let ProtocolConfig::Vless(vless) = config else {
-            panic!("vless")
-        };
-        assert_eq!(vless.security.sni(), Some("explicit.example"));
-        let common::TransportConfig::Ws(ws) = vless.transport else {
-            panic!("ws")
-        };
-        assert_eq!(ws.host.as_deref(), Some("explicit.example"));
-    }
-
-    #[test]
-    fn export_defaults_fill_absent_vless_values() {
-        let mut config = ProtocolConfig::Vless(VlessConfig {
+        }),
+        "explicit.example"
+    )]
+    #[case::fill_absent(
+        ProtocolConfig::Vless(VlessConfig {
             uuid: "00000000-0000-0000-0000-000000000001".into(),
             uuid_origin: None,
             security: SecurityConfig {
@@ -1316,16 +1307,22 @@ mod tests {
             splice: None,
             remarks: None,
             mux: None,
-        });
+        }),
+        "fallback.example"
+    )]
+    fn export_defaults_preserve_or_fill_vless(
+        #[case] mut config: ProtocolConfig,
+        #[case] expected: &str,
+    ) {
         config.set_export_defaults("fallback.example");
         let ProtocolConfig::Vless(vless) = config else {
             panic!("vless")
         };
-        assert_eq!(vless.security.sni(), Some("fallback.example"));
+        assert_eq!(vless.security.sni(), Some(expected));
         let common::TransportConfig::Ws(ws) = vless.transport else {
             panic!("ws")
         };
-        assert_eq!(ws.host.as_deref(), Some("fallback.example"));
+        assert_eq!(ws.host.as_deref(), Some(expected));
     }
     #[test]
     fn resolved_vless_reconstruct_uses_ip_authority_and_dns_sni() {

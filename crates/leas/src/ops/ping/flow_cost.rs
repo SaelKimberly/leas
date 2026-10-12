@@ -3,7 +3,7 @@
 //! Ignored by default. Run with:
 //!
 //! ```text
-//! cargo test -p leas --release --lib -- --ignored --nocapture flow_cost
+//! cargo test -p leas --release --lib --features perf-lab -- --ignored --nocapture flow_cost
 //! ```
 //!
 //! Every row is the MEDIAN of its per-operation samples on this machine (a
@@ -25,7 +25,7 @@
 //! rank keys, and measure the Active page for the filesort sorts across
 //! offsets, plus the band-seek A/B (P1b before/after). Independent of a real
 //! feed file.
-#![allow(clippy::all, clippy::pedantic, clippy::nursery, dead_code)]
+#![allow(dead_code)]
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -73,7 +73,7 @@ impl Acc {
         let ns = match samples.len() {
             0 => 0.0,
             n if n % 2 == 1 => samples[n / 2] as f64,
-            n => (samples[n / 2 - 1] as f64 + samples[n / 2] as f64) / 2.0,
+            n => f64::midpoint(samples[n / 2 - 1] as f64, samples[n / 2] as f64),
         };
         TableRow {
             name: name.to_owned(),
@@ -245,6 +245,9 @@ async fn flow_cost_report() {
     let page = synth_rows(200, 4);
     let links_all: Vec<ProfileStats> = page.iter().flat_map(|r| r.links.iter().cloned()).collect();
     let plan_acc = bench_sync(200, || {
+        // The `collect` IS the allocation this row measures; `count()` would
+        // time a different path.
+        #[allow(clippy::needless_collect)]
         let plan: Vec<PlanLink> = page.iter().flat_map(plan_row_links).collect();
         black_box(plan.len());
     });
@@ -274,17 +277,20 @@ async fn flow_cost_report() {
     rows_out.push(stage_acc.row("WriteBehind<LinkSpec>::stage (RESULT)", 1.0));
     writer.flush().await.expect("flush");
 
-    let stage3_acc = bench_sync(100_000, || {
+    let stage_all_acc = bench_sync(100_000, || {
         let link = &prebuilt[black_box(1)];
         writer.stage(link, leas_db::LinkGroups::ALL);
     });
-    rows_out.push(stage3_acc.row("WriteBehind<LinkSpec>::stage (ALL: 3 group inserts)", 1.0));
+    rows_out.push(stage_all_acc.row("WriteBehind<LinkSpec>::stage (ALL: 3 group inserts)", 1.0));
     writer.flush().await.expect("flush");
 
     let mut patch_acc = Acc::new();
     for _ in 0..64 {
         let links: Vec<ProfileStats> = (0..512).map(make_staged).collect();
         let started = Instant::now();
+        // The `collect` IS the allocation this row measures; `count()` would
+        // time a different path.
+        #[allow(clippy::needless_collect)]
         let patches: Vec<leas_db::LinkPatch> = links
             .iter()
             .map(|link| leas_db::LinkPatch {
@@ -370,7 +376,7 @@ async fn flow_cost_report() {
     });
     rows_out.push(hash_acc.row("dedup get, prehashed (u64, u16) key", 1.0));
 
-    let outcome_map: HashMap<(String, u16), ProbeOutcome> = [((
+    let outcome_map: HashMap<(String, u16), ProbeOutcome> = std::iter::once((
         host.clone(),
         port,
         ProbeOutcome::Failed {
@@ -379,8 +385,7 @@ async fn flow_cost_report() {
             hard: true,
             evidence: None,
         },
-    ))]
-    .into_iter()
+    ))
     .fold(HashMap::new(), |mut m, (h, p, o)| {
         m.insert((h, p), o);
         m
@@ -498,12 +503,12 @@ async fn flow_cost_report() {
     }
     rows_out.push(rank_acc.row("refresh_endpoint_ranks (200 endpoints)", 200.0));
 
-    let probe_hash: HashMap<(ProtocolId, EndpointId), ProfileStats> = probe_dash
+    let probe_snapshot: HashMap<(ProtocolId, EndpointId), ProfileStats> = probe_dash
         .iter()
         .map(|e| (*e.key(), e.value().clone()))
         .collect();
     let hash_len_acc = bench_sync(200_000, || {
-        black_box(probe_hash.len());
+        black_box(probe_snapshot.len());
     });
     rows_out.push(hash_len_acc.row("HashMap::len() (512-entry map)", 1.0));
 
@@ -540,6 +545,10 @@ async fn flow_cost_report() {
     let mut dedup_cache: HashMap<(String, u16), ProbeOutcome> = HashMap::new();
     let mut in_flight: HashMap<(String, u16), Arc<tokio::sync::Notify>> = HashMap::new();
     let dedup_key = (host.clone(), port);
+    // Both clones are the production dedup path this row measures ("2 key
+    // clones + 2 map ops"); moving instead would time a shape the owner never
+    // runs.
+    #[allow(clippy::redundant_clone)]
     let dedup_acc = bench_sync(20_000, || {
         let key = (host.clone(), port);
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -779,13 +788,10 @@ async fn flow_cost_report() {
                     let started = Instant::now();
                     let loaded = crate::ops::profiles::load_profiles_rows(&db, &load).await;
                     load_half.add(started.elapsed());
-                    match loaded {
-                        Ok((rows, meta)) => {
-                            let started = Instant::now();
-                            crate::ops::profiles::apply_profiles_rows(&mut ui_state, rows, &meta);
-                            apply_half.add(started.elapsed());
-                        }
-                        Err(_) => {}
+                    if let Ok((rows, meta)) = loaded {
+                        let started = Instant::now();
+                        crate::ops::profiles::apply_profiles_rows(&mut ui_state, rows, &meta);
+                        apply_half.add(started.elapsed());
                     }
                 }
                 rows_out.push(load_half.row("reload half: load_profiles_rows", 1.0));
@@ -876,10 +882,10 @@ async fn flow_cost_report() {
                         "SELECT AVG(LENGTH(error_text)), MAX(LENGTH(error_text)) FROM profile_stats WHERE error_text IS NOT NULL",
                     ),
                 ] {
-                    if let Ok(mut conn) = db.connection().await {
-                        if let Ok(rows) = toasty::sql::query(sql).exec(&mut conn).await {
-                            println!("[feed] {label}: {rows:?}");
-                        }
+                    if let Ok(mut conn) = db.connection().await
+                        && let Ok(rows) = toasty::sql::query(sql).exec(&mut conn).await
+                    {
+                        println!("[feed] {label}: {rows:?}");
                     }
                 }
 
@@ -1036,7 +1042,7 @@ async fn flow_cost_report() {
                     ] {
                         let _ = toasty::sql::query(ddl).exec(&mut conn).await;
                     }
-                    let _ = toasty::sql::query(&format!(
+                    let _ = toasty::sql::query(format!(
                         "UPDATE endpoint_rank SET mband = CASE WHEN rank_newest_seen >= {threshold} \
                          THEN 0 ELSE 1 END"
                     ))
@@ -1109,7 +1115,7 @@ async fn measure_page_scale() {
         return;
     };
     let sizes: Vec<usize> = if spec.trim().is_empty() || spec.trim() == "1" {
-        vec![7686, 50000, 200000]
+        vec![7686, 50000, 200_000]
     } else {
         spec.split(',')
             .filter_map(|s| s.trim().parse().ok())
@@ -1172,10 +1178,7 @@ async fn measure_page_scale() {
                 offset: 0,
                 limit: PROFILES_PAGE_SIZE,
             };
-            db.profiles_page(&req)
-                .await
-                .map(|p| p.total as usize)
-                .unwrap_or(0)
+            db.profiles_page(&req).await.map_or(0, |p| p.total as usize)
         };
         let offsets = [
             0usize,
@@ -1215,7 +1218,7 @@ async fn measure_page_scale() {
             ] {
                 let _ = toasty::sql::query(ddl).exec(&mut conn).await;
             }
-            let _ = toasty::sql::query(&format!(
+            let _ = toasty::sql::query(format!(
                 "UPDATE endpoint_rank SET mband = CASE WHEN rank_newest_seen >= {threshold} \
                  THEN 0 ELSE 1 END"
             ))
@@ -1307,6 +1310,8 @@ async fn measure_page_scale() {
 #[ignore = "perf lab: run explicitly with --ignored"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flow_cost_network() {
+    const PING_URL: &str = "https://www.gstatic.com/generate_204";
+
     let Ok(path) = std::env::var("LEAS_MEASURE_DB") else {
         println!("SKIP flow_cost_network: set LEAS_MEASURE_DB=<copy of data.db>");
         return;
@@ -1315,7 +1320,6 @@ async fn flow_cost_network() {
     let concurrency = env_usize("LEAS_MEASURE_CONCURRENCY", 256);
     let budget = Duration::from_secs(env_usize("LEAS_MEASURE_BUDGET_SECS", 5) as u64);
     let sample_size = env_usize("LEAS_MEASURE_SAMPLE", 400);
-    const PING_URL: &str = "https://www.gstatic.com/generate_204";
 
     let db = Arc::new(
         leas_db::Database::open(&path)
@@ -1442,11 +1446,11 @@ async fn flow_cost_network() {
         timeout: budget,
         retries: 1,
     };
-    'sample: for row in rows.iter() {
+    'sample: for row in &rows {
         if latencies.len() >= sample_size {
             break;
         }
-        for link in row.links.iter() {
+        for link in &row.links {
             if latencies.len() >= sample_size || sample_started.elapsed() >= sample_deadline {
                 break 'sample;
             }
@@ -1555,6 +1559,8 @@ async fn flow_cost_network() {
 #[ignore = "perf lab: run explicitly with --ignored"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flow_cost_transport_control() {
+    const PING_URL: &str = "https://www.gstatic.com/generate_204";
+
     let Ok(path) = std::env::var("LEAS_MEASURE_DB") else {
         println!("SKIP flow_cost_transport_control: set LEAS_MEASURE_DB");
         return;
@@ -1564,7 +1570,6 @@ async fn flow_cost_transport_control() {
         return;
     };
     let budget = Duration::from_secs(env_usize("LEAS_MEASURE_BUDGET_SECS", 5) as u64);
-    const PING_URL: &str = "https://www.gstatic.com/generate_204";
 
     let wanted: std::collections::HashSet<i64> = ids_raw
         .split(',')
@@ -1735,11 +1740,11 @@ struct ImportBatch {
 }
 
 impl ImportBatch {
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.links.len()
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.links.is_empty()
     }
 }
@@ -1910,7 +1915,7 @@ fn split_batches(slice: &ImportBatch, n: usize, per_tx: usize) -> Vec<ImportBatc
 ///   `LEAS_MEASURE_GEO_FLUSH`      country flushes per rep (default 16)
 ///   `LEAS_MEASURE_ROWS_PER_FLUSH` addresses per country flush (default 100)
 ///   `LEAS_MEASURE_FANIN`          concurrent writer tasks (default 16)
-///   `LEAS_MEASURE_TRICKLE_ROWS`   link-writer arrivals (default 4_028)
+///   `LEAS_MEASURE_TRICKLE_ROWS`   link-writer arrivals (default `4_028`)
 ///   `LEAS_MEASURE_TRICKLE_RPS`    arrival rate, rows/s (default 12)
 #[ignore = "perf lab: run explicitly with --ignored"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1961,8 +1966,7 @@ async fn flow_cost_contention() {
             limit: 1,
         })
         .await
-        .map(|page| page.total)
-        .unwrap_or(0);
+        .map_or(0, |page| page.total);
     if populated == 0 {
         println!(
             "ABORT flow_cost_contention: {path} holds no rows.\n\
@@ -2131,13 +2135,11 @@ async fn flow_cost_contention() {
     }
     if geo.is_empty() {
         println!("note: no persisted country rows; the geo rows are not meaningful");
-    } else {
-        if !arm_geo_batch.report() {
-            out.push(acc.row(
-                &format!("seq geo flush BATCHED ({rows_per_flush} rows)"),
-                1.0,
-            ));
-        }
+    } else if !arm_geo_batch.report() {
+        out.push(acc.row(
+            &format!("seq geo flush BATCHED ({rows_per_flush} rows)"),
+            1.0,
+        ));
     }
 
     // 2b. **Pre-fix** geo arm: the PER-ADDRESS writer `enrich.rs:444` used and
@@ -2395,7 +2397,7 @@ async fn flow_cost_seed_measure_db() {
     let mut state = test_state(Vec::new()).await;
     state.db = Arc::new(leas_db::Database::open(&path).await.expect("open seed db"));
     let rows = synth_rows(n, protos_per_endpoint);
-    seed_db(&mut state, &rows).await;
+    seed_db(&state, &rows).await;
     // Address rows too. Without them the contention mix skips its geo half
     // entirely ("no persisted country rows") — and the geo writer is the one
     // that produced the 2026-10-01 contention, so an A/B without it would

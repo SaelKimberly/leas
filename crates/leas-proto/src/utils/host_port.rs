@@ -196,6 +196,7 @@ pub fn host_port_spec(span: Span<'_>) -> RawResult<'_, (ServerName<'_>, PortSpec
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
 
     #[test]
     fn test_port_spec() {
@@ -230,28 +231,14 @@ mod tests {
         assert_eq!(spec.length(), 11);
     }
 
-    #[test]
-    fn test_dns_name_idn() {
-        let s = "例子.测试".as_bytes();
-        let (tail, name) = super::dns_name(s).unwrap();
-        assert!(tail.is_empty());
-        assert_eq!(name.as_ref(), "xn--fsqu00a.xn--0zwm56d");
-    }
-
-    #[test]
-    fn test_dns_name_mixed_idn() {
-        let s = "你好.example.com".as_bytes();
-        let (tail, name) = super::dns_name(s).unwrap();
-        assert!(tail.is_empty());
-        assert_eq!(name.as_ref(), "xn--6qq79v.example.com");
-    }
-
-    #[test]
-    fn test_dns_name_ascii_still_works() {
-        let s = b"example.com";
-        let (tail, name) = super::dns_name(s).unwrap();
-        assert!(tail.is_empty());
-        assert_eq!(name.as_ref(), "example.com");
+    #[rstest]
+    #[case::idn("例子.测试", "xn--fsqu00a.xn--0zwm56d")]
+    #[case::mixed_idn("你好.example.com", "xn--6qq79v.example.com")]
+    #[case::ascii("example.com", "example.com")]
+    fn test_dns_name(#[case] input: &str, #[case] expected: &str) {
+        let (tail, name) = super::dns_name(input.as_bytes()).unwrap();
+        assert_eq!(tail.len(), 0);
+        assert_eq!(name.as_ref(), expected);
     }
 
     #[test]

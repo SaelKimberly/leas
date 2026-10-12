@@ -914,6 +914,7 @@ mod tests {
 
     use leas_proto::proto_spec::endpoint::EndpointEssentials;
     use leas_proto::proto_spec::{ProtocolConfig, VlessConfig};
+    use rstest::rstest;
 
     use super::*;
     use crate::BoxStream;
@@ -1003,26 +1004,18 @@ mod tests {
         assert_eq!(frame.len(), MAX_FRAME - 16);
     }
 
-    #[test]
+    /// Both overflow arms of `encode_frame` panic with the same `MAX_FRAME`
+    /// message: content past the cap, and content exactly at the cap with any
+    /// padding.
+    #[rstest]
+    #[case::content_overflows_cap(MAX_FRAME - FRAME_OVERHEAD + 1, 0)]
+    #[case::padding_overflows_cap(MAX_FRAME - FRAME_OVERHEAD, 1)]
     #[should_panic(expected = "MAX_FRAME")]
-    fn encode_frame_panics_when_content_overflows_cap() {
-        let _ = encode_frame(
-            None,
-            CMD_CONTINUE,
-            &vec![0u8; MAX_FRAME - FRAME_OVERHEAD + 1],
-            0,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "MAX_FRAME")]
-    fn encode_frame_panics_when_padding_overflows_cap() {
-        let _ = encode_frame(
-            None,
-            CMD_CONTINUE,
-            &vec![0u8; MAX_FRAME - FRAME_OVERHEAD],
-            1,
-        );
+    fn encode_frame_panics_when_frame_overflows_cap(
+        #[case] content_len: usize,
+        #[case] pad: usize,
+    ) {
+        let _ = encode_frame(None, CMD_CONTINUE, &vec![0u8; content_len], pad);
     }
 
     #[test]
@@ -1185,34 +1178,26 @@ mod tests {
         assert_eq!(f.budget, FILTER_BUDGET - 1);
     }
 
-    #[test]
-    fn filter_tls13_server_hello_enables_xtls() {
-        let sh = server_hello(0x1301, true);
+    /// The XTLS-enable decision from the server's `ServerHello`: TLS 1.3 with a
+    /// non-CCM cipher enables XTLS; CCM8 and TLS 1.2 do not. The `ServerHello`
+    /// always consumes the whole filter budget.
+    #[rstest]
+    #[case::tls13(0x1301, true, true, true, true)]
+    #[case::ccm8(0x1305, true, true, true, false)]
+    #[case::tls12(0x1301, false, true, true, false)]
+    fn filter_server_hello_xtls_decision(
+        #[case] cipher: u16,
+        #[case] tls13: bool,
+        #[case] is_tls: bool,
+        #[case] tls12_or_above: bool,
+        #[case] enable_xtls: bool,
+    ) {
+        let sh = server_hello(cipher, tls13);
         let mut f = TlsFilter::new();
         f.feed(&sh);
-        assert!(f.is_tls);
-        assert!(f.is_tls12_or_above);
-        assert!(f.enable_xtls);
-        assert_eq!(f.budget, 0);
-    }
-
-    #[test]
-    fn filter_ccm8_server_hello_disables_xtls() {
-        let sh = server_hello(0x1305, true);
-        let mut f = TlsFilter::new();
-        f.feed(&sh);
-        assert!(f.is_tls12_or_above);
-        assert!(!f.enable_xtls);
-        assert_eq!(f.budget, 0);
-    }
-
-    #[test]
-    fn filter_tls12_server_hello_disables_xtls() {
-        let sh = server_hello(0x1301, false);
-        let mut f = TlsFilter::new();
-        f.feed(&sh);
-        assert!(f.is_tls12_or_above);
-        assert!(!f.enable_xtls);
+        assert_eq!(f.is_tls, is_tls);
+        assert_eq!(f.is_tls12_or_above, tls12_or_above);
+        assert_eq!(f.enable_xtls, enable_xtls);
         assert_eq!(f.budget, 0);
     }
 

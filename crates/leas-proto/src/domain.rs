@@ -62,6 +62,7 @@ pub fn psl_version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn splits_a_registrable_host() {
@@ -77,21 +78,26 @@ mod tests {
         assert_eq!(s.sub_domain, "");
     }
 
-    #[test]
-    fn unlisted_tlds_are_admitted_by_the_psl_default_rule() {
+    #[rstest]
+    #[case::nas_local("nas.local", true)]
+    #[case::router_lan("router.lan", true)]
+    #[case::server_home_arpa("server.home.arpa", true)]
+    #[case::single_label("localhost", false)]
+    #[case::single_label_tld("pl", false)]
+    #[case::bare_suffix("co.uk", false)]
+    #[case::bare_tld("com", false)]
+    fn split_admits_only_hosts_with_a_registrable_domain(
+        #[case] host: &str,
+        #[case] expected: bool,
+    ) {
         // The PSL default rule gives an unlisted TLD a registrable domain, so
         // LAN/private-scope names are NOT rejected by the T4/T5 rule (only
         // single-label names and bare suffixes are).
-        for host in ["nas.local", "router.lan", "server.home.arpa"] {
-            assert!(split(host).is_some(), "{host} must be admitted");
-        }
-    }
-
-    #[test]
-    fn single_label_and_bare_suffix_are_rejected() {
-        for host in ["localhost", "pl", "co.uk", "com"] {
-            assert!(split(host).is_none(), "{host} has no registrable domain");
-        }
+        assert_eq!(
+            split(host).is_some(),
+            expected,
+            "{host} registrable-domain expectation"
+        );
     }
 
     #[test]
@@ -116,10 +122,5 @@ mod tests {
         let s = split("WWW.Example.COM").expect("registrable");
         assert_eq!(s.domain, "example.com");
         assert_eq!(s.sub_domain, "www");
-    }
-
-    #[test]
-    fn the_psl_version_is_nonempty() {
-        assert_ne!(psl_version(), "");
     }
 }

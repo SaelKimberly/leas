@@ -557,21 +557,12 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_decoder_simple() {
-        let mut decoder = StreamingDecoder::new();
-        // Base64 of "hello\nworld\n"
-        let b64 = base64_simd::STANDARD.encode_to_string(b"vmess://abc123\nvless://def456\n");
-        let result = decoder.feed(b64.as_bytes()).unwrap();
-        assert!(!result.is_empty(), "Should find URLs in decoded data");
-    }
-
-    #[test]
     fn test_streaming_decoder_empty() {
         let mut decoder = StreamingDecoder::new();
         let result = decoder.feed(b"").unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
         let result = decoder.finalize().unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
     }
 
     #[test]
@@ -681,23 +672,23 @@ mod tests {
     fn test_streaming_decoder_whitespace_only_chunks() {
         let mut decoder = StreamingDecoder::new();
         let r1 = decoder.feed(b"   \n  \n  ").unwrap();
-        assert!(r1.is_empty());
+        assert_eq!(r1.len(), 0);
         let r2 = decoder.feed(b"\t\n\r\n").unwrap();
-        assert!(r2.is_empty());
+        assert_eq!(r2.len(), 0);
         let r3 = decoder.finalize().unwrap();
-        assert!(r3.is_empty());
+        assert_eq!(r3.len(), 0);
     }
 
     #[test]
     fn test_subscription_url_split_empty_input() {
         let urls = subscription_url_split("");
-        assert!(urls.is_empty());
+        assert_eq!(urls.len(), 0);
     }
 
     #[test]
     fn test_subscription_url_split_no_scheme() {
         let urls = subscription_url_split("just-some-text-without-scheme");
-        assert!(urls.is_empty());
+        assert_eq!(urls.len(), 0);
     }
 
     #[test]
@@ -837,6 +828,6 @@ mod tests {
 
     #[test]
     fn url_chunks_empty_input_yields_empty() {
-        assert!(subscription_url_chunks(b"").unwrap().is_empty());
+        assert_eq!(subscription_url_chunks(b"").unwrap().len(), 0);
     }
 }

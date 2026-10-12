@@ -634,6 +634,7 @@ mod tests {
     use super::super::{CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind};
     use super::{WireguardConfig, parse_reserved_bytes};
     use crate::urlx::{RawUrlX, SchemeX};
+    use rstest::rstest;
     use serde_json::json;
 
     const WG_URL: &str = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=&reserved=236%2C163%2C162&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280";
@@ -983,12 +984,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn xray_inject_without_endpoint_is_rejected() {
+    #[rstest]
+    #[case::xray(CoreType::Xray)]
+    #[case::singbox(CoreType::SingBox)]
+    fn inject_without_endpoint_is_rejected(#[case] core: CoreType) {
         let cfg = config(parse(WG_URL));
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .inject_to(&mut conf, core, None, InjectOptions::default())
             .expect_err("orphan wireguard must be rejected");
         assert!(matches!(
             err,
@@ -1052,18 +1055,5 @@ mod tests {
             "malformed reserved must be skipped: {conf}"
         );
         assert_eq!(conf["mtu"], 1420, "mtu defaults to 1420 when unset");
-    }
-
-    #[test]
-    fn singbox_inject_without_endpoint_is_rejected() {
-        let cfg = config(parse(WG_URL));
-        let mut conf = serde_json::json!({});
-        let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
-            .expect_err("orphan wireguard must be rejected");
-        assert!(matches!(
-            err,
-            SupportError::MissingField("server", "wireguard")
-        ));
     }
 }

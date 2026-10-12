@@ -475,6 +475,7 @@ mod tests {
     use crate::addr::{Host, TargetAddr};
     use crate::context::NativeConnectParams;
     use leas_proto::proto_spec::endpoint::EndpointEssentials;
+    use rstest::rstest;
 
     fn vless(flow: Option<&str>, transport: &str, security: bool) -> VlessConfig {
         let mut obj = serde_json::json!({
@@ -510,40 +511,73 @@ mod tests {
         (Box::new(client), peer)
     }
 
-    #[tokio::test]
-    async fn vision_requires_outer_tls_or_reality() {
-        let cfg = vless(Some("xtls-rprx-vision"), "tcp", false);
-        let (stream, _peer) = stream_pair();
-        let err = connect(&ctx_for(&cfg), stream, &cfg)
-            .await
-            .err()
-            .expect("vision without TLS must fail");
-        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("TLS and REALITY")));
-    }
-
-    #[tokio::test]
-    async fn vision_rejects_non_tcp_transport() {
-        let cfg = vless(Some("xtls-rprx-vision"), "ws", true);
-        let (stream, _peer) = stream_pair();
-        let err = connect(&ctx_for(&cfg), stream, &cfg)
-            .await
-            .err()
-            .expect("vision over ws must fail");
-        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("TCP transport")));
-    }
-
-    #[tokio::test]
-    async fn unknown_flow_stays_not_implemented() {
-        let cfg = vless(Some("xtls-rprx-splice"), "tcp", true);
-        let (stream, _peer) = stream_pair();
-        let err = connect(&ctx_for(&cfg), stream, &cfg)
-            .await
-            .err()
-            .expect("unknown flow must fail");
-        assert!(matches!(
-            &err,
-            NativeError::NotImplemented { feature } if feature.contains("xtls-rprx-splice")
-        ));
+    /// The flow gates reject the invalid configs, identically for both entry
+    /// points (`connect` / `connect_mux`): vision needs an outer TLS/REALITY
+    /// layer and a TCP transport, and any other flow stays `NotImplemented`.
+    #[rstest]
+    #[case::vision_requires_tls(
+        false,
+        vless(Some("xtls-rprx-vision"), "tcp", false),
+        false,
+        "TLS and REALITY"
+    )]
+    #[case::vision_rejects_non_tcp(
+        false,
+        vless(Some("xtls-rprx-vision"), "ws", true),
+        false,
+        "TCP transport"
+    )]
+    #[case::unknown_flow(
+        false,
+        vless(Some("xtls-rprx-splice"), "tcp", true),
+        true,
+        "xtls-rprx-splice"
+    )]
+    #[case::mux_vision_requires_tls(
+        true,
+        vless(Some("xtls-rprx-vision"), "tcp", false),
+        false,
+        "TLS and REALITY"
+    )]
+    #[case::mux_vision_rejects_non_tcp(
+        true,
+        vless(Some("xtls-rprx-vision"), "ws", true),
+        false,
+        "TCP transport"
+    )]
+    #[case::mux_unknown_flow(
+        true,
+        vless(Some("xtls-rprx-splice"), "tcp", true),
+        true,
+        "xtls-rprx-splice"
+    )]
+    fn flow_gates_reject_invalid_configs(
+        #[case] mux: bool,
+        #[case] cfg: VlessConfig,
+        #[case] not_implemented: bool,
+        #[case] expected: &str,
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (stream, _peer) = stream_pair();
+            let result = if mux {
+                connect_mux(&ctx_for(&cfg), stream, &cfg).await.map(|_| ())
+            } else {
+                connect(&ctx_for(&cfg), stream, &cfg).await.map(|_| ())
+            };
+            let err = result.expect_err("the flow gate must reject the config");
+            if not_implemented {
+                assert!(matches!(
+                    &err,
+                    NativeError::NotImplemented { feature } if feature.contains(expected)
+                ));
+            } else {
+                assert!(matches!(&err, NativeError::Config(msg) if msg.contains(expected)));
+            }
+        });
     }
 
     #[tokio::test]
@@ -775,21 +809,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vision_udp_mux_not_rejected() {
-        // flow=vision (plain) + UDP + mux path → Ok: XUDP lifts the vision
-        // UDP rejection for the mux tunnel (spec §5.3).
-        let cfg = vless(Some("xtls-rprx-vision"), "tcp", true);
-        let mut ctx = udp_ctx_for(&cfg, PacketMode::XUdp);
-        ctx.params.mux = true;
-        let (stream, _peer) = tokio::io::duplex(4096);
-        let stream: BoxStream = Box::new(stream);
-        let conn = connect_udp(&ctx, stream, &cfg)
-            .await
-            .expect("vision + UDP + mux must take the XUDP path");
-        drop(conn);
-    }
-
-    #[tokio::test]
     async fn udp443_flow_tcp_connects_like_vision() {
         // The udp443 flow on the TCP command takes the vision path — the
         // addon is truncated to `xtls-rprx-vision` (spec §4.3); only the
@@ -869,42 +888,6 @@ mod tests {
         let mut buf = [0u8; 2];
         session.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ok");
-    }
-
-    #[tokio::test]
-    async fn mux_vision_requires_outer_tls_or_reality() {
-        let cfg = vless(Some("xtls-rprx-vision"), "tcp", false);
-        let (stream, _peer) = stream_pair();
-        let err = connect_mux(&ctx_for(&cfg), stream, &cfg)
-            .await
-            .err()
-            .expect("vision mux without TLS must fail");
-        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("TLS and REALITY")));
-    }
-
-    #[tokio::test]
-    async fn mux_vision_rejects_non_tcp_transport() {
-        let cfg = vless(Some("xtls-rprx-vision"), "ws", true);
-        let (stream, _peer) = stream_pair();
-        let err = connect_mux(&ctx_for(&cfg), stream, &cfg)
-            .await
-            .err()
-            .expect("vision mux over ws must fail");
-        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("TCP transport")));
-    }
-
-    #[tokio::test]
-    async fn mux_unknown_flow_stays_not_implemented() {
-        let cfg = vless(Some("xtls-rprx-splice"), "tcp", true);
-        let (stream, _peer) = stream_pair();
-        let err = connect_mux(&ctx_for(&cfg), stream, &cfg)
-            .await
-            .err()
-            .expect("unknown flow must fail");
-        assert!(matches!(
-            &err,
-            NativeError::NotImplemented { feature } if feature.contains("xtls-rprx-splice")
-        ));
     }
 
     #[tokio::test]

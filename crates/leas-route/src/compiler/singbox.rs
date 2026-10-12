@@ -837,7 +837,7 @@ mod tests {
                     "config-level declaration warns: {:?}",
                     out.warnings
                 );
-                assert!(!out.ruleset.rules.is_empty());
+                assert_ne!(out.ruleset.rules.len(), 0);
             }
             other => panic!("expected tolerated declaration, got {other:?}"),
         }
@@ -1252,8 +1252,8 @@ mod tests {
     }
 
     #[test]
-    fn child_vetting_inside_logical_rules() {
-        // (a) child rule_set ref ⇒ Unsupported, positionally.
+    fn child_rule_set_ref_inside_logical_rule_is_unsupported() {
+        // Child rule_set ref ⇒ Unsupported, positionally.
         let rule_set_child = r#"{"route":{"rules":[{"mode":"and","rules":[
             {"rule_set":["geo"]},{"domain_suffix":[".a.com"]}],
             "action":"route","outbound":"o"}]}}"#;
@@ -1261,8 +1261,12 @@ mod tests {
             Err(RouteError::Unsupported(msg)) => assert!(msg.contains("rule_set"), "{msg}"),
             other => panic!("child rule_set must be Unsupported, got {other:?}"),
         }
-        // (b) child invert ⇒ genuine Cond::Invert on the child arm (T11
-        // made negation routable).
+    }
+
+    #[test]
+    fn child_invert_becomes_cond_invert_with_engine_roundtrip() {
+        // Child invert ⇒ genuine Cond::Invert on the child arm (T11 made
+        // negation routable).
         let invert_child = r#"{"route":{"rules":[{"mode":"or","rules":[
             {"domain_suffix":[".a.com"],"invert":true}],"action":"route","outbound":"o"}]}}"#;
         let out = compile_singbox(invert_child).unwrap();
@@ -1285,7 +1289,11 @@ mod tests {
             resolved_host_ips: vec![],
         };
         assert!(matches!(engine.decide(&m), Decision::Route { tag, .. } if &*tag == "o"));
-        // (c) child mode:"xor" ⇒ Unsupported, never silently OR'd.
+    }
+
+    #[test]
+    fn nested_child_xor_mode_is_unsupported() {
+        // Child mode:"xor" ⇒ Unsupported, never silently OR'd.
         let xor_child = r#"{"route":{"rules":[{"mode":"or","rules":[
             {"mode":"xor","rules":[{"domain_suffix":[".a.com"]}]},
             {"ip_cidr":["10.0.0.0/8"]}],"action":"route","outbound":"o"}]}}"#;
@@ -1293,7 +1301,11 @@ mod tests {
             Err(RouteError::Unsupported(msg)) => assert!(msg.contains("mode"), "{msg}"),
             other => panic!("child xor must be Unsupported, got {other:?}"),
         }
-        // (d) top-level xor ⇒ Unsupported.
+    }
+
+    #[test]
+    fn top_level_xor_mode_is_unsupported() {
+        // Top-level xor ⇒ Unsupported.
         let xor_top = r#"{"route":{"rules":[{"mode":"xor","rules":[
             {"domain_suffix":[".a.com"]}],"action":"route","outbound":"o"}]}}"#;
         match compile_singbox(xor_top) {

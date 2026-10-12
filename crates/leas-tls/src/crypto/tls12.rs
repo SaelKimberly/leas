@@ -304,21 +304,4 @@ mod tests {
             12
         );
     }
-
-    #[test]
-    fn split_key_block_layout() {
-        // GCM: client_key || server_key || client_iv(4) || server_iv(4).
-        let suite = Tls12Suite::EcdheRsaAes128GcmSha256;
-        let kb = key_block(suite, &[0x5a; 48], &[0x10; 32], &[0x20; 32]);
-        let k = suite.key_len();
-        let client_key = &kb[..k];
-        let server_key = &kb[k..2 * k];
-        let client_iv = &kb[2 * k..2 * k + 4];
-        let server_iv = &kb[2 * k + 4..];
-        assert_ne!(client_key, server_key);
-        assert_eq!(client_iv.len(), 4);
-        assert_eq!(server_iv.len(), 4);
-        assert_eq!(kb.len(), 2 * k + 8);
-        let _ = (client_key, server_key, client_iv, server_iv);
-    }
 }

@@ -93,8 +93,10 @@ use crate::retry_on_busy;
 pub const SCHEMA_VERSION: i64 = 18;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
-/// geo step wrote (`None` until it does). A named alias because the signature
-/// appears in three places and the tuple spelling is unreadable inline.
+/// geo step wrote (`None` until it does).
+///
+/// A named alias because the signature appears in three places and the tuple
+/// spelling is unreadable inline.
 pub type ResolvedAddress = (std::net::IpAddr, Option<String>);
 
 pub struct Database {
@@ -222,6 +224,8 @@ async fn open_direct_conn(path: &str, concurrent_writes: bool) -> Result<turso::
         .await
         .map_err(crate::export::turso_error)?;
     let conn = db.connect().map_err(crate::export::turso_error)?;
+    // The builder handle is only needed to open the connection.
+    drop(db);
     let journal = if concurrent_writes { "mvcc" } else { "wal" };
     let _ = conn
         .pragma_update("journal_mode", format!("'{journal}'"))
@@ -420,7 +424,7 @@ impl Database {
     /// turso connection (T13) — a file-backed database. False for an in-memory
     /// one, which uses the toasty execution path.
     #[must_use]
-    pub fn uses_direct_reader(&self) -> bool {
+    pub const fn uses_direct_reader(&self) -> bool {
         self.direct.is_some()
     }
 
@@ -488,14 +492,6 @@ impl Database {
     }
     pub(crate) fn export_path(&self) -> Option<&Path> {
         self.path.as_deref()
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn open_for_export_test(
-        path: impl AsRef<Path>,
-        concurrent_writes: bool,
-    ) -> Result<Self> {
-        Self::open_with_concurrent_writes(path, concurrent_writes).await
     }
 
     pub async fn in_memory() -> Result<Self> {
@@ -586,6 +582,7 @@ const LINK_STATEMENT_ROWS: usize = 400;
 /// A SQL TEXT literal: single quotes doubled, so a stored error message can
 /// never terminate the literal. The values come from our own rows, never from
 /// user input at this layer.
+#[must_use]
 pub fn sql_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -2173,14 +2170,14 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let id = 900 + i as i64;
+            let id = 900 + i64::try_from(i).expect("host-kind index fits");
             upsert_endpoints_bulk(
                 &mut conn,
                 &[Endpoint {
                     id: EndpointId::new(id),
                     domain: Endpoint::derive_domain(&format!("h{i}.example"), ht).0,
                     sub_domain: Endpoint::derive_domain(&format!("h{i}.example"), ht).1,
-                    port: 443 + i as u16,
+                    port: 443 + u16::try_from(i).expect("host-kind index fits"),
                     ports: if i == 0 { vec![] } else { vec![80, 443] },
                     last_source: None,
                     manual_protocol_override: None,
@@ -2218,7 +2215,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let id = 900 + i as i64;
+            let id = 900 + i64::try_from(i).expect("host-kind index fits");
             let rows = toasty::sql::query(format!(
                 "SELECT domain, ports FROM endpoints WHERE id = {id}"
             ))
@@ -2390,7 +2387,8 @@ mod tests {
     /// arm, WAL and MVCC, including 16 writers on shared rows — i.e. the residue
     /// the lab showed was the `set_country` TOCTOU, not contention.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[ignore = "timing probe; prints a table, asserts nothing"]
+    #[cfg(feature = "perf-lab")]
+    #[ignore = "timing probe; prints a table, asserts nothing (run with --features perf-lab -- --ignored)"]
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
@@ -2543,7 +2541,8 @@ mod tests {
     /// Ignored: timing-based, so it is a probe, not a gate; run it with
     /// `--ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[ignore = "timing probe; prints a table, asserts nothing"]
+    #[cfg(feature = "perf-lab")]
+    #[ignore = "timing probe; prints a table, asserts nothing (run with --features perf-lab -- --ignored)"]
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
@@ -3348,7 +3347,7 @@ mod tests {
         let db = Database::in_memory().await.expect("in-memory db");
 
         // Absent row ⇒ empty vec, not an error.
-        assert!(db.get_route_probes().await.expect("absent").is_empty());
+        assert_eq!(db.get_route_probes().await.expect("absent").len(), 0);
 
         // Create path: case-insensitive dedupe keeps the first spelling.
         db.upsert_route_probes(vec![

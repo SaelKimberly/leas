@@ -54,10 +54,7 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
             "subscription_url".into(),
             group.url.clone().unwrap_or_default(),
         ),
-        (
-            "user_agent".into(),
-            group.user_agent.clone().unwrap_or_default(),
-        ),
+        ("user_agent".into(), group.user_agent.unwrap_or_default()),
         ("update_interval".into(), update_interval_value),
     ];
     if let crate::AppMode::Settings {
@@ -680,7 +677,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
                     gid.clone(),
                     db.clone(),
                     validation.clone(),
-                    Default::default(),
+                    leas_config::app_config::ImportConfig::default(),
                     &flight,
                 )
                 .await;

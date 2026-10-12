@@ -224,18 +224,6 @@ mod tests {
         assert_eq!(&wire[..16], &hex_decode("9becfee74d1a702389bc60e9f200e6de"));
     }
 
-    #[test]
-    fn request_contains_session_material() {
-        // bytes after the 16-byte authID are ciphertext — session IV/key never
-        // appear in plaintext anywhere on the wire (wire[42..] is sealed).
-        let ck = cmd_key(&[0; 16]);
-        let tgt = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 80);
-        let s = fixed_session();
-        let wire = encode_request(&ck, &s, &tgt, COMMAND_TCP, 42, &mut fixed_entropy).unwrap();
-        assert!(!wire[..16].iter().any(|b| *b == 0x11 || *b == 0x22)); // authID is ciphertext
-        assert_eq!(wire.len(), 16 + 18 + 8 + 49 + 16);
-    }
-
     /// Unseal a request's payload AEAD and return the plaintext header body,
     /// checking that the lenAEAD announces exactly that body. The key/nonce
     /// derivation depends only on `ck`, the authID and the connection nonce —

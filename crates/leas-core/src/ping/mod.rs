@@ -16,7 +16,8 @@ pub enum PingCapability {
 }
 
 impl PingCapability {
-    pub fn name(&self) -> &'static str {
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::Tcp => "TCP",
             Self::Udp => "UDP",
@@ -106,11 +107,11 @@ pub enum PingError {
 impl From<crate::speed_test::SpeedTestError> for PingError {
     fn from(e: crate::speed_test::SpeedTestError) -> Self {
         match e {
-            crate::speed_test::SpeedTestError::Timeout(d) => PingError::Timeout(d),
+            crate::speed_test::SpeedTestError::Timeout(d) => Self::Timeout(d),
             // The `io::Error` is captured whole here, while it still knows its
             // kind and OS code — this is the one place they are available.
-            crate::speed_test::SpeedTestError::Io(e) => PingError::Io(e.into()),
-            other => PingError::Other(other.to_string()),
+            crate::speed_test::SpeedTestError::Io(e) => Self::Io(e.into()),
+            other => Self::Other(other.to_string()),
         }
     }
 }

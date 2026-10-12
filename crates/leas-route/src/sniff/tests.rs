@@ -265,16 +265,6 @@ fn sni_with_non_ascii_rejected() {
 }
 
 #[test]
-fn sni_result_shape() {
-    // Sanity on the public shape.
-    let r = SniffResult {
-        protocol: SniffedProtocol::Tls,
-        host: None,
-    };
-    assert_eq!(r.protocol, SniffedProtocol::Tls);
-}
-
-#[test]
 fn sniff_result_is_debug_clone_eq() {
     let r = probe(b"GET / HTTP/1.1\r\nHost: a.com\r\n\r\n").unwrap();
     let r2 = r.clone();

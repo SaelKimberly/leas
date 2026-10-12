@@ -238,7 +238,7 @@ mod tests {
         drop(a);
         let mut raw = Vec::new();
         b.read_to_end(&mut raw).await.unwrap();
-        assert!(raw.is_empty());
+        assert_eq!(raw.len(), 0);
     }
 
     #[tokio::test]

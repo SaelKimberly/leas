@@ -1,4 +1,4 @@
-//! FastPingAdapter trait + FastPingManager with adapter registry.
+//! `FastPingAdapter` trait + `FastPingManager` with adapter registry.
 //! Each sub-module implements the trait for one transport.
 
 #[cfg(feature = "quic-ping")]
@@ -31,7 +31,7 @@ pub use quic::QuicPingAdapter;
 pub use tcp::TcpPingAdapter;
 pub use udp::UdpPingAdapter;
 
-/// Manages a registry of FastPingAdapters and dispatches to the first match.
+/// Manages a registry of `FastPingAdapters` and dispatches to the first match.
 /// Built-in adapters are registered by default; new ones can be added via `register()`.
 pub struct FastPingManager {
     adapters: Vec<Box<dyn FastPingAdapter>>,
@@ -51,6 +51,7 @@ impl std::fmt::Debug for FastPingManager {
 }
 
 impl FastPingManager {
+    #[must_use]
     pub fn new(timeout: Duration) -> Self {
         let mut mgr = Self {
             adapters: Vec::new(),
@@ -68,21 +69,23 @@ impl FastPingManager {
     }
 
     /// Find the first adapter that supports this protocol kind.
+    #[must_use]
     pub fn adapter_for(&self, protocol: ProtocolKind) -> Option<&dyn FastPingAdapter> {
         self.adapters
             .iter()
             .find(|a| a.supports(protocol))
-            .map(|b| b.as_ref())
+            .map(std::convert::AsRef::as_ref)
     }
 
     /// Capability for a protocol — for TUI indicator display.
+    #[must_use]
     pub fn capability_for(&self, config_type: i32) -> PingCapability {
         let protocol = ProtocolKind::try_from_i32(config_type).unwrap_or(ProtocolKind::Custom);
         self.adapter_for(protocol)
-            .map_or(PingCapability::None, |a| a.transport())
+            .map_or(PingCapability::None, FastPingAdapter::transport)
     }
 
-    /// Run fast ping. Returns Ok(latency) or Err(PingError::NotSupported) if no adapter.
+    /// Run fast ping. Returns Ok(latency) or `Err(PingError::NotSupported)` if no adapter.
     pub async fn ping(
         &self,
         config_type: i32,

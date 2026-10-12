@@ -79,3 +79,4 @@ harness = false
 
 [dev-dependencies]
 criterion = { workspace = true }
+rstest.workspace = true

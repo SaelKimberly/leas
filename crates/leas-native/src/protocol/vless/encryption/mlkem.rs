@@ -1008,6 +1008,7 @@ const fn encode_length_header(l: usize) -> [u8; HEADER_LEN] {
 mod tests {
     use super::b3;
     use super::*;
+    use rstest::rstest;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     /// [`fake_server`] with an echo limit: after `max_echoes` records the
@@ -1270,30 +1271,23 @@ mod tests {
         server.await.expect("server task")
     }
 
-    #[tokio::test]
-    async fn roundtrip_native_default_padding() {
-        roundtrip(MlkemMode::Native, "", 10_000, 0).await;
-    }
-
-    #[tokio::test]
-    async fn roundtrip_xorpub_custom_padding() {
-        roundtrip(
-            MlkemMode::XorPub,
-            "100-35-70.0-0-0.50-100-200.0-0-0",
-            5_000,
-            0,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn roundtrip_random_default_padding() {
-        roundtrip(MlkemMode::Random, "", 17_345, 0).await;
-    }
-
-    #[tokio::test]
-    async fn roundtrip_random_custom_padding() {
-        roundtrip(MlkemMode::Random, "100-35-111.0-0-0", 100, 0).await;
+    /// The record-layer roundtrip per mode and padding spec: the fake server
+    /// echoes each record back and the payload survives both directions.
+    #[rstest]
+    #[case::native_default(MlkemMode::Native, "", 10_000)]
+    #[case::xorpub_custom(MlkemMode::XorPub, "100-35-70.0-0-0.50-100-200.0-0-0", 5_000)]
+    #[case::random_default(MlkemMode::Random, "", 17_345)]
+    #[case::random_custom(MlkemMode::Random, "100-35-111.0-0-0", 100)]
+    fn roundtrip_per_mode_and_padding(
+        #[case] mode: MlkemMode,
+        #[case] padding: &str,
+        #[case] payload_len: usize,
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(roundtrip(mode, padding, payload_len, 0));
     }
 
     /// A peer that EOFs at a RECORD BOUNDARY is a clean end of stream, not a

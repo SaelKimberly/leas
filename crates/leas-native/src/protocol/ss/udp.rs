@@ -2175,7 +2175,7 @@ mod tests {
             open_client_aes_datagram(method, &psk, &wire).unwrap();
         assert_eq!(packet_id, 0);
         assert_eq!(decoded, dest);
-        assert!(payload.is_empty());
+        assert_eq!(payload.len(), 0);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 This file is auto-detected project context: commands, structure, conventions. The wiki is [`docs/INDEX.md`](docs/INDEX.md); architecture decisions are [`docs/architecture/decisions.md`](docs/architecture/decisions.md).
 
 ## Package Manager & Toolchain
-- Rust 2024 workspace; `cargo` only (no JS toolchain). Pinned in `rust-toolchain.toml`.
+- Rust 2024 workspace; `cargo` only (no JS toolchain). Toolchain declared in `rust-toolchain.toml` — the channel floats on `stable` (see the gate note below).
 - Lint config: root `Cargo.toml` `[workspace.lints.clippy]`, opted in per crate. Format: `rustfmt.toml`.
 - Root `[workspace.dependencies]` holds only deps used by 2+ crates or architecture-driving crates; single-crate deps live in that crate's own manifest.
 
@@ -43,6 +43,12 @@ This file is auto-detected project context: commands, structure, conventions. Th
 - The schema cursor is `PRAGMA user_version` (`crate::schema`): a supported older version MIGRATES, an unknown one wipes. NEVER bump `SCHEMA_VERSION` for a change; an identity re-key is a DATA step, not a schema bump.
 - `leas-hakari` is generated — regenerate with `cargo hakari` after any `Cargo.lock` change; never edit it by hand.
 - `zeroize` on owned key buffers, and the `zeroize` FEATURE must stay listed on every crypto dep that touches keys — re-check after any crypto dep edit.
+- A test earns its place by discriminating a plausible consumer-visible bug: behaviour, boundary, invariant, state transition, precedence, error class, wire bytes, ordering, golden/parity. Tautologies (asserting a literal the test itself defined), source-text, mock echoes, bare not-throw, non-empty/length-grew/is_some-only and same-path duplicates do not.
+- Tests identical modulo literals are ONE `#[rstest]` table with named `#[case::…]` rows — never N near-identical `#[test]` fns. Every `#[case]`-supplied parameter must carry `#[case]` (a missing one makes rstest report "Wrong case signature" and silently drop the whole fn).
+- Perf labs and planner/timing probes are not tests: they live behind the crate's `perf-lab` feature as `#[cfg(all(test, feature = "perf-lab"))]` (the `test` term is required — a lab that drives test-only helpers and `tempfile` cannot compile in the lib unit), stay `#[ignore]`d, and print tables. Run one with `cargo nextest run -p <crate> --features perf-lab --run-ignored all <name>`.
+- Every hand-written crate opts into `[lints] workspace = true`. A crate without it is silently outside `pedantic`+`nursery`, generated code included (prost's `PartialEq`-without-`Eq` needs a scoped allow at the `include_proto!`).
+- `cargo nextest run` uses default features and is the suite; `--all-features` is clippy's surface. The `native-e2e` rows are opt-in and need real cores at `$LEAS_CORE_BIN_DIR`.
+- The toolchain floats on `stable`, and there is no CI: a new stable release can promote a lint and redden the gate silently. Run `just quality-gate code` after any toolchain bump.
 
 ## External References
 | Need | File |

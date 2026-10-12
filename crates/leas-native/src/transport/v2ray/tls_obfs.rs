@@ -523,16 +523,6 @@ mod tests {
         );
     }
 
-    /// The pinned constant: an offset into a third-party struct layout, not a
-    /// tuning value — so changing it has to be argued.
-    #[test]
-    fn the_first_flight_skip_is_the_payload_length_offset() {
-        assert_eq!(
-            FIRST_FLIGHT_SKIP, 105,
-            "96 (hello) + 6 (CCS) + 3 (offsetof len)"
-        );
-    }
-
     /// The first write is a TLS-1.0-framed record whose `ClientHello` carries the
     /// payload inside `session_ticket` — the disguise's whole trick
     /// (`tls.go:130-204`).

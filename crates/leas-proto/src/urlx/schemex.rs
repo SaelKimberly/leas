@@ -216,20 +216,3 @@ impl std::str::FromStr for SchemeX {
         Ok(scheme)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_slice_input() {
-        let input = include_str!("/home/user/oss/sub-healer/v2ray.txt");
-
-        let chunks = SchemeX::slice_input(input);
-        for (schema, c) in &chunks {
-            let c = c.lines().collect::<Vec<_>>().join("");
-            eprintln!("{schema:>15}| {c}");
-        }
-        eprintln!("Total: {}", chunks.len());
-    }
-}

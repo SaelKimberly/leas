@@ -1076,6 +1076,7 @@ mod tests {
     use super::VlessConfig;
     use crate::proto_spec::common::TransportConfig;
     use crate::urlx::{RawUrlX, SchemeX};
+    use rstest::rstest;
 
     const UUID: &str = "6202b230-417c-4d8e-b624-0f71afa9c75d";
 
@@ -1736,12 +1737,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn xray_inject_without_endpoint_is_rejected() {
+    #[rstest]
+    #[case::xray(CoreType::Xray)]
+    #[case::singbox(CoreType::SingBox)]
+    fn inject_without_endpoint_is_rejected(#[case] core: CoreType) {
         let cfg = vless_ws_tls();
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .inject_to(&mut conf, core, None, InjectOptions::default())
             .expect_err("orphan vless must be rejected");
         assert!(matches!(err, SupportError::MissingField("server", "vless")));
     }
@@ -1812,16 +1815,6 @@ mod tests {
             "spider_x must never be emitted: {conf}"
         );
         assert_eq!(conf["tls"]["utls"]["fingerprint"], "chrome");
-    }
-
-    #[test]
-    fn singbox_inject_without_endpoint_is_rejected() {
-        let cfg = vless_ws_tls();
-        let mut conf = serde_json::json!({});
-        let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
-            .expect_err("orphan vless must be rejected");
-        assert!(matches!(err, SupportError::MissingField("server", "vless")));
     }
 
     #[test]

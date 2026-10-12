@@ -2010,7 +2010,7 @@ mod tests {
         drop(a);
         let mut raw = Vec::new();
         b.read_to_end(&mut raw).await.unwrap();
-        assert!(raw.is_empty());
+        assert_eq!(raw.len(), 0);
     }
 
     #[tokio::test]
@@ -2035,7 +2035,7 @@ mod tests {
         drop(a);
         let mut raw = Vec::new();
         b.read_to_end(&mut raw).await.unwrap();
-        assert!(raw.is_empty());
+        assert_eq!(raw.len(), 0);
     }
 
     // ---- MuxClient + SessionStream ------------------------------------
@@ -3067,7 +3067,7 @@ mod tests {
             assert_eq!(new1.session_id, 1, "first session id is 1");
             assert_eq!(new1.status, STATUS_NEW, "eager New frame");
             assert_eq!(new1.option, 0);
-            assert!(new1.payload.is_empty());
+            assert_eq!(new1.payload.len(), 0);
             let (network, port, atyp, addr) = new1.target.expect("New frame carries a target");
             assert_eq!(network, 1, "New network byte is TCP");
             assert_eq!(port, 80, "target port");
@@ -3170,7 +3170,7 @@ mod tests {
             assert_eq!(ka.session_id, 0, "keepalive uses session id 0");
             assert_eq!(ka.status, STATUS_KEEPALIVE, "keepalive status");
             assert_eq!(ka.option, 0);
-            assert!(ka.payload.is_empty());
+            assert_eq!(ka.payload.len(), 0);
             // Answer it; the client's demux consumes the reply (never a
             // session event — session 1 must stay healthy).
             write_mux_frame(conn, sock, 0, STATUS_KEEPALIVE, 0, &[])?;

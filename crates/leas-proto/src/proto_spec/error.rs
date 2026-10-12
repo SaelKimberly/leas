@@ -14,28 +14,22 @@ pub enum SupportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn unsupported_protocol_message() {
-        let err = SupportError::UnsupportedProtocol("tuic".into(), CoreType::SingBox);
-        assert_eq!(
-            err.to_string(),
-            "protocol tuic is not supported by core sing-box"
-        );
-    }
-
-    #[test]
-    fn config_message() {
-        let err = SupportError::Config("invalid listen address".into());
-        assert_eq!(err.to_string(), "config error: invalid listen address");
-    }
-
-    #[test]
-    fn missing_field_message() {
-        let err = SupportError::MissingField("password", "shadowsocks");
-        assert_eq!(
-            err.to_string(),
-            "missing required field password for shadowsocks"
-        );
+    #[rstest]
+    #[case::unsupported_protocol(
+        SupportError::UnsupportedProtocol("tuic".into(), CoreType::SingBox),
+        "protocol tuic is not supported by core sing-box"
+    )]
+    #[case::config(
+        SupportError::Config("invalid listen address".into()),
+        "config error: invalid listen address"
+    )]
+    #[case::missing_field(
+        SupportError::MissingField("password", "shadowsocks"),
+        "missing required field password for shadowsocks"
+    )]
+    fn support_error_message(#[case] err: SupportError, #[case] expected: &str) {
+        assert_eq!(err.to_string(), expected);
     }
 }

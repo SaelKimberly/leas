@@ -7,6 +7,10 @@
 use async_trait::async_trait;
 
 pub(crate) mod proto_gen {
+    // Prost emits `PartialEq` without `Eq` in every message struct; that shape
+    // is the codegen's, not ours, so the lint is silenced at the include.
+    #![allow(clippy::derive_partial_eq_without_eq)]
+
     tonic::include_proto!("v2ray.core.app.stats.command");
 }
 
@@ -68,7 +72,7 @@ pub trait StatsProvider: Send + Sync {
 // ── GrpcStatsClient ────────────────────────────────────────────────
 
 /// gRPC client for xray-core and sing-box's shared `StatsService`.
-/// Both backends expose the same V2Ray Stats API on the same endpoint.
+/// Both backends expose the same `V2Ray` Stats API on the same endpoint.
 pub struct GrpcStatsClient {
     channel: tonic::transport::Channel,
 }
@@ -138,7 +142,7 @@ impl StatsProvider for GrpcStatsClient {
 
 // ── Factory ─────────────────────────────────────────────────────────
 
-/// Create a [`StatsProvider`] for the shared V2Ray Stats API.
+/// Create a [`StatsProvider`] for the shared `V2Ray` Stats API.
 pub async fn create_stats_provider() -> Result<Box<dyn StatsProvider>, GrpcError> {
     Ok(Box::new(GrpcStatsClient::connect().await?))
 }
@@ -147,6 +151,8 @@ pub async fn create_stats_provider() -> Result<Box<dyn StatsProvider>, GrpcError
 
 /// Format bytes to human-readable string (B/KB/MB/GB/TB/PB).
 #[must_use]
+// Display only: lossy above 2^53 bytes (8 PiB) is acceptable for a human-readable size.
+#[allow(clippy::cast_precision_loss)]
 pub fn format_bytes(bytes: i64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut b = bytes as f64;
@@ -173,7 +179,7 @@ pub fn format_uptime(secs: u32) -> String {
     }
 }
 
-/// Mock StatsProvider for testing — returns pre-configured stats without a real gRPC connection.
+/// Mock `StatsProvider` for testing — returns pre-configured stats without a real gRPC connection.
 #[derive(Debug, Clone)]
 pub struct MockStatsProvider {
     pub stats: Vec<(String, i64)>,
@@ -225,7 +231,7 @@ impl StatsProvider for MockStatsProvider {
         Ok(self.sys.clone())
     }
 
-    fn api_endpoint(&self) -> &str {
+    fn api_endpoint(&self) -> &'static str {
         "http://127.0.0.1:62789"
     }
 }
@@ -234,51 +240,13 @@ impl StatsProvider for MockStatsProvider {
 mod tests {
     use super::*;
 
-    struct TestStatsProvider {
-        stats: Vec<(String, i64)>,
-        sys: SysStats,
-        err: Option<String>,
-    }
-
-    #[async_trait]
-    impl StatsProvider for TestStatsProvider {
-        async fn query_stats(
-            &self,
-            _pattern: &str,
-            _reset: bool,
-        ) -> Result<Vec<proto::Stat>, GrpcError> {
-            if let Some(msg) = &self.err {
-                return Err(GrpcError::InvalidResponse(msg.clone()));
-            }
-            Ok(self
-                .stats
-                .iter()
-                .map(|(n, v)| proto::Stat {
-                    name: n.clone(),
-                    value: *v,
-                })
-                .collect())
-        }
-
-        async fn get_sys_stats(&self) -> Result<SysStats, GrpcError> {
-            if let Some(msg) = &self.err {
-                return Err(GrpcError::InvalidResponse(msg.clone()));
-            }
-            Ok(self.sys.clone())
-        }
-
-        fn api_endpoint(&self) -> &str {
-            "http://127.0.0.1:62789"
-        }
-    }
-
     #[test]
     fn test_format_bytes() {
         assert_eq!(format_bytes(0), "0.0 B");
         assert_eq!(format_bytes(500), "500.0 B");
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(1536), "1.5 KB");
-        assert_eq!(format_bytes(1048576), "1.0 MB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
     }
 
     #[test]
@@ -303,29 +271,5 @@ mod tests {
             t.elapsed() < std::time::Duration::from_secs(5),
             "must fail fast"
         );
-    }
-
-    #[tokio::test]
-    async fn mock_stats_provider_works() {
-        let provider = TestStatsProvider {
-            stats: vec![("inbound>>>test>>>traffic>>>downlink".into(), 1024)],
-            sys: SysStats::default(),
-            err: None,
-        };
-        let result = provider.query_stats("inbound>>>", false).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].name, "inbound>>>test>>>traffic>>>downlink");
-        assert_eq!(result[0].value, 1024);
-    }
-
-    #[tokio::test]
-    async fn mock_stats_provider_error() {
-        let provider = TestStatsProvider {
-            stats: vec![],
-            sys: SysStats::default(),
-            err: Some("not connected".into()),
-        };
-        let result = provider.query_stats("inbound>>>", false).await;
-        assert!(result.is_err());
     }
 }

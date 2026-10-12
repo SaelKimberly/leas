@@ -85,7 +85,7 @@ pub struct ClashApiOptions {
 
 pub struct SingBoxConfigBuilder;
 impl SingBoxConfigBuilder {
-    /// Build a sing-box config. `core_type` (SingBox, already resolved from
+    /// Build a sing-box config. `core_type` (`SingBox`, already resolved from
     /// the per-pair link) is handed to `inject_to` for the proxy outbound.
     pub fn build(
         endpoint: &Endpoint,
@@ -613,7 +613,7 @@ mod tests {
             sort_order: None,
         };
         let routing = build_routing(&[rule]);
-        assert!(routing.rules.is_empty());
+        assert_eq!(routing.rules.len(), 0);
     }
 
     #[test]
@@ -668,7 +668,7 @@ mod tests {
             sort_order: None,
         };
         let routing = build_routing(&[rule]);
-        assert!(routing.rules.is_empty());
+        assert_eq!(routing.rules.len(), 0);
     }
 
     #[test]

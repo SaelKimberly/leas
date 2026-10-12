@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(ac.next(), Some('b'));
         assert_eq!(ac.next(), Some('c'));
         assert_eq!(ac.next(), None);
-        assert!(ac.remaining().is_empty());
+        assert_eq!(ac.remaining().len(), 0);
 
         // Test raw bytes
         let mut ac = AutoChars::new(b"hello");
@@ -162,7 +162,7 @@ mod tests {
         // Test empty
         let mut ac = AutoChars::new(b"");
         assert_eq!(ac.next(), None);
-        assert!(ac.remaining().is_empty());
+        assert_eq!(ac.remaining().len(), 0);
 
         // Truncated multibyte tail: the sequence can never complete, so the
         // bytes are consumed (with one replacement char surfaced by callers

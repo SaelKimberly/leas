@@ -744,7 +744,7 @@ mod tests {
             &validation,
             2,
             None::<&fn(usize)>,
-            Default::default(),
+            leas_config::app_config::ImportConfig::default(),
         )
         .await;
         assert_eq!(outcome.links, 4, "one link per unique host");
@@ -762,7 +762,7 @@ mod tests {
         // write an endpoint whose dial target / rank `addr` / page Address
         // column are all empty, unnoticed (fixtures seed `resolved_ips` by
         // hand, so only a real import exercises the writer).
-        let ids: Vec<_> = meta.ids.iter().copied().collect();
+        let ids: Vec<_> = meta.ids.clone();
         let resolutions = db.endpoint_resolutions(&ids).await.expect("addresses");
         let expected: std::collections::HashSet<std::net::IpAddr> =
             ["1.2.3.4", "5.6.7.8", "9.10.11.12", "13.14.15.16"]
@@ -801,7 +801,7 @@ mod tests {
             &validation,
             2,
             None::<&fn(usize)>,
-            Default::default(),
+            leas_config::app_config::ImportConfig::default(),
         )
         .await;
         let reason = outcome.ended_early.expect("budget must end the run early");
@@ -901,7 +901,7 @@ mod tests {
             &validation,
             2,
             None::<&fn(usize)>,
-            Default::default(),
+            leas_config::app_config::ImportConfig::default(),
         )
         .await;
         assert_eq!(
@@ -963,7 +963,7 @@ mod tests {
             &validation,
             1,
             None::<&fn(usize)>,
-            Default::default(),
+            leas_config::app_config::ImportConfig::default(),
         )
         .await;
 
@@ -1006,7 +1006,7 @@ mod tests {
             &validation,
             2,
             None::<&fn(usize)>,
-            Default::default(),
+            leas_config::app_config::ImportConfig::default(),
         )
         .await;
 

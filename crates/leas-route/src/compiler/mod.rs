@@ -407,15 +407,15 @@ mod merge_tests {
         assert_eq!(with_warning.ruleset.probes, vec!["p".to_owned()]);
 
         let empty = merge(Vec::new());
-        assert!(empty.ruleset.rules.is_empty());
+        assert_eq!(empty.ruleset.rules.len(), 0);
         assert_eq!(
             empty.ruleset.default,
             DefaultRoute::Reject {
                 method: crate::ir::RejectMethod::Drop
             }
         );
-        assert!(empty.ruleset.probes.is_empty());
-        assert!(empty.warnings.is_empty());
+        assert_eq!(empty.ruleset.probes.len(), 0);
+        assert_eq!(empty.warnings.len(), 0);
         assert_eq!(empty.ruleset.resolve_strategy, ResolveStrategy::AsIs);
     }
 }

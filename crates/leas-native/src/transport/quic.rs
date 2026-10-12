@@ -62,7 +62,6 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
 // own OS thread with its own harness CA, so parallel e2e cases can't
 // clobber each other's trust store. Production builds use webpki-roots and
 // carry no test state.
-#[doc(hidden)]
 #[cfg(any(test, feature = "native-e2e"))]
 std::thread_local! {
     static TEST_CA: std::cell::RefCell<Option<rustls::pki_types::CertificateDer<'static>>> =

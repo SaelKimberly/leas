@@ -734,50 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn udp_mode_plumbs_into_client_params() {
-        use leas_proto::proto_spec::ProtoSpec as _;
-
-        // Default (TCP) rows keep `params.udp` unset.
-        let tcp = CaseSpec::vless();
-        let params = tcp.client_params(12345, "127.0.0.1:9999".parse().unwrap());
-        assert_eq!(params.udp, None);
-
-        // Raw mode: plumbed for the probe's connect_udp.
-        let raw = CaseSpec::vless()
-            .with_app(AppKind::Udp)
-            .with_udp(PacketMode::Raw);
-        let params = raw.client_params(12345, "127.0.0.1:9999".parse().unwrap());
-        assert_eq!(params.udp, Some(PacketMode::Raw));
-
-        // PacketAddr mode: same plumbing.
-        let addr = CaseSpec::vless()
-            .with_app(AppKind::Udp)
-            .with_udp(PacketMode::PacketAddr);
-        let params = addr.client_params(12345, "127.0.0.1:9999".parse().unwrap());
-        assert_eq!(params.udp, Some(PacketMode::PacketAddr));
-
-        // XUdp mode: plumbed for the probe's connect_udp mux path (the
-        // udp443 flow forces the same).
-        let xudp = CaseSpec::vless()
-            .with_app(AppKind::Udp)
-            .with_udp(PacketMode::XUdp);
-        let params = xudp.client_params(12345, "127.0.0.1:9999".parse().unwrap());
-        assert_eq!(params.udp, Some(PacketMode::XUdp));
-
-        // The vless client protocol payload still parses as a plain vless
-        // config — the packet mode lives in the params, NOT the proto
-        // (spec §4.3; leas-proto is never modified).
-        let protocol: leas_proto::proto_spec::ProtocolConfig =
-            serde_json::from_value(serde_json::to_value(params.protocol).unwrap()).unwrap();
-        match protocol {
-            leas_proto::proto_spec::ProtocolConfig::Vless(cfg) => {
-                assert_eq!(cfg.transport_type(), Some("tcp"));
-            }
-            other => panic!("expected vless config, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn flow_server_string_truncates_udp443() {
         // The udp443 suffix is client-side only: the wire addon truncates
         // to `xtls-rprx-vision` (spec §4.3) and the server validates

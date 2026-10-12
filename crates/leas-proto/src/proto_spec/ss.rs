@@ -617,6 +617,7 @@ mod tests {
     use super::SsConfig;
     use crate::proto_spec::ss_plugin::{PluginFamily, PluginMode};
     use crate::urlx::{RawUrlX, SchemeX};
+    use rstest::rstest;
 
     fn parse(url: &str) -> ParsedProto {
         SsConfig::try_parse_proto(&RawUrlX::from(url))
@@ -967,12 +968,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn xray_inject_without_endpoint_is_rejected() {
+    #[rstest]
+    #[case::xray(CoreType::Xray)]
+    #[case::singbox(CoreType::SingBox)]
+    fn inject_without_endpoint_is_rejected(#[case] core: CoreType) {
         let cfg = ss_aead();
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .inject_to(&mut conf, core, None, InjectOptions::default())
             .expect_err("orphan ss must be rejected");
         assert!(matches!(err, SupportError::MissingField("server", "ss")));
     }
@@ -1144,16 +1147,6 @@ mod tests {
             uid_of("v2ray-plugin;host=h"),
             parse(other).identity_once().2
         );
-    }
-
-    #[test]
-    fn singbox_inject_without_endpoint_is_rejected() {
-        let cfg = ss_aead();
-        let mut conf = serde_json::json!({});
-        let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
-            .expect_err("orphan ss must be rejected");
-        assert!(matches!(err, SupportError::MissingField("server", "ss")));
     }
 
     // ── Injectors (T5) ──────────────────────────────────────────────────

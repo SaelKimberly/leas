@@ -382,7 +382,7 @@ mod tests {
         req.port = addr.port();
         let response = fetch_over(stream, &req).await.unwrap();
         assert_eq!(response.status, 204);
-        assert!(response.body.is_empty());
+        assert_eq!(response.body.len(), 0);
         assert!(response.elapsed > Duration::ZERO);
         server.await.unwrap();
     }

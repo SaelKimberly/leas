@@ -258,6 +258,7 @@ impl tokio::io::AsyncWrite for V2rayStream {
 mod tests {
     use leas_proto::proto_spec::ProtocolConfig;
     use leas_proto::proto_spec::endpoint::EndpointEssentials;
+    use rstest::rstest;
 
     use crate::addr::{Host, TargetAddr};
     use crate::context::{LinkContext, NativeConnectParams};
@@ -288,23 +289,22 @@ mod tests {
         )
     }
 
-    #[test]
-    fn method_defaults_to_put_and_authority_defaults_to_www_example_com() {
+    /// The request head: the defaults (PUT / `www.example.com`) and the
+    /// per-transport overrides; the path is always the transport's `/h2`.
+    #[rstest]
+    #[case::defaults(None, None, "PUT", "www.example.com")]
+    #[case::method_and_host_override(Some("POST"), Some("cdn.example"), "POST", "cdn.example")]
+    fn request_head_method_and_authority(
+        #[case] method: Option<&str>,
+        #[case] host: Option<&str>,
+        #[case] want_method: &str,
+        #[case] want_authority: &str,
+    ) {
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let ctx = ctx_at(addr, vless_http(None, None));
+        let ctx = ctx_at(addr, vless_http(method, host));
         let (method, authority, path) = request_head(&ctx).unwrap();
-        assert_eq!(method, "PUT");
-        assert_eq!(authority, "www.example.com");
-        assert_eq!(path, "/h2");
-    }
-
-    #[test]
-    fn method_and_host_override() {
-        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let ctx = ctx_at(addr, vless_http(Some("POST"), Some("cdn.example")));
-        let (method, authority, path) = request_head(&ctx).unwrap();
-        assert_eq!(method, "POST");
-        assert_eq!(authority, "cdn.example");
+        assert_eq!(method, want_method);
+        assert_eq!(authority, want_authority);
         assert_eq!(path, "/h2");
     }
 

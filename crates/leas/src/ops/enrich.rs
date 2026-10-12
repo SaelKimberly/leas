@@ -941,6 +941,8 @@ pub fn spawn_outbound_enrich(state: &mut AppState, endpoint_id: i64, ip_info: Op
 mod tests {
     use super::*;
 
+    use rstest::rstest;
+
     /// The flag a DNS endpoint shows must come from `endpoint_ip` when it is
     /// already stored: the seed reads it back and the mmdb is never asked.
     /// (The state's `geo_ip` is whatever the fixture config built — the
@@ -985,39 +987,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolvable_hostname_accepts_valid_domains() {
-        for host in [
-            "example.com",
-            "cdn.example.com",
-            "like.myolddomain.kesug.com",
-            "x.com",
-            "a-b.example.com",
-            "example.com.", // trailing-dot FQDN
-        ] {
-            assert!(is_resolvable_hostname(host), "{host} should be resolvable");
-        }
-    }
-
-    #[test]
-    fn resolvable_hostname_rejects_garbage() {
-        // Observed in dumps: plugin URLs, port suffixes, Telegram-channel
-        // names with underscores, spaces and non-ASCII — all hickory errors.
-        for host in [
-            "",
-            "1.2.3.4:8388?plugin=obfs-local;obfs=tls;obfs-host=x",
-            "v2ray_configs_poolsTELEGRAM.kesug.com",
-            "foo bar.com",
-            "foo..com",
-            ".foo.com",
-            "-foo.com",
-            "foo-.com",
-            "foo@bar.com",
-            "exämple.com",
-            "foo_com.com",
-        ] {
-            assert!(!is_resolvable_hostname(host), "{host:?} should be rejected");
-        }
+    /// One host → resolvable table: the valid-domain set and the garbage set
+    /// (plugin URLs, port suffixes, Telegram-channel names with underscores,
+    /// spaces and non-ASCII — all hickory errors) as named rows.
+    #[rstest]
+    #[case::accepts_example_com("example.com", true)]
+    #[case::accepts_cdn_subdomain("cdn.example.com", true)]
+    #[case::accepts_deeply_nested_subdomain("like.myolddomain.kesug.com", true)]
+    #[case::accepts_short_two_label("x.com", true)]
+    #[case::accepts_hyphenated_label("a-b.example.com", true)]
+    #[case::accepts_trailing_dot_fqdn("example.com.", true)]
+    #[case::rejects_empty("", false)]
+    #[case::rejects_plugin_url("1.2.3.4:8388?plugin=obfs-local;obfs=tls;obfs-host=x", false)]
+    #[case::rejects_underscore_channel_name("v2ray_configs_poolsTELEGRAM.kesug.com", false)]
+    #[case::rejects_space("foo bar.com", false)]
+    #[case::rejects_empty_label("foo..com", false)]
+    #[case::rejects_leading_dot(".foo.com", false)]
+    #[case::rejects_leading_hyphen("-foo.com", false)]
+    #[case::rejects_trailing_hyphen("foo-.com", false)]
+    #[case::rejects_at_sign("foo@bar.com", false)]
+    #[case::rejects_non_ascii("exämple.com", false)]
+    #[case::rejects_underscore("foo_com.com", false)]
+    fn is_resolvable_hostname_over_inputs(#[case] host: &str, #[case] expected: bool) {
+        assert_eq!(is_resolvable_hostname(host), expected, "{host:?}");
     }
 
     #[test]

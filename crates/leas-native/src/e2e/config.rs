@@ -1091,6 +1091,12 @@ mod tests {
     use super::super::variant::{FingerprintTls, NoTls, RealityTls, StandardTls};
     use super::*;
     use leas_proto::proto_spec::{ProtoSpec, SecurityConfig};
+    use rstest::rstest;
+
+    /// The boxed TLS input the `client_params_security_per_tls_variant` table
+    /// carries, so one case list can hold the heterogeneous fixtures
+    /// (`RealityTls::fresh`, `FingerprintTls`, `StandardTls`, `NoTls`).
+    type Tls = Box<dyn TlsVariant>;
 
     #[test]
     fn reality_keypair_round_trips() {
@@ -1164,30 +1170,34 @@ mod tests {
         assert_eq!(reality["short_id"][0], tls.reality_sid().unwrap());
     }
 
-    #[test]
-    fn client_params_reality_carry_pbk_and_sid() {
-        let tls = RealityTls::fresh();
+    /// Every `TlsVariant` drives the client `security` object: REALITY carries
+    /// the server's pbk/sid, the fingerprint engine sets `fp`, stock TLS leaves
+    /// it unset, and `NoTls` omits the object entirely.
+    #[rstest]
+    #[case::reality(Box::new(RealityTls::fresh()) as Tls, Some("reality"), None)]
+    #[case::fingerprint(Box::new(FingerprintTls("chrome")) as Tls, Some("tls"), Some("chrome"))]
+    #[case::standard(Box::new(StandardTls) as Tls, Some("tls"), None)]
+    #[case::no_tls(Box::new(NoTls) as Tls, None, None)]
+    fn client_params_security_per_tls_variant(
+        #[case] tls: Tls,
+        #[case] expected_type: Option<&str>,
+        #[case] expected_fp: Option<&str>,
+    ) {
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, None, &tls, "tcp", None);
-        let sec = params.protocol.security().unwrap();
-        assert_eq!(sec.type_str(), Some("reality"));
-        assert_eq!(sec.pbk(), Some(tls.reality_pbk().unwrap()));
-        assert_eq!(sec.sid(), Some(tls.reality_sid().unwrap()));
-    }
-
-    #[test]
-    fn client_params_fingerprint_set_fp() {
-        let target = "1.2.3.4:80".parse().unwrap();
-        let params =
-            client_params_vless(12345, target, None, &FingerprintTls("chrome"), "tcp", None);
-        assert_eq!(params.protocol.security().unwrap().fp(), Some("chrome"));
-    }
-
-    #[test]
-    fn client_params_standard_has_no_fp() {
-        let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, None, &StandardTls, "tcp", None);
-        assert_eq!(params.protocol.security().unwrap().fp(), None);
+        // `NoTls` omits the `security` key entirely, so the object is absent;
+        // every other variant carries its own security object (kcp vs tcp does
+        // not matter for the non-reality ALPN dialect here).
+        let network = if tls.tls_enabled() { "tcp" } else { "kcp" };
+        let params = client_params_vless(12345, target, None, &*tls, network, None);
+        let sec = params.protocol.security();
+        assert_eq!(sec.and_then(SecurityConfig::type_str), expected_type);
+        assert_eq!(sec.and_then(SecurityConfig::fp), expected_fp);
+        // REALITY carries the server's pbk/sid pair (the client consumes it).
+        if expected_type == Some("reality") {
+            let sec = sec.expect("reality params carry a security object");
+            assert_eq!(sec.pbk(), tls.reality_pbk());
+            assert_eq!(sec.sid(), tls.reality_sid());
+        }
     }
 
     #[test]
@@ -1260,8 +1270,9 @@ mod tests {
         assert_eq!(http_version(Some(sec)), "3");
     }
 
+    /// A `Flow::Vision` row lands the flow in xray's `settings.clients[0].flow`.
     #[test]
-    fn vless_flow_emitted_when_set() {
+    fn vless_flow_in_xray_clients() {
         let env = ServerEnv {
             port: 12345,
             certs: &generate_certs(),
@@ -1271,9 +1282,6 @@ mod tests {
             inner_tls_echo: None,
             udp_echo: None,
         };
-        let target = "1.2.3.4:80".parse().unwrap();
-
-        // Server JSON: flow lands in xray's clients[0] / sing-box's users[0].
         let xray: serde_json::Value = serde_json::from_str(&vless_inbound(
             CoreKind::Xray,
             &env,
@@ -1287,6 +1295,20 @@ mod tests {
             xray["inbounds"][0]["settings"]["clients"][0]["flow"],
             "xtls-rprx-vision"
         );
+    }
+
+    /// The same row lands the flow in sing-box's `users[0].flow`.
+    #[test]
+    fn vless_flow_in_sing_box_users() {
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+            inner_tls_echo: None,
+            udp_echo: None,
+        };
         let sing: serde_json::Value = serde_json::from_str(&vless_inbound(
             CoreKind::SingBox,
             &env,
@@ -1297,8 +1319,20 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(sing["inbounds"][0]["users"][0]["flow"], "xtls-rprx-vision");
+    }
 
-        // The REALITY inbound carries the flow too.
+    /// The REALITY inbound carries the flow too.
+    #[test]
+    fn vless_flow_in_reality_inbound() {
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+            inner_tls_echo: None,
+            udp_echo: None,
+        };
         let reality = RealityTls::fresh();
         let xray_reality: serde_json::Value = serde_json::from_str(&vless_inbound(
             CoreKind::Xray,
@@ -1313,8 +1347,12 @@ mod tests {
             xray_reality["inbounds"][0]["settings"]["clients"][0]["flow"],
             "xtls-rprx-vision"
         );
+    }
 
-        // Client JSON: flow reaches the native client's VlessConfig.
+    /// Client JSON: the flow reaches the native client's `VlessConfig`.
+    #[test]
+    fn vless_flow_in_client_params() {
+        let target = "1.2.3.4:80".parse().unwrap();
         let params =
             client_params_vless(12345, target, Some(Flow::Vision), &StandardTls, "tcp", None);
         let ProtocolConfig::Vless(vless) = &params.protocol else {
@@ -1442,29 +1480,6 @@ mod tests {
     }
 
     #[test]
-    fn client_params_no_tls_omit_security() {
-        // The client params carry no TLS type — the `security` key is
-        // omitted entirely, so the `SecurityConfig` parses empty and the
-        // native `wrap` passthrough (`sec.is_empty()` → `Ok(stream)`)
-        // leaves the kcp stream raw.
-        let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, None, &NoTls, "kcp", None);
-        assert_eq!(
-            params
-                .protocol
-                .security()
-                .and_then(SecurityConfig::type_str),
-            None
-        );
-        // The tls-standard row keeps its security object (regression guard).
-        let tls_params = client_params_vless(12345, target, None, &StandardTls, "kcp", None);
-        assert_eq!(
-            tls_params.protocol.security().unwrap().type_str(),
-            Some("tls")
-        );
-    }
-
-    #[test]
     fn ss_password_matches_the_method_key_length() {
         // Classic rows take an arbitrary string (MD5 EVP_BytesToKey); a 2022
         // row's PSK must decode to exactly the method's key length — any
@@ -1485,8 +1500,10 @@ mod tests {
         assert_eq!(ss_password("2022-blake3-aes-192-gcm"), SS_PASSWORD);
     }
 
+    /// Plain TCP row, xray dialect: `settings.{method,password,network}` and a
+    /// streamSettings WITHOUT a security layer.
     #[test]
-    fn ss_builders_emit_the_per_core_dialect() {
+    fn ss_xray_inbound_omits_the_security_layer() {
         let env = ServerEnv {
             port: 12345,
             certs: &generate_certs(),
@@ -1496,9 +1513,6 @@ mod tests {
             inner_tls_echo: None,
             udp_echo: None,
         };
-        // Plain TCP row: xray takes `settings.{method,password,network}` and
-        // a streamSettings WITHOUT a security layer; sing-box the same
-        // values top-level and no `tls` object.
         let xray: serde_json::Value = serde_json::from_str(&ss_inbound(
             CoreKind::Xray,
             &env,
@@ -1515,7 +1529,21 @@ mod tests {
         let stream = &xray["inbounds"][0]["streamSettings"];
         assert!(stream.get("security").is_none());
         assert!(stream.get("tlsSettings").is_none());
+    }
 
+    /// Plain TCP row, sing-box dialect: the same values top-level and no `tls`
+    /// object.
+    #[test]
+    fn ss_sing_box_inbound_takes_the_values_top_level() {
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+            inner_tls_echo: None,
+            udp_echo: None,
+        };
         let sing: serde_json::Value = serde_json::from_str(&ss_inbound(
             CoreKind::SingBox,
             &env,
@@ -1530,23 +1558,12 @@ mod tests {
         assert_eq!(inbound["method"], "aes-128-gcm");
         assert_eq!(inbound["password"], SS_PASSWORD);
         assert!(inbound.get("tls").is_none());
+    }
 
-        // The UDP row widens ONLY xray's `network` (sing-box serves both
-        // networks by default) and the 2022 method carries its PSK.
-        let udp: serde_json::Value = serde_json::from_str(&ss_inbound(
-            CoreKind::Xray,
-            &env,
-            &NoTls,
-            "tcp",
-            "2022-blake3-aes-256-gcm",
-            true,
-        ))
-        .unwrap();
-        assert_eq!(udp["inbounds"][0]["settings"]["network"], "tcp,udp");
-        assert_eq!(udp["inbounds"][0]["settings"]["password"], SS_2022_KEY);
-
-        // Client params parse as an Ss config: the method/password pair and
-        // the omitted-vs-present `security` key.
+    /// Client params parse as an Ss config: the method/password pair and the
+    /// omitted-vs-present `security` key.
+    #[test]
+    fn ss_client_params_round_trip_the_security_key() {
         let target = "1.2.3.4:80".parse().unwrap();
         let params = client_params_ss(12345, target, &NoTls, "tcp", "2022-blake3-aes-256-gcm");
         match &params.protocol {
@@ -1564,5 +1581,42 @@ mod tests {
             }
             other => panic!("expected an Ss config, got {other:?}"),
         }
+    }
+
+    /// The UDP row widens ONLY xray's `network` to `tcp,udp` (sing-box serves
+    /// both networks by default) and the 2022 method carries its PSK.
+    #[test]
+    fn ss_udp_row_widens_only_xray_network() {
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+            inner_tls_echo: None,
+            udp_echo: None,
+        };
+        let udp: serde_json::Value = serde_json::from_str(&ss_inbound(
+            CoreKind::Xray,
+            &env,
+            &NoTls,
+            "tcp",
+            "2022-blake3-aes-256-gcm",
+            true,
+        ))
+        .unwrap();
+        assert_eq!(udp["inbounds"][0]["settings"]["network"], "tcp,udp");
+        assert_eq!(udp["inbounds"][0]["settings"]["password"], SS_2022_KEY);
+        // sing-box is UDP-capable by default and carries no `network` field.
+        let sing: serde_json::Value = serde_json::from_str(&ss_inbound(
+            CoreKind::SingBox,
+            &env,
+            &NoTls,
+            "tcp",
+            "2022-blake3-aes-256-gcm",
+            true,
+        ))
+        .unwrap();
+        assert!(sing["inbounds"][0].get("network").is_none());
     }
 }

@@ -798,6 +798,7 @@ impl ValidationSummary {
 mod tests {
     use super::*;
     use leas_proto::proto_spec::{ProtoSpec, ProtocolKind};
+    use rstest::rstest;
 
     /// Test settings with private IPs allowed (existing tests use various IPs).
     fn permissive_settings() -> ValidationSettings {
@@ -847,40 +848,17 @@ mod tests {
 
     // ── normalize_remark ──
 
-    #[test]
-    fn normalize_remark_basic() {
-        assert_eq!(normalize_remark("hello"), "hello");
-    }
-
-    #[test]
-    fn normalize_remark_percent_decoded() {
-        // Japanese "test" in percent-encoded UTF-8
-        let result = normalize_remark("%E6%B5%8B%E8%AF%95");
-        assert_eq!(result, "测试");
-    }
-
-    #[test]
-    fn normalize_remark_whitespace_collapsed() {
-        assert_eq!(normalize_remark("  hello   world  "), "hello world");
-        assert_eq!(normalize_remark("\tfoo \n bar\r\n baz"), "foo bar baz");
-    }
-
-    #[test]
-    fn normalize_remark_emoji_percent_decoded() {
-        // Grinning face emoji
-        let result = normalize_remark("%F0%9F%98%80");
-        assert_eq!(result, "😀");
-    }
-
-    #[test]
-    fn normalize_remark_empty_after_trim() {
-        assert_eq!(normalize_remark("  "), "");
-        assert_eq!(normalize_remark("%20%20"), "");
-    }
-
-    #[test]
-    fn normalize_remark_no_change_for_plain_text() {
-        assert_eq!(normalize_remark("  My Server 1  "), "My Server 1");
+    #[rstest]
+    #[case::basic("hello", "hello")]
+    #[case::percent_decoded("%E6%B5%8B%E8%AF%95", "测试")]
+    #[case::whitespace_collapsed("  hello   world  ", "hello world")]
+    #[case::whitespace_collapsed_tabs("\tfoo \n bar\r\n baz", "foo bar baz")]
+    #[case::emoji_percent_decoded("%F0%9F%98%80", "😀")]
+    #[case::empty_after_trim("  ", "")]
+    #[case::empty_after_trim_percent("%20%20", "")]
+    #[case::no_change_for_plain_text("  My Server 1  ", "My Server 1")]
+    fn normalize_remark_cases(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(normalize_remark(input).as_str(), expected);
     }
 
     // ── validate_host ──
@@ -1311,77 +1289,30 @@ mod tests {
         assert_roundtrip(&url);
     }
 
-    #[test]
-    fn roundtrip_vless() {
-        assert_roundtrip("vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?type=tcp");
-    }
-
-    #[test]
-    fn roundtrip_trojan() {
-        assert_roundtrip("trojan://pass@example.com:443?security=none");
-    }
-
-    #[test]
-    fn roundtrip_shadowsocks() {
-        assert_roundtrip("ss://Y2xlb2Y6cGFzc3dvcmQ@example.com:443#my-server");
-    }
-
-    #[test]
-    fn roundtrip_shadowsocksr() {
-        assert_roundtrip(
-            "ssr://ZXhhbXBsZS5jb206NDQzOm9yaWdpbjpyYzQtbWQ1OnBsYWluOmNHRnpjM2R2Y21RLz9ncm91cD1WR1Z6ZEVkeWIzVncmcmVtYXJrcz1WR1Z6ZEZObGNuWmxjZw",
-        );
-    }
-
-    #[test]
-    fn roundtrip_tuic() {
-        assert_roundtrip(
-            "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
-        );
-    }
-
-    #[test]
-    fn roundtrip_hysteria2() {
-        assert_roundtrip("hysteria2://secret@example.com:443,7788,9999?insecure=1");
-    }
-
-    #[test]
-    fn roundtrip_hysteria() {
-        assert_roundtrip("hysteria://example.com:443?protocol=udp#My%20Server");
-    }
-
-    #[test]
-    fn roundtrip_socks() {
-        assert_roundtrip("socks://user:pass@1.2.3.4:1080");
-    }
-
-    #[test]
-    fn roundtrip_http() {
-        assert_roundtrip("http://user:pass@1.2.3.4:8080");
-    }
-
-    #[test]
-    fn roundtrip_naive() {
-        assert_roundtrip("naive+https://user:pass@example.com:443#my-server");
-    }
-
-    #[test]
-    fn roundtrip_anytls() {
-        assert_roundtrip("anytls://1.2.3.4:8080?password=secret");
-    }
-
-    #[test]
-    fn roundtrip_shadowtls() {
-        // No password: parse + format still round-trip; validation errs
-        // (covered by `missing_credential_reports_validation_error`).
-        assert_roundtrip("shadowtls://1.2.3.4:443");
-    }
-
-    #[test]
-    fn roundtrip_wireguard() {
-        assert_roundtrip(
-            "wireguard://privatekey==@wg.example.com:51820?address=10.0.0.2%2F32&publickey=serverpubkey==",
-        );
+    #[rstest]
+    #[case::vless("vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?type=tcp")]
+    #[case::trojan("trojan://pass@example.com:443?security=none")]
+    #[case::shadowsocks("ss://Y2xlb2Y6cGFzc3dvcmQ@example.com:443#my-server")]
+    #[case::shadowsocksr(
+        "ssr://ZXhhbXBsZS5jb206NDQzOm9yaWdpbjpyYzQtbWQ1OnBsYWluOmNHRnpjM2R2Y21RLz9ncm91cD1WR1Z6ZEVkeWIzVncmcmVtYXJrcz1WR1Z6ZEZObGNuWmxjZw"
+    )]
+    #[case::tuic(
+        "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3"
+    )]
+    #[case::hysteria2("hysteria2://secret@example.com:443,7788,9999?insecure=1")]
+    #[case::hysteria("hysteria://example.com:443?protocol=udp#My%20Server")]
+    #[case::socks("socks://user:pass@1.2.3.4:1080")]
+    #[case::http("http://user:pass@1.2.3.4:8080")]
+    #[case::naive("naive+https://user:pass@example.com:443#my-server")]
+    #[case::anytls("anytls://1.2.3.4:8080?password=secret")]
+    // No password: parse + format still round-trip; validation errs
+    // (covered by `missing_credential_reports_validation_error`).
+    #[case::shadowtls("shadowtls://1.2.3.4:443")]
+    #[case::wireguard(
+        "wireguard://privatekey==@wg.example.com:51820?address=10.0.0.2%2F32&publickey=serverpubkey=="
+    )]
+    fn roundtrip_urls(#[case] url: &str) {
+        assert_roundtrip(url);
     }
 
     // ── Identity ──

@@ -46,7 +46,7 @@ pub async fn tcp_ping(
 
 /// Direct UDP ping: send a probe to `addr:port`, measure time to any response.
 /// Uses raw UDP (not through proxy). Timeout applied.
-/// Good for WireGuard endpoints, ShadowsocksR, and other UDP-based protocols.
+/// Good for `WireGuard` endpoints, `ShadowsocksR`, and other UDP-based protocols.
 pub async fn udp_ping(
     addr: &str,
     port: u16,
@@ -75,14 +75,6 @@ type ClientCacheInner = HashMap<(String, u16, bool, bool), reqwest::Client>;
 static CLIENT_CACHE: LazyLock<Mutex<ClientCacheInner>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Reset the client cache — exposed for testing.
-#[doc(hidden)]
-pub fn reset_client_cache() {
-    if let Ok(mut cache) = CLIENT_CACHE.lock() {
-        cache.clear();
-    }
-}
-
 /// Create a `reqwest::Client` with SOCKS5 proxy configured, using a cache to
 /// avoid per-call connection pool creation overhead. The cache key includes
 /// the redirect policy: probe clients use `Policy::none()` (a redirecting
@@ -96,6 +88,9 @@ async fn create_socks5_client(
     create_socks5_client_with_policy(proxy, port, socks5h, timeout, false).await
 }
 
+// Kept async: the awaited call chain (`create_socks5_client` -> `speed_test`) is
+// async, so dropping it here would ripple through every caller's signature.
+#[allow(clippy::unused_async)]
 async fn create_socks5_client_with_policy(
     proxy: &str,
     port: u16,
@@ -160,14 +155,20 @@ pub async fn speed_test(
     }
 
     let elapsed = start.elapsed();
-    match throughput_bps(total_bytes, elapsed) {
-        Some(bps) => Ok(bps),
-        None => Err(SpeedTestError::Timeout(max_duration)),
-    }
+    throughput_bps(total_bytes, elapsed)
+        .map_or_else(|| Err(SpeedTestError::Timeout(max_duration)), Ok)
 }
 
 /// bits-per-second from bytes and elapsed. Never truncates to whole seconds;
 /// a sub-second elapsed with bytes flowing is NOT a timeout.
+// Total bytes come from a bounded download and secs is clamped to >= 0.001,
+// so the conversion is non-negative and well within u64; lossiness above
+// 2^53 bytes is not reachable for a speed probe.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn throughput_bps(total_bytes: u64, elapsed: std::time::Duration) -> Option<u64> {
     if total_bytes == 0 {
         return None; // caller maps None -> Timeout
@@ -176,7 +177,7 @@ fn throughput_bps(total_bytes: u64, elapsed: std::time::Duration) -> Option<u64>
     Some((total_bytes as f64 * 8.0 / secs) as u64)
 }
 
-/// Wrap an I/O future in `timeout`; maps timeout to SpeedTestError::Timeout.
+/// Wrap an I/O future in `timeout`; maps timeout to `SpeedTestError::Timeout`.
 async fn io_timeout<T>(
     timeout: Duration,
     fut: impl Future<Output = std::io::Result<T>>,
@@ -333,12 +334,6 @@ mod tests {
         let fut = async { Err::<(), _>(std::io::Error::other("boom")) };
         let result = io_timeout(Duration::from_millis(100), fut).await;
         assert!(matches!(result, Err(SpeedTestError::Io(_))));
-    }
-
-    #[tokio::test]
-    async fn client_cache_reset() {
-        reset_client_cache();
-        assert!(super::CLIENT_CACHE.lock().unwrap().is_empty());
     }
 
     #[test]

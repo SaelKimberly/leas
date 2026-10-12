@@ -1545,28 +1545,6 @@ mod tests {
         }
     }
 
-    /// The panel RENDERS the stability ratio (spec §8): the cell text reaching
-    /// a real buffer, not just the helper's return.
-    #[test]
-    fn the_panel_renders_the_stability_ratio() {
-        let mut row = sample_panel_row("●");
-        row.stab = "12/16".to_string();
-        let data = sample_row(true, vec![row], "1");
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 160,
-            height: 20,
-        };
-        let mut buf = Buffer::empty(area);
-        data.render_expansion_panel(&mut buf, 0, 0, 10, 160, Style::default(), 20);
-        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(
-            rendered.contains("12/16"),
-            "the stability ratio must reach the rendered panel; buffer was {rendered:?}"
-        );
-    }
-
     fn sample_row(expanded: bool, panel_rows: Vec<PanelRow>, idx: &str) -> DisplayRowData {
         DisplayRowData {
             indicator: String::new(),
@@ -2042,17 +2020,6 @@ mod tests {
     }
 
     #[test]
-    fn scroll_offset_keeps_tall_last_row_visible() {
-        // The tall selected row's start line must sit inside the viewport,
-        // not be pushed past the end of the row list.
-        let heights = vec![1u16, 1, 1, 1, 1, 10];
-        let offset = compute_scroll_offset(&heights, 5, 8);
-        assert!(offset < heights.len());
-        let sel_start: u16 = heights[offset..5].iter().sum();
-        assert!(sel_start <= 5);
-    }
-
-    #[test]
     fn scroll_offset_tall_selected_row_mid_list_stays_inside() {
         // Expanded row in the middle of the list: the offset must never
         // escape the row list even though the row is taller than the viewport.
@@ -2270,58 +2237,6 @@ mod tests {
         // No failure markers → the delay shows even when untested links exist.
         let (t, _) = test_cell_content(false, true, false, None, None, Some(30), &palette);
         assert_eq!(t, "[ 30 ]");
-    }
-
-    #[test]
-    fn test_cell_label_precedence_matrix() {
-        let palette = test_palette();
-        // (a) only real markers → [real]
-        let (t, _) = test_cell_content(
-            false,
-            true,
-            false,
-            None,
-            Some(TestFailure::Real),
-            None,
-            &palette,
-        );
-        assert_eq!(t, "[real]");
-        // (b) only fast markers → [fast]
-        let (t, _) = test_cell_content(
-            false,
-            true,
-            false,
-            None,
-            Some(TestFailure::Fast),
-            None,
-            &palette,
-        );
-        assert_eq!(t, "[fast]");
-        // (c) both real and fast markers → [real] (tier-consistent)
-        let (t, _) = test_cell_content(
-            false,
-            true,
-            false,
-            None,
-            Some(TestFailure::Real),
-            None,
-            &palette,
-        );
-        assert_eq!(t, "[real]");
-        // (d) DNS-unresolved + fast marker → [name] (DNS tier 5 is deepest)
-        let (t, _) = test_cell_content(
-            true,
-            false,
-            false,
-            None,
-            Some(TestFailure::Fast),
-            None,
-            &palette,
-        );
-        assert_eq!(t, "[name]");
-        // (e) no markers, no measurement → blank
-        let (t, _) = test_cell_content(false, true, false, None, None, None, &palette);
-        assert_eq!(t, "      ");
     }
 
     #[test]

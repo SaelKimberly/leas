@@ -740,6 +740,7 @@ mod tests {
     use super::VmessConfig;
     use crate::proto_spec::common::TransportConfig;
     use crate::urlx::{RawUrlX, SchemeX};
+    use rstest::rstest;
 
     const UUID: &str = "9b4c2eda-341e-488f-a3b2-1dc716b9f36a";
     const BASIC_B64: &str = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==";
@@ -1300,12 +1301,14 @@ mod tests {
         assert_eq!(conf["streamSettings"]["tlsSettings"]["allowInsecure"], true);
     }
 
-    #[test]
-    fn xray_inject_without_endpoint_is_rejected() {
+    #[rstest]
+    #[case::xray(CoreType::Xray)]
+    #[case::singbox(CoreType::SingBox)]
+    fn inject_without_endpoint_is_rejected(#[case] core: CoreType) {
         let cfg = config(parse(&format!("vmess://{BASIC_B64}")));
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .inject_to(&mut conf, core, None, InjectOptions::default())
             .expect_err("orphan vmess must be rejected");
         assert!(matches!(err, SupportError::MissingField("server", "vmess")));
     }
@@ -1369,15 +1372,5 @@ mod tests {
         let transport = &conf["transport"];
         assert_eq!(transport["type"], "grpc");
         assert_eq!(transport["service_name"], "svc");
-    }
-
-    #[test]
-    fn singbox_inject_without_endpoint_is_rejected() {
-        let cfg = config(parse(&format!("vmess://{BASIC_B64}")));
-        let mut conf = serde_json::json!({});
-        let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
-            .expect_err("orphan vmess must be rejected");
-        assert!(matches!(err, SupportError::MissingField("server", "vmess")));
     }
 }

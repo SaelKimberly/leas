@@ -469,6 +469,7 @@ mod tests {
         IP_INFO_ATTEMPTS, IpInfoOutcome, IpInfoStep, ProbeClass, ProbeFailure, next_step,
         parse_probe_url, refusal_reason,
     };
+    use rstest::rstest;
 
     /// T6: the class names the STAGE that failed. A tunnel that ended under a
     /// later phase is a protocol-stage failure, and the engine now says so with
@@ -524,76 +525,107 @@ mod tests {
         );
     }
 
-    #[test]
-    fn probe_url_defaults_the_port_per_scheme() {
-        let https = parse_probe_url("https://www.gstatic.com/generate_204").unwrap();
-        assert!(https.https);
-        assert_eq!(https.host, "www.gstatic.com");
-        assert_eq!(https.port, 443);
-        assert_eq!(https.path, "/generate_204");
-
-        let http = parse_probe_url("http://example.com").unwrap();
-        assert!(!http.https);
-        assert_eq!(http.port, 80);
-        assert_eq!(http.path, "/");
+    /// Expected shape of a parsed probe URL, for the url → expectation table.
+    enum UrlExpect {
+        Parsed {
+            https: bool,
+            host: &'static str,
+            port: u16,
+            path: &'static str,
+        },
+        Rejected,
     }
 
-    #[test]
-    fn probe_url_keeps_explicit_port_and_query() {
-        let parsed = parse_probe_url("https://ip-api.com:8443/json/?fields=query,country").unwrap();
-        assert_eq!(parsed.port, 8443);
-        assert_eq!(parsed.path, "/json/?fields=query,country");
+    /// The three probe-URL parsing cases folded into one url → expectation
+    /// table: scheme-defaulted ports, an explicit port with a query, and the
+    /// rejections (an unsupported scheme, and a bare host with no scheme).
+    #[rstest]
+    #[case::probe_url_defaults_the_port_per_scheme_https(
+        "https://www.gstatic.com/generate_204",
+        UrlExpect::Parsed {
+            https: true,
+            host: "www.gstatic.com",
+            port: 443,
+            path: "/generate_204",
+        }
+    )]
+    #[case::probe_url_defaults_the_port_per_scheme_http(
+        "http://example.com",
+        UrlExpect::Parsed {
+            https: false,
+            host: "example.com",
+            port: 80,
+            path: "/",
+        }
+    )]
+    #[case::probe_url_keeps_explicit_port_and_query(
+        "https://ip-api.com:8443/json/?fields=query,country",
+        UrlExpect::Parsed {
+            https: true,
+            host: "ip-api.com",
+            port: 8443,
+            path: "/json/?fields=query,country",
+        }
+    )]
+    #[case::probe_url_rejects_unsupported_scheme("socks5://127.0.0.1:1080", UrlExpect::Rejected)]
+    #[case::probe_url_rejects_garbage("www.gstatic.com/generate_204", UrlExpect::Rejected)]
+    fn probe_url_parsing(#[case] url: &str, #[case] expect: UrlExpect) {
+        match expect {
+            UrlExpect::Parsed {
+                https,
+                host,
+                port,
+                path,
+            } => {
+                let got = parse_probe_url(url).unwrap_or_else(|e| panic!("{url:?}: {e}"));
+                assert_eq!(got.https, https, "{url:?}");
+                assert_eq!(got.host, host, "{url:?}");
+                assert_eq!(got.port, port, "{url:?}");
+                assert_eq!(got.path, path, "{url:?}");
+            }
+            UrlExpect::Rejected => {
+                assert!(parse_probe_url(url).is_err(), "{url:?} must be rejected");
+            }
+        }
     }
 
-    #[test]
-    fn probe_url_rejects_unsupported_scheme_and_garbage() {
-        assert!(parse_probe_url("socks5://127.0.0.1:1080").is_err());
-        assert!(parse_probe_url("www.gstatic.com/generate_204").is_err());
-    }
-
-    /// The fall-through lives in `next_step`, so this is the sequence that
-    /// decides whether a rate-limited provider is ever left behind: a refusal is
-    /// deterministic (ask the next provider at once — no retry can change a rate
-    /// limit every concurrent probe shares), a transport miss is transient and
-    /// gets the retries first, and an answer ends the fetch.
-    #[test]
-    fn exit_ip_policy_refuses_fast_and_retries_transport() {
-        assert_eq!(
-            next_step(IpInfoOutcome::Refused("HTTP 429".into()), 0),
-            IpInfoStep::NextProvider
-        );
-        assert_eq!(
-            next_step(
-                IpInfoOutcome::Refused("status=fail".into()),
-                IP_INFO_ATTEMPTS - 1
-            ),
-            IpInfoStep::NextProvider
-        );
-        assert_eq!(
-            next_step(IpInfoOutcome::Transport("eof".into()), 0),
-            IpInfoStep::Retry
-        );
-        assert_eq!(
-            next_step(IpInfoOutcome::Transport("eof".into()), IP_INFO_ATTEMPTS - 1),
-            IpInfoStep::NextProvider
-        );
-        assert_eq!(
-            next_step(IpInfoOutcome::Answer("1.2.3.4 | X".into()), 0),
-            IpInfoStep::Answered("1.2.3.4 | X".into())
-        );
-    }
-
-    /// A transport miss must actually be retried the declared number of times
-    /// before the provider is given up on.
-    #[test]
-    fn a_transport_miss_is_retried_before_the_next_provider() {
-        let attempts: Vec<IpInfoStep> = (0..IP_INFO_ATTEMPTS)
-            .map(|attempt| next_step(IpInfoOutcome::Transport("eof".into()), attempt))
-            .collect();
-        assert_eq!(
-            attempts,
-            vec![IpInfoStep::Retry, IpInfoStep::NextProvider],
-            "IP_INFO_ATTEMPTS and the policy disagree"
-        );
+    /// The exit-IP policy in one (outcome, attempt) → step table: this is the
+    /// sequence that decides whether a rate-limited provider is ever left
+    /// behind — a refusal is deterministic (ask the next provider at once — no
+    /// retry can change a rate limit every concurrent probe shares), a transport
+    /// miss is transient and gets the retries first, and an answer ends the
+    /// fetch.
+    #[rstest]
+    #[case::refusal_is_fast_on_the_first_attempt(
+        IpInfoOutcome::Refused("HTTP 429".into()),
+        0,
+        IpInfoStep::NextProvider
+    )]
+    #[case::refusal_is_fast_on_the_last_attempt(
+        IpInfoOutcome::Refused("status=fail".into()),
+        IP_INFO_ATTEMPTS - 1,
+        IpInfoStep::NextProvider
+    )]
+    #[case::transport_miss_is_retried_while_attempts_remain(
+        IpInfoOutcome::Transport("eof".into()),
+        0,
+        IpInfoStep::Retry
+    )]
+    #[case::transport_miss_steps_on_at_the_last_attempt(
+        IpInfoOutcome::Transport("eof".into()),
+        IP_INFO_ATTEMPTS - 1,
+        IpInfoStep::NextProvider
+    )]
+    #[case::an_answer_ends_the_fetch(
+        IpInfoOutcome::Answer("1.2.3.4 | X".into()),
+        0,
+        IpInfoStep::Answered("1.2.3.4 | X".into())
+    )]
+    fn next_step_over_outcomes(
+        #[case] outcome: IpInfoOutcome,
+        #[case] attempt: u32,
+        #[case] expected: IpInfoStep,
+    ) {
+        assert_eq!(next_step(outcome, attempt), expected);
     }
 }

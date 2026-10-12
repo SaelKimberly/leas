@@ -637,7 +637,7 @@ mod tests {
             let enc = varint(v);
             let (got, rest) = read_varint(&enc).expect("decodes");
             assert_eq!(got, v);
-            assert!(rest.is_empty());
+            assert_eq!(rest.len(), 0);
         }
     }
 

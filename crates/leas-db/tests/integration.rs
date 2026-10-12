@@ -84,13 +84,13 @@ const fn ts(secs: i64) -> i64 {
     secs
 }
 
-fn tcp_transport() -> Transport {
+const fn tcp_transport() -> Transport {
     Transport {
         r#type: TransportType::Tcp,
     }
 }
 
-fn no_security() -> Security {
+const fn no_security() -> Security {
     Security {
         r#type: SecurityType::None,
         sni: None,
@@ -740,7 +740,7 @@ async fn get_endpoint_and_get_by_protocol_id() {
     seed_endpoint(&mut conn, 7, 3001, "10.0.0.1", HostType::Ipv4, 53, 100).await;
 
     let row = db.get_endpoint(EndpointId::new(7)).await.expect("get");
-    assert!(row.as_ref().expect("row").endpoint.domain.is_empty());
+    assert_eq!(row.as_ref().expect("row").endpoint.domain.len(), 0);
     assert_eq!(row.unwrap().links.len(), 1);
 
     let by_proto = db

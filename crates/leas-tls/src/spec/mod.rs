@@ -740,7 +740,7 @@ mod tests {
             )
         });
         let out = apply_curve_preferences(&spec, &[0x001D]);
-        assert!(out.extensions.is_empty());
+        assert_eq!(out.extensions.len(), 0);
         // The input spec is untouched (borrow → clone semantics).
         assert_eq!(
             curve_spec().extensions[0],

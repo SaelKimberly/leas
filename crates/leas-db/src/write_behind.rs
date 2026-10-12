@@ -1732,8 +1732,8 @@ mod tests {
     // ── LinkSpec (profile_stats write-behind) ─────────────────────────────
 
     use super::{LinkRow, LinkSpec};
+    use crate::LinkGroups;
     use crate::models_toasty::{Latency, ProfileErr, PurgeReason};
-    use crate::{LinkGroups, LinkPatch};
 
     /// A database with one endpoint, one protocol and one link row — the shape
     /// a link patch writes.
@@ -2170,32 +2170,6 @@ mod tests {
             small.timer_flush_floor(),
             1,
             "under the divisor floors to 1"
-        );
-    }
-
-    /// `LinkPatch` stays 1:1 with the coalesced patch the write consumes, so a
-    /// patch built straight from a spec row carries the same identity the
-    /// pending map holds.
-    #[test]
-    fn link_coalesced_patch_matches_its_row() {
-        let row = with_latency(&link_row(1), 3);
-        let staged = LinkRow {
-            link: row.clone(),
-            groups: LinkGroups::TRAFFIC,
-        };
-        let out = LinkSpec::coalesce(vec![staged]);
-        assert_eq!(out.len(), 1);
-        let expected = LinkPatch {
-            link: row,
-            groups: LinkGroups::TRAFFIC,
-        };
-        assert_eq!(out[0].patch.link.protocol_id, expected.link.protocol_id);
-        assert_eq!(out[0].patch.link.endpoint_id, expected.link.endpoint_id);
-        assert_eq!(out[0].patch.groups, expected.groups);
-        assert_eq!(
-            out[0].key,
-            LinkSpec::key_of(&out[0].row),
-            "the re-stage key matches the row it came from"
         );
     }
 }

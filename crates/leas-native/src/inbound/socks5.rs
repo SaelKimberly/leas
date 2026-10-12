@@ -688,7 +688,7 @@ mod tests {
         let datagram = new_udp_header(&target);
         let (_, parsed, payload) = parse_udp_request(&datagram).expect("parses");
         assert_eq!(parsed, target);
-        assert!(payload.is_empty());
+        assert_eq!(payload.len(), 0);
     }
 
     #[test]
