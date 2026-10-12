@@ -795,7 +795,7 @@ const PAGE_PROJECTION: &[&str] = &[
     "(SELECT group_concat(hex(ip_key), ',') FROM endpoint_ip ip WHERE ip.endpoint_id = e.id)",
     "e.resolved_at",
     "e.created_at",
-    // profile_stats (23)
+    // profile_stats (25)
     "ps.protocol_id",
     "ps.endpoint_id",
     "ps.last_used_at",
@@ -1001,7 +1001,7 @@ fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<(Endpoint, Vec<Ip
     ))
 }
 
-/// `profile_stats` (23 columns, in [`PAGE_PROJECTION`] order). The three
+/// `profile_stats` (25 columns, in [`PAGE_PROJECTION`] order). The three
 /// multi-column embeds (`latency`, `error`, `traffic`) are flattened in the
 /// table, so they are reassembled by hand — the parity test against
 /// [`Database::load_page_rows`] pins every one of them.

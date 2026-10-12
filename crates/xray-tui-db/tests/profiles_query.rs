@@ -22,7 +22,7 @@ const fn ts(secs: i64) -> i64 {
     secs
 }
 
-const ALL_ENDPOINTS: [i64; 7] = [1, 2, 3, 4, 5, 6, 7];
+const ALL_ENDPOINTS: [i64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
 const ALL_SORTS: [PageSort; 4] = [PageSort::Test, PageSort::Port, PageSort::Ip, PageSort::Id];
 
@@ -279,6 +279,34 @@ async fn seed_into(db: &Database) {
     // a revert-proof test silently stops proving anything.
     seed_endpoint(&mut conn, 6, HostType::Dns, &[]).await;
     seed_link(&mut conn, 6, 109, Some(5), None, 170).await;
+    // e8: the endpoint-level stability discriminator. It and e2 below are both
+    // a single tcp link in bin 0 with the SAME static weight, and they differ
+    // ONLY on the ring: e2 perfect, e8 poor. That makes their relative position
+    // a pure function of the term order — with `rank_stab` before `rank_weight`
+    // (the shipped law) e2 leads; swap the two terms and e8 leads, so the
+    // parity golden goes red. Nothing else in the feed can discriminate the
+    // two terms, because the weight only decides when bins and stability tie.
+    seed_endpoint(&mut conn, 8, HostType::Dns, &["10.0.0.8"]).await;
+    seed_link(&mut conn, 8, 113, Some(10), None, 210).await;
+    toasty::sql::statement(
+        "UPDATE profile_stats SET stab_mask = 0, stab_len = 4 \
+         WHERE endpoint_id = 8 AND protocol_id = 113",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("e8 ring: 0 of 4 (poor)");
+    // e1's 101 (real 30, tcp, bin 0) is e8's true peer: same bin, same static
+    // weight, opposite ring. e2 is left truthful because
+    // `resolving_a_dns_host_moves_its_stored_key` anchors on that endpoint's
+    // position relative to e7.
+    toasty::sql::statement(
+        "UPDATE profile_stats SET stab_mask = 15, stab_len = 4 \
+         WHERE endpoint_id = 1 AND protocol_id = 101",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("e1/101 ring: 4 of 4 (perfect)");
+
     // e7: dns host WITH a persisted resolution, plus a name-resolution failure
     seed_endpoint(&mut conn, 7, HostType::Dns, &["203.0.113.7"]).await;
     seed_link(&mut conn, 7, 110, Some(7), None, 180).await;
@@ -295,7 +323,7 @@ async fn seed_into(db: &Database) {
     // These fixtures write links with raw statements, bypassing the write
     // paths that keep `endpoint_rank` current (see the freshness test below).
     // Establish the same invariant they do, explicitly.
-    let ids: Vec<EndpointId> = (1..=7).map(EndpointId::new).collect();
+    let ids: Vec<EndpointId> = (1..=8).map(EndpointId::new).collect();
     db.refresh_endpoint_ranks(&ids).await.expect("seed ranks");
 }
 
@@ -527,7 +555,7 @@ async fn count_narrows_with_search_and_group_filters() {
         let db = &db;
         async move { db.profiles_page(&req).await.expect("count").total }
     };
-    assert_eq!(total(request(PageSort::Test, true, 0, 10)).await, 7);
+    assert_eq!(total(request(PageSort::Test, true, 0, 10)).await, 8);
 
     let searched = total(PageRequest {
         search: Some("H1.".to_string()),
@@ -541,7 +569,7 @@ async fn count_narrows_with_search_and_group_filters() {
         ..request(PageSort::Test, true, 0, 10)
     })
     .await;
-    assert_eq!(port, 7, "port match");
+    assert_eq!(port, 8, "port match");
 
     let none = total(PageRequest {
         search: Some("%".to_string()),
@@ -560,7 +588,7 @@ async fn anchor_returns_each_rows_position_for_every_sort_and_direction() {
                 .profiles_page(&request(sort, ascending, 0, 100))
                 .await
                 .expect("page");
-            assert_eq!(page.ids.len(), 7, "{sort:?} {ascending}");
+            assert_eq!(page.ids.len(), 8, "{sort:?} {ascending}");
             for (position, id) in page.ids.iter().enumerate() {
                 let anchored = db
                     .profiles_anchor(&request(sort, ascending, 0, 10), *id)
@@ -670,15 +698,17 @@ async fn resolving_a_dns_host_moves_its_stored_key() {
         .await
         .expect("page")
         .ids;
-    // It LEAVES the sunk position — that is the point of the test. It does not
-    // take first place: e7's representative is `x_http` (mimicry band 7 against
-    // this endpoint's tcp row's 5), and inside a tier the static weight outranks
-    // latency, so e7's 9 ms leads this endpoint's 5 ms. Under the `x_http`
-    // label bug that order inverts and this assertion goes red.
-    assert_eq!(
-        after.first(),
-        Some(&EndpointId::new(7)),
-        "e7's x_http representative outranks on weight, not on its 9 ms"
+    // It LEAVES the sunk position — that is the point of the test. The
+    // ordering CLAIM is that e6 lands behind e7, not that e7 takes first place
+    // (several endpoints tie on bin 0): e7's representative is `x_http`
+    // (mimicry band 7 against e6's tcp row's 5), and inside a bin the stability
+    // ties and the static weight decides, so e7's 9 ms leads e6's 5 ms. Under
+    // the `x_http` label bug that order inverts and this assertion goes red.
+    let e7 = after.iter().position(|id| *id == EndpointId::new(7));
+    let e6 = after.iter().position(|id| *id == unresolved);
+    assert!(
+        e7 < e6,
+        "e7's x_http representative outranks e6 on weight, not on its 9 ms: {after:?}"
     );
     let pos = after
         .iter()
@@ -938,15 +968,19 @@ fn min_address_key(row: &xray_tui_db::models::EndpointRow) -> Vec<u8> {
 /// SQL reads the stored pack DESCENDING. Comparing the negated form here is
 /// what pins that the two directions are the same order — a flip between them
 /// fails THIS test, not the field.
-type OracleKey = (i64, i64, u64, String, String, Vec<u8>, i64);
+/// The `Test` shape is `(band, bin, stab, neg_weight, domain, sub_domain,
+/// addr, endpoint_id)` — the SQL term list, same arity and same ORDER. A
+/// stab-less oracle compares equal whenever the fixture's stab values are
+/// uniform, which is how a dropped or reordered `rank_stab` term stays green.
+type OracleKey = (i64, i64, i64, u64, String, String, Vec<u8>, i64);
 
 fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleKey {
     match sort {
         PageSort::Test => {
-            // The binned law (db-rewamp D11): (bin, neg_weight, domain,
+            // The binned law with stability: (bin, stab, neg_weight, domain,
             // sub_domain, addr, endpoint_id). bin/neg_weight come from the
             // representative link; the rest are endpoint-level.
-            let (bin, _stab, neg_weight, _seen, _pid) = row
+            let (bin, stab, neg_weight, _seen, _pid) = row
                 .best_test_priority_key(dns_unresolved(row))
                 .unwrap_or((u8::MAX, u8::MAX, u64::MAX, i64::MAX, i64::MAX));
             let domain = row.endpoint.domain.clone();
@@ -964,6 +998,7 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleK
             (
                 band,
                 i64::from(bin),
+                i64::from(stab),
                 neg_weight,
                 domain,
                 sub_domain,
@@ -975,12 +1010,14 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleK
             0,
             0,
             0,
+            0,
             String::new(),
             String::new(),
             Vec::new(),
             row.endpoint.id.get(),
         ),
         PageSort::Id => (
+            0,
             0,
             row.endpoint.id.get(),
             0,
@@ -990,6 +1027,7 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleK
             0,
         ),
         PageSort::Port => (
+            0,
             0,
             i64::from(row.endpoint.port),
             0,
@@ -1009,7 +1047,7 @@ async fn page_order_matches_the_rust_oracle_for_every_sort() {
         .await
         .expect("all ids");
     let rows = db.load_page_rows(&all.ids, true).await.expect("rows");
-    assert_eq!(rows.len(), 7, "fixture rows");
+    assert_eq!(rows.len(), 8, "fixture rows");
 
     for sort in ALL_SORTS {
         for ascending in [true, false] {
@@ -1209,6 +1247,17 @@ fn assert_same_link(typed: &ProfileStats, projected: &ProfileStats, ctx: &str) {
     assert_eq!(typed.latency, projected.latency, "{ctx}: latency");
     assert_eq!(typed.speed_bps, projected.speed_bps, "{ctx}: speed_bps");
     assert_eq!(typed.error, projected.error, "{ctx}: error");
+    // The stability ring is a projected column PAIR; asserting it here is what
+    // makes the positional decode testable — a decoder reading them at the
+    // wrong offset (or dropping them) otherwise passes this golden.
+    assert_eq!(
+        typed.stab_mask, projected.stab_mask,
+        "{ctx}: stab_mask (projection slot order)"
+    );
+    assert_eq!(
+        typed.stab_len, projected.stab_len,
+        "{ctx}: stab_len (projection slot order)"
+    );
     assert_eq!(typed.traffic, projected.traffic, "{ctx}: traffic");
     assert_eq!(typed.created_at, projected.created_at, "{ctx}: created_at");
     assert_eq!(typed.updated_at, projected.updated_at, "{ctx}: updated_at");
