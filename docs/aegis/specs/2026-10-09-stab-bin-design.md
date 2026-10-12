@@ -244,10 +244,20 @@ before `backfill_all`. A seeded link gets `attempts = 1 < STAB_WARMUP` →
 neutral `stab_bin` (correct: we know it worked, we have no reliability
 estimate) and `proven = 1` (correct, and it restores the §5.3 invariant).
 
-Gate: capture whether the ALTER raised `duplicate column` in `ensure_raw_ddl`
-and run the seed only when it did not. Do **not** key the seed on
-`rank_bin ∈ 0..=5`: that misses a succeeded-then-failed link, the exact case
-the feature exists for.
+Gate: **a durable stamp**, written in the same transaction as the seed
+(`app_meta['stability_seeded']`), and the seed re-run whenever the stamp is
+absent. Do **not** gate it on "the ALTER just added the column": a process
+killed between the ALTER and the UPDATE would leave every pre-upgrade success
+with an empty ring, and every later open would see `duplicate column`, skip the
+seed, and strand those endpoints outside all four scopes until each was
+re-probed — weeks on a large feed. The stamp closes that window; the seed and
+its stamp are all-or-nothing.
+
+Do **not** key the seed on `rank_bin ∈ 0..=5`: that misses a
+succeeded-then-failed link, the exact case the feature exists for. And a
+never-yet-probed database stamps too (a fresh file, and a first run with no real
+links): the backfill is a MIGRATION concern, and a link that earns a real
+latency later gets its ring from the probe that measured it.
 
 Cold start is otherwise correct by construction: empty ring → `len = 0` →
 neutral `stab_bin`, `rank_proven = 0` until samples arrive.

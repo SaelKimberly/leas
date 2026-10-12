@@ -27,8 +27,11 @@
 //!   EXPLICIT verdict; previously the same situation was inferred from a
 //!   `CREATE TABLE` failing.
 
+use toasty_core::driver::operation::TransactionMode;
+
 use crate::Result;
 use crate::error::DatabaseError;
+use crate::models_toasty::AppMeta;
 
 pub mod ddl;
 
@@ -52,20 +55,18 @@ async fn cursor(conn: &mut impl toasty::Executor) -> Result<i64> {
 /// the only signal that the column is already there. Any OTHER error is real
 /// and propagates.
 ///
-/// Returns `true` when the `stab_mask` ALTER actually ADDED the column, i.e.
-/// this open is the one that introduced the stability ring to an existing
-/// database. The caller uses that to run the day-one seed exactly once (spec
-/// `2026-10-09-stab-bin-design` §6.2).
-async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<bool> {
-    let mut stabbed = false;
+/// The stability seed's own one-way stamp: its presence means the day-one seed
+/// has run on this database. `app_meta` is the typed key/value table the PSL
+/// version already uses.
+const STABILITY_SEEDED_KEY: &str = "stability_seeded";
+
+async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<()> {
     for alter in ddl::STAB_ADD_COLUMNS {
         if let Err(e) = toasty::sql::query(*alter).exec(conn).await {
             let message = e.to_string();
             if !message.contains("duplicate column") {
                 return Err(e.into());
             }
-        } else {
-            stabbed = true;
         }
     }
     for alter in ddl::ENDPOINT_RANK_ADD_COLUMNS {
@@ -79,7 +80,7 @@ async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<bool> {
     for statement in ddl::V18_AFTER_ALTERS {
         toasty::sql::query(*statement).exec(conn).await?;
     }
-    Ok(stabbed)
+    Ok(())
 }
 
 /// Bring `db`/`conn` to the current schema version.
@@ -94,7 +95,7 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             // Current. Still ensure the derived tables/indexes exist — this is
             // the only path a database created before a new raw statement was
             // added to `ddl.rs` takes, and every statement is idempotent.
-            let stabbed = ensure_raw_ddl(conn).await?;
+            ensure_raw_ddl(conn).await?;
             // Day-one stability seed (spec `2026-10-09-stab-bin-design` §6.2).
             // `latency = 'real'` is evidence a real success happened —
             // `apply_test_result` writes `Latency::Real` only on success and
@@ -104,13 +105,14 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             // menus. Seeding the ring with that one known success keeps
             // `proven` true and the window neutral (one sample < `STAB_WARMUP`).
             //
-            // Gated on the ALTER having ADDED the column, so it runs exactly
-            // once; a later open tolerates the duplicate and skips this.
-            if stabbed {
-                let seeded = seed_stability(conn).await?;
-                tracing::info!(target: "xray_tui_db",
-                    "profile_stats: seeded {seeded} proven links into the stability ring");
-            }
+            // Keyed on a DURABLE STAMP, never on "did the ALTER just run":
+            // a kill between the ALTER and this UPDATE would otherwise leave
+            // every pre-upgrade success with an empty ring, and every later
+            // open would see "duplicate column", skip the seed, and strand
+            // those endpoints outside all four scopes until each was re-probed
+            // (weeks on a large feed). The stamp is written in the same
+            // transaction as the seed, so the pair is all-or-nothing.
+            seed_stability_once(conn).await?;
             Ok(())
         }
         0 => {
@@ -130,6 +132,19 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
                 }
             })?;
             ensure_raw_ddl(conn).await?;
+            // Stamp the seed as done: a freshly created database has no links,
+            // so there is nothing to backfill, and the stamp keeps the
+            // invariant "every database that has completed an open is stamped"
+            // true on this path too (the backfill is a MIGRATION concern; a
+            // link that earns its real latency later gets its ring from the
+            // probe that measured it).
+            toasty::sql::query(format!(
+                "INSERT INTO app_meta (key, value) VALUES ('{STABILITY_SEEDED_KEY}', '{}') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                i64::from(crate::endpoint_rank::STAB_VERSION)
+            ))
+            .exec(conn)
+            .await?;
             toasty::sql::query(format!("PRAGMA user_version = {LATEST}"))
                 .exec(conn)
                 .await?;
@@ -153,33 +168,64 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
 /// same one the rank refresh matches on. Only `'real'` seeds: a fast latency is
 /// a TCP handshake, which proves nothing about the config.
 ///
-/// Returns the number of rows seeded (counted before the update, since the
-/// engine reports no affected-row count for a raw `UPDATE`).
-///
-/// Also CLEARS the key-input stamp, so `endpoint_rank::ensure` (which runs
-/// later in `open`) sees a mismatch and recomputes every stored key — the
-/// seeded rings must reach `rank_proven`/`rank_stab` or the seed has no effect
-/// on the page.
-async fn seed_stability(conn: &mut impl toasty::Executor) -> Result<i64> {
-    let count = scalar_count(
-        conn,
-        "SELECT COUNT(*) FROM profile_stats WHERE latency = 'real'",
-    )
-    .await?;
-    if count == 0 {
-        return Ok(0);
+/// Runs at most ONCE per database, and the seed and its stamp land in ONE
+/// transaction — so the crash window the ALTER-gated form had (ALTER applied,
+/// seed lost, every later open skipping it) cannot exist. A first open with
+/// nothing to seed still stamps, because "there were no real links yet" is a
+/// settled answer: a link that earns a real latency later gets its ring from the
+/// probe that measured it, never from this backfill.
+async fn seed_stability_once(conn: &mut toasty::Connection) -> Result<()> {
+    let already: Option<String> = AppMeta::filter_by_key(STABILITY_SEEDED_KEY.to_owned())
+        .first()
+        .exec(&mut *conn)
+        .await?
+        .map(|m| m.value);
+    if already.is_some() {
+        return Ok(());
     }
-    toasty::sql::query(
-        "UPDATE profile_stats SET stab_mask = 1, stab_len = 1 WHERE latency = 'real'",
-    )
-    .exec(conn)
-    .await?;
-    // `rank_weight_meta` may not exist yet on a very old file; the rank `ensure`
-    // creates it. A failed delete here is therefore not an error.
-    let _ = toasty::sql::query("DELETE FROM rank_weight_meta")
-        .exec(conn)
-        .await;
-    Ok(count)
+    let mut tx = conn
+        .transaction_builder()
+        .mode(TransactionMode::Immediate)
+        .begin()
+        .await?;
+    let result = async {
+        let count = scalar_count(
+            &mut tx,
+            "SELECT COUNT(*) FROM profile_stats WHERE latency = 'real'",
+        )
+        .await?;
+        toasty::sql::query(
+            "UPDATE profile_stats SET stab_mask = 1, stab_len = 1 WHERE latency = 'real'",
+        )
+        .exec(&mut tx)
+        .await?;
+        // CLEAR the key-input stamp so `endpoint_rank::ensure` (later in
+        // `open`) sees a mismatch and recomputes every stored key: the seeded
+        // rings must reach `rank_proven`/`rank_stab` or the seed does nothing
+        // visible. `rank_weight_meta` may not exist on a very old file; the
+        // rank `ensure` creates it, so a failed delete is not an error.
+        let _ = toasty::sql::query("DELETE FROM rank_weight_meta")
+            .exec(&mut tx)
+            .await;
+        toasty::sql::query(format!(
+            "INSERT INTO app_meta (key, value) VALUES ('{STABILITY_SEEDED_KEY}', '{}') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            i64::from(crate::endpoint_rank::STAB_VERSION)
+        ))
+        .exec(&mut tx)
+        .await?;
+        Ok::<i64, DatabaseError>(count)
+    }
+    .await;
+    match result {
+        Ok(count) => {
+            tx.commit().await?;
+            tracing::info!(target: "xray_tui_db",
+                "profile_stats: seeded {count} proven links into the stability ring");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// One integer from a single-value query (the schema module's own copy; the

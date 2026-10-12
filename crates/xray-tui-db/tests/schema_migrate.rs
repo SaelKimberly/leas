@@ -184,6 +184,111 @@ async fn unknown_cursor_is_recreated_not_migrated() {
     );
 }
 
+/// The seed is keyed on a DURABLE STAMP, not on "did the ALTER run".
+///
+/// The earlier form fired only on the open that ADDED the column, so a process
+/// killed between the ALTER and the seed left every pre-upgrade success with an
+/// empty ring — and every later open saw "duplicate column" and skipped the
+/// seed forever, stranding those endpoints outside all four scoped menus. This
+/// test performs exactly that partial upgrade and proves the next open heals it.
+#[tokio::test]
+async fn a_seed_lost_to_a_crash_is_rerun_on_the_next_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("crash.db");
+    {
+        let db = Database::open(&path).await.expect("open");
+        let mut conn = db.connection().await.expect("conn");
+        let (domain, sub_domain) = Endpoint::derive_domain("198.51.100.9", HostType::Ipv4);
+        toasty::create!(Endpoint {
+            id: EndpointId::new(9),
+            domain,
+            sub_domain,
+            port: 443,
+            ports: Vec::<u16>::new(),
+            created_at: 0,
+            last_source: None,
+            manual_protocol_override: None,
+            resolved_at: None,
+        })
+        .exec(&mut conn)
+        .await
+        .expect("endpoint");
+        toasty::sql::statement(
+            "INSERT INTO protocols (id, sig, proto_kind, transport_type, security_type, \
+             security_sni, security_fp, security_insecure, config, created_at) \
+             VALUES (901, 901, 'vless', 'tcp', 'none', NULL, NULL, NULL, 'null', 0)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("protocol");
+        toasty::sql::statement(
+            "INSERT INTO profile_stats (protocol_id, endpoint_id, last_seen_at, latency, \
+             latency_delay, speed_bps, traffic_today_up, traffic_today_down, traffic_total_up, \
+             traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) \
+             VALUES (901, 9, 0, 'real', 42, NULL, 0, 0, 0, 0, 0, 0, 1, 0, 0)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("link");
+        // Simulate the interrupted upgrade: the columns exist (as if the ALTER
+        // had run) but no seed and NO STAMP was ever written.
+        toasty::sql::statement("DELETE FROM app_meta WHERE key = 'stability_seeded'")
+            .exec(&mut conn)
+            .await
+            .expect("unstamped");
+    }
+
+    let db = Database::open(&path).await.expect("reopen");
+    let mut conn = db.connection().await.expect("conn");
+    let ring: Vec<(i64, i64)> = {
+        let rows = toasty::sql::query(
+            "SELECT stab_mask, stab_len FROM profile_stats WHERE endpoint_id = 9",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("read ring");
+        rows.iter()
+            .filter_map(|v| match v {
+                Value::Record(rec) => match (&rec.fields[0], &rec.fields[1]) {
+                    (Value::I64(a), Value::I64(b)) => Some((*a, *b)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        ring,
+        vec![(1, 1)],
+        "the lost seed is re-run: the surviving real latency is seeded on reopen"
+    );
+}
+
+/// The seed runs at most ONCE: a second open must not touch the rings (a live
+/// link's ring is the probe path's to maintain).
+#[tokio::test]
+async fn the_stability_seed_runs_once_and_is_stamped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("once.db");
+    let db = Database::open(&path).await.expect("open");
+    let mut conn = db.connection().await.expect("conn");
+    let stamp = toasty::sql::query("SELECT COUNT(*) FROM app_meta WHERE key = 'stability_seeded'")
+        .exec(&mut conn)
+        .await
+        .expect("stamp");
+    assert_eq!(first_i64(&stamp), Some(1), "the seed stamps itself");
+    drop(conn);
+    drop(db);
+
+    let db = Database::open(&path).await.expect("reopen");
+    let mut conn = db.connection().await.expect("conn");
+    let stamp2 = toasty::sql::query("SELECT COUNT(*) FROM app_meta WHERE key = 'stability_seeded'")
+        .exec(&mut conn)
+        .await
+        .expect("stamp");
+    assert_eq!(first_i64(&stamp2), Some(1), "the stamp is a single row");
+}
+
 /// The day-one stability seed (spec `2026-10-09-stab-bin-design` §6.2).
 ///
 /// An existing database's rings are empty, but `apply_test_result` KEEPS
@@ -240,9 +345,11 @@ async fn the_stab_seed_marks_real_latency_links_as_proven() {
             .await
             .expect("link");
         }
-        // Simulate the pre-seed state: drop the ring columns so the next open's
-        // ALTER re-adds them and the seed fires. (An existing table is exactly
-        // the case the ALTER path exists for.)
+        // Simulate the pre-seed state: drop the ring columns AND clear the
+        // stamp, so the next open re-adds them and the seed fires. (An existing
+        // table is exactly the case the ALTER path exists for; the stamp is
+        // what the seed is now keyed on, so an interrupted upgrade has to clear
+        // it too.)
         toasty::sql::statement("ALTER TABLE profile_stats DROP COLUMN stab_mask")
             .exec(&mut conn)
             .await
@@ -251,6 +358,10 @@ async fn the_stab_seed_marks_real_latency_links_as_proven() {
             .exec(&mut conn)
             .await
             .expect("drop stab_len");
+        toasty::sql::statement("DELETE FROM app_meta WHERE key = 'stability_seeded'")
+            .exec(&mut conn)
+            .await
+            .expect("clear the seed stamp");
     }
 
     let db = Database::open(&path).await.expect("reopen");
