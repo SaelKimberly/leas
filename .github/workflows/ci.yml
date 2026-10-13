@@ -45,18 +45,23 @@ name: ci
 #
 # Linkers. Not part of the `just fast`-prohibited set — that rule is about
 # `-Ctarget-cpu=native` (a runner-specific CPU baseline) and sccache, i.e. about
-# artifact portability, not about the linker. Two facts decided the shape here,
-# both checked against the pinned toolchain rather than from memory:
+# artifact portability, not about the linker. Measured rather than assumed:
 #   * `-Clinker-features=+lld` (the plural is the real spelling) is **unstable**
-#     on rustc 1.99 — it demands `-Z unstable-options`. The stable path is the
-#     default: on `x86_64-unknown-linux-gnu` rustc already passes `-fuse-ld=lld`
-#     to the driver and silently retries without it when the driver rejects the
-#     flag. Ubuntu 22.04's gcc 11 does reject it (the `lld` name landed in gcc
-#     12), which is why this container has been quietly linking with bfd.
-#   * so the driver is made explicit: `-Clinker=clang -Clink-arg=-fuse-ld=mold`.
-#     clang accepts that name, and mold 3.0.0 (the Rust rewrite) was verified to
-#     run inside this very image. `-Clinker=lld` does NOT work — lld has no
-#     driver flag of that shape, which is why clang has to be the driver.
+#     on rustc 1.99 — it demands `-Z unstable-options`. No flag is needed anyway:
+#     on `x86_64-unknown-linux-gnu` rustc already passes `-fuse-ld=lld` to the
+#     driver and silently retries without it when that fails.
+#   * the container's own gcc (`11.4.0-1ubuntu1~22.04.3`) accepts
+#     `-fuse-ld=bfd|gold|lld|mold` — verified by linking a probe and reading the
+#     `.comment` section back (`mold` and `LLD` land there respectively). So the
+#     only thing missing was `ld.lld` on PATH, which `apt-get install lld`
+#     supplies; no RUSTFLAGS are involved, which also means the cargo cache key
+#     and every fingerprint stay untouched and a run stays comparable to the
+#     pre-linker baseline.
+#   * therefore: nothing to configure on Linux beyond installing `lld`. `clang`
+#     as a driver and a downloaded mold would both work (mold 3.0.0's release
+#     binary was verified to run inside this image), but each would need a
+#     RUSTFLAGS change, i.e. one cold rebuild plus a new cache namespace, for a
+#     gain that has not been shown yet.
 # The floor assert below is unaffected: `GLIBC_*` symbol versions come from libc,
 # not from the linker.
 
@@ -73,26 +78,27 @@ jobs:
     name: code (linux, glibc 2.35 floor)
     runs-on: ubuntu-24.04
     container: ubuntu:22.04
-    env:
-      # clang as the driver (gcc 11 cannot name mold), mold 3.0 as the linker.
-      RUSTFLAGS: "-Clinker=clang -Clink-arg=-fuse-ld=mold"
     steps:
       - name: Prerequisites (C toolchain for ring / zstd-sys / libsqlite3-sys)
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl git pkg-config clang
-      - name: mold 3.0.0 (Rust rewrite) — the fast linker
-        run: |
-          curl -sSL https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-x86_64-linux.tar.gz \
-            | tar xz -C /usr/local --strip-components=1
-          mold --version
-          clang --version | head -1
+            build-essential ca-certificates curl git pkg-config lld
       - uses: actions/checkout@v7
       - name: Toolchain + task runners (prebuilt, verified)
         uses: taiki-e/install-action@v2
         with:
           tool: rust+rustfmt+clippy,just,cargo-nextest
+      # Deliberately after the toolchain: this asserts that the *default* path
+      # rustc takes on this target really lands on lld, rather than trusting the
+      # flag names. `readelf` comes with binutils (a build-essential dependency).
+      - name: Confirm the linker rustc will actually use
+        run: |
+          ld.lld --version | head -1
+          printf 'fn main() {}\n' > /tmp/probe.rs
+          rustc --crate-type bin -o /tmp/probe /tmp/probe.rs
+          readelf -p .comment /tmp/probe | grep -o 'LLD' || {
+            echo "rustc did not link with lld inside this container" >&2; exit 1; }
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
