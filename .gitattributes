@@ -1,0 +1,11 @@
+# One normalization rule for every platform.
+#
+# `rustfmt.toml` pins `newline_style = "Unix"`, while a Windows checkout defaults
+# to git's `core.autocrlf=true` — which rewrites every text file to CRLF, so
+# `cargo fmt --check` fails on the Windows CI runner before the build starts.
+# Forcing LF at checkout makes formatting platform-independent; existing clones
+# on Windows need a one-off `git add --renormalize .` after pulling this file.
+* text=auto eol=lf
+
+# Never normalize binary assets.
+*.bin binary
