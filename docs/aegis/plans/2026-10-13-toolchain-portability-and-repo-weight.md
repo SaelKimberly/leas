@@ -154,7 +154,19 @@ The removal tracks exactly which crates the new **build-dependency edge** brings
 
 **T9 — absorb what the CI run surfaces (evidence-driven).**
 *Change:* only if required. Candidates already known: `crates/leas-core/src/updater.rs:641` (`#!/bin/sh` test), `/tmp` literals in unit tests (`process.rs:537,578`, `forms.rs:3184`, `resolve.rs:282`), `bin_manager` `PATH`/`which`/`.exe` naming.
-*Verification:* the failing job's own output; each fix gets a focused regression test if it changes runtime behavior (strict).
+*Measured — CI run #1* (`ci` #1, id `38370247990`, branch `portability/msvc-ci`, sha `1f7ad2e`):
+
+| Job | Outcome |
+|---|---|
+| `deps` | **success** on the first attempt — hakari-check, deny, machete, outdated and audit all green on a clean runner, with msvc in the graph and the regenerated hack crate |
+| `code-linux` | failed on **one** test: `leas-native transport::xhttp::tests::h3_packet_up_seq_order_and_chunking` — 2368 run, 2367 passed, 1 failed |
+| `code-windows` | failed at `cargo fmt --check`: *"Incorrect newline style"* for every file — git's Windows default `core.autocrlf=true` rewrites the checkout to CRLF while `rustfmt.toml` pins `newline_style = "Unix"` |
+
+Both failures are environmental, and neither is a portability wall — but note the msvc experiment is **still unproven**: the Windows job died in fmt before clippy or nextest ever compiled anything.
+
+*Fix 1 — CRLF.* New `.gitattributes`: `* text=auto eol=lf` plus `*.bin binary` (the four `crates/leas-route/tests/fixtures/*.bin` captures). This is the durable fix — it also protects Windows contributors — and existing Windows clones need one `git add --renormalize .`.
+*Fix 2 — the pacing flake.* `assert_chunked_uploads` asserted `t1 - t0 ≥ 25 ms` on *server-arrival* timestamps. That bound is unsound: the client paces POST **starts** (`xhttp.rs:589-594` sleeps to `POST_INTERVAL` before stamping the next POST), so a first send that outlasts the window compresses the arrival delta while the client is correct — CI observed 12 ms against a 30 ms interval. A first attempt (anchoring on the upload start) was **rejected by its own mutation test**: with the sleep removed the test still passed, because the idle-window flush spaces the two POSTs anyway. The landed version records the client's own stamps in a `#[cfg(test)] static POST_STARTS` and asserts consecutive *client* starts are ≥ 25 ms apart. Mutation-verified: sleep removed → `FAIL … got 12.889835ms`; restored → pass. Sound because the sleep makes consecutive stamps ≥ `POST_INTERVAL` apart by construction, and scheduling can only widen that.
+*Verification:* `just quality-gate code` green on the change (fmt, clippy `--all-features`, nextest).
 *Fallback:* if msvc cannot be made green, revert T7 and adopt the gnu recipe from `roadmap.md:356-359` with the Q4-option-1 job shape — record the outcome either way.
 
 ### S4 — Record the decision
