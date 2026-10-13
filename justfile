@@ -7,6 +7,40 @@
 # `just quality-gate-ci`         — every check, minimal output, stops at first failure (exit 0/1, for CI)
 # `just quality-gate-ci code|deps` — the same subsets in CI mode
 
+# The gate recipes and the recipes below are bash scripts (`set -uo pipefail`,
+# arrays, `case`). Pin the Windows interpreter so a Windows runner resolves it
+# deterministically instead of falling back to whatever `sh` happens to be.
+set windows-shell := ["bash", "-c"]
+
+# ─── Fast local build (opt-in) ────────────────────────────────────
+#
+# The committed .cargo/config.toml is deliberately portable, so the host-tuned
+# speedups live here, for LOCAL work only:
+#
+#   * sccache           — `RUSTC_WRAPPER` must resolve to a real binary.
+#   * mold              — Linux only; the flag would break other linkers.
+#   * target-cpu=native — a machine-specific CPU baseline. NEVER use that for an
+#                         artifact meant to run elsewhere, and never in CI.
+#
+# Two consequences worth stating out loud:
+#   1. perf numbers — `just bench` and the ignored perf labs — are comparable
+#      only when the build went through this recipe; and
+#   2. arguments are word-split, so quote-and-escape for anything exotic.
+#
+#   just fast cargo check -p leas-core
+fast *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(uname -s)" = "Linux" ]; then
+        flags="-Clink-arg=-fuse-ld=mold -Ctarget-cpu=native"
+    else
+        flags=""
+    fi
+    export RUSTC_WRAPPER=sccache
+    export RUSTFLAGS="${flags} ${RUSTFLAGS:-}"
+    export LEAS_CORE_BIN_DIR="${LEAS_CORE_BIN_DIR:-/tmp/core-bin}"
+    exec {{args}}
+
 # Run the quality gate (verbose report). `target` selects the group:
 # code | deps | all (default). Exit 0 = all passed, 1 = any failed.
 quality-gate target='all':
@@ -125,9 +159,14 @@ _gate mode target:
 # comparable at the same transfer size.
 #
 # LEAS_CORE_BIN_DIR is exported explicitly: `cargo criterion` launches the
-# bench executable itself and does NOT apply `[env]` from .cargo/config.toml,
-# so the throughput rows would silently print "SKIP ... is not set" and the run
-# would still exit 0.
+# bench executable itself, so an unset variable makes the throughput rows print
+# "SKIP ... is not set" while the run still exits 0. (The `[env]` default that
+# used to cover this lived in .cargo/config.toml and is gone with the
+# portability change.)
+#
+# Every criterion call goes through `just fast`, so the measured build carries
+# the same rustflags as any other local measurement — without it the numbers are
+# not comparable across time.
 bench target='all':
     #!/usr/bin/env bash
     set -euo pipefail
@@ -147,16 +186,16 @@ bench target='all':
         echo "install the pinned versions or run 'just bench micro'" >&2
         exit 2
     fi
-    cargo criterion -p leas-tls    --bench record
-    cargo criterion -p leas-route  --bench decide
-    cargo criterion -p leas-native --bench dispatch
+    just fast cargo criterion -p leas-tls    --bench record
+    just fast cargo criterion -p leas-route  --bench decide
+    just fast cargo criterion -p leas-native --bench dispatch
     # Hermetic Shadowsocks codec/KDF rows — no cores, no sockets, so micro-safe.
-    cargo criterion -p leas-native --bench ss_codec
+    just fast cargo criterion -p leas-native --bench ss_codec
     # Per-kind ProtocolId identity traversal — hermetic, micro-safe.
-    cargo criterion -p leas-proto  --bench identity
-    cargo criterion -p leas-native --features native-e2e --bench relay
+    just fast cargo criterion -p leas-proto  --bench identity
+    just fast cargo criterion -p leas-native --features native-e2e --bench relay
     if [ "{{target}}" = all ]; then
-        cargo criterion -p leas-native --features native-e2e --bench throughput
+        just fast cargo criterion -p leas-native --features native-e2e --bench throughput
     fi
 
 # ─── Tier-3b test oracle: pinned SIP003 plugin binaries ────────────

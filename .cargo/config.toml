@@ -1,10 +1,12 @@
+# Portable build configuration.
+#
+# Nothing host-specific belongs here. The speedups this file used to carry —
+# `rustc-wrapper = "sccache"`, a clang + mold link, `-Ctarget-cpu=native`, and a
+# `/tmp` default for `LEAS_CORE_BIN_DIR` — are opt-in through `just fast <cmd>`
+# (see the justfile), because each of them made a clean machine fail outright or
+# produced artifacts that only ran on the machine that built them.
+#
+# `incremental = false` is kept deliberately: gate timings and the perf labs are
+# comparable only against non-incremental builds.
 [build]
-rustc-wrapper = "sccache"
 incremental = false
-
-[target.'cfg(target_os = "linux")']
-linker = "clang"
-rustflags = ["-Clink-arg=-fuse-ld=mold", "-Ctarget-cpu=native"]
-
-[env]
-LEAS_CORE_BIN_DIR = "/tmp/core-bin"
