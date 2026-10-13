@@ -42,6 +42,23 @@ name: ci
 #     The repository shares a 10 GB cache budget with every branch, so
 #     `cache-on-failure` is on (a red test run still leaves a warm cache) and the
 #     `deps` job caches the registry only.
+#
+# Linkers. Not part of the `just fast`-prohibited set — that rule is about
+# `-Ctarget-cpu=native` (a runner-specific CPU baseline) and sccache, i.e. about
+# artifact portability, not about the linker. Two facts decided the shape here,
+# both checked against the pinned toolchain rather than from memory:
+#   * `-Clinker-features=+lld` (the plural is the real spelling) is **unstable**
+#     on rustc 1.99 — it demands `-Z unstable-options`. The stable path is the
+#     default: on `x86_64-unknown-linux-gnu` rustc already passes `-fuse-ld=lld`
+#     to the driver and silently retries without it when the driver rejects the
+#     flag. Ubuntu 22.04's gcc 11 does reject it (the `lld` name landed in gcc
+#     12), which is why this container has been quietly linking with bfd.
+#   * so the driver is made explicit: `-Clinker=clang -Clink-arg=-fuse-ld=mold`.
+#     clang accepts that name, and mold 3.0.0 (the Rust rewrite) was verified to
+#     run inside this very image. `-Clinker=lld` does NOT work — lld has no
+#     driver flag of that shape, which is why clang has to be the driver.
+# The floor assert below is unaffected: `GLIBC_*` symbol versions come from libc,
+# not from the linker.
 
 on:
   push:
@@ -56,12 +73,21 @@ jobs:
     name: code (linux, glibc 2.35 floor)
     runs-on: ubuntu-24.04
     container: ubuntu:22.04
+    env:
+      # clang as the driver (gcc 11 cannot name mold), mold 3.0 as the linker.
+      RUSTFLAGS: "-Clinker=clang -Clink-arg=-fuse-ld=mold"
     steps:
       - name: Prerequisites (C toolchain for ring / zstd-sys / libsqlite3-sys)
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl git pkg-config
+            build-essential ca-certificates curl git pkg-config clang
+      - name: mold 3.0.0 (Rust rewrite) — the fast linker
+        run: |
+          curl -sSL https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-x86_64-linux.tar.gz \
+            | tar xz -C /usr/local --strip-components=1
+          mold --version
+          clang --version | head -1
       - uses: actions/checkout@v7
       - name: Toolchain + task runners (prebuilt, verified)
         uses: taiki-e/install-action@v2
@@ -87,11 +113,19 @@ jobs:
   code-windows:
     name: code (windows-2022, x86_64-pc-windows-msvc)
     runs-on: windows-2022
+    env:
+      # No stable `linker-features` for msvc, so the linker is named outright.
+      # The image ships LLVM (lld-link); rustc infers the `lld-link` flavor.
+      RUSTFLAGS: "-Clinker=lld-link"
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v7
+      - name: lld-link from the image's LLVM
+        run: |
+          echo "/c/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+          "/c/Program Files/LLVM/bin/lld-link.exe" --version
       - name: Cache the rustup toolchain (Windows pays the same download)
         uses: actions/cache@v6
         with:
