@@ -83,6 +83,11 @@ leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
 	[build-dependencies]
 	tonic-prost-build = "0.14.6"
+	# Pure-Rust protobuf front-end. `protoc` stops being a build prerequisite:
+	# protox parses the source in-process and hands `prost-build::compile_fds` a
+	# `FileDescriptorSet`, so the emitted code is unchanged (pinned by a byte
+	# comparison against the protoc-generated baseline).
+	protox = "0.9"
 
 	[lints]
 	workspace = true
@@ -95,6 +100,7 @@ leas-hakari = { version = "0.1", path = "../leas-hakari" }
 	# Deps used only by build.rs / OUT_DIR-generated code (invisible to
 	# cargo-machete) or documented feature overrides:
 	# - prost, tonic-prost, tonic-prost-build: tonic codegen output in OUT_DIR
+	# - protox: build-script-only protobuf front-end, no `use` in the crate
 	# - tokio-rustls: deliberate transitive backend override (ring pin), see the
 	#   comment in [dependencies]
-	ignored = ["prost", "tonic-prost", "tonic-prost-build", "tokio-rustls"]
+	ignored = ["prost", "tonic-prost", "tonic-prost-build", "protox", "tokio-rustls"]
