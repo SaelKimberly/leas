@@ -499,6 +499,10 @@ fn find_binary_in_dir(dir: &Path, exe_name: &str) -> Result<PathBuf, UpdateError
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The module's only `#[rstest]` row is the `#[cfg(unix)]` permission test,
+    // so on Windows the import would be unused — and `-D warnings` turns that
+    // into a build failure on the msvc target.
+    #[cfg(unix)]
     use rstest::rstest;
 
     #[test]

@@ -238,6 +238,6 @@ fn proc_rss_bytes() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn proc_rss_bytes() -> u64 {
+const fn proc_rss_bytes() -> u64 {
     0
 }
