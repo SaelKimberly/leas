@@ -1,6 +1,6 @@
 [graph]
 # Match rust-toolchain.toml targets; excludes UEFI-only r-efi (LGPL-2.1-or-later) from the graph.
-targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 all-features = true
 
 [licenses]
