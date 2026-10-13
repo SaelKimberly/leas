@@ -1,0 +1,40 @@
+name: stable-drift
+
+# `rust-toolchain.toml` floats on `stable`, so a new Rust release can promote a
+# lint and redden the `-D warnings` gate — or break the build — with no commit
+# from anyone. This job is the only guard: it re-runs the code gate on the
+# *newest* stable, container and all, so the floor question and the toolchain
+# question cannot mask each other.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Beats rust-toolchain.toml, whose point is the same moving target.
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  stable-drift:
+    name: code gate against freshly updated stable
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    steps:
+      - name: Prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git pkg-config
+      - uses: actions/checkout@v4
+      - name: rustup + update to the newest stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable --component rustfmt clippy
+          "$HOME/.cargo/bin/rustup" update stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Task runners
+        run: cargo install --locked just cargo-nextest
+      - name: Gate — fmt, clippy, tests
+        run: just quality-gate-ci code

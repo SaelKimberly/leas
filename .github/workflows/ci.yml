@@ -1,0 +1,87 @@
+name: ci
+
+# Two properties this file exists to guarantee, both chosen deliberately:
+#
+#   1. The Linux build runs inside an `ubuntu:22.04` container on a current
+#      runner. glibc is forward-compatible only, so a binary linked against the
+#      runner's 2.39 will not start on the 2.35 machines this project develops
+#      on (`ldd --version` on the reference box: Ubuntu GLIBC 2.35). The floor is
+#      therefore a property of the container, not of a runner label GitHub can
+#      retire — `ubuntu-22.04` as a *label* is already deprecated.
+#   2. No job enables `just fast`. That recipe adds `-Ctarget-cpu=native` (a
+#      runner-specific CPU baseline) and sccache/mold, none of which belong in an
+#      artifact meant to run elsewhere.
+#
+# `deps` runs on the host rather than in the container: `cargo deny`'s graph
+# comes from `deny.toml [graph] targets` and `cargo hakari`'s from
+# `.config/hakari.toml platforms`, so the checks are host-independent and a
+# second environment buys provisioning cost and no signal.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  code-linux:
+    name: code (linux, glibc 2.35 floor)
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    steps:
+      - name: Prerequisites (C toolchain for ring / zstd-sys / libsqlite3-sys)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git pkg-config
+      - uses: actions/checkout@v4
+      - name: rustup (resolves rust-toolchain.toml)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Task runners
+        run: cargo install --locked just cargo-nextest
+      - name: Gate — fmt, clippy, tests
+        run: just quality-gate-ci code
+
+      # The `code` gate never produces `target/release/leas`, so the floor this
+      # container exists to hold would otherwise be an unverified claim. Assert
+      # it against a real optimized binary.
+      - name: Release binary stays runnable on the 2.35 floor
+        run: |
+          cargo build --release -p leas
+          max="$(objdump -T target/release/leas | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          echo "highest required symbol: ${max:-none}"
+          test "$(printf '%s\n' GLIBC_2.35 "$max" | sort -V | tail -1)" = "GLIBC_2.35"
+
+  code-windows:
+    name: code (windows-2022, x86_64-pc-windows-msvc)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: nasm (ring assembles its perlasm with it on Windows)
+        run: |
+          choco install -y nasm
+          echo "/c/Program Files/NASM" >> "$GITHUB_PATH"
+      - name: Task runners
+        run: cargo install --locked just cargo-nextest
+      - name: Gate — fmt, clippy, tests
+        run: just quality-gate-ci code
+
+  deps:
+    name: deps (single-homed on linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate tools
+        run: >-
+          cargo install --locked
+          just cargo-hakari cargo-machete cargo-deny cargo-audit cargo-outdated
+      - name: Gate — hakari, deny, machete, outdated, audit
+        run: just quality-gate-ci deps
