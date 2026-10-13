@@ -22,8 +22,10 @@ name: ci
 #     `cargo-outdated`, which are not in it.
 #   * `actions/cache` for `~/.rustup` — the toolchain download (~250 MB: stable
 #     plus components and the msvc target std) is not what rust-cache caches, and
-#     a fresh container pays for it every run. Keyed on `rust-toolchain.toml`, so
-#     a toolchain change starts a new cache instead of serving a stale one.
+#     every job pays for it: the container rebuilds it each run, Windows re-adds
+#     the target std, and `deps` needs a working `cargo` for `cargo hakari`/`deny`.
+#     Keyed on `rust-toolchain.toml`, so a toolchain change starts a new cache
+#     instead of serving a stale one.
 #   * `Swatinem/rust-cache` for `~/.cargo/registry` + `./target` — keyed by the
 #     rustc version and hashes of `Cargo.lock`/`Cargo.toml`/`rust-toolchain.toml`
 #     /`.cargo/config.toml`. It must run *after* the toolchain exists, sets
@@ -53,7 +55,7 @@ jobs:
             build-essential ca-certificates curl git pkg-config
       - uses: actions/checkout@v7
       - name: Cache the rustup toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.rustup
           key: rustup-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
@@ -86,6 +88,11 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
+      - name: Cache the rustup toolchain (Windows pays the same download)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup
+          key: rustup-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
       - name: nasm (ring assembles its perlasm with it on Windows)
         run: |
           choco install -y nasm
@@ -108,6 +115,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - name: Cache the rustup toolchain (cargo hakari/deny need it)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup
+          key: rustup-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
       - name: Gate tools (prebuilt where listed, cargo-binstall otherwise)
         uses: taiki-e/install-action@v2
         with:
