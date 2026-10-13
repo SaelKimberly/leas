@@ -48,7 +48,7 @@ This file is auto-detected project context: commands, structure, conventions. Th
 - Perf labs and planner/timing probes are not tests: they live behind the crate's `perf-lab` feature as `#[cfg(all(test, feature = "perf-lab"))]` (the `test` term is required — a lab that drives test-only helpers and `tempfile` cannot compile in the lib unit), stay `#[ignore]`d, and print tables. Run one with `cargo nextest run -p <crate> --features perf-lab --run-ignored all <name>`.
 - Every hand-written crate opts into `[lints] workspace = true`. A crate without it is silently outside `pedantic`+`nursery`, generated code included (prost's `PartialEq`-without-`Eq` needs a scoped allow at the `include_proto!`).
 - `cargo nextest run` uses default features and is the suite; `--all-features` is clippy's surface. The `native-e2e` rows are opt-in and need real cores at `$LEAS_CORE_BIN_DIR`.
-- The toolchain floats on `stable`, and there is no CI: a new stable release can promote a lint and redden the gate silently. Run `just quality-gate code` after any toolchain bump.
+- The toolchain floats on `stable`; a new stable release can promote a lint and redden the gate. That is now detected rather than silent: `stable-drift.yml` re-runs the `code` gate weekly against the newest stable, so drift surfaces within a week, and `just quality-gate code` after a toolchain bump stays the local check. CI (`.github/workflows/`, added 2026-10-13): `code-linux` runs the `code` gate plus a release build inside an `ubuntu:22.04` container (the `GLIBC_2.35` floor), `code-windows` runs the `code` gate on `windows-2022`, `deps` runs single-homed on the host.
 
 ## External References
 | Need | File |
@@ -59,6 +59,7 @@ This file is auto-detected project context: commands, structure, conventions. Th
 | Native core + TLS engine (purpose, verification tiers, roadmap) | `docs/reference/native-core.md` |
 | TUI screens, keybindings, workflows | `docs/guides/tui-manual.md` |
 | Releasing to crates.io | `docs/guides/publishing.md` |
+| Building, prerequisites, the `just fast` opt-in, CI jobs | `docs/guides/building.md` |
 | Ordering law | `docs/reference/ordering-law.md` |
 | DB schema, indexes, invariants | `docs/reference/database.md` |
 | Raw-SQL sites and rules | `docs/reference/database-manual-sql.md` |
