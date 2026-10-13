@@ -5,6 +5,11 @@ name: stable-drift
 # from anyone. This job is the only guard: it re-runs the code gate on the
 # *newest* stable, container and all, so the floor question and the toolchain
 # question cannot mask each other.
+#
+# It deliberately carries no `~/.rustup` cache: a cached toolchain is the one
+# thing that would defeat the point of the job. The cargo registry and target
+# caches are still worth having, and they are keyed on the rustc version, so a
+# new stable starts its own.
 
 on:
   schedule:
@@ -27,14 +32,16 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential ca-certificates curl git pkg-config
-      - uses: actions/checkout@v4
-      - name: rustup + update to the newest stable
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable --component rustfmt clippy
-          "$HOME/.cargo/bin/rustup" update stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Task runners
-        run: cargo install --locked just cargo-nextest
+      - uses: actions/checkout@v7
+      - name: Newest stable + task runners
+        uses: taiki-e/install-action@v2
+        with:
+          tool: rust+rustfmt+clippy,just,cargo-nextest
+      - name: Update to the newest stable
+        run: rustup update stable
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
       - name: Gate — fmt, clippy, tests
         run: just quality-gate-ci code

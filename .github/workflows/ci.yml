@@ -12,10 +12,25 @@ name: ci
 #      runner-specific CPU baseline) and sccache/mold, none of which belong in an
 #      artifact meant to run elsewhere.
 #
-# `deps` runs on the host rather than in the container: `cargo deny`'s graph
-# comes from `deny.toml [graph] targets` and `cargo hakari`'s from
-# `.config/hakari.toml platforms`, so the checks are host-independent and a
-# second environment buys provisioning cost and no signal.
+# Caching, in three layers, because the three costs have different lifetimes:
+#
+#   * `taiki-e/install-action` — prebuilt, checksum- and attestation-verified
+#     binaries for `just` / `cargo-nextest` / the `deps` tools. This replaces
+#     `cargo install`, which used to compile every tool on every run. Note it
+#     covers `cargo-deny`, `cargo-machete` and `cargo-audit` from its manifest
+#     list but falls back to cargo-binstall for `cargo-hakari` and
+#     `cargo-outdated`, which are not in it.
+#   * `actions/cache` for `~/.rustup` — the toolchain download (~250 MB: stable
+#     plus components and the msvc target std) is not what rust-cache caches, and
+#     a fresh container pays for it every run. Keyed on `rust-toolchain.toml`, so
+#     a toolchain change starts a new cache instead of serving a stale one.
+#   * `Swatinem/rust-cache` for `~/.cargo/registry` + `./target` — keyed by the
+#     rustc version and hashes of `Cargo.lock`/`Cargo.toml`/`rust-toolchain.toml`
+#     /`.cargo/config.toml`. It must run *after* the toolchain exists, sets
+#     `CARGO_INCREMENTAL=0`, and never caches the workspace crates themselves.
+#     The repository shares a 10 GB cache budget with every branch, so
+#     `cache-on-failure` is on (a red test run still leaves a warm cache) and the
+#     `deps` job caches the registry only.
 
 on:
   push:
@@ -36,14 +51,20 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential ca-certificates curl git pkg-config
-      - uses: actions/checkout@v4
-      - name: rustup (resolves rust-toolchain.toml)
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain none
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Task runners
-        run: cargo install --locked just cargo-nextest
+      - uses: actions/checkout@v7
+      - name: Cache the rustup toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.rustup
+          key: rustup-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
+      - name: Toolchain + task runners (prebuilt, verified)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: rust+rustfmt+clippy,just,cargo-nextest
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
       - name: Gate — fmt, clippy, tests
         run: just quality-gate-ci code
 
@@ -64,13 +85,21 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: nasm (ring assembles its perlasm with it on Windows)
         run: |
           choco install -y nasm
           echo "/c/Program Files/NASM" >> "$GITHUB_PATH"
-      - name: Task runners
-        run: cargo install --locked just cargo-nextest
+      - name: Task runners (prebuilt, verified)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+      - name: Toolchain components (the runner ships rustup already)
+        run: rustup component add rustfmt clippy
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
       - name: Gate — fmt, clippy, tests
         run: just quality-gate-ci code
 
@@ -78,10 +107,20 @@ jobs:
     name: deps (single-homed on linux)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Gate tools
-        run: >-
-          cargo install --locked
-          just cargo-hakari cargo-machete cargo-deny cargo-audit cargo-outdated
+      - uses: actions/checkout@v7
+      - name: Gate tools (prebuilt where listed, cargo-binstall otherwise)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: |
+            just
+            cargo-deny
+            cargo-machete
+            cargo-audit
+            cargo-hakari
+            cargo-outdated
+      - name: "Cache the cargo registry only (nothing is built in this job)"
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
       - name: Gate — hakari, deny, machete, outdated, audit
         run: just quality-gate-ci deps
