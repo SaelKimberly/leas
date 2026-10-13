@@ -537,6 +537,17 @@ async fn post_packet<S: V3Send>(
     Ok(())
 }
 
+/// Client-side POST stamps, for the pacing assertion in `tests`.
+///
+/// Pacing is between POST *starts* (`last = Instant::now()` in the loop), a
+/// quantity the server double cannot observe: an arrival delta conflates send
+/// duration with scheduling — 12 ms measured against a 30 ms interval on a
+/// 2-core CI container — and the idle-window flush spaces two POSTs even when
+/// the sleep is gone. This test-only static is the seam that measures pacing
+/// where it is actually decided.
+#[cfg(test)]
+static POST_STARTS: std::sync::Mutex<Vec<Instant>> = std::sync::Mutex::new(Vec::new());
+
 /// Shared packet-up pacing/batching core. Drains `rx`, accumulates app
 /// bytes, and POSTs chunks (≤ [`MAX_POST_BYTES`], ≥ [`POST_INTERVAL`] apart,
 /// one in flight, via [`post_packet`]) in seq order. The h1/h2/h3 upload
@@ -594,6 +605,8 @@ async fn upload_loop_core<S: V3Send>(
                 }
             }
             last = Instant::now();
+            #[cfg(test)]
+            POST_STARTS.lock().expect("post-starts lock").push(last);
             let take = chunk.len().min(MAX_POST_BYTES);
             let payload = chunk.split_to(take).freeze();
             url_path.clear();
@@ -2141,11 +2154,15 @@ mod tests {
 
     /// Assert the chunked-upload observations: two packet POSTs, seqs 0 + 1
     /// in arrival order, each ≤ the 1 MB cap, concatenated == the payload,
-    /// paced ≥ 25 ms apart, both carrying the Referer.
+    /// both carrying the Referer. The *pacing* is asserted on the client's own
+    /// POST stamps in the test body: no arrival-based bound can carry it, since
+    /// the client paces POST *starts* (`xhttp.rs:589-594`) while the first send
+    /// may itself outlast the window, and the idle-window flush can mask a
+    /// missing sleep altogether.
     fn assert_chunked_uploads(o: &H3Obs, payload: &[u8]) {
         assert_eq!(o.posts.len(), 2, "{o:#?}");
-        let (s0, b0, r0, t0) = &o.posts[0];
-        let (s1, b1, r1, t1) = &o.posts[1];
+        let (s0, b0, r0, _) = &o.posts[0];
+        let (s1, b1, r1, _) = &o.posts[1];
         assert_eq!(*s0, 0, "seq order");
         assert_eq!(*s1, 1, "seq order");
         assert_eq!(b0.len(), MAX_POST_BYTES, "first chunk = the size cap");
@@ -2156,10 +2173,6 @@ mod tests {
         assert_eq!(joined, payload, "no byte loss across the split");
         assert_referer(r0);
         assert_referer(r1);
-        assert!(
-            t1.duration_since(*t0) >= POST_INTERVAL.saturating_sub(Duration::from_millis(5)),
-            "posts must be paced ≥ 25 ms apart: {t0:?} -> {t1:?}"
-        );
     }
 
     /// Assert the stream-up observations: session-open GET with Referer, one
@@ -2205,9 +2218,9 @@ mod tests {
     /// Packet-up chunking + seq order + pacing: a > 1 MB tunnel write is
     /// split at `scMaxEachPostBytes` into consecutive seqs, each POST ≤
     /// 1 MB, paced ≥ `scMinPostsIntervalMs` apart (the first rides the idle
-    /// window), in arrival order, each carrying the Referer. The split and
-    /// the 30 ms sleep are client-side guarantees, so the assertions are
-    /// lower bounds — deterministic, no flake.
+    /// window), in arrival order, each carrying the Referer. The split is a
+    /// client-side guarantee; pacing is asserted on the client's POST stamps
+    /// (`POST_STARTS`) rather than on arrival times, which cannot carry it.
     #[tokio::test]
     async fn h3_packet_up_seq_order_and_chunking() {
         let (addr, obs, server_task) = spawn_h3_fake(false);
@@ -2217,6 +2230,7 @@ mod tests {
         // 1.2 MB in one write: the upload loop splits it into a 1 MB +
         // 200 KB pair (the server 413s anything over the size cap).
         let payload = vec![0xABu8; MAX_POST_BYTES + 200_000];
+        POST_STARTS.lock().expect("post-starts lock").clear();
         t.write_all(&payload).await.expect("upload write");
         let mut out = [0u8; H3_DOWNLOAD.len()];
         t.read_exact(&mut out).await.expect("download read");
@@ -2227,6 +2241,22 @@ mod tests {
         // tunnel dropped), then the h3 connection closes.
         wait_obs(&obs, |o| o.posts.len() == 2 && o.conn_closed).await;
         assert_chunked_uploads(&obs.data.lock().expect("obs lock"), &payload);
+
+        // The pacing is the client's own guarantee, so it is asserted on the
+        // client's POST stamps: the sleep makes consecutive starts ≥
+        // `POST_INTERVAL` apart by construction, which scheduling can only widen
+        // (never close), while removing the sleep collapses the gap to ~0.
+        let starts = POST_STARTS.lock().expect("post-starts lock").clone();
+        assert!(
+            starts.len() >= 2,
+            "expected ≥ 2 client POST stamps, got {}",
+            starts.len()
+        );
+        let gap = starts[1].duration_since(starts[0]);
+        assert!(
+            gap >= POST_INTERVAL.saturating_sub(Duration::from_millis(5)),
+            "client-paced POST starts must be ≥ 25 ms apart, got {gap:?}"
+        );
         server_task.await.expect("server task");
     }
 
