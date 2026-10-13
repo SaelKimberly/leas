@@ -20,14 +20,21 @@ name: ci
 #     covers `cargo-deny`, `cargo-machete` and `cargo-audit` from its manifest
 #     list but falls back to cargo-binstall for `cargo-hakari` and
 #     `cargo-outdated`, which are not in it.
-#   * `actions/cache` for `~/.rustup`, where rust-cache does not reach. Two jobs
-#     use it, with *disjoint* keys: the `ubuntu:22.04` container — a toolchain
-#     built on ubuntu-24.04 links glibc 2.39 and cannot run on 2.35, and a cache
-#     key is immutable once written, so sharing one would let whichever job saves
-#     first decide the content for every later run — and `windows-2022`. The
-#     `deps` job deliberately has none: measured, the restore cost more than the
-#     install it replaced (0:36 without, 1:16 with). Both keys incorporate
-#     `hashFiles('rust-toolchain.toml')`, so a toolchain change starts fresh.
+#   * `actions/cache` for `~/.rustup`, where rust-cache does not reach — used by
+#     the Windows job only. Two measured decisions are behind that:
+#       - the `ubuntu:22.04` container does **not** cache its toolchain: runs
+#         #5–#7 came in at 7:06 (cold), 7:11 (cold, saved at end) and 7:16
+#         (restored), i.e. restoring ~250 MB costs what installing it does. It
+#         also removes the one way a host job (glibc 2.39) could ever seed a
+#         toolchain cache that the 2.35 container restores — a cache key is
+#         immutable once written, so the first saver decides the content for
+#         every later run, and a host-built `rustc` inside the container is the
+#         very `GLIBC_2.38 not found` failure the container exists to prevent.
+#       - the `deps` job has none either: 0:36 without it against 1:16 with.
+#     The Windows entry stays because Windows re-installs the msvc target std
+#     every run. Note that `actions/cache` saves in a post step that is skipped
+#     when the job fails — so while the Windows tests are red this cache never
+#     populates, and it starts paying the moment that job goes green.
 #   * `Swatinem/rust-cache` for `~/.cargo/registry` + `./target` — keyed by the
 #     rustc version and hashes of `Cargo.lock`/`Cargo.toml`/`rust-toolchain.toml`
 #     /`.cargo/config.toml`. It must run *after* the toolchain exists, sets
@@ -56,15 +63,6 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential ca-certificates curl git pkg-config
       - uses: actions/checkout@v7
-      - name: Cache the rustup toolchain
-        uses: actions/cache@v6
-        with:
-          path: ~/.rustup
-          # Deliberately NOT shared with any host job: a toolchain built on
-          # ubuntu-24.04 links against glibc 2.39 and cannot run inside this
-          # 2.35 container — and a cache key is immutable once written, so the
-          # first job to save it decides the content for every later run.
-          key: rustup-ubuntu2204-container-${{ hashFiles('rust-toolchain.toml') }}
       - name: Toolchain + task runners (prebuilt, verified)
         uses: taiki-e/install-action@v2
         with:
