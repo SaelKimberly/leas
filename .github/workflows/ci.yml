@@ -43,27 +43,30 @@ name: ci
 #     `cache-on-failure` is on (a red test run still leaves a warm cache) and the
 #     `deps` job caches the registry only.
 #
-# Linkers. Not part of the `just fast`-prohibited set — that rule is about
-# `-Ctarget-cpu=native` (a runner-specific CPU baseline) and sccache, i.e. about
-# artifact portability, not about the linker. Measured rather than assumed:
-#   * `-Clinker-features=+lld` (the plural is the real spelling) is **unstable**
-#     on rustc 1.99 — it demands `-Z unstable-options`. No flag is needed anyway:
-#     on `x86_64-unknown-linux-gnu` rustc already passes `-fuse-ld=lld` to the
-#     driver and silently retries without it when that fails.
-#   * the container's own gcc (`11.4.0-1ubuntu1~22.04.3`) accepts
-#     `-fuse-ld=bfd|gold|lld|mold` — verified by linking a probe and reading the
-#     `.comment` section back (`mold` and `LLD` land there respectively). So the
-#     only thing missing was `ld.lld` on PATH, which `apt-get install lld`
-#     supplies; no RUSTFLAGS are involved, which also means the cargo cache key
-#     and every fingerprint stay untouched and a run stays comparable to the
-#     pre-linker baseline.
-#   * therefore: nothing to configure on Linux beyond installing `lld`. `clang`
-#     as a driver and a downloaded mold would both work (mold 3.0.0's release
-#     binary was verified to run inside this image), but each would need a
-#     RUSTFLAGS change, i.e. one cold rebuild plus a new cache namespace, for a
-#     gain that has not been shown yet.
-# The floor assert below is unaffected: `GLIBC_*` symbol versions come from libc,
-# not from the linker.
+# Linkers: tried, measured, reverted — do not repeat this without new evidence.
+# On `x86_64-unknown-linux-gnu` rustc already passes `-fuse-ld=lld` to the driver
+# and retries without it when that fails (the stable `-Clinker-features` value is
+# the `-lld` opt-out; `+lld` is unstable on 1.99), and the container's own gcc
+# 11.4 accepts `-fuse-ld=lld|mold` by name. So both were wired in and measured:
+# lld via one apt line with the flags left untouched, and mold 3.0.0 from its
+# release tarball (verified to *run* inside this image) behind a RUSTFLAGS
+# change. Warm runs, same cache namespace, per step:
+#
+#   step                          bfd (#8)   lld (#10)
+#   prerequisites                    16 s        19 s
+#   toolchain + task runners         15 s        18 s
+#   cache restore                    52 s        74 s   <- nothing to do with linking
+#   gate (fmt+clippy+nextest)       222 s       236 s
+#   release build + floor assert     91 s       118 s
+#   total                           413 s       477 s
+#
+# Both link-heavy steps got *slower*, the largest single delta is a step the
+# linker cannot affect, and the warm baseline spans 6:53-7:16 unaided — so the
+# effect sits at or below the noise floor. The same numbers say why: this job's
+# time goes to compiling, linting and testing (~236 s), not to linking. Windows
+# agreed (8:41 warm with lld-link against 7:00 warm without, on a changed cache
+# key). A real verdict would need several runs per configuration, i.e. CI time
+# spent measuring a step that is not the bottleneck.
 
 on:
   push:
@@ -83,22 +86,12 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl git pkg-config lld
+            build-essential ca-certificates curl git pkg-config
       - uses: actions/checkout@v7
       - name: Toolchain + task runners (prebuilt, verified)
         uses: taiki-e/install-action@v2
         with:
           tool: rust+rustfmt+clippy,just,cargo-nextest
-      # Deliberately after the toolchain: this asserts that the *default* path
-      # rustc takes on this target really lands on lld, rather than trusting the
-      # flag names. `readelf` comes with binutils (a build-essential dependency).
-      - name: Confirm the linker rustc will actually use
-        run: |
-          ld.lld --version | head -1
-          printf 'fn main() {}\n' > /tmp/probe.rs
-          rustc --crate-type bin -o /tmp/probe /tmp/probe.rs
-          readelf -p .comment /tmp/probe | grep -o 'LLD' || {
-            echo "rustc did not link with lld inside this container" >&2; exit 1; }
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
@@ -119,19 +112,11 @@ jobs:
   code-windows:
     name: code (windows-2022, x86_64-pc-windows-msvc)
     runs-on: windows-2022
-    env:
-      # No stable `linker-features` for msvc, so the linker is named outright.
-      # The image ships LLVM (lld-link); rustc infers the `lld-link` flavor.
-      RUSTFLAGS: "-Clinker=lld-link"
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v7
-      - name: lld-link from the image's LLVM
-        run: |
-          echo "/c/Program Files/LLVM/bin" >> "$GITHUB_PATH"
-          "/c/Program Files/LLVM/bin/lld-link.exe" --version
       - name: Cache the rustup toolchain (Windows pays the same download)
         uses: actions/cache@v6
         with:
