@@ -228,6 +228,8 @@ Both fixed and locally verified: `cargo clippy -p leas-core -p leas --all-target
 4. `inbound::http::tests::oversized_head_is_refused` — the client read an **empty** response. `write_refusal` wrote, flushed, and returned while the caller then dropped a socket whose receive queue still held the oversized head the peer was still sending; closing with unread data makes the stack send an RST that discards the response in flight. Owner fix: sequence the close — write, flush, `shutdown` the write side, then discard what the peer keeps sending (`REFUSAL_DRAIN_BUDGET` 500 ms / `REFUSAL_DRAIN_BYTES` 64 KiB). The test now also asserts a **clean EOF** after the refusal, which is the RST-free close stated as a contract.
 *Verification:* `cargo nextest run -p leas-core -p leas-native -p leas-db`, then `just quality-gate code`, then the msvc `nextest` job (the only place the Windows half of 1/2/4 can be observed). T11/T12 stay held until that job is green.
 
+*Measured (2026-10-14):* locally `cargo nextest run -p leas-core -p leas-native -p leas-db` **1020/1020** and `just quality-gate-ci code` **2386/2386** (the count rose from 2368 with the new table rows). CI run `38527679422` (sha `26da5f7`): `code-linux` **6:32 green**, `code-windows` **9:32 green** — the first green Windows job of the effort — and `deps` **0:34**. The refusal fix was proven discriminating before it was kept: with the close sequencing disabled the new assertion fails with `ConnectionReset` (errno 104) where EOF is required, which is the Windows failure mechanism reproduced on Linux.
+
 ## Verification Summary
 
 | Task | Command-shaped exit |

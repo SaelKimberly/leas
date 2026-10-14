@@ -6,10 +6,12 @@
 //! VLESS encryption (`mlkem768x25519plus`).
 //!
 //! The former liboqs backend (`oqs` -> `oqs-sys` -> `CMake` + `bindgen`/`libclang` +
-//! C/C++ toolchain) was removed on 2026-09-18: `x86_64-pc-windows-gnu` is a
-//! first-class target of this workspace (`rust-toolchain.toml`, `deny.toml`)
-//! and cannot assume that toolchain. The FIPS 203 byte encodings are identical
-//! across the swap — the migration KAT at the bottom of this file pins the
+//! C/C++ toolchain) was removed on 2026-09-18: the declared Windows target
+//! cannot assume that toolchain (`x86_64-pc-windows-gnu` when this decision was
+//! taken, `x86_64-pc-windows-msvc` since ADR 0013 — neither ships `CMake`, and
+//! the `bindgen` pair is not on the path of a stock msvc install). The FIPS 203
+//! byte encodings are identical across the swap — the migration KAT at the
+//! bottom of this file pins the
 //! seed -> encapsulation-key bytes against both the retired liboqs
 //! implementation and Go 1.27.1's stdlib `crypto/mlkem`.
 //!

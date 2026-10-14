@@ -72,8 +72,10 @@ the dial.
   exception: `ml-kem` (RustCrypto, pure Rust) for ML-KEM-768 —
   ring has no post-quantum KEM (SP7). It replaced `oqs`/liboqs on 2026-09-18:
   liboqs' vendored build needed CMake, libclang and a C/C++ toolchain, which
-  the `x86_64-pc-windows-gnu` target cannot assume, and the FIPS 203 bytes are
-  unchanged (pinned by the seed→ek KAT in `crypto/mlkem.rs`). `zeroize` is NOT
+  the declared Windows target cannot assume (`x86_64-pc-windows-gnu` when that
+  decision was taken, `x86_64-pc-windows-msvc` since ADR 0013 — neither ships
+  CMake), and the FIPS 203 bytes are unchanged (pinned by the seed→ek KAT in
+  `crypto/mlkem.rs`). `zeroize` is NOT
   a third exception:
   it supplies no algorithm and competes with nothing in ring — it is a
   memory-hygiene dep, and both its own feature and the `zeroize` features
@@ -107,7 +109,7 @@ the dial.
   self-consistent round-trip), and a retirement trigger. ML-KEM is RustCrypto
   `ml-kem`; the liboqs backend was removed 2026-09-18 because its vendored build
   added CMake, libclang and a C/C++ toolchain requirement on top of what the
-  `x86_64-pc-windows-gnu` target already needs (`cc` for zstd-sys / lmdb /
+  `x86_64-pc-windows-msvc` target already needs (`cc` for zstd-sys / lmdb /
   sqlite, plus turso's unused `bindgen` build-dep); FIPS 203 bytes are
   unchanged — pinned by the KAT in `crypto/mlkem.rs`.
 

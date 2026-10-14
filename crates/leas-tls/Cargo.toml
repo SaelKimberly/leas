@@ -48,7 +48,8 @@ serde.workspace = true
 thiserror.workspace = true
 # ML-KEM-768 (FIPS 203) — RustCrypto, pure Rust. Replaces liboqs/`oqs`, whose
 # vendored build required CMake, bindgen/libclang and a C/C++ toolchain — the
-# `x86_64-pc-windows-gnu` target this workspace builds for cannot assume them.
+# declared Windows target (`x86_64-pc-windows-msvc`, ADR 0013) cannot assume
+# them.
 # `zeroize` wipes the decapsulation key on drop; `default-features = false`
 # keeps ciphertexts and shared secrets inline (no heap), which the
 # allocation-free `encapsulate_into` path depends on.

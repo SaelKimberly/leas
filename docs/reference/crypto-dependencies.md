@@ -87,8 +87,8 @@ entry; they are deliberately **not** in `ignore` so they keep showing up):
   RustCrypto route means a custom rustls `CryptoProvider` plus X.509 signature
   verification (RSA/ECDSA/EdDSA, which `rustls-webpki` provides only through
   ring/aws-lc-rs). That is a TLS-provider migration, i.e. a separate epic.
-- **`aws-lc-rs` as the workspace provider.** C/asm build, worse for
-  `x86_64-pc-windows-gnu`, no security win at this threat model.
+- **`aws-lc-rs` as the workspace provider.** C/asm build, worse for the declared
+  Windows target (`x86_64-pc-windows-msvc`), no security win at this threat model.
 - **Keeping liboqs for ML-KEM.** Its build needed CMake, libclang (bindgen) and
   a C/C++ toolchain; RustCrypto `ml-kem` 0.3.2 is pure Rust with
   `unsafe_code = "deny"`, and the FIPS 203 bytes are unchanged
