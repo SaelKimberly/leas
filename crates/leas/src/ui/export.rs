@@ -6,12 +6,12 @@ use crossterm::event::{KeyCode, KeyEvent};
 use leas_db::export::ExportScope;
 use ratatui::Frame;
 use ratatui::layout::Alignment;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tui_popup::{KnownSizeWrapper, Popup};
 
 use crate::ops::export::{self, ExportDestination};
+use crate::ui::theme::ThemeStyles;
 use crate::{AppMode, AppState, CoreEvent};
 
 const SCOPES: [ExportScope; 4] = [
@@ -174,6 +174,7 @@ fn dispatch(
 }
 
 pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let theme = state.theme();
     let lines = match &state.mode {
         AppMode::ExportScope { selected } => SCOPES
             .iter()
@@ -183,6 +184,7 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) 
                 menu_line(
                     format!("{prefix}{}", scope_label(*scope)),
                     index == *selected,
+                    theme,
                 )
             })
             .collect(),
@@ -191,7 +193,7 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) 
             .enumerate()
             .map(|(index, label)| {
                 let prefix = if index == *selected { "► " } else { "  " };
-                menu_line(format!("{prefix}{label}"), index == *selected)
+                menu_line(format!("{prefix}{label}"), index == *selected, theme)
             })
             .collect(),
         AppMode::ExportPath {
@@ -204,17 +206,17 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) 
             if *overwrite {
                 lines.push(Line::from(Span::styled(
                     " File exists. Overwrite? (y/N)",
-                    Style::default().fg(Color::Red),
+                    ThemeStyles::error(theme),
                 )));
             } else if let Some(error) = error {
                 lines.push(Line::from(Span::styled(
                     format!(" Error: {error}"),
-                    Style::default().fg(Color::Red),
+                    ThemeStyles::error(theme),
                 )));
             } else {
                 lines.push(Line::from(Span::styled(
                     " Enter write  Esc cancel",
-                    Style::default().fg(Color::DarkGray),
+                    ThemeStyles::hint(theme),
                 )));
             }
             lines
@@ -237,20 +239,17 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) 
     ))
     .title(title)
     .border_set(ratatui::symbols::border::ROUNDED)
-    .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+    .style(ThemeStyles::dialog(theme));
     frame.render_widget(popup, area);
 }
 
-fn menu_line(text: String, selected: bool) -> Line<'static> {
+fn menu_line(text: String, selected: bool, theme: &opaline::Theme) -> Line<'static> {
     Line::from(Span::styled(
         text,
         if selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Gray)
-                .add_modifier(Modifier::BOLD)
+            ThemeStyles::table_row_selected(theme)
         } else {
-            Style::default().fg(Color::White)
+            ThemeStyles::footer_value(theme)
         },
     ))
 }

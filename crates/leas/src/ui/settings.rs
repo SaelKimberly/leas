@@ -8,7 +8,6 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui_cheese::field::ValidationKind;
 use ratatui_cheese::input::{Input, InputState};
 use ratatui_cheese::list::{List, ListItem, ListItemContext, ListState};
-use ratatui_cheese::theme::Palette;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -146,12 +145,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         mode: SettingsMode::Split { tree, focus, right },
     } = &state.mode
     {
-        let palette = state.current_palette();
+        let theme = state.theme();
         let left_pct = if area.width < 80 { 0.35 } else { 0.30 };
         let left_w = (f64::from(area.width) * left_pct) as u16;
         let (left_area, right_area) = split_rect(area, left_w);
-        render_tree(frame, left_area, &palette, tree, *focus);
-        render_right_pane(frame, right_area, state, &palette, right, *focus);
+        render_tree(frame, left_area, theme, tree, *focus);
+        render_right_pane(frame, right_area, state, theme, right, *focus);
     }
 }
 pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
@@ -177,26 +176,34 @@ fn split_rect(area: Rect, left_w: u16) -> (Rect, Rect) {
 fn render_tree(
     frame: &mut Frame,
     area: Rect,
-    palette: &Palette,
+    theme: &opaline::Theme,
     tree_state: &RefCell<TreeState>,
     focus: SplitFocus,
 ) {
     let block = Block::default()
         .title(" Settings ")
         .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(palette));
+        .border_style(ThemeStyles::container_border(theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut styles = TreeStyles::from_palette(palette);
-    styles.selected = Style::default()
-        .fg(palette.surface)
-        .bg(palette.primary)
-        .add_modifier(Modifier::BOLD);
+    let mut styles = TreeStyles {
+        parent: ThemeStyles::table_row_normal(theme),
+        child: ThemeStyles::hint(theme),
+        selected: Style::default()
+            .fg(theme.color("bg.selection").into())
+            .bg(theme.color("accent.primary").into())
+            .add_modifier(Modifier::BOLD),
+        chevron: ThemeStyles::hint(theme),
+        chevron_active: ThemeStyles::spinner(theme),
+        chevron_dim: ThemeStyles::hint(theme),
+        count: ThemeStyles::footer_label(theme),
+        icon: Style::default(),
+    };
 
     // Dim selection when focus is on right pane
     if focus == SplitFocus::Right {
-        styles.selected = Style::default().fg(palette.muted);
+        styles.selected = ThemeStyles::hint(theme);
     }
 
     let groups = build_tree_groups();
@@ -214,7 +221,7 @@ fn render_right_pane(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
-    palette: &Palette,
+    theme: &opaline::Theme,
     right: &SplitRightPane,
     _focus: SplitFocus,
 ) {
@@ -230,7 +237,7 @@ fn render_right_pane(
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(palette));
+        .border_style(ThemeStyles::container_border(theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -245,7 +252,7 @@ fn render_right_pane(
             render_form_with_area(
                 frame,
                 inner,
-                palette,
+                theme,
                 *section,
                 fields.as_slice(),
                 *focus_index,
@@ -253,7 +260,7 @@ fn render_right_pane(
             );
         }
         SplitRightPane::RoutingList { selected } => {
-            render_routing_list_inner(frame, inner, state, palette, *selected);
+            render_routing_list_inner(frame, inner, state, theme, *selected);
         }
         SplitRightPane::RoutingForm {
             fields,
@@ -264,7 +271,7 @@ fn render_right_pane(
             render_routing_form_inner(
                 frame,
                 inner,
-                palette,
+                theme,
                 fields.as_slice(),
                 *focus_index,
                 form_errors,
@@ -274,13 +281,13 @@ fn render_right_pane(
             status_xray,
             status_singbox,
         } => {
-            render_update_form_inner(frame, inner, palette, status_xray, status_singbox);
+            render_update_form_inner(frame, inner, theme, status_xray, status_singbox);
         }
         SplitRightPane::GroupList {
             selected,
             selected_mask,
         } => {
-            render_group_list_inner(frame, inner, state, palette, *selected, selected_mask);
+            render_group_list_inner(frame, inner, state, theme, *selected, selected_mask);
         }
         SplitRightPane::GroupForm {
             fields,
@@ -291,7 +298,7 @@ fn render_right_pane(
             render_form_with_area(
                 frame,
                 inner,
-                palette,
+                theme,
                 SettingsSection::Subscriptions,
                 fields.as_slice(),
                 *focus_index,
@@ -627,7 +634,7 @@ const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
 fn render_form_with_area(
     frame: &mut Frame,
     area: Rect,
-    palette: &Palette,
+    theme: &opaline::Theme,
     section: SettingsSection,
     fields: &[(String, String)],
     focus_index: usize,
@@ -652,11 +659,11 @@ fn render_form_with_area(
         // Label style
         let label_style = if is_focused {
             Style::default()
-                .fg(palette.primary)
-                .bg(palette.surface)
+                .fg(theme.color("accent.primary").into())
+                .bg(theme.color("bg.selection").into())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(palette.foreground)
+            Style::default().fg(theme.color("text.primary").into())
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(*label, label_style))),
@@ -1382,21 +1389,21 @@ async fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
 fn render_update_form_inner(
     frame: &mut Frame,
     area: Rect,
-    palette: &Palette,
+    theme: &opaline::Theme,
     status_xray: &BackendUpdateStatus,
     status_singbox: &BackendUpdateStatus,
 ) {
     let label_style = Style::default()
-        .fg(palette.foreground)
+        .fg(theme.color("text.primary").into())
         .add_modifier(Modifier::BOLD);
     let header_style = Style::default()
-        .fg(palette.primary)
+        .fg(theme.color("accent.primary").into())
         .add_modifier(Modifier::BOLD);
     let avail_style = Style::default()
-        .fg(palette.success)
+        .fg(theme.color("success").into())
         .add_modifier(Modifier::BOLD);
-    let error_style = Style::default().fg(palette.error);
-    let hint_style = Style::default().fg(palette.muted);
+    let error_style = Style::default().fg(theme.color("error").into());
+    let hint_style = Style::default().fg(theme.color("text.muted").into());
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -1533,7 +1540,7 @@ fn render_routing_list_inner(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
-    palette: &Palette,
+    theme: &opaline::Theme,
     selected: usize,
 ) {
     let rules = &state.routing_rules;
@@ -1564,7 +1571,7 @@ fn render_routing_list_inner(
 
     // Render list widget
     let list = List::new(&items)
-        .palette(palette.clone())
+        .palette(crate::ui::theme::widget_palette(theme))
         .show_paginator(false);
     let mut list_state = ListState::new(items.len());
     list_state.select(selected, items.len());
@@ -1574,7 +1581,7 @@ fn render_routing_list_inner(
     let footer_y = area.bottom().saturating_sub(1);
     let footer = Paragraph::new(Line::from(Span::styled(
         " [a] Add  [e] Edit  [d] Delete  [Ctrl+↑/↓] Reorder  [Esc] Back ",
-        Style::default().fg(palette.muted),
+        Style::default().fg(theme.color("text.muted").into()),
     )));
     frame.render_widget(footer, Rect::new(area.x, footer_y, area.width, 1));
 }
@@ -1584,7 +1591,7 @@ fn render_routing_list_inner(
 fn render_routing_form_inner(
     frame: &mut Frame,
     area: Rect,
-    palette: &Palette,
+    theme: &opaline::Theme,
     fields: &[(String, String)],
     focus_index: usize,
     form_errors: &HashMap<String, String>,
@@ -1608,7 +1615,7 @@ fn render_routing_form_inner(
             val.to_string()
         };
 
-        let input = Input::new(label).palette(palette);
+        let input = Input::new(label).palette(&crate::ui::theme::widget_palette(theme));
         let mut input_state = InputState::new();
         input_state.set_value(display_val);
         input_state.set_focused(is_focused);
@@ -1629,7 +1636,7 @@ fn render_routing_form_inner(
     if y < max_y {
         let help = " [Tab] Next  [Shift+Tab] Prev  [Enter] Save  [Esc] Cancel ";
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(help, ThemeStyles::hint(palette)))),
+            Paragraph::new(Line::from(Span::styled(help, ThemeStyles::hint(theme)))),
             Rect::new(area.x, y, area.width, 1),
         );
     }
@@ -1671,7 +1678,7 @@ fn render_group_list_inner(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
-    palette: &Palette,
+    theme: &opaline::Theme,
     selected: usize,
     selected_mask: &[bool],
 ) {
@@ -1718,7 +1725,7 @@ fn render_group_list_inner(
 
     // Render list widget
     let list = List::new(&items)
-        .palette(palette.clone())
+        .palette(crate::ui::theme::widget_palette(theme))
         .show_paginator(false);
     let mut list_state = ListState::new(items.len());
     list_state.select(selected, items.len());
@@ -1728,7 +1735,7 @@ fn render_group_list_inner(
     let footer_y = area.bottom().saturating_sub(1);
     let footer = Paragraph::new(Line::from(Span::styled(
         " [Space] Toggle select  [a] Add  [e] Edit  [d] Delete selected  [u] Update  [Esc] Back ",
-        Style::default().fg(palette.muted),
+        Style::default().fg(theme.color("text.muted").into()),
     )));
     frame.render_widget(footer, Rect::new(area.x, footer_y, area.width, 1));
 }

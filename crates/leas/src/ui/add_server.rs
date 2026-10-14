@@ -15,7 +15,6 @@ use ratatui_cheese::field::ValidationKind;
 use ratatui_cheese::fieldset::{Fieldset, FieldsetFill};
 use ratatui_cheese::input::{Input, InputState};
 use ratatui_cheese::select::{Select, SelectOption, SelectState};
-use ratatui_cheese::theme::Palette;
 use tui_popup::{KnownSizeWrapper, Popup};
 
 /// Protocol picker layout groups
@@ -76,7 +75,7 @@ const ALL_PICKER_PROTOCOLS: &[ProtocolKind] = &[
 // ── Render dispatch ──────────────────────────────────────────────────────
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
-    let palette = state.current_palette();
+    let theme = state.theme();
     match &state.mode {
         AppMode::AddServer { protocol: None, .. } => {
             render_protocol_picker(frame, area, state);
@@ -95,7 +94,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 *focus_index,
                 form_errors,
                 false,
-                &palette,
+                theme,
             );
         }
         AppMode::EditServer {
@@ -116,7 +115,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 *focus_index,
                 form_errors,
                 true,
-                &palette,
+                theme,
             );
         }
         _ => {}
@@ -127,7 +126,7 @@ pub fn render_import_url(frame: &mut Frame, area: Rect, state: &AppState) {
     let AppMode::ImportUrl { input, error } = &state.mode else {
         return;
     };
-    let palette = state.current_palette();
+    let theme = state.theme();
 
     let display_text = if input.is_empty() {
         "(paste URL here)".to_string()
@@ -139,7 +138,7 @@ pub fn render_import_url(frame: &mut Frame, area: Rect, state: &AppState) {
     if let Some(err) = error {
         lines.push(Line::from(Span::styled(
             format!("Error: {err}"),
-            ThemeStyles::error(&palette),
+            ThemeStyles::error(theme),
         )));
     }
     let para = Paragraph::new(lines);
@@ -153,15 +152,15 @@ pub fn render_import_url(frame: &mut Frame, area: Rect, state: &AppState) {
     let popup = Popup::new(sized)
         .title(" Import URL — Ctrl+V paste, Enter parse, Esc cancel ")
         .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(&palette))
-        .style(Style::default().bg(palette.surface));
+        .border_style(ThemeStyles::container_border(theme))
+        .style(ThemeStyles::dialog(theme));
     frame.render_widget(popup, area);
 }
 
 // ── Protocol picker ──────────────────────────────────────────────────────
 
 fn render_protocol_picker(frame: &mut Frame, area: Rect, state: &AppState) {
-    let palette = state.current_palette();
+    let theme = state.theme();
 
     // Build options with disabled separators for section headers
     let mut item_labels: Vec<String> = Vec::new();
@@ -191,7 +190,8 @@ fn render_protocol_picker(frame: &mut Frame, area: Rect, state: &AppState) {
         1 + xray_count + 1 + (state.selected_index - xray_count)
     };
 
-    let select = Select::new("Select Protocol", &opts).palette(&palette);
+    let select =
+        Select::new("Select Protocol", &opts).palette(&crate::ui::theme::widget_palette(theme));
     let mut select_state = SelectState::from_options(&opts);
     select_state.set_cursor(cursor_pos);
     select_state.set_focused(true);
@@ -210,14 +210,14 @@ fn render_form(
     focus_index: usize,
     form_errors: &HashMap<String, String>,
     _is_edit: bool,
-    palette: &Palette,
+    theme: &opaline::Theme,
 ) {
     let title = format!(" {protocol} ");
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(palette))
-        .title_style(ThemeStyles::container_title(palette));
+        .border_style(ThemeStyles::container_border(theme))
+        .title_style(ThemeStyles::container_title(theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -253,7 +253,7 @@ fn render_form(
         let fieldset = Fieldset::new()
             .title(sec_name)
             .fill(FieldsetFill::Dash)
-            .palette(palette);
+            .palette(&crate::ui::theme::widget_palette(theme));
         frame.render_widget(&fieldset, fs_area);
         y += 1;
 
@@ -290,9 +290,11 @@ fn render_form(
 
             // Build Input widget
             let input = if matches!(ff.field_type, FormFieldType::Password) {
-                Input::new(ff.label).palette(palette).password_mode(true)
+                Input::new(ff.label)
+                    .palette(&crate::ui::theme::widget_palette(theme))
+                    .password_mode(true)
             } else {
-                Input::new(ff.label).palette(palette)
+                Input::new(ff.label).palette(&crate::ui::theme::widget_palette(theme))
             };
 
             let mut input_state = InputState::new();
@@ -316,7 +318,7 @@ fn render_form(
     // Help text at the bottom
     if y < max_y {
         let help = " Tab/Shift+Tab focus  ↵ Enter save  Esc cancel  Ctrl+S save";
-        let hint_style = ThemeStyles::hint(palette);
+        let hint_style = ThemeStyles::hint(theme);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(help, hint_style))),
             Rect::new(inner.x, y, inner.width, 1),
@@ -549,7 +551,7 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
     let AppMode::BatchImport { results, scroll } = &state.mode else {
         return;
     };
-    let palette = state.current_palette();
+    let theme = state.theme();
 
     let total = results.len();
     let scroll = *scroll;
@@ -564,7 +566,7 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
         format!(" {ok_count} valid, {err_count} invalid — Enter to import, Esc to cancel ");
     lines.push(Line::from(Span::styled(
         header,
-        Style::default().fg(palette.primary),
+        Style::default().fg(theme.color("accent.primary").into()),
     )));
     lines.push(Line::from(""));
 
@@ -581,9 +583,9 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
 
         // Status icon
         let (icon, icon_style) = if item.profile.is_some() {
-            (" ✓", ThemeStyles::success(&palette))
+            (" ✓", ThemeStyles::success(theme))
         } else {
-            (" ✗", ThemeStyles::error(&palette))
+            (" ✗", ThemeStyles::error(theme))
         };
 
         // URL display (truncate to fit)
@@ -609,7 +611,7 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
         );
         lines.push(Line::from(Span::styled(
             scroll_text,
-            Style::default().fg(palette.muted),
+            Style::default().fg(theme.color("text.muted").into()),
         )));
     }
 
@@ -626,8 +628,8 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
     let popup = Popup::new(sized)
         .title(" Batch Import ")
         .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(&palette))
-        .style(Style::default().bg(palette.surface));
+        .border_style(ThemeStyles::container_border(theme))
+        .style(ThemeStyles::dialog(theme));
     frame.render_widget(popup, area);
 }
 

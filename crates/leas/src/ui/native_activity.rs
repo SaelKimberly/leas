@@ -7,9 +7,7 @@ use leas_native::telemetry::{TraceKind, TraceSecurity};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
-use ratatui_cheese::theme::Palette;
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::AppState;
 use crate::NativeActivityEntry;
@@ -46,19 +44,21 @@ fn clamp_scroll(len: usize) -> usize {
 
 /// Render the `NativeActivity` tab: session totals plus one line per connection.
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
-    let palette = state.current_palette();
-    let fieldset = Fieldset::new()
+    let theme = state.theme();
+    let block = Block::default()
         .title(" Native Activity ")
-        .styles(FieldsetStyles::from_palette(&palette));
-    let inner = fieldset.inner(area);
-    frame.render_widget(fieldset, area);
+        .borders(Borders::ALL)
+        .border_style(ThemeStyles::container_border(theme))
+        .title_style(ThemeStyles::container_title(theme));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
     // Only the in-process native core emits trace events.
     if state.connected_core != Some(leas_core::CoreType::Native) {
         let paragraph = Paragraph::new(
             " No native session — connect with the native core to see live connections ",
         )
-        .style(ThemeStyles::hint(&palette))
+        .style(ThemeStyles::hint(theme))
         .alignment(Alignment::Center);
         frame.render_widget(paragraph, inner);
         return;
@@ -84,13 +84,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         )),
     ];
     frame.render_widget(
-        Paragraph::new(header).style(ThemeStyles::hint(&palette)),
+        Paragraph::new(header).style(ThemeStyles::hint(theme)),
         chunks[0],
     );
 
     if log.entries.is_empty() {
         let paragraph =
-            Paragraph::new(" No connections recorded yet. ").style(ThemeStyles::hint(&palette));
+            Paragraph::new(" No connections recorded yet. ").style(ThemeStyles::hint(theme));
         frame.render_widget(paragraph, chunks[1]);
         return;
     }
@@ -104,7 +104,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         .entries
         .range(start..)
         .take(height)
-        .map(|entry| render_entry(entry, &palette))
+        .map(|entry| render_entry(entry, theme))
         .collect();
     frame.render_widget(Paragraph::new(visible), chunks[1]);
 }
@@ -138,7 +138,7 @@ fn next_scroll(code: KeyCode, scroll: usize, page: usize, max: usize) -> Option<
 
 /// One line per connection:
 /// `[id] kind dest [protocol/transport] [security] up↑ down↓ dur err`.
-fn render_entry(entry: &NativeActivityEntry, palette: &Palette) -> Line<'static> {
+fn render_entry(entry: &NativeActivityEntry, theme: &opaline::Theme) -> Line<'static> {
     let mut text = format!(
         "[{}] {} {} [{}/{}] [{}] ↑{} ↓{} {}ms",
         entry.conn_id,
@@ -156,12 +156,12 @@ fn render_entry(entry: &NativeActivityEntry, palette: &Palette) -> Line<'static>
     }
     let style = if entry.closed {
         if entry.error.is_some() {
-            ThemeStyles::error(palette)
+            ThemeStyles::error(theme)
         } else {
-            ThemeStyles::hint(palette)
+            ThemeStyles::hint(theme)
         }
     } else {
-        ThemeStyles::table_row_normal(palette)
+        ThemeStyles::table_row_normal(theme)
     };
     Line::from(Span::styled(text, style))
 }

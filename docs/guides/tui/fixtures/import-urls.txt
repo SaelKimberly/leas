@@ -1,0 +1,8 @@
+vless://11111111-1111-4111-8111-111111111111@nl-ams-01.synthetic-node.example:443?encryption=none&security=reality&sni=cdn.synthetic.example&fp=chrome&pbk=AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLL&sid=0123abcd&type=tcp&flow=xtls-rprx-vision#Amsterdam-REALITY
+vless://11111111-1111-4111-8111-111111111111@nl-ams-01.synthetic-node.example:443?encryption=none&security=tls&sni=cdn.synthetic.example&type=ws&path=%2Fws&host=cdn.synthetic.example#Amsterdam-WS
+vmess://eyJ2IjogIjIiLCAicHMiOiAiRnJhbmtmdXJ0LVdTIiwgImFkZCI6ICJkZS1mcmEtMDIuc3ludGhldGljLW5vZGUuZXhhbXBsZSIsICJwb3J0IjogIjg0NDMiLCAiaWQiOiAiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIiwgImFpZCI6ICIwIiwgInNjeSI6ICJhdXRvIiwgIm5ldCI6ICJ3cyIsICJ0eXBlIjogIm5vbmUiLCAiaG9zdCI6ICJkZS1mcmEtMDIuc3ludGhldGljLW5vZGUuZXhhbXBsZSIsICJwYXRoIjogIi92bSIsICJ0bHMiOiAidGxzIn0=
+trojan://password-synthetic@sg-sin-03.synthetic-node.example:443?security=tls&sni=sg-sin-03.synthetic-node.example&type=tcp#Singapore-TROJAN
+ss://YWVzLTI1Ni1nY206cGFzc3dvcmQtc3ludGhldGlj@us-nyc-04.synthetic-node.example:8388#NewYork-SS
+vless://44444444-4444-4444-8444-444444444444@jp-tyo-05.this-is-a-deliberately-long-hostname-for-truncation-testing.synthetic-node.example:8080?encryption=none&security=none&type=tcp#Tokyo-LONGHOST
+vless://44444444-4444-4444-8444-444444444444@203.0.113.77:443?encryption=none&security=reality&sni=cdn.synthetic.example&fp=chrome&pbk=AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLL&sid=0123abcd&type=tcp&flow=xtls-rprx-vision#IPv4-Direct
+tuic://33333333-3333-4333-8333-333333333333:synthetic-pass@fi-hel-06.synthetic-node.example:443?congestion_control=bbr&alpn=h3&sni=fi-hel-06.synthetic-node.example#Helsinki-TUIC

@@ -8,20 +8,20 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
+use ratatui::widgets::{Block, Borders};
 
 fn connection_icon(state: &AppState) -> (&'static str, Style) {
-    let palette = state.current_palette();
+    let theme = state.theme();
     if state.connecting {
-        ("⠋", ThemeStyles::spinner(&palette))
+        ("⠋", ThemeStyles::spinner(theme))
     } else if state.connected_core.is_some() {
-        ("●", ThemeStyles::success(&palette))
+        ("●", ThemeStyles::success(theme))
     } else if state.connection_error.is_some() {
-        ("⏹", ThemeStyles::error(&palette))
+        ("⏹", ThemeStyles::error(theme))
     } else if state.connected_protocol_id.is_some() {
-        ("⏏", ThemeStyles::warning(&palette))
+        ("⏏", ThemeStyles::warning(theme))
     } else {
-        ("○", ThemeStyles::hint(&palette))
+        ("○", ThemeStyles::hint(theme))
     }
 }
 
@@ -61,7 +61,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 // ── Compact render (1-line bar) ────────────────────────────────────────
 
 pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
-    let palette = state.current_palette();
+    let theme = state.theme();
     let (icon, icon_style) = connection_icon(state);
     let (proto, addr, port, core) = server_summary(state);
 
@@ -112,33 +112,24 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
     // Build the line
     let mut spans = Vec::new();
     spans.push(Span::styled(format!("{icon} "), icon_style));
-    spans.push(Span::styled(
-        server_str,
-        ThemeStyles::footer_value(&palette),
-    ));
+    spans.push(Span::styled(server_str, ThemeStyles::footer_value(theme)));
 
     if !test_str.is_empty() {
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(test_str, ThemeStyles::footer_label(&palette)));
+        spans.push(Span::styled(test_str, ThemeStyles::footer_label(theme)));
     }
 
     if state.current_traffic_up != 0 || state.current_traffic_down != 0 {
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(
-            traffic_str,
-            ThemeStyles::footer_value(&palette),
-        ));
+        spans.push(Span::styled(traffic_str, ThemeStyles::footer_value(theme)));
     }
 
     if !log_snippet.is_empty() {
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(
-            log_snippet,
-            ThemeStyles::footer_label(&palette),
-        ));
+        spans.push(Span::styled(log_snippet, ThemeStyles::footer_label(theme)));
     }
 
-    let paragraph = Paragraph::new(Line::from(spans)).style(ThemeStyles::status_footer(&palette));
+    let paragraph = Paragraph::new(Line::from(spans)).style(ThemeStyles::status_footer(theme));
     frame.render_widget(paragraph, area);
 }
 
@@ -150,7 +141,7 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
 const STAT_BLOCK_W: u16 = 42;
 
 pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
-    let palette = state.current_palette();
+    let theme = state.theme();
     let (icon, icon_style) = connection_icon(state);
     let (proto, addr, port, core) = server_summary(state);
 
@@ -178,7 +169,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             format!("🖥 {server_info}")
         },
-        ThemeStyles::footer_value(&palette),
+        ThemeStyles::footer_value(theme),
     ));
 
     // Row 3: Test results — every value padded to a fixed width (the bar's
@@ -204,7 +195,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     let row3 = Line::from(Span::styled(
         format!("⏱ TCP:{tcp_str:>8}  RP:{rp_str:>8}  SPD:{spd_str:>9}"),
-        ThemeStyles::footer_label(&palette),
+        ThemeStyles::footer_label(theme),
     ));
 
     // Row 4: Traffic & memory
@@ -217,7 +208,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     let row4 = Line::from(Span::styled(
         format!("📊 ⬆{traffic_up:>9}  ⬇{traffic_down:>9}  💾{mem_mb:>8}"),
-        ThemeStyles::footer_value(&palette),
+        ThemeStyles::footer_value(theme),
     ));
     // Row 5: Core log (scan log_cache backwards for non-tui entry)
     let core_log = state
@@ -227,7 +218,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         .find(|l| l.target != "tui")
         .map(|l| format!("📋 Core: [{}] {}", l.level, l.message))
         .unwrap_or_default();
-    let row5 = Line::from(Span::styled(core_log, ThemeStyles::footer_label(&palette)));
+    let row5 = Line::from(Span::styled(core_log, ThemeStyles::footer_label(theme)));
 
     // Row 6: TUI log (scan log_cache backwards for tui entry)
     let tui_log = state
@@ -237,13 +228,15 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         .find(|l| l.target == "tui")
         .map(|l| format!("📋 TUI:  [{}] {} ({})", l.level, l.message, l.target))
         .unwrap_or_default();
-    let row6 = Line::from(Span::styled(tui_log, ThemeStyles::footer_label(&palette)));
+    let row6 = Line::from(Span::styled(tui_log, ThemeStyles::footer_label(theme)));
 
-    let fieldset = Fieldset::new()
+    let block = Block::default()
         .title(" ⚙ Actions Log ")
-        .styles(FieldsetStyles::from_palette(&palette));
-    let inner_area = fieldset.inner(area);
-    frame.render_widget(fieldset, area);
+        .borders(Borders::ALL)
+        .border_style(ThemeStyles::container_border(theme))
+        .title_style(ThemeStyles::container_title(theme));
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
     let available = inner_area.height as usize;
 
     // The batch's two levels share rows 3-4 with the statistics cells: the log
@@ -252,7 +245,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     // full width (the status bar carries the numbers there).
     let bar_w = inner_area.width.saturating_sub(STAT_BLOCK_W + 1) as usize;
     let (real_bar, fast_bar) = if bar_w >= 18 {
-        batch_bars(state, &palette, bar_w)
+        batch_bars(state, theme, bar_w)
     } else {
         (None, None)
     };
@@ -289,7 +282,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "│",
-                ThemeStyles::container_border(&palette),
+                ThemeStyles::container_border(theme),
             ))),
             sep_rect,
         );
@@ -305,7 +298,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
 /// exists to report.
 fn batch_bars(
     state: &AppState,
-    palette: &ratatui_cheese::theme::Palette,
+    theme: &opaline::Theme,
     width: usize,
 ) -> (Option<Line<'static>>, Option<Line<'static>>) {
     use std::sync::atomic::Ordering;
@@ -320,7 +313,7 @@ fn batch_bars(
             meters.fast.done.load(Ordering::Relaxed),
             meters.fast.total.load(Ordering::Relaxed),
         );
-        progress::bar_line("Fast", done, total, meters.fast.eta_secs(), width, palette)
+        progress::bar_line("Fast", done, total, meters.fast.eta_secs(), width, theme)
     };
     let pages = (
         meters.plan_pages_done.load(Ordering::Relaxed),
@@ -329,7 +322,7 @@ fn batch_bars(
     let fast_line = if pages.1 > 0 && pages.0 < pages.1 {
         Line::from(Span::styled(
             format!("planning {}/{} pages", pages.0, pages.1),
-            ThemeStyles::footer_label(palette),
+            ThemeStyles::footer_label(theme),
         ))
     } else {
         fast()
@@ -346,7 +339,7 @@ fn batch_bars(
         real_total,
         meters.real.eta_secs(),
         width,
-        palette,
+        theme,
     );
     (Some(real), Some(fast_line))
 }
@@ -391,10 +384,11 @@ mod tests {
     async fn without_a_batch_the_statistics_rows_keep_the_full_width() {
         let state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
         let lines = render_panel(&state);
+        // No batch, no bars anywhere — the statistics rows keep the full width.
         for line in &lines {
             assert!(
-                !line.contains('│'),
-                "no separator without a batch: {line:?}"
+                !line.contains('█') && !line.contains('░'),
+                "no bar without a batch: {line:?}"
             );
         }
     }
@@ -410,9 +404,13 @@ mod tests {
         // row 3 = line 3, row 4 = line 4.
         assert!(lines[3].contains("Fast"), "bar on row 3: {:?}", lines[3]);
         assert!(lines[3].contains("25/100"), "counters: {:?}", lines[3]);
-        assert!(lines[3].contains('│'), "separator: {:?}", lines[3]);
         assert!(
-            !lines[4].contains('│'),
+            lines[3].contains('█') || lines[3].contains('░'),
+            "the row carries a bar: {:?}",
+            lines[3]
+        );
+        assert!(
+            !lines[4].contains('█') && !lines[4].contains('░'),
             "the second bar row stays full width: {:?}",
             lines[4]
         );

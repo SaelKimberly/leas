@@ -3,13 +3,13 @@ pub mod add_server;
 pub mod export;
 pub mod logs;
 pub mod native_activity;
-pub mod palette_bridge;
 pub mod profiles;
 pub mod settings;
 pub mod statistics;
 pub mod status_bar;
 pub mod theme;
 pub mod widgets;
+use crate::ui::theme::ThemeStyles;
 use crate::{AppMode, AppState, ConfirmAction, Tab};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
@@ -24,7 +24,6 @@ use leas_config::subscription::subscription_url_split;
 use leas_db::profiles_query::PlanScope;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
@@ -33,7 +32,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tui_popup::{KnownSizeWrapper, Popup};
 
-pub fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
+pub fn render_confirmation_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    text: &str,
+    theme: &opaline::Theme,
+) {
     use unicode_width::UnicodeWidthStr;
     let width = text.width() as u16 + 2;
     let height = 3u16;
@@ -43,20 +47,21 @@ pub fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
     }
 
     let para = Paragraph::new(text.to_string())
-        .style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD))
+        .style(ThemeStyles::container_title(theme))
         .alignment(Alignment::Center);
     let sized = KnownSizeWrapper::new(para, width as usize, height as usize);
     let popup = Popup::new(sized)
         .title(" Confirm ")
         .border_set(ratatui::symbols::border::ROUNDED)
-        .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
-        .style(Style::new().bg(Color::Rgb(40, 20, 20)));
+        .border_style(ThemeStyles::error(theme))
+        .style(ThemeStyles::dialog(theme));
     frame.render_widget(popup, area);
 }
 
 /// Render the correct confirmation text for any `ConfirmAction` variant.
 /// Call once per render path instead of duplicating per-variant checks.
 pub fn render_any_confirmation(frame: &mut Frame, area: Rect, state: &AppState) {
+    let theme = state.theme();
     let text = match state.confirmation {
         Some(crate::ConfirmAction::Quit) => " Quit? (y/N) ",
         Some(crate::ConfirmAction::ClearStats) => " Clear all stats? (y/N) ",
@@ -64,7 +69,7 @@ pub fn render_any_confirmation(frame: &mut Frame, area: Rect, state: &AppState) 
         Some(crate::ConfirmAction::PurgeLogsDatabase) => " Purge logs database? (y/N) ",
         _ => return,
     };
-    render_confirmation_overlay(frame, area, text);
+    render_confirmation_overlay(frame, area, text, theme);
 }
 // ── Entry point ───────────────────────────────────────────────────────
 
@@ -1161,7 +1166,7 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
 }
 
 fn render_help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
-    let palette = state.current_palette();
+    let theme = state.theme();
     let content = help_content(state);
     let lines: Vec<Line> = content
         .iter()
@@ -1169,10 +1174,10 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
             Line::from(vec![
                 Span::styled(
                     format!(" {key:<20}"),
-                    crate::ui::theme::ThemeStyles::hint(&palette),
+                    crate::ui::theme::ThemeStyles::hint(theme),
                 ),
                 Span::raw("  "),
-                Span::styled(*desc, Style::default().fg(Color::White)),
+                Span::styled(*desc, ThemeStyles::footer_value(theme)),
             ])
         })
         .collect();
@@ -1185,7 +1190,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     let popup = Popup::new(sized)
         .title(" Keyboard Shortcuts ")
         .border_set(ratatui::symbols::border::ROUNDED)
-        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+        .style(ThemeStyles::dialog(theme));
     frame.render_widget(popup, area);
 }
 
@@ -1216,6 +1221,7 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
 ];
 
 fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
+    let theme = state.theme();
     let selected = match &state.mode {
         crate::AppMode::SpeedTestMenu { selected } => *selected,
         _ => return,
@@ -1235,14 +1241,11 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         let is_stop_item = *label == "Stop Testing";
         let is_disabled = is_stop_item && state.testing_profiles.is_empty();
         let style = if is_disabled {
-            Style::default().fg(Color::DarkGray)
+            ThemeStyles::hint(theme)
         } else if i == selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Gray)
-                .add_modifier(Modifier::BOLD)
+            ThemeStyles::table_row_selected(theme)
         } else {
-            Style::default().fg(Color::White)
+            ThemeStyles::footer_value(theme)
         };
         lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
     }
@@ -1255,11 +1258,11 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     let popup = Popup::new(sized)
         .title(" Server Tools ")
         .border_set(ratatui::symbols::border::ROUNDED)
-        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+        .style(ThemeStyles::dialog(theme));
     frame.render_widget(popup, area);
 }
 fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
-    let palette = state.current_palette();
+    let theme = state.theme();
     // Split area into [indicator(3) | tabs]
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1267,11 +1270,11 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
         .split(area);
     // Connection indicator
     let indicator = if state.connecting {
-        Span::styled(" ⟳", crate::ui::theme::ThemeStyles::spinner(&palette))
+        Span::styled(" ⟳", crate::ui::theme::ThemeStyles::spinner(theme))
     } else if state.connected_core.is_some() {
-        Span::styled(" ●", crate::ui::theme::ThemeStyles::success(&palette))
+        Span::styled(" ●", crate::ui::theme::ThemeStyles::success(theme))
     } else {
-        Span::styled(" ○", crate::ui::theme::ThemeStyles::hint(&palette))
+        Span::styled(" ○", crate::ui::theme::ThemeStyles::hint(theme))
     };
     let indicator_para = Paragraph::new(Line::from(indicator));
     frame.render_widget(indicator_para, chunks[0]);
@@ -1289,7 +1292,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
             };
             Line::from(Span::styled(
                 name,
-                crate::ui::theme::ThemeStyles::tab_deselected(&palette),
+                crate::ui::theme::ThemeStyles::tab_deselected(theme),
             ))
         })
         .collect();
@@ -1301,15 +1304,20 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
                 .position(|t| *t == state.current_tab)
                 .unwrap_or(0),
         )
-        .highlight_style(crate::ui::theme::ThemeStyles::tab_selected(&palette))
+        .highlight_style(crate::ui::theme::ThemeStyles::tab_selected(theme))
         .divider(Span::raw(""));
     frame.render_widget(tabs, chunks[1]);
 }
 
-pub fn render_placeholder_screen(frame: &mut Frame, area: Rect, name: &str) {
+pub fn render_placeholder_screen(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    theme: &opaline::Theme,
+) {
     let text = format!("{name} — Coming Soon");
     let paragraph = Paragraph::new(text)
-        .style(Style::default().fg(Color::Gray))
+        .style(ThemeStyles::hint(theme))
         .block(Block::default().title(name).borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }

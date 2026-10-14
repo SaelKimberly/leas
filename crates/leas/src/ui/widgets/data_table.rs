@@ -368,6 +368,25 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
         // the sort arrow overwrites the column's trailing cells with a second
         // `set_stringn` instead of a re-allocated header string.
         let mut header_y = inner.y;
+        // Fill the whole header row with the header style first, so the band is
+        // a rectangle and not just the letters. `set_line` only paints the
+        // cells the spans cover, which left the pad cells on the table's own
+        // background — the header read as bold text with no band.
+        // The first span's style is the header role the caller put on the line.
+        let header_row_style = self
+            .columns
+            .iter()
+            .filter_map(|c| c.header.spans.first())
+            .map(|s| s.style)
+            .find(|s| *s != ratatui::style::Style::default())
+            .unwrap_or_default();
+        if header_row_style != ratatui::style::Style::default() {
+            for x in inner.x..inner.x + inner.width {
+                if let Some(cell) = buf.cell_mut((x, header_y)) {
+                    cell.set_style(header_row_style);
+                }
+            }
+        }
         for (i, col) in self.columns.iter().take(ncols).enumerate() {
             let w = col_widths[i];
             if w == 0 {

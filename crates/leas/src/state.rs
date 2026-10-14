@@ -51,8 +51,12 @@ pub struct AppState {
     /// `LinkWriter` this field replaced (see
     /// `docs/aegis/specs/2026-10-05-rowcache-write-behind-design.md`).
     pub link_stage: Arc<leas_db::WriteBehind<leas_db::LinkSpec>>,
-    /// Currently selected theme name from config or UI selection.
-    pub theme_name: ratatui_themes::ThemeName,
+    /// The loaded theme (opaline), with the app's roles registered.
+    ///
+    /// One owner: `config.theme_name` is the kebab-case slug this was loaded
+    /// from. `AppState::current_palette()` and the `ratatui-cheese` bridge are
+    /// gone — every style resolves from here.
+    pub theme: opaline::Theme,
     pub current_tab: Tab,
     /// The loaded Profiles page: the window the tab renders and indexes.
     /// `selected_index` indexes this vector, never the whole feed.
@@ -504,7 +508,7 @@ pub(crate) fn clamp_dns_defer_secs(configured: i64) -> i64 {
 
 impl AppState {
     pub async fn new(db: Arc<Database>, config: AppConfig) -> Self {
-        let theme_name = config.theme_name;
+        let theme = crate::ui::theme::load(&config.theme_name).unwrap_or_else(|e| panic!("{e}"));
         let (core_tx, core_rx) = tokio::sync::mpsc::channel(65536);
         let purgatory_ttl_secs = (config.purgatory.ttl_days * 86400) as i64;
         let purgatory_retention_secs = (config.purgatory.retention_days * 86400) as i64;
@@ -533,7 +537,7 @@ impl AppState {
             config,
             scheduler: Arc::new(scheduler::TaskScheduler::new(queue_limit, dns_defer_secs)),
             link_stage,
-            theme_name,
+            theme,
             current_tab: Tab::Profiles,
             update_status: HashMap::new(),
             endpoints: Vec::new(),
@@ -653,9 +657,8 @@ impl AppState {
     }
     /// Build a ratatui-cheese `Palette` from the currently selected theme.
     #[must_use]
-    pub const fn current_palette(&self) -> ratatui_cheese::theme::Palette {
-        let theme = ratatui_themes::Theme::new(self.theme_name);
-        crate::ui::palette_bridge::current_palette(&theme)
+    pub const fn theme(&self) -> &opaline::Theme {
+        &self.theme
     }
 
     /// Load the most recent log entries from heed into [`log_cache`].

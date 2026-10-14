@@ -1,0 +1,94 @@
+{
+  "core": {
+    "xray_path": null,
+    "sing_box_path": null,
+    "log_level": "warning",
+    "protocol_core_overrides": {},
+    "skip_cert_verify": false
+  },
+  "gui": {
+    "language": "en",
+    "theme": null,
+    "refresh_interval_secs": "5s"
+  },
+  "inbound": {
+    "socks_port": 10808,
+    "http_port": null,
+    "mixed_port": null,
+    "listen": "127.0.0.1",
+    "sniffing": false
+  },
+  "tun": {
+    "enabled": false,
+    "interface_name": null,
+    "mtu": null
+  },
+  "mux": {
+    "enabled": false,
+    "concurrency": null,
+    "protocol": "smux",
+    "max_connections": null,
+    "min_streams": null,
+    "max_streams": null,
+    "padding": false,
+    "fragment_enabled": false,
+    "fragment_packets": null,
+    "fragment_length": null,
+    "fragment_interval": null
+  },
+  "system_proxy": {
+    "enabled": false,
+    "http_port": null,
+    "socks_port": null,
+    "bypass": null
+  },
+  "statistics": {
+    "enabled": true,
+    "clash_api_port": 9090
+  },
+  "updates": {
+    "check_on_startup": false,
+    "last_check": null,
+    "xray_latest_known": null,
+    "sing_box_latest_known": null
+  },
+  "speed_test": {
+    "ping_url": "https://www.gstatic.com/generate_204",
+    "ip_provider": "ip-api",
+    "tcp_timeout_secs": "5s",
+    "real_ping_timeout_secs": "5s",
+    "real_ping_retries": 2,
+    "real_ping_concurrency": 100,
+    "fast_ping_concurrency": 200,
+    "real_ping_test_all_protocols": false,
+    "error_ttl_hours": null,
+    "task_queue_limit": 3,
+    "dns_failure_defer_secs": 15
+  },
+  "logging": {
+    "ttl_secs": "3days",
+    "log_to_file": false,
+    "log_file_path": "leas.log"
+  },
+  "parsing": {
+    "allow_private_ips": false,
+    "reject_insecure": false
+  },
+  "geo": {
+    "geoip_url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+    "geosite_url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+    "auto_update": false,
+    "update_interval_hours": 24
+  },
+  "theme_name": "catppuccin-latte",
+  "clash_api_port": null,
+  "clash_mixin": null,
+  "purgatory": {
+    "ttl_days": 7,
+    "retention_days": 30
+  },
+  "import": {
+    "max_feed_bytes": 67108864,
+    "max_feed_links": 200000
+  }
+}

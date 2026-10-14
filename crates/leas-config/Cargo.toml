@@ -37,7 +37,6 @@ strum = { version = "0.28.0", default-features = false, features = ["derive"] }
 # ============ Text / Search / Hash ============
 	aho-corasick.workspace = true
 memchr.workspace = true
-ratatui-themes.workspace = true
 
 # ============ Memory ============
 smallvec.workspace = true

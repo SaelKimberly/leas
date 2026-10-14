@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::collections::{HashSet, VecDeque};
@@ -49,7 +49,7 @@ impl DataTableRow for LogRow<'_> {
             y,
             &self.ts,
             col_widths[0] as usize,
-            Style::default().fg(Color::DarkGray),
+            self.target_style,
         );
         buf.set_stringn(
             col_xs[1],
@@ -83,23 +83,20 @@ impl DataTableRow for LogRow<'_> {
 
 /// Narrow a [`crate::LogLine`] to its [`LogRow`] display form (borrows the
 /// line; allocates only the formatted timestamp).
-fn log_row_from<'a>(
-    log: &'a crate::LogLine,
-    palette: &ratatui_cheese::theme::Palette,
-) -> LogRow<'a> {
+fn log_row_from<'a>(log: &'a crate::LogLine, theme: &opaline::Theme) -> LogRow<'a> {
     let target_style = if log.target.starts_with("xray") {
-        Style::default().fg(Color::Cyan)
+        ThemeStyles::log_info(theme)
     } else if log.target.starts_with("sing") {
-        Style::default().fg(Color::Green)
+        ThemeStyles::success(theme)
     } else if log.target == "tui" {
-        Style::default().fg(Color::Yellow)
+        ThemeStyles::log_warning(theme)
     } else {
-        Style::default().fg(Color::Gray)
+        ThemeStyles::log_debug(theme)
     };
     let level_style = match log.level.as_str() {
-        "error" | "fatal" | "panic" => ThemeStyles::error(palette),
-        "warning" | "warn" => ThemeStyles::warning(palette),
-        "debug" | "trace" => ThemeStyles::hint(palette),
+        "error" | "fatal" | "panic" => ThemeStyles::error(theme),
+        "warning" | "warn" => ThemeStyles::warning(theme),
+        "debug" | "trace" => ThemeStyles::hint(theme),
         _ => Style::default(),
     };
     LogRow {
@@ -117,24 +114,23 @@ fn log_row_from<'a>(
 /// frame); the render pass now passes just the visible window.
 #[cfg(test)]
 fn build_rows_viewport(cache: &[crate::LogLine], offset: usize, visible: usize) -> Vec<LogRow<'_>> {
-    let palette =
-        crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+    let theme = crate::ui::theme::load("tokyo-night").unwrap();
     let end = offset.saturating_add(visible).min(cache.len());
     cache
         .get(offset..end)
         .unwrap_or(&[])
         .iter()
-        .map(|log| log_row_from(log, &palette))
+        .map(|log| log_row_from(log, &theme))
         .collect()
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
-    let palette = state.current_palette();
+    let theme = state.theme();
     let block = Block::default()
         .title(" Logs ")
         .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(&palette))
-        .title_style(ThemeStyles::container_title(&palette));
+        .border_style(ThemeStyles::container_border(theme))
+        .title_style(ThemeStyles::container_title(theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -163,7 +159,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             " [T] Filter {filter_label}  \u{2191}\u{2193} Scroll  y Copy  Shift+\u{2191}\u{2193} Select  PgUp/PgDn  Home/End",
         )
     };
-    let bar = Line::from(Span::styled(filter_text, ThemeStyles::hint(&palette)));
+    let bar = Line::from(Span::styled(filter_text, ThemeStyles::hint(theme)));
     frame.render_widget(Paragraph::new(bar), filter_area);
 
     let log_count = state.log_cache.len();
@@ -173,7 +169,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             " No logs yet. Run a profile or wait for core output."
         };
-        let paragraph = Paragraph::new(Line::from(empty_msg)).style(ThemeStyles::hint(&palette));
+        let paragraph = Paragraph::new(Line::from(empty_msg)).style(ThemeStyles::hint(theme));
         frame.render_widget(paragraph, log_area);
         return;
     }
@@ -192,7 +188,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     if filtered_count == 0 {
         let paragraph = Paragraph::new(Line::from(" No logs match current filter"))
-            .style(ThemeStyles::hint(&palette));
+            .style(ThemeStyles::hint(theme));
         frame.render_widget(paragraph, log_area);
         return;
     }
@@ -237,7 +233,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             continue;
         }
         if rank >= offset {
-            log_rows.push(log_row_from(log, &palette));
+            log_rows.push(log_row_from(log, theme));
             if log_rows.len() >= visible {
                 break;
             }
@@ -271,14 +267,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let data_table = DataTable::new(columns, &log_rows)
         .column_spacing(1)
-        .selection_style(ThemeStyles::table_row_selected(&palette))
+        .selection_style(ThemeStyles::table_row_selected(theme))
         // The slice is the visible window; the scrollbar still reports the
         // full filtered length and the true offset.
         .total_rows(Some(filtered_count))
         .scrollbar_offset(Some(offset))
         .scrollbar(
-            ThemeStyles::scrollbar_thumb(&palette),
-            ThemeStyles::scrollbar_track(&palette),
+            ThemeStyles::scrollbar_thumb(theme),
+            ThemeStyles::scrollbar_track(theme),
         );
     let mut dt_state = DataTableState {
         offset: 0,
@@ -288,13 +284,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(data_table, log_area, &mut dt_state);
 
     if matches!(state.confirmation, Some(crate::ConfirmAction::ClearLogs)) {
-        render_confirmation_overlay(frame, area, " Clear all logs? (y/N) ");
+        render_confirmation_overlay(frame, area, " Clear all logs? (y/N) ", state.theme());
     }
     if matches!(
         state.confirmation,
         Some(crate::ConfirmAction::PurgeLogsDatabase)
     ) {
-        render_confirmation_overlay(frame, area, " Purge entire log database? (y/N) ");
+        render_confirmation_overlay(
+            frame,
+            area,
+            " Purge entire log database? (y/N) ",
+            state.theme(),
+        );
     }
 }
 
@@ -546,18 +547,18 @@ pub fn render_target_picker(frame: &mut Frame, area: Rect, state: &AppState) {
         crate::AppMode::TargetPicker { selected } => *selected,
         _ => return,
     };
-    let palette = state.current_palette();
+    let theme = state.theme();
 
     // Empty state: small centered popup
     if state.known_targets.is_empty() {
         let text = Paragraph::new(Line::from(" No targets available"))
-            .style(ThemeStyles::hint(&palette))
+            .style(ThemeStyles::hint(theme))
             .alignment(Alignment::Center);
         let sized = KnownSizeWrapper::new(text, 30, 3);
         let popup = Popup::new(sized)
             .title(" Select Targets (t=done, Enter=toggle) ")
             .border_set(ratatui::symbols::border::ROUNDED)
-            .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+            .style(ThemeStyles::dialog(theme));
         frame.render_widget(popup, area);
         return;
     }
@@ -585,7 +586,7 @@ pub fn render_target_picker(frame: &mut Frame, area: Rect, state: &AppState) {
             Line::from(Span::styled(
                 format!("{prefix}{checked} {target}"),
                 if i == selected {
-                    Style::default().fg(Color::Yellow)
+                    ThemeStyles::log_warning(theme)
                 } else {
                     Style::default()
                 },
@@ -598,7 +599,7 @@ pub fn render_target_picker(frame: &mut Frame, area: Rect, state: &AppState) {
     let popup = Popup::new(sized)
         .title(" Select Targets (t=done, Enter=toggle) ")
         .border_set(ratatui::symbols::border::ROUNDED)
-        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+        .style(ThemeStyles::dialog(theme));
     frame.render_widget(popup, area);
 }
 

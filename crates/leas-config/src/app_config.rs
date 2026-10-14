@@ -1,8 +1,25 @@
-use ratatui_themes::ThemeName;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Kebab-case opaline slug used when a config carries no `theme_name` key.
+pub const DEFAULT_THEME: &str = "dracula";
+
+fn default_theme_name() -> String {
+    DEFAULT_THEME.to_string()
+}
+
+impl Default for AppConfig {
+    /// The derive cannot express "this one field has a non-empty default", and
+    /// an empty slug is an error at load — so `Default` is written by hand.
+    fn default() -> Self {
+        Self {
+            theme_name: DEFAULT_THEME.to_string(),
+            ..serde_json::from_str("{}").expect("an empty object fills every default")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub core: CoreConfig,
@@ -28,8 +45,11 @@ pub struct AppConfig {
     pub parsing: ParsingSettings,
     #[serde(default)]
     pub geo: GeoConfig,
-    #[serde(default)]
-    pub theme_name: ThemeName,
+    /// Kebab-case opaline slug. `Default` is the fallback for a config with no
+    /// key and for tests that build an `AppConfig` directly; an unknown slug in
+    /// a *file* is an error, not this.
+    #[serde(default = "default_theme_name")]
+    pub theme_name: String,
     pub clash_api_port: Option<u16>,
     #[serde(default)]
     pub clash_mixin: Option<String>,

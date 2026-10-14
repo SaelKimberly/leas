@@ -344,7 +344,7 @@ impl DisplayRowData {
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let rows: Vec<&EndpointRow> = state.filtered_profiles().collect();
     let selected = state.selected_index;
-    let palette = state.current_palette();
+    let theme = state.theme();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -354,7 +354,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(area);
 
-    render_filter_strip(frame, chunks[0], state, &palette);
+    render_filter_strip(frame, chunks[0], state, theme);
 
     // Empty state guidance
     if rows.is_empty() {
@@ -366,18 +366,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             unreachable!()
         };
         let paragraph = Paragraph::new(msg)
-            .style(ThemeStyles::hint(&palette))
+            .style(ThemeStyles::hint(theme))
             .alignment(Alignment::Center);
         frame.render_widget(paragraph, chunks[1]);
-        render_footer(frame, chunks[2], state, &palette);
+        render_footer(frame, chunks[2], state, theme);
         return;
     }
 
     // One display row per endpoint; the expanded panel lives inside the row.
-    let display_rows = build_display_rows(&rows, selected, state, &palette);
+    let display_rows = build_display_rows(&rows, selected, state, theme);
 
-    render_data_grid(frame, chunks[1], &display_rows, selected, state, &palette);
-    render_footer(frame, chunks[2], state, &palette);
+    render_data_grid(frame, chunks[1], &display_rows, selected, state, theme);
+    render_footer(frame, chunks[2], state, theme);
     render_confirmation_overlays(frame, area, &rows, state);
 }
 
@@ -413,11 +413,7 @@ const TEST_BAD_MS: i32 = 1000;
 /// Precedence follows the tier model (decision 16): real-err (3) ranks above
 /// fast-err (4) — when both marker classes are present the deeper real check
 /// wins — and DNS-unresolved (5) is the deepest, so `[name]` beats both.
-fn compute_test_cell(
-    row: &EndpointRow,
-    resolved: bool,
-    palette: &ratatui_cheese::theme::Palette,
-) -> (String, Style) {
+fn compute_test_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) -> (String, Style) {
     use leas_db::models::ProfileErr;
     let representative = row
         .representative_link_index(!resolved)
@@ -468,7 +464,7 @@ fn compute_test_cell(
         purged,
         failure,
         delay,
-        palette,
+        theme,
     );
     if approximated {
         text.push('~');
@@ -513,9 +509,9 @@ fn test_cell_content(
     purged: Option<&str>,
     failure: Option<TestFailure>,
     active_delay: Option<i32>,
-    palette: &ratatui_cheese::theme::Palette,
+    theme: &opaline::Theme,
 ) -> (String, Style) {
-    let bad = ThemeStyles::test_delay_bad(palette);
+    let bad = ThemeStyles::test_delay_bad(theme);
     if host_is_dns && !resolved {
         return (format!("[{}]", center_cell("name", 4)), bad);
     }
@@ -555,9 +551,9 @@ fn test_cell_content(
             let style = if d >= TEST_BAD_MS {
                 bad
             } else if d >= TEST_WARN_MS {
-                ThemeStyles::test_delay_warn(palette)
+                ThemeStyles::test_delay_warn(theme)
             } else {
-                ThemeStyles::test_delay_ok(palette)
+                ThemeStyles::test_delay_ok(theme)
             };
             (format!("[{}]", center_cell(&d.to_string(), 4)), style)
         }
@@ -624,16 +620,16 @@ fn restyle_row(
     index: usize,
     selected: usize,
     state: &AppState,
-    palette: &ratatui_cheese::theme::Palette,
+    theme: &opaline::Theme,
     source: &EndpointRow,
 ) {
     let is_connected = state.connected_protocol_id.as_ref() == Some(&source.endpoint.id.get());
     row.row_style = match (index == selected, is_connected) {
-        (true, true) => ThemeStyles::table_row_connected(palette)
+        (true, true) => ThemeStyles::table_row_connected(theme)
             .add_modifier(ratatui::style::Modifier::UNDERLINED),
-        (false, true) => ThemeStyles::table_row_connected(palette),
-        (true, false) => ThemeStyles::table_row_selected(palette),
-        (false, false) => ThemeStyles::table_row_normal(palette),
+        (false, true) => ThemeStyles::table_row_connected(theme),
+        (true, false) => ThemeStyles::table_row_selected(theme),
+        (false, false) => ThemeStyles::table_row_normal(theme),
     };
     row.panel_selected = if index == selected {
         state.selected_sub
@@ -646,7 +642,7 @@ fn build_display_rows(
     rows: &[&EndpointRow],
     selected: usize,
     state: &AppState,
-    palette: &ratatui_cheese::theme::Palette,
+    theme: &opaline::Theme,
 ) -> std::rc::Rc<Vec<DisplayRowData>> {
     // Cache check (part-2 runtime bounds): reuse the previous frame's rows
     // when every input is unchanged — structural gen, the selection,
@@ -683,7 +679,7 @@ fn build_display_rows(
                 if index < rows.len()
                     && let Some(row) = cached_rows.get_mut(index)
                 {
-                    restyle_row(row, index, selected, state, palette, rows[index]);
+                    restyle_row(row, index, selected, state, theme, rows[index]);
                 }
             }
             cache.selected_index = selected;
@@ -696,17 +692,17 @@ fn build_display_rows(
     for (i, row) in rows.iter().enumerate() {
         let is_connected = state.connected_protocol_id.as_ref() == Some(&row.endpoint.id.get());
         let base_style = match (i == selected, is_connected) {
-            (true, true) => ThemeStyles::table_row_connected(palette)
+            (true, true) => ThemeStyles::table_row_connected(theme)
                 .add_modifier(ratatui::style::Modifier::UNDERLINED),
-            (false, true) => ThemeStyles::table_row_connected(palette),
-            (true, false) => ThemeStyles::table_row_selected(palette),
-            (false, false) => ThemeStyles::table_row_normal(palette),
+            (false, true) => ThemeStyles::table_row_connected(theme),
+            (true, false) => ThemeStyles::table_row_selected(theme),
+            (false, false) => ThemeStyles::table_row_normal(theme),
         };
 
         // Indicator: connected → ●; else active protocol's test glyph; else the
         // first protocol under test.
         let (indicator, indicator_fg) = if is_connected {
-            ("●".to_string(), ThemeStyles::success(palette))
+            ("●".to_string(), ThemeStyles::success(theme))
         } else {
             let active_id = row.active_link().map(|l| l.protocol_id.get());
             let glyph = active_id
@@ -778,7 +774,7 @@ fn build_display_rows(
             truncate_pad(&ip_feature, 2),
             truncate_pad(&sni_feature, 2)
         );
-        let (test_str, test_style) = compute_test_cell(row, resolved, palette);
+        let (test_str, test_style) = compute_test_cell(row, resolved, theme);
 
         let protocol_info_str = protocol_info_cell(row);
 
@@ -955,7 +951,7 @@ fn build_display_rows(
             has_sub_rows: row.links.len() > 1,
             expanded: row.expanded,
             row_style: base_style,
-            panel_selected_style: ThemeStyles::panel_row_selected(palette),
+            panel_selected_style: ThemeStyles::panel_row_selected(theme),
             panel_selected: if i == selected {
                 state.selected_sub
             } else {
@@ -988,37 +984,60 @@ fn render_data_grid(
     display_rows: &[DisplayRowData],
     selected_display_idx: usize,
     state: &AppState,
-    palette: &ratatui_cheese::theme::Palette,
+    theme: &opaline::Theme,
 ) {
     let block = Block::default()
         .title(" Profiles ")
         .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(palette))
-        .title_style(ThemeStyles::container_title(palette));
+        .border_style(ThemeStyles::container_border(theme))
+        .title_style(ThemeStyles::container_title(theme));
 
     // Map sort state to DataTable column indices
     let sort_column = Some(11);
     let sort_direction = SortDirection::Ascending;
 
     // 16 fixed columns (118 cells total); headers carry only descriptive
-    // names (decorative separator cells have empty headers).
+    // names (decorative separator cells have empty headers). Every label is
+    // styled with the header role, so the band reads as one row.
+    let header_style = ThemeStyles::table_header(theme);
     let columns = vec![
-        Column::new("", ColumnWidth::Fixed(1)),  // 0 — tree marker
-        Column::new("", ColumnWidth::Fixed(2)),  // 1 — indicator
-        Column::new("#", ColumnWidth::Fixed(7)), // 2 — index (6 digits + gap)
-        Column::new("", ColumnWidth::Fixed(1)),  // 3 — [
-        Column::new("", ColumnWidth::Fixed(4)),  // 4 — country flag
-        Column::new("Address", ColumnWidth::Fixed(34)), // 5
-        Column::new("", ColumnWidth::Fixed(2)),  // 6 — ][
-        Column::new("Feat", ColumnWidth::Fixed(4)), // 7 — IP+SNI flags
-        Column::new("", ColumnWidth::Fixed(4)),  // 8 — ]=>{
-        Column::new("Protocol Info", ColumnWidth::Fixed(24)), // 9 — protocol/transport/security
-        Column::new("", ColumnWidth::Fixed(3)),  // 10 — }=> arrow
-        Column::new("Test", ColumnWidth::Fixed(7)), // 11 — [delay]/[name]/[fast]/[real] + `~` approximation
-        Column::new("", ColumnWidth::Fixed(1)),     // 12 — [ outbound opener
-        Column::new("Outbound", ColumnWidth::Fixed(16)), // 13
-        Column::new("Country", ColumnWidth::Fixed(7)), // 14
-        Column::new("", ColumnWidth::Fixed(1)),     // 15 — ]
+        Column::new(Line::raw(""), ColumnWidth::Fixed(1)), // 0 — tree marker
+        Column::new(Line::raw(""), ColumnWidth::Fixed(2)), // 1 — indicator
+        Column::new(
+            Line::from(Span::styled("#", header_style)),
+            ColumnWidth::Fixed(7),
+        ), // 2 — index (6 digits + gap)
+        Column::new(Line::raw(""), ColumnWidth::Fixed(1)), // 3 — [
+        Column::new(Line::raw(""), ColumnWidth::Fixed(4)), // 4 — country flag
+        Column::new(
+            Line::from(Span::styled("Address", header_style)),
+            ColumnWidth::Fixed(34),
+        ), // 5
+        Column::new(Line::raw(""), ColumnWidth::Fixed(2)), // 6 — ][
+        Column::new(
+            Line::from(Span::styled("Feat", header_style)),
+            ColumnWidth::Fixed(4),
+        ), // 7 — IP+SNI flags
+        Column::new(Line::raw(""), ColumnWidth::Fixed(4)), // 8 — ]=>{
+        Column::new(
+            Line::from(Span::styled("Protocol Info", header_style)),
+            ColumnWidth::Fixed(24),
+        ), // 9 — protocol/transport/security
+        Column::new(Line::raw(""), ColumnWidth::Fixed(3)), // 10 — }=> arrow
+        Column::new(
+            Line::from(Span::styled("Test", header_style)),
+            ColumnWidth::Fixed(7),
+        ), // 11 — [delay]/[name]/[fast]/[real] + `~` approximation
+        Column::new(Line::raw(""), ColumnWidth::Fixed(1)), // 12 — [ outbound opener
+        Column::new(
+            Line::from(Span::styled("Outbound", header_style)),
+            ColumnWidth::Fixed(16),
+        ), // 13
+        Column::new(
+            Line::from(Span::styled("Country", header_style)),
+            ColumnWidth::Fixed(7),
+        ), // 14
+        Column::new(Line::raw(""), ColumnWidth::Fixed(1)), // 15 — ]
     ];
 
     // Scroll offset: keep the selected row roughly centered, in line units —
@@ -1032,15 +1051,15 @@ fn render_data_grid(
     let scrollbar_total = usize::try_from(state.page_total).unwrap_or(usize::MAX);
     let scrollbar_offset = state.page_offset.saturating_add(data_offset);
     let data_table = DataTable::new(columns, display_rows)
-        .highlight_style(ThemeStyles::table_row_selected(palette))
+        .highlight_style(ThemeStyles::table_row_selected(theme))
         .column_spacing(0)
         .block(block)
         .sort_column(sort_column, sort_direction)
         .total_rows(Some(scrollbar_total))
         .scrollbar_offset(Some(scrollbar_offset))
         .scrollbar(
-            ThemeStyles::scrollbar_thumb(palette),
-            ThemeStyles::scrollbar_track(palette),
+            ThemeStyles::scrollbar_thumb(theme),
+            ThemeStyles::scrollbar_track(theme),
         );
 
     let mut table_state = DataTableState {
@@ -1193,12 +1212,7 @@ pub(crate) fn footer_row(state: &AppState) -> Option<&EndpointRow> {
     state.filtered_profiles().nth(state.selected_index)
 }
 
-fn render_footer(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    palette: &ratatui_cheese::theme::Palette,
-) {
+fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline::Theme) {
     if area.height < 1 {
         return;
     }
@@ -1207,7 +1221,7 @@ fn render_footer(
         || {
             Line::from(Span::styled(
                 " Server: (none selected)",
-                ThemeStyles::footer_label(palette),
+                ThemeStyles::footer_label(theme),
             ))
         },
         |row| {
@@ -1221,45 +1235,37 @@ fn render_footer(
             };
             let port = row.endpoint.port.to_string();
             Line::from(vec![
-                Span::styled(" Server: ", ThemeStyles::footer_label(palette)),
-                Span::styled(
-                    format!("{addr}:{port}  "),
-                    ThemeStyles::footer_value(palette),
-                ),
-                Span::styled(format!("[{core}] "), ThemeStyles::footer_value(palette)),
+                Span::styled(" Server: ", ThemeStyles::footer_label(theme)),
+                Span::styled(format!("{addr}:{port}  "), ThemeStyles::footer_value(theme)),
+                Span::styled(format!("[{core}] "), ThemeStyles::footer_value(theme)),
             ])
         },
     );
     // Page position: a 200-row window must not look like a 200-entry feed.
-    let line = line.patch_style(ThemeStyles::status_footer(palette));
+    let line = line.patch_style(ThemeStyles::status_footer(theme));
     let mut spans = line.spans;
     if state.profiles_total() > 0 {
         let first = state.page_offset as u64 + 1;
         let last = state.page_offset as u64 + state.endpoints.len() as u64;
-        spans.push(Span::styled(" ", ThemeStyles::footer_label(palette)));
+        spans.push(Span::styled(" ", ThemeStyles::footer_label(theme)));
         spans.push(Span::styled(
             format!("rows {first}-{last} of {}", state.profiles_total()),
-            ThemeStyles::footer_label(palette),
+            ThemeStyles::footer_label(theme),
         ));
     }
     let line = Line::from(spans);
-    let footer = Paragraph::new(line).style(ThemeStyles::status_footer(palette));
+    let footer = Paragraph::new(line).style(ThemeStyles::status_footer(theme));
     frame.render_widget(footer, area);
 }
 
-fn render_filter_strip(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    palette: &ratatui_cheese::theme::Palette,
-) {
+fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline::Theme) {
     let view_label = match state.purgatory_view {
         leas_db::models::PurgatoryView::Active => "Active",
         leas_db::models::PurgatoryView::Purgatory => "Purgatory",
         leas_db::models::PurgatoryView::All => "All",
     };
     let view_text = format!(" View: {view_label} [P]");
-    let view_span = Span::styled(view_text, ThemeStyles::container_title(palette));
+    let view_span = Span::styled(view_text, ThemeStyles::container_title(theme));
     let search_text = if state.search_focused {
         format!("/ {}▉", state.search_query)
     } else if state.search_query.is_empty() {
@@ -1267,7 +1273,7 @@ fn render_filter_strip(
     } else {
         format!("/ {}", state.search_query)
     };
-    let search_span = Span::styled(search_text, ThemeStyles::warning(palette));
+    let search_span = Span::styled(search_text, ThemeStyles::warning(theme));
 
     let line = Line::from(vec![view_span, Span::raw("  "), search_span]);
     let paragraph = Paragraph::new(line);
@@ -1297,6 +1303,7 @@ fn render_confirmation_overlays(
                 frame,
                 area,
                 &format!(" Delete \"{profile_name}\"? (y/N) "),
+                state.theme(),
             );
         }
         Some(ConfirmAction::DeleteProfiles(ref ids)) => {
@@ -1304,6 +1311,7 @@ fn render_confirmation_overlays(
                 frame,
                 area,
                 &format!(" Delete {} profiles? (y/N) ", ids.len()),
+                state.theme(),
             );
         }
         Some(ConfirmAction::ClearGroup(ref group_id)) => {
@@ -1317,6 +1325,7 @@ fn render_confirmation_overlays(
                 frame,
                 area,
                 &format!(" Clear all profiles in \"{group_name}\"? (y/N) "),
+                state.theme(),
             );
         }
         _ => {}
@@ -1341,7 +1350,7 @@ mod page_window_tests {
                     rows,
                     state.selected_index,
                     state,
-                    &state.current_palette(),
+                    state.theme(),
                 );
             })
             .unwrap();
@@ -1422,8 +1431,8 @@ mod page_window_tests {
 
     fn display(state: &AppState) -> Vec<DisplayRowData> {
         let rows: Vec<&EndpointRow> = state.endpoints.iter().collect();
-        let palette = state.current_palette();
-        (*build_display_rows(&rows, state.selected_index, state, &palette)).clone()
+        let theme = state.theme();
+        (*build_display_rows(&rows, state.selected_index, state, theme)).clone()
     }
 
     /// The `#` column carries the row's position in the FEED, not in the
@@ -1578,8 +1587,7 @@ mod tests {
     #[test]
     fn approximation_marker_follows_the_representative_link() {
         use crate::ops::profiles::test_support::fake_row;
-        let palette =
-            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = fake_row(1, "1.2.3.4", 3); // p100, p101, p102
         let rep = row
             .representative_link_index(true)
@@ -1593,19 +1601,19 @@ mod tests {
             .expect("sibling")
             .security
             .fp = Some(String::from("qq"));
-        let (text, _) = compute_test_cell(&row, true, &palette);
+        let (text, _) = compute_test_cell(&row, true, &theme);
         assert!(!text.contains('~'), "sibling-only: {text:?}");
 
         // The representative's own protocol carrying it MUST.
         row.protocols.get_mut(&rep_id).expect("rep").security.fp = Some(String::from("qq"));
-        let (text, _) = compute_test_cell(&row, true, &palette);
+        let (text, _) = compute_test_cell(&row, true, &theme);
         assert!(text.ends_with('~'), "representative: {text:?}");
 
         // A roster id, and the two spellings of "no fingerprint requested", are
         // honoured as specified and unmarked.
         for fp in ["chrome", "firefox", "", "unsafe"] {
             row.protocols.get_mut(&rep_id).expect("rep").security.fp = Some(String::from(fp));
-            let (text, _) = compute_test_cell(&row, true, &palette);
+            let (text, _) = compute_test_cell(&row, true, &theme);
             assert!(!text.contains('~'), "fp={fp:?} honoured: {text:?}");
         }
     }
@@ -1616,13 +1624,12 @@ mod tests {
     fn approximation_marker_composes_with_the_verdict() {
         use crate::ops::profiles::test_support::fake_row;
         use leas_db::models::Latency;
-        let palette =
-            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = fake_row(1, "1.2.3.4", 1);
         let rep_id = row.links[0].protocol_id;
         row.links[0].latency = Some(Latency::Fast { delay: 42 });
         row.protocols.get_mut(&rep_id).expect("rep").security.fp = Some(String::from("qq"));
-        let (text, _) = compute_test_cell(&row, true, &palette);
+        let (text, _) = compute_test_cell(&row, true, &theme);
         assert!(text.contains("42"), "the measurement survives: {text:?}");
         assert!(text.ends_with('~'), "and carries the marker: {text:?}");
     }
@@ -1636,8 +1643,7 @@ mod tests {
     fn test_cell_follows_the_representative_link() {
         use crate::ops::profiles::test_support::fake_row;
         use leas_db::models::{ErrorInfo, Latency, ProfileErr};
-        let palette =
-            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = fake_row(1, "1.2.3.4", 3); // p100, p101, p102
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Real,
@@ -1653,7 +1659,7 @@ mod tests {
         // shows — whatever the selection is.
         for selected in [0, 1, 2] {
             row.selected_protocol = selected;
-            let (text, _) = compute_test_cell(&row, true, &palette);
+            let (text, _) = compute_test_cell(&row, true, &theme);
             assert!(text.contains("40"), "representative delay: {text:?}");
             assert!(!text.contains("real"), "no marker: {text:?}");
         }
@@ -1670,7 +1676,7 @@ mod tests {
             text: "timeout".into(),
         });
         row.selected_protocol = 1;
-        let (text, _) = compute_test_cell(&row, true, &palette);
+        let (text, _) = compute_test_cell(&row, true, &theme);
         assert_eq!(text, "[real]");
     }
 
@@ -1685,8 +1691,7 @@ mod tests {
     fn test_cell_ignores_a_marker_on_a_link_worse_than_the_endpoints_tier() {
         use crate::ops::profiles::test_support::fake_row;
         use leas_db::models::{ErrorInfo, Latency, ProfileErr};
-        let palette =
-            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = fake_row(1, "1.2.3.4", 2);
         row.links[0].latency = Some(Latency::Fast { delay: 12 });
         row.links[0].error = Some(ErrorInfo {
@@ -1701,7 +1706,7 @@ mod tests {
         probing.select_best_measured_link();
         assert_eq!(probing.selected_protocol, 0, "the error-blind rule picks A");
 
-        let (text, _) = compute_test_cell(&row, true, &palette);
+        let (text, _) = compute_test_cell(&row, true, &theme);
         assert_eq!(
             text, "[ 20 ]",
             "the endpoint's tier is 1, so its clean measurement shows"
@@ -1719,22 +1724,21 @@ mod tests {
     fn test_cell_failure_marker_beats_the_links_own_delay() {
         use crate::ops::profiles::test_support::fake_row;
         use leas_db::models::{ErrorInfo, Latency, ProfileErr};
-        let palette =
-            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = fake_row(1, "1.2.3.4", 1);
         row.links[0].latency = Some(Latency::Fast { delay: 44 });
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "timeout".into(),
         });
-        let (text, _style) = compute_test_cell(&row, true, &palette);
+        let (text, _style) = compute_test_cell(&row, true, &theme);
         assert_eq!(text, "[fast]", "the marker must win over a stale delay");
         assert!(!text.contains("44"), "no delay over a marker: {text:?}");
 
         // The delay is displayable again once the marker is gone — the TTL
         // sweep is the only remover.
         row.links[0].error = None;
-        let (text, _style) = compute_test_cell(&row, true, &palette);
+        let (text, _style) = compute_test_cell(&row, true, &theme);
         assert!(
             text.contains("44"),
             "a clean measurement still shows: {text:?}"
@@ -1807,8 +1811,7 @@ mod tests {
 
     #[test]
     fn panel_config_and_delay_keep_a_gap() {
-        let palette =
-            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut pr = sample_panel_row("●");
         // A config value wider than its 14-cell column (the cell clips it):
         // without the deliberate 1-cell gap the latency text would run into
@@ -1816,7 +1819,7 @@ mod tests {
         pr.config_type = "splithttp/reality".to_string();
         pr.delay = "1234ms".to_string();
         let mut row = sample_row(true, vec![pr], "00");
-        row.row_style = ThemeStyles::table_row_normal(&palette);
+        row.row_style = ThemeStyles::table_row_normal(&theme);
         let col_widths = vec![1u16, 2, 7, 1, 4, 34, 2, 4, 4, 24, 3, 7, 1, 16, 7, 1];
         let mut col_xs = Vec::with_capacity(col_widths.len());
         let mut x = 0u16;
@@ -1837,8 +1840,7 @@ mod tests {
 
     #[test]
     fn windowed_panel_renders_selected_window_and_range() {
-        let palette =
-            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = sample_row(
             true,
             (0..23)
@@ -1850,8 +1852,8 @@ mod tests {
                 .collect(),
             "00",
         );
-        row.row_style = ThemeStyles::table_row_normal(&palette);
-        row.panel_selected_style = ThemeStyles::panel_row_selected(&palette);
+        row.row_style = ThemeStyles::table_row_normal(&theme);
+        row.panel_selected_style = ThemeStyles::panel_row_selected(&theme);
         row.panel_selected = Some(9);
         // Real column geometry (118 cells) so the panel draws at its
         // production width. Keep in step with the `Column::new` widths in
@@ -1897,15 +1899,14 @@ mod tests {
 
     #[test]
     fn selected_sub_row_reverse_highlights_full_width() {
-        let palette =
-            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = sample_row(
             true,
             vec![sample_panel_row("●"), sample_panel_row("○")],
             "00",
         );
-        row.row_style = ThemeStyles::table_row_normal(&palette);
-        row.panel_selected_style = ThemeStyles::panel_row_selected(&palette);
+        row.row_style = ThemeStyles::table_row_normal(&theme);
+        row.panel_selected_style = ThemeStyles::panel_row_selected(&theme);
         row.panel_selected = Some(0);
         let col_xs: Vec<u16> = (0..17).collect();
         let col_widths = vec![1u16; 17];
@@ -1915,7 +1916,7 @@ mod tests {
         // (including the expanded panel area) sits on `surface`.
         for x in 0..17u16 {
             for y in 0..8u16 {
-                buf[(x, y)].set_style(ThemeStyles::table_row_selected(&palette));
+                buf[(x, y)].set_style(ThemeStyles::table_row_selected(&theme));
             }
         }
 
@@ -1939,7 +1940,7 @@ mod tests {
         // …the unselected sub-row keeps the panel's highlight background.
         assert_eq!(
             buf[(1, 5)].style().bg,
-            Some(palette.surface),
+            Some(theme.color("bg.highlight").into()),
             "unselected sub-row keeps the endpoint highlight background"
         );
     }
@@ -2052,33 +2053,24 @@ mod tests {
             endpoint_row(3, "c.example", 443),
         ];
         let state = test_state(rows).await;
-        let palette = state.current_palette();
+        let theme = state.theme();
         let refs: Vec<&leas_db::models::EndpointRow> = state.endpoints.iter().collect();
 
-        let first = build_display_rows(&refs, 0, &state, &palette);
-        assert_eq!(
-            first[0].row_style,
-            ThemeStyles::table_row_selected(&palette)
-        );
-        assert_eq!(first[1].row_style, ThemeStyles::table_row_normal(&palette));
+        let first = build_display_rows(&refs, 0, &state, theme);
+        assert_eq!(first[0].row_style, ThemeStyles::table_row_selected(theme));
+        assert_eq!(first[1].row_style, ThemeStyles::table_row_normal(theme));
 
         // Move the selection: row 0 and row 1 restyle, row 2 is untouched.
-        let moved = build_display_rows(&refs, 1, &state, &palette);
-        assert_eq!(moved[0].row_style, ThemeStyles::table_row_normal(&palette));
-        assert_eq!(
-            moved[1].row_style,
-            ThemeStyles::table_row_selected(&palette)
-        );
-        assert_eq!(moved[2].row_style, ThemeStyles::table_row_normal(&palette));
+        let moved = build_display_rows(&refs, 1, &state, theme);
+        assert_eq!(moved[0].row_style, ThemeStyles::table_row_normal(theme));
+        assert_eq!(moved[1].row_style, ThemeStyles::table_row_selected(theme));
+        assert_eq!(moved[2].row_style, ThemeStyles::table_row_normal(theme));
         assert_eq!(moved.len(), 3);
 
         // Same selection again: still consistent (cache hit).
-        let again = build_display_rows(&refs, 1, &state, &palette);
-        assert_eq!(
-            again[1].row_style,
-            ThemeStyles::table_row_selected(&palette)
-        );
-        assert_eq!(again[0].row_style, ThemeStyles::table_row_normal(&palette));
+        let again = build_display_rows(&refs, 1, &state, theme);
+        assert_eq!(again[1].row_style, ThemeStyles::table_row_selected(theme));
+        assert_eq!(again[0].row_style, ThemeStyles::table_row_normal(theme));
     }
 
     /// Minimal `EndpointRow` with just enough to be filtered and described:
@@ -2132,60 +2124,58 @@ mod tests {
         assert_eq!(row.endpoint.id.get(), 2);
     }
 
-    fn test_palette() -> ratatui_cheese::theme::Palette {
-        crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight)
+    fn test_theme() -> opaline::Theme {
+        crate::ui::theme::load("tokyo-night").unwrap()
     }
 
     /// The purge verdict outranks the delay the link still carries from phase 1
     /// — the row is retired, and its only reachable position is Purgatory/All.
     #[test]
     fn test_cell_shows_the_purge_label_over_a_delay() {
-        let palette =
-            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
-        let (text, _) =
-            test_cell_content(false, true, false, Some("mitm"), None, Some(12), &palette);
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let (text, _) = test_cell_content(false, true, false, Some("mitm"), None, Some(12), &theme);
         assert_eq!(text, "[mitm]", "the verdict replaces the delay");
 
         // A row with no verdict is unchanged by the new slot.
-        let (text, _) = test_cell_content(false, true, false, None, None, Some(12), &palette);
+        let (text, _) = test_cell_content(false, true, false, None, None, Some(12), &theme);
         assert_eq!(text, "[ 12 ]");
     }
 
     #[test]
     fn test_cell_colors_delay_by_threshold() {
-        let palette = test_palette();
-        let (t, s) = test_cell_content(false, true, false, None, None, Some(12), &palette);
+        let theme = test_theme();
+        let (t, s) = test_cell_content(false, true, false, None, None, Some(12), &theme);
         assert_eq!(t, "[ 12 ]");
-        assert_eq!(s.fg, Some(palette.success));
-        let (t, s) = test_cell_content(false, true, false, None, None, Some(612), &palette);
+        assert_eq!(s.fg, Some(theme.color("success").into()));
+        let (t, s) = test_cell_content(false, true, false, None, None, Some(612), &theme);
         assert_eq!(t, "[ 612]");
-        assert_eq!(s.fg, Some(ratatui::style::Color::Yellow));
-        let (t, s) = test_cell_content(false, true, false, None, None, Some(1234), &palette);
+        assert_eq!(s.fg, Some(theme.color("warning").into()));
+        let (t, s) = test_cell_content(false, true, false, None, None, Some(1234), &theme);
         assert_eq!(t, "[1234]");
-        assert_eq!(s.fg, Some(palette.error));
+        assert_eq!(s.fg, Some(theme.color("error").into()));
     }
 
     #[test]
     fn test_cell_blank_without_measurement() {
-        let palette = test_palette();
-        let (t, _) = test_cell_content(false, true, false, None, None, None, &palette);
+        let theme = test_theme();
+        let (t, _) = test_cell_content(false, true, false, None, None, None, &theme);
         assert_eq!(t, "      ");
     }
 
     #[test]
     fn test_cell_shows_name_when_dns_unresolved() {
-        let palette = test_palette();
-        let (t, s) = test_cell_content(true, false, false, None, None, Some(12), &palette);
+        let theme = test_theme();
+        let (t, s) = test_cell_content(true, false, false, None, None, Some(12), &theme);
         assert_eq!(t, "[name]");
-        assert_eq!(s.fg, Some(palette.error));
+        assert_eq!(s.fg, Some(theme.color("error").into()));
         // Resolved DNS name behaves like a normal host.
-        let (t, _) = test_cell_content(true, true, false, None, None, Some(12), &palette);
+        let (t, _) = test_cell_content(true, true, false, None, None, Some(12), &theme);
         assert_eq!(t, "[ 12 ]");
     }
 
     #[test]
     fn test_cell_labels_persisted_failure_markers() {
-        let palette = test_palette();
+        let theme = test_theme();
         // A failure marker outranks the link's OWN measurement: a failed probe
         // keeps its latency stored, and rendering it would hide a failure the
         // ordering law already ranks in an error tier.
@@ -2196,7 +2186,7 @@ mod tests {
             None,
             Some(TestFailure::Real),
             Some(12),
-            &palette,
+            &theme,
         );
         assert_eq!(t, "[real]");
         let (t, _) = test_cell_content(
@@ -2206,7 +2196,7 @@ mod tests {
             None,
             Some(TestFailure::Fast),
             Some(12),
-            &palette,
+            &theme,
         );
         assert_eq!(t, "[fast]");
         // Both marker classes present with no delay → [real]: real-err
@@ -2219,10 +2209,10 @@ mod tests {
             None,
             Some(TestFailure::Real),
             None,
-            &palette,
+            &theme,
         );
         assert_eq!(t, "[real]");
-        assert_eq!(s.fg, Some(palette.error));
+        assert_eq!(s.fg, Some(theme.color("error").into()));
         // Only a fast-class failure marker with no delay → [fast].
         let (t, _) = test_cell_content(
             false,
@@ -2231,22 +2221,22 @@ mod tests {
             None,
             Some(TestFailure::Fast),
             None,
-            &palette,
+            &theme,
         );
         assert_eq!(t, "[fast]");
         // No failure markers → the delay shows even when untested links exist.
-        let (t, _) = test_cell_content(false, true, false, None, None, Some(30), &palette);
+        let (t, _) = test_cell_content(false, true, false, None, None, Some(30), &theme);
         assert_eq!(t, "[ 30 ]");
     }
 
     #[test]
     fn untestable_marker_outranks_a_measured_delay() {
-        let palette = test_palette();
+        let theme = test_theme();
         // A stored (fast) delay must not hide the "cannot be tested" status —
         // that is the whole point of the marker.
-        let (t, s) = test_cell_content(false, true, true, None, None, Some(12), &palette);
+        let (t, s) = test_cell_content(false, true, true, None, None, Some(12), &theme);
         assert_eq!(t, "[real]");
-        assert_eq!(s.fg, Some(palette.error));
+        assert_eq!(s.fg, Some(theme.color("error").into()));
         // A genuine failure marker outranks a measured delay too — the marker
         // is the later, deeper statement about the link.
         let (t, _) = test_cell_content(
@@ -2256,11 +2246,11 @@ mod tests {
             None,
             Some(TestFailure::Real),
             Some(12),
-            &palette,
+            &theme,
         );
         assert_eq!(t, "[real]");
         // DNS-unresolved stays the deepest state.
-        let (t, _) = test_cell_content(true, false, true, None, None, None, &palette);
+        let (t, _) = test_cell_content(true, false, true, None, None, None, &theme);
         assert_eq!(t, "[name]");
     }
 }

@@ -48,7 +48,6 @@ dirs.workspace = true
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 unicode-width = "0.2.2"
-ratatui-themes.workspace = true
 ratatui-cheese = "0.7.0"
 tui-popup = "0.7.7"
 tui-scrollbar = "0.2.8"
@@ -72,6 +71,7 @@ parking_lot.workspace = true
 # the tree — direct edges only for the TUI's bounded caches.
 lru.workspace = true
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
+opaline = { version = "0.4.2", default-features = false, features = ["builtin-themes", "ratatui", "gradients", "discovery", "widgets"] }
 
 [features]
 # Cost-lab probes (`ops::ping::flow_cost`): measurement harnesses that print

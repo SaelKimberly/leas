@@ -1,5 +1,4 @@
 use ratatui::text::{Line, Span};
-use ratatui_cheese::theme::Palette;
 
 use crate::ui::theme::ThemeStyles;
 
@@ -70,7 +69,7 @@ pub fn format_eta(secs: Option<u64>) -> String {
 }
 
 /// One Actions-Log row's right region: label, bar, counters, ETA, styled from
-/// the palette and degrading with the available width.
+/// the theme and degrading with the available width.
 #[must_use]
 pub fn bar_line(
     label: &str,
@@ -78,7 +77,7 @@ pub fn bar_line(
     total: u32,
     eta: Option<u64>,
     width: usize,
-    palette: &Palette,
+    theme: &opaline::Theme,
 ) -> Line<'static> {
     if width < MIN_REGION_WIDTH {
         return Line::default();
@@ -87,7 +86,7 @@ pub fn bar_line(
     let counters = format!("{done}/{total}");
     let eta = format_eta(eta);
     let pct = pct_text(done, total);
-    let muted = ThemeStyles::footer_label(palette);
+    let muted = ThemeStyles::footer_label(theme);
     if width < MIN_BAR_WIDTH {
         return Line::from(vec![
             Span::styled(format!("{label} "), muted),
@@ -106,8 +105,8 @@ pub fn bar_line(
         width.saturating_sub(fixed).max(MIN_SHORT_BAR_CELLS)
     };
     let (fill, track) = runs(done, total, bar_width);
-    let fill_style = ThemeStyles::progress_fill(palette);
-    let track_style = ThemeStyles::progress_bar(palette);
+    let fill_style = ThemeStyles::progress_fill(theme);
+    let track_style = ThemeStyles::progress_bar(theme);
     Line::from(vec![
         Span::styled(format!("{label} "), track_style),
         Span::styled("[", track_style),
@@ -126,7 +125,6 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::text::Line;
     use ratatui::widgets::Widget;
-    use ratatui_cheese::theme::Palette;
 
     /// The rendered text of a line — what the terminal actually shows.
     fn plain(line: &Line<'_>) -> String {
@@ -179,8 +177,8 @@ mod tests {
 
     #[test]
     fn ladder_degrades_with_the_right_region_width() {
-        let palette = Palette::default();
-        let row = |width| plain(&bar_line("Fast", 1234, 34562, Some(180), width, &palette));
+        let theme = crate::ui::theme::load("dracula").unwrap();
+        let row = |width| plain(&bar_line("Fast", 1234, 34562, Some(180), width, &theme));
         assert_eq!(row(17), "", "below 18 there is no right region");
         assert_eq!(row(18), "Fast 1234/34562 ~3m", "18..=29 is numbers and ETA");
         assert_eq!(row(29), "Fast 1234/34562 ~3m");
@@ -201,8 +199,8 @@ mod tests {
 
     #[test]
     fn bar_glyphs_are_painted_from_the_palette() {
-        let palette = Palette::default();
-        let line = bar_line("Fast", 1, 2, None, 60, &palette);
+        let theme = crate::ui::theme::load("dracula").unwrap();
+        let line = bar_line("Fast", 1, 2, None, 60, &theme);
         let area = Rect::new(0, 0, u16::try_from(line.width()).unwrap(), 1);
         let mut buf = Buffer::empty(area);
         (&line).render(area, &mut buf);
@@ -213,21 +211,39 @@ mod tests {
             u16::try_from(text[..idx].chars().count()).unwrap()
         };
         let fill = &buf[(col("█"), 0)];
-        assert_eq!((fill.fg, fill.bg), (palette.primary, palette.primary));
+        assert_eq!(
+            (fill.fg, fill.bg),
+            (
+                theme.color("accent.primary").into(),
+                theme.color("accent.primary").into()
+            )
+        );
         let head = &buf[(col(">"), 0)];
         assert_eq!(
             (head.fg, head.bg),
-            (palette.primary, palette.primary),
+            (
+                theme.color("accent.primary").into(),
+                theme.color("accent.primary").into()
+            ),
             "the head belongs to the fill"
         );
         let bracket = &buf[(col("["), 0)];
         assert_eq!(
             (bracket.fg, bracket.bg),
-            (palette.foreground, palette.surface)
+            (
+                theme.color("text.primary").into(),
+                theme.color("bg.selection").into()
+            )
         );
         let track = &buf[(col("░"), 0)];
-        assert_eq!((track.fg, track.bg), (palette.foreground, palette.surface));
+        assert_eq!(
+            (track.fg, track.bg),
+            (
+                theme.color("text.primary").into(),
+                theme.color("bg.selection").into()
+            )
+        );
         let counters = &buf[(col("1/2"), 0)];
-        assert_eq!(counters.fg, palette.muted);
+        assert_eq!(counters.fg, theme.color("text.muted").into());
     }
 }
