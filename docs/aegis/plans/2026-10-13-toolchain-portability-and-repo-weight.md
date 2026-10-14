@@ -202,11 +202,13 @@ Both fixed and locally verified: `cargo clippy -p leas-core -p leas --all-target
 *Files:* `crates/leas-tls/src/crypto/mlkem.rs:8-15`, `crates/leas-tls/Cargo.toml:48-51`, `docs/reference/crypto-dependencies.md:90-94`, `docs/reference/native-core.md:71-76,108-111`; `docs/history/roadmap.md:356-359` + Phase-27 ✅ line marked obsolete/superseded.
 *Change:* restate each rationale against the *actual* reason it survives (pure-Rust/`forbid(unsafe_code)` posture, no CMake/libclang/C++ chain in the build) rather than the retired triple.
 *Verification:* `grep -rn 'windows-gnu'` over editable files returns only deliberate history mentions; `just quality-gate code` still green (comment-only edits).
+*Landed (2026-10-14, `5b168a5`):* the four editable files carry the declared target — `crypto/mlkem.rs`, `leas-tls/Cargo.toml`, `docs/reference/crypto-dependencies.md`, `docs/reference/native-core.md` (two sites), and `roadmap.md:357`'s gnu cross recipe is marked obsolete rather than deleted. A filtered `grep -rn 'windows-gnu'` over `crates/`, `docs/reference/` and `docs/history/` returns only deliberate history: the `when this decision was taken` clauses, the obsolete marker, and `roadmap.md:356`'s crossterm-probe sentence.
 
 **T12 — ADR 0013.**
 *Files:* `docs/aegis/adr/0013-*.md` (new), `docs/aegis/INDEX.md` row.
 *Change:* record the ABI decision, the alternatives (keep gnu, two-stage, msvc), the evidence that forced it (the CI run), and that it amends `0007`. Compose `recording-architecture-decisions` when writing it.
 *Verification:* ADR 0007 unmodified (`git diff --stat adr/0007-*` empty), registry row present.
+*Landed (2026-10-14, `5b168a5`):* `adr/0013-declared-windows-abi-msvc.md` records the decision, three rejected alternatives, the four defects the msvc target made findable, and its re-evaluation trigger (`aarch64-pc-windows-msvc`). ADR 0007's diff against the base (`37399ca`) is **empty**, and the registry row was appended with the run that paid for it.
 *Authority:* only write this **after** T9 is green (spec §7: no accepted architecture memory from an unproven ABI).
 
 ### S5 — Repository weight
