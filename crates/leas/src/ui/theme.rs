@@ -69,6 +69,17 @@ fn derive_readable(
             fg.lighten(0.06)
         };
     }
+    // Budget exhausted: no colour on this ramp clears `target` against `bg`.
+    // Return the best we saw (never worse than the input) rather than an
+    // out-of-gamut colour, and say so — silence here would otherwise be
+    // indistinguishable from "the derivation worked".
+    if contrast(best, bg) < target {
+        tracing::debug!(
+            target: "tui::theme",
+            "hint contrast {:.2}:1 < {target} after 12 steps — best effort;              a user TOML can override app.statusbar_hint",
+            contrast(best, bg)
+        );
+    }
     best
 }
 
@@ -97,7 +108,7 @@ pub fn with_app_roles(mut theme: Theme) -> Theme {
     // own muted colour against the strip it actually sits on, rather than
     // pinning a fixed value that only suits one background.
     let status_bg = theme.color("bg.selection");
-    let hint_fg = derive_readable(theme.color("text.muted"), status_bg, 4.5, theme.is_light());
+    let hint_fg = derive_readable(theme.color("text.muted"), status_bg, 4.6, theme.is_light());
     theme.register_default_style(
         "app.statusbar_hint",
         OpalineStyle::fg(hint_fg).with_bg(status_bg),
@@ -337,5 +348,56 @@ pub fn widget_palette(theme: &Theme) -> ratatui_cheese::theme::Palette {
         on_highlight: theme.color("text.primary").into(),
         error: theme.color("error").into(),
         success: theme.color("success").into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A muted fg on a near-white strip: the ramp runs out of steps.
+    #[test]
+    fn derive_readable_exhausting_its_budget_returns_best_effort_not_a_clamp() {
+        // #1a1a1a is already near-black; darkening further cannot lift the ratio.
+        let fg = OpalineColor::new(0x1a, 0x1a, 0x1a);
+        let bg = OpalineColor::new(0xef, 0xf1, 0xf5);
+        let out = derive_readable(fg, bg, 4.6, true);
+        // Never worse than the input, and the colour is still a real colour.
+        assert!(
+            contrast(out, bg) >= contrast(fg, bg) - f64::EPSILON,
+            "best effort must not regress: {out:?}"
+        );
+        assert!(
+            out.r <= 0x1a && out.g <= 0x1a && out.b <= 0x1a,
+            "only darkens"
+        );
+    }
+
+    /// A light fg on a dark strip succeeds, and the result clears the target.
+    #[test]
+    fn derive_readable_succeeds_when_the_ramp_can_reach_the_target() {
+        let out = derive_readable(
+            OpalineColor::new(0x9a, 0x9a, 0x9a),
+            OpalineColor::new(0x44, 0x47, 0x5a),
+            4.6,
+            false,
+        );
+        assert!(
+            contrast(out, OpalineColor::new(0x44, 0x47, 0x5a)) >= 4.6,
+            "clears target"
+        );
+    }
+
+    /// Both fixture themes land above the bar after the derivation.
+    #[test]
+    fn fixture_themes_clear_the_hint_contrast_target() {
+        for slug in ["dracula", "catppuccin-latte"] {
+            let theme = load(slug).expect("builtin theme");
+            let hint = theme.style("app.statusbar_hint");
+            let bg = theme.color("bg.selection");
+            let fg = hint.fg.expect("hint has a fg");
+            let ratio = contrast(fg, bg);
+            assert!(ratio >= 4.6, "{slug}: hint contrast {ratio:.2} < 4.6");
+        }
     }
 }
