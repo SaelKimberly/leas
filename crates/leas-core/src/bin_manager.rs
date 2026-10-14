@@ -22,15 +22,36 @@ pub const fn get_core_info(core_type: CoreType) -> Option<CoreBinInfo> {
     }
 }
 
+/// The candidate executable names for `core_type` **as the running platform
+/// spells them**: `["sing-box-client.exe", "sing-box.exe"]` on Windows,
+/// `["sing-box-client", "sing-box"]` elsewhere.
+///
+/// This is the single owner of that spelling. `find_binary` walks the managed
+/// directory and PATH with these names, and the updater uses the same list to
+/// find the binary inside a freshly extracted upstream archive. The old
+/// extensionless list could never match the real Windows case (upstream ships
+/// `xray.exe`/`sing-box.exe`), and PATH was searched through `which`, which
+/// Windows does not have — the two defects recorded at `roadmap.md:358`.
+#[must_use]
+pub fn exe_names(core_type: CoreType) -> Option<Vec<String>> {
+    let info = get_core_info(core_type)?;
+    Some(
+        info.exe_names
+            .iter()
+            .map(|name| format!("{name}{}", std::env::consts::EXE_SUFFIX))
+            .collect(),
+    )
+}
+
 /// Find a core binary by checking the managed directory first, then PATH.
 #[must_use]
 pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf> {
-    let info = get_core_info(core_type)?;
+    let names = exe_names(core_type)?;
 
     // 1. Check managed binary directory (inside per-core subdirectory)
     let core_dir = bin_dir.join(core_type.to_string());
     if core_dir.is_dir() {
-        for exe in info.exe_names {
+        for exe in &names {
             let managed = core_dir.join(exe);
             if managed.is_file() {
                 // Check if executable (on Unix, file must be executable)
@@ -52,19 +73,22 @@ pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf> {
     }
 
     // 1b. If flat check failed, search recursively inside core_dir
-    if let Some(path) = find_binary_recursive(&core_dir, info.exe_names) {
+    if let Some(path) = find_binary_recursive(&core_dir, &names) {
         return Some(path);
     }
 
-    // 2. Check PATH via `which` command
-    for exe in info.exe_names {
-        if let Ok(path) = std::process::Command::new("which").arg(exe).output()
-            && path.status.success()
+    // 2. Check PATH with the platform's lookup tool: `where` on Windows,
+    //    `which` elsewhere (`which` does not exist on Windows).
+    let lookup = if cfg!(windows) { "where" } else { "which" };
+    for exe in &names {
+        if let Ok(out) = std::process::Command::new(lookup).arg(exe).output()
+            && out.status.success()
         {
-            let path_str = String::from_utf8_lossy(&path.stdout);
-            let trimmed = path_str.trim();
-            if !trimmed.is_empty() {
-                let p = PathBuf::from(trimmed);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // `where` lists every match, one per line; the first is the one it
+            // would run.
+            if let Some(first) = stdout.lines().map(str::trim).find(|line| !line.is_empty()) {
+                let p = PathBuf::from(first);
                 if p.is_file() {
                     return Some(p);
                 }
@@ -77,7 +101,7 @@ pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf> {
 
 /// Search recursively for any of the given executable names in `dir`.
 /// Returns the first match that passes the executable check (Unix).
-fn find_binary_recursive(dir: &Path, exe_names: &[&str]) -> Option<PathBuf> {
+fn find_binary_recursive(dir: &Path, exe_names: &[String]) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
         if let Ok(rd) = std::fs::read_dir(&current) {
@@ -86,7 +110,7 @@ fn find_binary_recursive(dir: &Path, exe_names: &[&str]) -> Option<PathBuf> {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && exe_names.contains(&name)
+                    && exe_names.iter().any(|candidate| candidate == name)
                 {
                     #[cfg(unix)]
                     {
@@ -108,6 +132,34 @@ fn find_binary_recursive(dir: &Path, exe_names: &[&str]) -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Packaging {
+    Zip,
+    TarGz,
+}
+
+/// Which packaging a filename names, or `None` if it is not an archive this
+/// module extracts. The single owner of that shape test, used both to choose an
+/// extractor and to recognise a dropped-in download.
+///
+/// `.tar.gz` is two extensions, so it is matched the way `extract_archive`
+/// always did: a `.gz` whose stem ends in `.tar`.
+fn packaging(path: &Path) -> Option<Packaging> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("zip") => Some(Packaging::Zip),
+        Some("gz")
+            if path
+                .file_stem()
+                .and_then(|stem| Path::new(stem).extension())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tar")) =>
+        {
+            Some(Packaging::TarGz)
+        }
+        Some("tgz") => Some(Packaging::TarGz),
+        _ => None,
+    }
+}
+
 /// Extract a core binary archive (zip or tar.gz) into the target directory.
 pub fn extract_archive(
     archive: &Path,
@@ -116,22 +168,13 @@ pub fn extract_archive(
 ) -> Result<(), BinError> {
     let ext = archive.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    let stem = archive.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-
     // Create target dir
     std::fs::create_dir_all(target_dir)?;
 
-    match ext {
-        "zip" => extract_zip(archive, target_dir)?,
-        "gz" | "tgz"
-            if std::path::Path::new(stem)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
-                || ext == "tgz" =>
-        {
-            extract_tar_gz(archive, target_dir)?;
-        }
-        _ => {
+    match packaging(archive) {
+        Some(Packaging::Zip) => extract_zip(archive, target_dir)?,
+        Some(Packaging::TarGz) => extract_tar_gz(archive, target_dir)?,
+        None => {
             return Err(BinError::ExtractionFailed(format!(
                 "Unsupported archive format: .{ext}"
             )));
@@ -248,33 +291,42 @@ fn copy_dir_contents(src_dir: &Path, dst_dir: &Path) -> Result<(), std::io::Erro
     Ok(())
 }
 
+/// Which core an archive belongs to, and the per-core directory it extracts
+/// into, or `None` for a file this path does not claim.
+///
+/// The names are the upstream ones and platform-shaped, which is why the match
+/// is on the filename rather than on extensions alone: Xray ships
+/// `Xray-<os>-<arch>.zip` everywhere, while sing-box ships
+/// `sing-box-<version>-linux-<arch>.tar.gz` on Linux and
+/// `sing-box-<version>-windows-<arch>.zip` on Windows (`Compress-Archive`).
+/// Matching only `.tar.gz` ignored every sing-box download on Windows.
+fn archive_core(name: &str) -> Option<(CoreType, &'static str)> {
+    // Lowercased first, so the packaging test below is case-insensitive — which
+    // is also why this does not need clippy's string-extension comparison lint
+    // to be silenced.
+    let lower = name.to_lowercase();
+    let packaging = packaging(Path::new(&lower))?;
+    if lower.starts_with("xray") && packaging == Packaging::Zip {
+        return Some((CoreType::Xray, "xray"));
+    }
+    if lower.starts_with("sing-box") {
+        return Some((CoreType::SingBox, "sing-box"));
+    }
+    None
+}
+
 /// Find archives in the current directory and extract them to the bin dir.
 pub fn find_and_extract_archives(bin_dir: &Path) -> Result<(), BinError> {
     let cwd = std::env::current_dir()?;
 
-    // Xray zip
     for entry in std::fs::read_dir(&cwd)? {
         let entry = entry?;
         let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        if name.starts_with("xray")
-            && std::path::Path::new(&name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
-        {
-            let xray_dir = bin_dir.join("xray");
-            extract_archive(&path, CoreType::Xray, &xray_dir)?;
-        }
-
-        if name.starts_with("sing-box") && name.ends_with(".tar.gz") {
-            let singbox_dir = bin_dir.join("sing-box");
-            extract_archive(&path, CoreType::SingBox, &singbox_dir)?;
-        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let Some((core_type, core_dir)) = archive_core(name) else {
+            continue;
+        };
+        extract_archive(&path, core_type, &bin_dir.join(core_dir))?;
     }
 
     Ok(())
@@ -296,6 +348,63 @@ pub enum BinError {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    /// A fixture binary's name as THIS platform spells an executable. The
+    /// fixture and the product have to agree, and on Windows that means `.exe`
+    /// — the mismatch is exactly the shipped defect, so the tests must not
+    /// hardcode the extensionless spelling the product used to look for.
+    fn exe(name: &str) -> String {
+        format!("{name}{}", std::env::consts::EXE_SUFFIX)
+    }
+
+    /// The platform spelling is one owner: `find_binary` walks the managed
+    /// directory and PATH with these names, and the updater looks inside an
+    /// extracted archive with the same list.
+    #[test]
+    fn exe_names_carry_the_platform_suffix() {
+        let suffix = std::env::consts::EXE_SUFFIX;
+        assert_eq!(
+            exe_names(CoreType::Xray).unwrap(),
+            vec![format!("xray{suffix}")]
+        );
+        assert_eq!(
+            exe_names(CoreType::SingBox).unwrap(),
+            vec![
+                format!("sing-box-client{suffix}"),
+                format!("sing-box{suffix}")
+            ]
+        );
+        // The base table stays extensionless: it is the source the suffix is
+        // applied to, not the lookup list.
+        assert_eq!(get_core_info(CoreType::Xray).unwrap().exe_names, &["xray"]);
+        assert_eq!(exe_names(CoreType::Auto), None);
+        assert_eq!(exe_names(CoreType::Native), None);
+    }
+
+    /// The drop-in path must recognise the platform packagings, not only the
+    /// Linux ones: matching `.tar.gz` alone ignored every sing-box archive a
+    /// Windows user could download.
+    #[rstest]
+    #[case::xray_linux_zip("Xray-linux-64.zip", Some((CoreType::Xray, "xray")))]
+    #[case::xray_windows_zip("Xray-windows-64.zip", Some((CoreType::Xray, "xray")))]
+    #[case::singbox_linux_tarball(
+        "sing-box-1.13.13-linux-amd64.tar.gz",
+        Some((CoreType::SingBox, "sing-box"))
+    )]
+    #[case::singbox_windows_zip(
+        "sing-box-1.13.13-windows-amd64.zip",
+        Some((CoreType::SingBox, "sing-box"))
+    )]
+    #[case::uppercase_is_matched("XRAY-WINDOWS-64.ZIP", Some((CoreType::Xray, "xray")))]
+    #[case::unrelated_zip("geoip.zip", None)]
+    #[case::unrelated_tarball("geosite.tar.gz", None)]
+    #[case::xray_only_ships_zips("xray.tar.gz", None)]
+    fn archive_core_matches_the_upstream_packagings(
+        #[case] name: &str,
+        #[case] expected: Option<(CoreType, &'static str)>,
+    ) {
+        assert_eq!(archive_core(name), expected);
+    }
 
     #[rstest]
     #[case::xray(CoreType::Xray, Some(&["xray"][..]))]
@@ -331,7 +440,7 @@ mod tests {
         // Create managed binary at tmp/xray/xray
         let core_dir = tmp.join("xray");
         std::fs::create_dir_all(&core_dir).unwrap();
-        let binary = core_dir.join("xray");
+        let binary = core_dir.join(exe("xray"));
         std::fs::write(&binary, "fake binary content").unwrap();
         // Mark executable
         #[cfg(unix)]
@@ -374,7 +483,7 @@ mod tests {
 
         let core_dir = tmp.join("sing-box");
         std::fs::create_dir_all(&core_dir).unwrap();
-        let binary = core_dir.join("sing-box");
+        let binary = core_dir.join(exe("sing-box"));
         std::fs::write(&binary, "fake sing-box").unwrap();
         #[cfg(unix)]
         {
@@ -399,7 +508,7 @@ mod tests {
         // Create managed binary at tmp/xray/xray WITHOUT executable bit
         let core_dir = tmp.join("xray");
         std::fs::create_dir_all(&core_dir).unwrap();
-        let binary = core_dir.join("xray");
+        let binary = core_dir.join(exe("xray"));
         std::fs::write(&binary, "fake non-executable binary").unwrap();
         // Intentionally NOT setting executable permissions
 
@@ -422,10 +531,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // Create versioned subdirectory like sing-box-1.13.13-linux-amd64/sing-box
-        let version_dir = tmp.join("sing-box/sing-box-1.13.13-linux-amd64");
+        // Create versioned subdirectory like sing-box-1.13.13-windows-amd64/sing-box.exe
+        let version_dir = tmp.join("sing-box").join(format!(
+            "sing-box-1.13.13-{}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
         std::fs::create_dir_all(&version_dir).unwrap();
-        let binary = version_dir.join("sing-box");
+        let binary = version_dir.join(exe("sing-box"));
         std::fs::write(&binary, "fake sing-box").unwrap();
         #[cfg(unix)]
         {
@@ -434,14 +547,13 @@ mod tests {
         }
 
         let found = find_binary(CoreType::SingBox, &tmp);
-        assert!(found.is_some(), "should find sing-box via recursive search");
+        let found = found.expect("should find sing-box via recursive search");
+        // Compare path COMPONENTS: a string compare would bake in `/` and fail
+        // on Windows, whose separator is `\` — which is what this assertion did.
         assert!(
-            found
-                .as_deref()
-                .unwrap()
-                .to_string_lossy()
-                .contains("sing-box-1.13.13-linux-amd64/sing-box"),
-            "should find binary inside versioned subdirectory"
+            found.ends_with(version_dir.join(exe("sing-box"))),
+            "should find binary inside versioned subdirectory, got {}",
+            found.display()
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -456,7 +568,7 @@ mod tests {
         // Create flat binary at tmp/sing-box/sing-box
         let core_dir = tmp.join("sing-box");
         std::fs::create_dir_all(&core_dir).unwrap();
-        let flat_binary = core_dir.join("sing-box");
+        let flat_binary = core_dir.join(exe("sing-box"));
         std::fs::write(&flat_binary, "flat sing-box").unwrap();
         #[cfg(unix)]
         {
@@ -467,7 +579,7 @@ mod tests {
         // Create nested binary too
         let version_dir = core_dir.join("sing-box-1.13.13-linux-amd64");
         std::fs::create_dir_all(&version_dir).unwrap();
-        let nested_binary = version_dir.join("sing-box");
+        let nested_binary = version_dir.join(exe("sing-box"));
         std::fs::write(&nested_binary, "nested sing-box").unwrap();
         #[cfg(unix)]
         {

@@ -11,6 +11,16 @@
 //! keeps `prepare_cached` only for engine-generated `Insert`/`QuerySql`. This
 //! test drives the `RawSql` path with fresh text on ONE pooled connection and
 //! asserts RSS does not scale with the call count.
+//!
+//! **Linux-only.** The bound is calibrated against `VmRSS` from
+//! `/proc/self/status`, the probe the original leak was measured with, and
+//! Windows has no `/proc` — the product's own reader is Linux-only by design
+//! (`ops/native_connect.rs::proc_rss_bytes`, `roadmap.md:360`). A
+//! `GetProcessMemoryInfo` probe would measure a different quantity (working
+//! set, not resident pages) and would need its own calibration before it could
+//! assert anything, so this guard skips where it cannot measure rather than
+//! asserting something weaker. The routing it pins is platform-independent.
+#![cfg(target_os = "linux")]
 
 use leas_db::Database;
 

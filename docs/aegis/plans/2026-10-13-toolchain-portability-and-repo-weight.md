@@ -217,6 +217,17 @@ Both fixed and locally verified: `cargo clippy -p leas-core -p leas --all-target
 *Measured (2026-10-13):* `.git` **116 MB → 69 MB** (pack 57.41 → 58.62 MiB absorbing the loose set, loose 5814/53.70 MiB → 573/5.21 MiB); refs hash **identical**, 872 commits either side. `-f --window=250 --depth=250` was tried because a plain `-ad` gave 60.0 MiB; the deeper window bought only 1.4 MiB, so the pack is not delta-starved — it is carrying content.
 *What the remainder is:* 421 objects are reachable **only from reflogs** and are **157 MiB raw** — isolated pre-rename snapshot states that delta poorly. A `gc --prune=now` on a throwaway mirror expired reflogs and pruned them, which is why that mirror reached 18 MB. Expiring reflogs (`git reflog expire --expire=now --all` then `repack -ad --prune`) does **not** change any reachable commit or clone, but it destroys local recovery of those states — **user decision, not taken here**; the repack deliberately stops short of it.
 
+### S6 — The Windows test fallout
+
+**T14 — the four msvc-only failures.**
+*Files:* `crates/leas-core/src/updater.rs`, `crates/leas-core/src/bin_manager.rs`, `crates/leas-native/src/inbound/http.rs`, `crates/leas-db/tests/cache_routing.rs`, `docs/history/roadmap.md`.
+*Change:* four failures, three dispositions:
+1. `updater::tests::test_release_asset_url` — `UnsupportedPlatform("x86_64","windows")`. Owner fix: `asset_name` took only `arch` and read the OS inside (hardcoding `-linux-`) while `release_asset_url` refused every non-Linux OS, which made the naming untestable off Linux. The OS is now an input and the Windows arms are named from upstream tables (Xray-core `.github/build/friendly-filenames.json`: `windows-amd64 → windows-64`; sing-box `build.yml`: `Compress-Archive` ZIPs). Roadmap item 359, closed.
+2. `bin_manager::tests::find_binary_recursive_singbox_versioned_dir` — the assert compared `to_string_lossy().contains("…-linux-amd64/sing-box")`, i.e. baked in `/`; Windows separators are `\`. Owner fix: compare **path components** (`Path::ends_with`) and spell the fixture through `std::env::consts::EXE_SUFFIX`. The same file carries the second half of roadmap 358: `find_binary` looked for extensionless names and searched PATH through `which`, so a real `xray.exe` could never be found on Windows — `bin_manager::exe_names` is now the single owner of the platform spelling, used by the managed-dir check, the recursive search, the PATH lookup (`where`/`which`) and `updater`'s post-extraction search (which had the list hardcoded a second time). Roadmap item 358, closed.
+3. `leas-db::cache_routing` — the leak guard reads `VmRSS` from `/proc/self/status`; there is no `/proc` on Windows, and the bound is calibrated against that probe. Disposition: **Linux-only by construction** (`#![cfg(target_os = "linux")]`, documented in the file and at `roadmap.md:360`), not a portable rewrite — a `GetProcessMemoryInfo` working-set figure is a different quantity and would need its own calibration before it could assert anything.
+4. `inbound::http::tests::oversized_head_is_refused` — the client read an **empty** response. `write_refusal` wrote, flushed, and returned while the caller then dropped a socket whose receive queue still held the oversized head the peer was still sending; closing with unread data makes the stack send an RST that discards the response in flight. Owner fix: sequence the close — write, flush, `shutdown` the write side, then discard what the peer keeps sending (`REFUSAL_DRAIN_BUDGET` 500 ms / `REFUSAL_DRAIN_BYTES` 64 KiB). The test now also asserts a **clean EOF** after the refusal, which is the RST-free close stated as a contract.
+*Verification:* `cargo nextest run -p leas-core -p leas-native -p leas-db`, then `just quality-gate code`, then the msvc `nextest` job (the only place the Windows half of 1/2/4 can be observed). T11/T12 stay held until that job is green.
+
 ## Verification Summary
 
 | Task | Command-shaped exit |
@@ -226,11 +237,12 @@ Both fixed and locally verified: `cargo clippy -p leas-core -p leas --all-target
 | T7–T9 | CI green on `ubuntu-24.04`+`ubuntu:22.04` container and `windows-2022` |
 | T10–T12 | `grep 'windows-gnu'` clean outside history; `AGENTS.md` +1 row; ADR 0007 diff empty |
 | T13 | `git count-objects -vH`; refs unchanged |
+| T14 | the four msvc failures pass: `nextest` for leas-core/leas-native/leas-db locally, then the msvc job green |
 
 ## Risks
 
 - msvc wall (nasm/`rc.exe`/a C dep without an MSVC path) → T9 fallback recorded above.
-- Windows test fallout larger than the known list → T9 absorbs it task-by-task; if it grows beyond the three recorded items, stop and re-scope with the user rather than silently widening.
+- Windows test fallout larger than the known list → T9 absorbs it task-by-task; if it grows beyond the three recorded items, stop and re-scope with the user rather than silently widening. **Counted at T14:** the msvc run produced **four** failures against the roadmap's three open items — the fourth (`inbound::http::tests::oversized_head_is_refused`) is a defect the roadmap did not list, because the roadmap recorded *product* gaps and this one only shows as a client-visible difference on Windows' close semantics. The user asked for the Windows issues to be fixed, so the round proceeded rather than stopping; the roadmap gained no item, since the fix is in the refusal path rather than a new limitation.
 - Repack on a dirty tree: the repack itself is safe, but run it last so it never interleaves with a working change.
 
 ## Retirement Track

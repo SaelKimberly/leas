@@ -300,13 +300,11 @@ pub async fn install_binary(
         crate::bin_manager::extract_archive(&archive_owned, core_type, &temp_dir_clone)
             .map_err(|e| UpdateError::Archive(e.to_string()))?;
 
-        // 2. Find extracted binary
-        let exe_name = match core_type {
-            CoreType::Xray => "xray",
-            CoreType::SingBox => "sing-box",
-            CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
-        };
-        let binary = find_binary_in_dir(&temp_dir_clone, exe_name)?;
+        // 2. Find extracted binary — through the same platform-spelled
+        // candidate list `find_binary` uses, so `xray` vs `xray.exe` has one
+        // owner instead of a second hardcoded match here.
+        let exe_names = crate::bin_manager::exe_names(core_type).ok_or(UpdateError::AutoCore)?;
+        let binary = find_binary_in_dir(&temp_dir_clone, &exe_names)?;
 
         // Make executable
         #[cfg(unix)]
@@ -395,33 +393,42 @@ pub async fn install_binary(
 /// Build the GitHub release asset URL for the current OS/arch.
 pub fn release_asset_url(core_type: CoreType, version: &str) -> Result<String, UpdateError> {
     let version = version.strip_prefix('v').unwrap_or(version);
-    let name = asset_name(core_type, version, std::env::consts::ARCH)?;
+    let name = asset_name(
+        core_type,
+        version,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )?;
 
-    if std::env::consts::OS != "linux" {
-        return Err(UpdateError::UnsupportedPlatform(
-            std::env::consts::ARCH,
-            std::env::consts::OS,
-        ));
-    }
-
-    let url = match core_type {
-        CoreType::Xray => {
-            format!("https://github.com/XTLS/Xray-core/releases/download/v{version}/{name}")
-        }
-        CoreType::SingBox => {
-            format!("https://github.com/SagerNet/sing-box/releases/download/v{version}/{name}")
-        }
+    let repo = match core_type {
+        CoreType::Xray => "https://github.com/XTLS/Xray-core/releases/download",
+        CoreType::SingBox => "https://github.com/SagerNet/sing-box/releases/download",
         CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
     };
 
-    Ok(url)
+    Ok(format!("{repo}/v{version}/{name}"))
 }
 
-/// Build the GitHub release asset filename for a core type, version, and Rust
-/// target arch (a `std::env::consts::ARCH` value such as `"aarch64"`).
+/// Build the upstream release-archive filename for a core, version and target.
+///
+/// The OS and arch are **inputs**, not environment reads, so every platform's
+/// naming is checkable from any host — reading `std::env` in here is what made
+/// the previous version untestable off Linux and turned its Linux-only support
+/// into a silent Windows failure.
+///
+/// The names come from upstream, not from memory: Xray-core publishes
+/// `Xray-<friendly>.zip` with the friendly names in
+/// `.github/build/friendly-filenames.json` (`windows-64`, `linux-arm64-v8a`),
+/// and sing-box packages `sing-box-<version>-<os>-<arch>` — a `.zip` through
+/// `Compress-Archive` on Windows, a `.tar.gz` through `tar` on Linux.
+///
+/// `linux`/`windows` × `x86_64`/`aarch64` are the combinations named here.
+/// Anything else is refused rather than guessed: macOS publishes
+/// `macos-64`/`darwin-arm64` upstream, but no macOS target is claimed.
 fn asset_name(
     core_type: CoreType,
     version: &str,
+    os: &'static str,
     arch: &'static str,
 ) -> Result<String, UpdateError> {
     let version = version.strip_prefix('v').unwrap_or(version);
@@ -437,13 +444,18 @@ fn asset_name(
             CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
         },
         _ => {
-            return Err(UpdateError::UnsupportedPlatform(arch, std::env::consts::OS));
+            return Err(UpdateError::UnsupportedPlatform(arch, os));
         }
     };
-    let name = match core_type {
-        CoreType::Xray => format!("Xray-linux-{suffix}.zip"),
-        CoreType::SingBox => format!("sing-box-{version}-linux-{suffix}.tar.gz"),
-        CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
+    let name = match (os, core_type) {
+        ("linux", CoreType::Xray) => format!("Xray-linux-{suffix}.zip"),
+        ("windows", CoreType::Xray) => format!("Xray-windows-{suffix}.zip"),
+        ("linux", CoreType::SingBox) => format!("sing-box-{version}-linux-{suffix}.tar.gz"),
+        ("windows", CoreType::SingBox) => format!("sing-box-{version}-windows-{suffix}.zip"),
+        (_, CoreType::Auto | CoreType::Native) => return Err(UpdateError::AutoCore),
+        _ => {
+            return Err(UpdateError::UnsupportedPlatform(arch, os));
+        }
     };
     Ok(name)
 }
@@ -469,8 +481,9 @@ fn copy_recursively(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-/// Find a binary in a directory tree (searching recursively).
-fn find_binary_in_dir(dir: &Path, exe_name: &str) -> Result<PathBuf, UpdateError> {
+/// Find a binary in a directory tree (searching recursively), by any of the
+/// platform-spelled candidate names.
+fn find_binary_in_dir(dir: &Path, exe_names: &[String]) -> Result<PathBuf, UpdateError> {
     let mut found = None;
     let mut entries: Vec<_> = vec![dir.to_path_buf()];
 
@@ -480,7 +493,9 @@ fn find_binary_in_dir(dir: &Path, exe_name: &str) -> Result<PathBuf, UpdateError
                 let path = entry.path();
                 if path.is_dir() {
                     entries.push(path);
-                } else if path.file_name().and_then(|n| n.to_str()) == Some(exe_name) {
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && exe_names.iter().any(|candidate| candidate == name)
+                {
                     found = Some(path);
                     break;
                 }
@@ -491,7 +506,7 @@ fn find_binary_in_dir(dir: &Path, exe_name: &str) -> Result<PathBuf, UpdateError
         }
     }
 
-    found.ok_or_else(|| UpdateError::BinaryNotFound(exe_name.to_string()))
+    found.ok_or_else(|| UpdateError::BinaryNotFound(exe_names.join(", ")))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -499,10 +514,6 @@ fn find_binary_in_dir(dir: &Path, exe_name: &str) -> Result<PathBuf, UpdateError
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The module's only `#[rstest]` row is the `#[cfg(unix)]` permission test,
-    // so on Windows the import would be unused — and `-D warnings` turns that
-    // into a build failure on the msvc target.
-    #[cfg(unix)]
     use rstest::rstest;
 
     #[test]
@@ -531,12 +542,123 @@ mod tests {
     }
 
     #[test]
-    fn test_release_asset_url() {
-        let xray_url = release_asset_url(CoreType::Xray, "v1.8.10").unwrap();
-        assert!(xray_url.contains("Xray-linux-64.zip"));
+    fn release_asset_url_points_at_the_hosts_own_archive() {
+        // The URL the host actually fetches. The naming itself is the table
+        // below's job; what this pins is the URL shape around it, per host —
+        // it failed on `windows` while `asset_name` refused every non-Linux OS.
+        let xray = release_asset_url(CoreType::Xray, "v1.8.10").unwrap();
+        let singbox = release_asset_url(CoreType::SingBox, "v1.10.3").unwrap();
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        assert_eq!(
+            xray,
+            format!(
+                "https://github.com/XTLS/Xray-core/releases/download/v1.8.10/{}",
+                asset_name(CoreType::Xray, "1.8.10", os, arch).unwrap()
+            )
+        );
+        assert_eq!(
+            singbox,
+            format!(
+                "https://github.com/SagerNet/sing-box/releases/download/v1.10.3/{}",
+                asset_name(CoreType::SingBox, "1.10.3", os, arch).unwrap()
+            )
+        );
+    }
 
-        let singbox_url = release_asset_url(CoreType::SingBox, "v1.10.3").unwrap();
-        assert!(singbox_url.contains("sing-box-1.10.3-linux-amd64.tar.gz"));
+    /// Upstream archive naming is a table over (os, arch). Because the OS is an
+    /// input, every platform is checked from every host — which is what makes
+    /// the Windows rows a local regression test rather than a CI-only one.
+    #[rstest]
+    #[case::xray_linux_x86_64("linux", "x86_64", "1.8.0", CoreType::Xray, "Xray-linux-64.zip")]
+    #[case::xray_linux_aarch64(
+        "linux",
+        "aarch64",
+        "1.8.0",
+        CoreType::Xray,
+        "Xray-linux-arm64-v8a.zip"
+    )]
+    #[case::singbox_linux_x86_64(
+        "linux",
+        "x86_64",
+        "1.8.0",
+        CoreType::SingBox,
+        "sing-box-1.8.0-linux-amd64.tar.gz"
+    )]
+    #[case::singbox_linux_aarch64(
+        "linux",
+        "aarch64",
+        "1.8.0",
+        CoreType::SingBox,
+        "sing-box-1.8.0-linux-arm64.tar.gz"
+    )]
+    #[case::xray_windows_x86_64(
+        "windows",
+        "x86_64",
+        "1.8.0",
+        CoreType::Xray,
+        "Xray-windows-64.zip"
+    )]
+    #[case::xray_windows_aarch64(
+        "windows",
+        "aarch64",
+        "1.8.0",
+        CoreType::Xray,
+        "Xray-windows-arm64-v8a.zip"
+    )]
+    #[case::singbox_windows_x86_64(
+        "windows",
+        "x86_64",
+        "1.8.0",
+        CoreType::SingBox,
+        "sing-box-1.8.0-windows-amd64.zip"
+    )]
+    #[case::singbox_windows_aarch64(
+        "windows",
+        "aarch64",
+        "1.8.0",
+        CoreType::SingBox,
+        "sing-box-1.8.0-windows-arm64.zip"
+    )]
+    #[case::version_prefix_is_stripped(
+        "linux",
+        "x86_64",
+        "v1.8.0",
+        CoreType::Xray,
+        "Xray-linux-64.zip"
+    )]
+    fn asset_name_follows_the_upstream_archive_tables(
+        #[case] os: &'static str,
+        #[case] arch: &'static str,
+        #[case] version: &str,
+        #[case] core: CoreType,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(asset_name(core, version, os, arch).unwrap(), expected);
+    }
+
+    /// The refusals are part of the contract: no guess for a platform the
+    /// project does not target, and no asset at all for the pseudo-cores.
+    #[test]
+    fn asset_name_refuses_undeclared_platforms_and_pseudo_cores() {
+        assert!(matches!(
+            asset_name(CoreType::Xray, "1.8.0", "macos", "aarch64"),
+            Err(UpdateError::UnsupportedPlatform("aarch64", "macos"))
+        ));
+        assert!(matches!(
+            asset_name(CoreType::SingBox, "1.8.0", "linux", "riscv64"),
+            Err(UpdateError::UnsupportedPlatform("riscv64", "linux"))
+        ));
+        for core in [CoreType::Auto, CoreType::Native] {
+            assert!(matches!(
+                asset_name(core, "1.8.0", "linux", "aarch64"),
+                Err(UpdateError::AutoCore)
+            ));
+            assert!(matches!(
+                release_asset_url(core, "v1.8.10"),
+                Err(UpdateError::AutoCore)
+            ));
+        }
     }
 
     /// The redirect guard must recognise the local-use targets a malicious
@@ -568,40 +690,6 @@ mod tests {
                 "{public} must be allowed"
             );
         }
-    }
-
-    #[test]
-    fn aarch64_xray_asset_uses_v8a_suffix() {
-        // XTLS publishes arm64-v8a for aarch64 (not arm64); sing-box keeps linux-arm64.
-        assert_eq!(
-            asset_name(CoreType::Xray, "1.8.0", "aarch64").unwrap(),
-            "Xray-linux-arm64-v8a.zip"
-        );
-        assert_eq!(
-            asset_name(CoreType::SingBox, "1.8.0", "aarch64").unwrap(),
-            "sing-box-1.8.0-linux-arm64.tar.gz"
-        );
-        // x86_64 naming and version 'v'-prefix stripping are unchanged.
-        assert_eq!(
-            asset_name(CoreType::Xray, "1.8.0", "x86_64").unwrap(),
-            "Xray-linux-64.zip"
-        );
-        assert_eq!(
-            asset_name(CoreType::SingBox, "v1.8.0", "x86_64").unwrap(),
-            "sing-box-1.8.0-linux-amd64.tar.gz"
-        );
-        assert!(matches!(
-            asset_name(CoreType::Auto, "1.8.0", "aarch64"),
-            Err(UpdateError::AutoCore)
-        ));
-        assert!(matches!(
-            asset_name(CoreType::Native, "1.8.0", "aarch64"),
-            Err(UpdateError::AutoCore)
-        ));
-        assert!(matches!(
-            release_asset_url(CoreType::Native, "v1.8.10"),
-            Err(UpdateError::AutoCore)
-        ));
     }
 
     #[cfg(unix)]

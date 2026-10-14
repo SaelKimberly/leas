@@ -27,7 +27,7 @@ use base64::Engine as _;
 use leas_route::engine::decide_async;
 use leas_route::ir::NetworkMask;
 use leas_route::{ConnMeta, Decision, Engine};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
@@ -42,6 +42,15 @@ use crate::error::{NativeError, timeouts};
 /// Upper bound on the CONNECT request head (request line + headers).
 /// CONNECT heads are tiny; anything larger is a slowloris / abuse.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
+
+/// How long a refusal may spend discarding what the peer keeps sending before
+/// the socket is closed. Short by design: the response and the FIN are already
+/// out, and this is the abuse path.
+const REFUSAL_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many further bytes a refusal discards. Comfortably above `MAX_HEAD_BYTES`,
+/// because the point is to leave nothing unread at close, not to read the peer.
+const REFUSAL_DRAIN_BYTES: usize = 64 * 1024;
 
 /// Bytes of the previous chunk re-scanned for the head terminator, so a
 /// terminator split across two reads is still found (`\r\n\r\n` minus one).
@@ -604,9 +613,18 @@ where
 /// two packets. The body plus its `Content-Length` is what lets a client tell
 /// that the PROXY refused rather than the destination, and `Connection: close`
 /// says the socket is about to go — which it is, as the caller drops it.
+///
+/// The refusal has to actually arrive, and on Windows it did not: the caller
+/// drops a socket whose receive queue still holds the oversized head the peer
+/// is still sending, and closing with unread data makes the stack send an RST
+/// that discards the response in flight (`oversized_head_is_refused` failed
+/// with an empty read). So the close is sequenced instead: write, flush,
+/// half-close our write side so the peer sees a FIN, then discard the rest of
+/// what it keeps sending. Drained, the close is graceful and no RST is
+/// generated.
 async fn write_refusal<S>(mut conn: S, refusal: Refusal) -> Result<(), NativeError>
 where
-    S: tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let body = refusal.reason();
     let response = format!(
@@ -624,7 +642,34 @@ where
         .await
         .map_err(NativeError::Io)?;
     conn.flush().await.map_err(NativeError::Io)?;
+    conn.shutdown().await.map_err(NativeError::Io)?;
+    drain_refused_head(&mut conn).await;
     Ok(())
+}
+
+/// Discard what a refused peer keeps sending, so the socket can be closed
+/// without unread data and therefore without an RST.
+///
+/// Bounded twice on purpose: a peer that keeps pushing must not hold the
+/// connection task open, and the budget has to be short because this is the
+/// abuse path — a client that ignores the refusal does not get to keep a task
+/// alive for `timeouts::PROTOCOL`'s ten seconds. Both limits are about
+/// ordering, not about reading the peer: the response is already flushed and
+/// the FIN already sent before this runs.
+async fn drain_refused_head<S>(conn: &mut S)
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + REFUSAL_DRAIN_BUDGET;
+    let mut scratch = [0u8; 4096];
+    let mut discarded = 0usize;
+    while discarded < REFUSAL_DRAIN_BYTES {
+        match tokio::time::timeout_at(deadline, conn.read(&mut scratch)).await {
+            // EOF, deadline, or a reset: there is nothing left to drain either way.
+            Ok(Ok(0) | Err(_)) | Err(_) => break,
+            Ok(Ok(read)) => discarded += read,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -894,6 +939,17 @@ mod tests {
         });
 
         let response = read_line_within(&mut read_half).await;
+        // A refusal must be the end of a *graceful* close. Closing with this
+        // junk still unread makes the stack send an RST, which is how the
+        // refusal got discarded on Windows — and here that shows up as a read
+        // error where EOF is required.
+        let mut rest = Vec::new();
+        let after =
+            tokio::time::timeout(Duration::from_secs(5), read_half.read_to_end(&mut rest)).await;
+        assert!(
+            matches!(after, Ok(Ok(_))),
+            "refusal must be followed by a clean EOF, not a reset: {after:?}"
+        );
         writer.abort();
         assert!(
             response.starts_with("HTTP/1.1 431"),
