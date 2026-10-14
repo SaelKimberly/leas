@@ -21,6 +21,57 @@ use ratatui::style::{Color, Modifier, Style};
 ///
 /// `register_default_*` only fills gaps, so a theme (or a user TOML that
 /// already defines `table.header`) wins over the derivation.
+/// WCAG relative luminance of an opaline colour.
+fn luminance(c: OpalineColor) -> f64 {
+    let lin = |v: u8| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126f64.mul_add(lin(c.r), 0.7152f64.mul_add(lin(c.g), 0.0722 * lin(c.b)))
+}
+
+/// WCAG contrast ratio between two opaline colours.
+fn contrast(a: OpalineColor, b: OpalineColor) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Darken (or lighten, on a light background) `fg` until it clears `target`
+/// against `bg`, or give up after `steps` and return the best seen.
+///
+/// The theme's own `text.muted` is legible on a dark theme but not on a light
+/// one: on catppuccin-latte's selection background it computes to 2.72:1, and
+/// no Latte token reaches 4.5:1 there (`text.primary` tops out at 4.39). So the
+/// hint role is *derived* rather than taken from the theme, which keeps it a
+/// registered token a user TOML can still override.
+fn derive_readable(
+    mut fg: OpalineColor,
+    bg: OpalineColor,
+    target: f64,
+    light_bg: bool,
+) -> OpalineColor {
+    let mut best = fg;
+    for _ in 0..12 {
+        if contrast(fg, bg) >= target {
+            return fg;
+        }
+        if contrast(fg, bg) > contrast(best, bg) {
+            best = fg;
+        }
+        fg = if light_bg {
+            fg.darken(0.06)
+        } else {
+            fg.lighten(0.06)
+        };
+    }
+    best
+}
+
 #[must_use]
 pub fn with_app_roles(mut theme: Theme) -> Theme {
     // Roles opaline's 14 core styles do not name.
@@ -41,6 +92,15 @@ pub fn with_app_roles(mut theme: Theme) -> Theme {
     theme.register_default_style(
         "app.progress_fill",
         OpalineStyle::fg(theme.color("accent.primary")).with_bg(theme.color("accent.primary")),
+    );
+    // The hint row must stay legible on every theme. Derive it from the theme's
+    // own muted colour against the strip it actually sits on, rather than
+    // pinning a fixed value that only suits one background.
+    let status_bg = theme.color("bg.selection");
+    let hint_fg = derive_readable(theme.color("text.muted"), status_bg, 4.5, theme.is_light());
+    theme.register_default_style(
+        "app.statusbar_hint",
+        OpalineStyle::fg(hint_fg).with_bg(status_bg),
     );
     theme.register_default_style(
         "app.dialog",
@@ -158,7 +218,7 @@ impl ThemeStyles {
     }
     #[must_use]
     pub fn status_bar_hint(theme: &Theme) -> Style {
-        theme.style("muted").into()
+        theme.style("app.statusbar_hint").into()
     }
 
     // ── Feedback / progress ─────────────────────────────────────────────

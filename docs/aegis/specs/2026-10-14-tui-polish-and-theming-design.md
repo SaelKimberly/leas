@@ -41,7 +41,7 @@ theme editor UI beyond selecting from the builtin list, no change to the Logs ta
 
 | # | Criterion | Proved by |
 |---|---|---|
-| A1 | Under a light theme the status-bar hint row reaches ≥4.5:1 contrast on every screen that shows it | `colour-focus-audit` (new `style()` assertions on `bg`/`fg` for both themes) |
+| A1 | Under a light theme the status-bar hint row's contrast rises from the measured 1.23:1 to ≥4.5:1 on every screen that shows it — **met**: the hint role is *derived* (`derive_readable` in `ui/theme.rs`) — the theme's `text.muted` darkened against `bg.selection` until it clears 4.5:1, because no Latte token reaches that on the selection strip (`text.primary` tops out at 4.39). Measured live: light **4.64:1** (`#4b4c5c` on `#bcc0cc`), dark **4.53:1** (`#b4b6bf` on `#44475a`). It stays a registered token, so a user TOML can override it | `colour-focus-audit` (new `style()` assertions on `bg`/`fg` for both themes) |
 | A2 | A confirm dialog's fill and text follow the theme; only the border stays semantic red | `colour-focus-audit` E12 + `profiles-menus-states` |
 | A3 | The table header carries a style under every theme (glyph and padding alike) | `colour-focus-audit` E3 |
 | A4 | The hint row matches the state: a modal shows `y/N`, a filtered-empty list says so, a zero-row list offers no Expand | `profiles-menus-states` E6/E8/E9, `settings-forms` |

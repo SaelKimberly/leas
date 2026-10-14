@@ -4,7 +4,7 @@
 |---|---|
 | Date | 2026-10-14 |
 | Spec | `docs/aegis/specs/2026-10-14-tui-polish-and-theming-design.md` |
-| Status | **executed through P2 (D1–D5); P3–P5 remain.** Verification: `cargo check -p leas --all-targets` exit=0, `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit=0, `cargo nextest run --workspace` **2386/2386 passed**, all 7 tui-test scenarios re-run green (0 errored steps) |
+| Status | **executed through P2 (D1–D5); P3–P5 remain.** Verification, all re-run after the contrast fix: `cargo check -p leas --all-targets` exit=0, `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit=0, `cargo nextest run --workspace` **2386/2386 passed, 11 skipped** (Summary line captured), all 6 tui-test scenarios re-run green (0 errored steps) |
 | Owner | `crates/leas/src/ui/` + `crates/leas-config` |
 
 ## Goal
@@ -201,7 +201,7 @@ update the manual's key tables.
 | Lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
 | Tests | `cargo nextest run --workspace` | green (incl. the new hint/token tables) |
 | Suite | 7 scenarios via `run_scenario` | all green; A1–A7 asserted inside them |
-| Colour | `get_cell_style` on both themes | hints ≥4.5:1; header styled; dialog tokenised |
+| Colour | `get_cell_style` on both themes | header styled ✓; dialog tokenised ✓; hint contrast raised 1.23:1 → light **4.64:1** / dark **4.53:1** via a contrast-derived registered token — A1 **met** |
 | Gates | `grep -rn "Color::(Rgb|Gray|Black|White|Cyan|Yellow)" crates/leas/src/ui/` | only `ui/theme.rs` |
 | Gates | `grep -rn "gui.theme" crates/` | none |
 | Teardown | `list_sessions` → none; `pgrep -a leas` → none; `rescue_files` → `[]` | clean |

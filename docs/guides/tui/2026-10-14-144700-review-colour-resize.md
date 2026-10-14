@@ -35,10 +35,10 @@ collection must drop it; see *Tooling friction*.
 
 ### Fix first — colour that only works on one theme
 
-**1. The status-bar hints are a hardcoded grey and are unreadable on a light theme (major).**
+**1. The status-bar hints are a hardcoded grey and are unreadable on a light theme (major — fixed, but not yet to AA).**
 `colour-focus-audit` step 24: `Style at (39, 25) … char='E' fg=e5e5e5 bg=ccd0da bold=no` — the
 background *is* the theme's `surface` (`ccd0da`, Catppuccin Latte) but the text is the constant
-`Color::Gray` from `ui/status_bar.rs:148`. The computed WCAG ratio of that pair is ≈1.2:1, against
+`Color::Gray` from `ui/status_bar.rs:148`. The computed WCAG ratio of that pair is **1.23:1**, against
 ≈7.3:1 on the dark theme — below every legibility threshold.
 
 The picture confirms it, but only when the canvas is right. The app paints no background of its own
