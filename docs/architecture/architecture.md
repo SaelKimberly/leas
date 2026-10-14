@@ -355,23 +355,28 @@ pub struct MockCoreManager { /* start_error, stop_error, is_running, ... */ }
 **`bin_manager.rs`** — Binary discovery and archive extraction
 ```rust
 pub struct CoreBinInfo {
-    pub name: &'static str,
-    pub bin_names: &'static [&'static str],
+    pub exe_names: &'static [&'static str],
     pub args_template: &'static str,
-    pub archive_patterns: &'static [&'static str],
 }
 
 pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf>;
 pub const fn get_core_info(core_type: CoreType) -> Option<CoreBinInfo>;
-pub fn find_and_extract_archives(core_type: CoreType, bin_dir: &Path) -> Result<(), BinError>;
+pub fn exe_names(core_type: CoreType) -> Option<Vec<String>>;
+pub fn find_and_extract_archives(bin_dir: &Path) -> Result<(), BinError>;
 ```
-`find_binary` checks `bin_dir`/`core_type` first (managed install), then falls back to `which`.
-`get_core_info` returns binary names (xray: `["xray"]`; sing-box: `["sing-box-client", "sing-box"]`)
-and archive patterns for automatic extraction in dev environments. `Auto` and
+`find_binary` checks `bin_dir`/`core_type` first (managed install), then falls back
+to the platform's PATH lookup (`where` on Windows, `which` elsewhere).
+`get_core_info` returns the extensionless base names (xray: `["xray"]`; sing-box:
+`["sing-box-client", "sing-box"]`); `exe_names` appends the platform's
+`EXE_SUFFIX` and is the single owner of that spelling (`xray.exe` on Windows),
+used by `find_binary` and by `updater`'s post-extraction search. `Auto` and
 `Native` have no binary: `get_core_info` answers `None` and every `updater.rs`
 entry point (`get_current_version`, `get_latest_version`, `release_asset_url`,
 `install_binary`) refuses them — the in-process core is built into the binary, so
-there is nothing to discover, download or update.
+there is nothing to discover, download or update. `find_and_extract_archives`
+extracts upstream archives dropped into the working directory, recognising the
+platform-specific packagings (`Xray-<os>-<arch>.zip`, and for sing-box
+`-linux-<arch>.tar.gz` or `-windows-<arch>.zip`); it has no in-tree caller today.
 
 ---
 

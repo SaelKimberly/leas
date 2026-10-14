@@ -301,9 +301,8 @@ fn copy_dir_contents(src_dir: &Path, dst_dir: &Path) -> Result<(), std::io::Erro
 /// `sing-box-<version>-windows-<arch>.zip` on Windows (`Compress-Archive`).
 /// Matching only `.tar.gz` ignored every sing-box download on Windows.
 fn archive_core(name: &str) -> Option<(CoreType, &'static str)> {
-    // Lowercased first, so the packaging test below is case-insensitive — which
-    // is also why this does not need clippy's string-extension comparison lint
-    // to be silenced.
+    // Lowercased first: upstream builds the names from the target triple, but a
+    // download keeps whatever case the filesystem had.
     let lower = name.to_lowercase();
     let packaging = packaging(Path::new(&lower))?;
     if lower.starts_with("xray") && packaging == Packaging::Zip {
@@ -355,6 +354,17 @@ mod tests {
     /// hardcode the extensionless spelling the product used to look for.
     fn exe(name: &str) -> String {
         format!("{name}{}", std::env::consts::EXE_SUFFIX)
+    }
+
+    /// A versioned sing-box release directory, named the way upstream does
+    /// (`sing-box-<version>-<os>-<arch>`), so a fixture never hardcodes a Linux
+    /// spelling next to a platform-spelled binary.
+    fn version_dir(root: &Path) -> PathBuf {
+        root.join(format!(
+            "sing-box-1.13.13-{}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
     }
 
     /// The platform spelling is one owner: `find_binary` walks the managed
@@ -531,12 +541,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // Create versioned subdirectory like sing-box-1.13.13-windows-amd64/sing-box.exe
-        let version_dir = tmp.join("sing-box").join(format!(
-            "sing-box-1.13.13-{}-{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ));
+        // Create versioned subdirectory like sing-box-1.13.13-<os>-<arch>/sing-box<exe>
+        let version_dir = version_dir(&tmp.join("sing-box"));
         std::fs::create_dir_all(&version_dir).unwrap();
         let binary = version_dir.join(exe("sing-box"));
         std::fs::write(&binary, "fake sing-box").unwrap();
@@ -577,7 +583,7 @@ mod tests {
         }
 
         // Create nested binary too
-        let version_dir = core_dir.join("sing-box-1.13.13-linux-amd64");
+        let version_dir = version_dir(&core_dir);
         std::fs::create_dir_all(&version_dir).unwrap();
         let nested_binary = version_dir.join(exe("sing-box"));
         std::fs::write(&nested_binary, "nested sing-box").unwrap();
