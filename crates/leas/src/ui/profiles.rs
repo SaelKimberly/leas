@@ -2,7 +2,7 @@ use leas_core::speed_test::TestType;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
@@ -82,6 +82,11 @@ const PANEL_MAX_ROWS: usize = 8;
 /// Width of the single-row Protocol Info cell (`protocol/transport/security`).
 const PROTOCOL_INFO_WIDTH: usize = 24;
 
+/// Column the fixed sort arrow points at (D13): the page request orders by
+/// `PageSort::Test`, which is column 7 in the §7 grid. Derived from the sort
+/// the page asks for — not a second magic number.
+const PROFILES_SORT_COLUMN: usize = 7;
+
 /// One row of the expanded per-protocol sub-table inside an endpoint panel.
 #[derive(Clone)]
 struct PanelRow {
@@ -116,12 +121,18 @@ struct PanelRow {
 pub struct DisplayRowData {
     indicator: String,
     indicator_fg: Style,
-    idx_str: String,
-    country_flag: String,
-    address_port_str: String,
-    /// Whitelist feature flags: `🏁` DNS unresolved, `🏳️` IP/CIDR or SNI
-    /// whitelisted (4 cells, one per flag).
-    feat_str: String,
+    /// `{:08x}` of the representative link's protocol id; `*` when the row is
+    /// multi-selected (D9/D10 — the marker replaces the id, both padded to 8).
+    id_hex: String,
+    /// Inbound flag cell: `<flag>-<ISO>` or bare `<ISO>`, `—` unknown (D14).
+    inbound_flag: String,
+    /// Host only (elided when the subdomain overflows); the port moved to its
+    /// own column (spec §7).
+    address_str: String,
+    /// Right-aligned port (spec §7 col 5).
+    port_str: String,
+    /// Whitelist tokens `SNI` / `CIDR` / `SNI+CIDR` / `—` (9 cells).
+    white_str: String,
     /// `protocol/transport/security` single-row cell (the braces around it
     /// come from the neighbouring decoration columns).
     protocol_info_str: String,
@@ -130,10 +141,21 @@ pub struct DisplayRowData {
     test_str: String,
     test_style: Style,
     outbound_addr: String,
-    outbound_country: String,
-    has_sub_rows: bool,
+    /// Exit flag cell (D14): `<flag>-<ISO>` or bare `<ISO>`, `—` unknown.
+    outbound_flag: String,
+    /// `+` collapsed / `-` expanded, drawn accent-bold one cell before the
+    /// host (D11); `' '` when the endpoint has no variants. Carries the
+    /// expandability fact that used to live in a separate `has_sub_rows` flag.
+    expand_prefix: char,
     expanded: bool,
     row_style: Style,
+    /// Per-column colour map (spec D12): one style per styled column.
+    id_style: Style,
+    address_style: Style,
+    port_style: Style,
+    white_style: Style,
+    protocol_style: Style,
+    prefix_style: Style,
     panel_selected_style: Style,
     panel_selected: Option<usize>,
     panel_ips: String,
@@ -154,32 +176,31 @@ impl DataTableRow for DisplayRowData {
         if y >= clip_bottom {
             return;
         }
-        let tree_marker = if self.has_sub_rows {
-            if self.expanded { "▾" } else { "▶" }
-        } else {
-            " "
-        };
         for (i, &x) in col_xs.iter().enumerate() {
             let (text, style) = match i {
-                0 => (tree_marker, self.row_style),
-                1 => (self.indicator.as_str(), self.indicator_fg),
-                2 => (self.idx_str.as_str(), self.row_style),
-                3 | 12 => ("[", self.row_style),
-                4 => (self.country_flag.as_str(), self.row_style),
-                5 => (self.address_port_str.as_str(), self.row_style),
-                6 => ("][", self.row_style),
-                7 => (self.feat_str.as_str(), self.row_style),
-                8 => ("]=>{", self.row_style),
-                9 => (self.protocol_info_str.as_str(), self.row_style),
-                10 => ("}=>", self.row_style),
-                11 => (self.test_str.as_str(), self.test_style),
-                13 => (self.outbound_addr.as_str(), self.row_style),
-                14 => (self.outbound_country.as_str(), self.row_style),
-                15 => ("]", self.row_style),
+                0 => (self.indicator.as_str(), self.indicator_fg),
+                1 => (self.id_hex.as_str(), self.id_style),
+                2 => (self.inbound_flag.as_str(), self.row_style),
+                3 => (self.address_str.as_str(), self.address_style),
+                4 => (self.port_str.as_str(), self.port_style),
+                5 => (self.white_str.as_str(), self.white_style),
+                6 => (self.protocol_info_str.as_str(), self.protocol_style),
+                7 => (self.test_str.as_str(), self.test_style),
+                8 => (self.outbound_flag.as_str(), self.row_style),
+                9 => (self.outbound_addr.as_str(), self.address_style),
                 _ => ("", self.row_style),
             };
             let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
-            buf.set_stringn(x, y, text, max_w, style);
+            if i == 3 {
+                // The `+`/`-` marker takes the first cell; the host starts one
+                // cell in and is one cell narrower (D11).
+                if self.expand_prefix != ' ' {
+                    buf.set_stringn(x, y, self.expand_prefix.encode_utf8(&mut [0u8; 4]), 1, self.prefix_style);
+                }
+                buf.set_stringn(x + 1, y, text, max_w.saturating_sub(1), style);
+            } else {
+                buf.set_stringn(x, y, text, max_w, style);
+            }
         }
 
         if self.expanded {
@@ -583,14 +604,89 @@ fn stability_ratio(link: &leas_db::models::ProfileStats) -> String {
 /// Row-number cell: a 6-cell right-aligned slot plus a trailing gap cell
 /// (carrying the multi-select `*`) — room for 100000+ profiles without the
 /// number bleeding into the next column.
-fn index_cell(number: usize, is_multi: bool) -> String {
-    let digits = if is_multi {
-        String::new()
-    } else {
-        number.to_string()
+/// Row id cell (D9/D10): `{:08x}` of the representative link's protocol id —
+/// the same link the Test cell describes, so ID and Test never disagree.
+/// Multi-selected rows print `*` instead, mirroring `index_cell`'s old law
+/// (marker replaces the number, widths equal).
+fn link_id_cell(row: &EndpointRow, dns_unresolved: bool, is_multi: bool) -> String {
+    if is_multi {
+        // The marker replaces the id, both padded to 8 — the same equal-width
+        // law `index_cell` used for the number slot.
+        return format!("{:>8}", "*");
+    }
+    row.representative_link_index(dns_unresolved)
+        .and_then(|idx| row.links.get(idx))
+        .map_or_else(String::new, |l| format!("{:08x}", l.protocol_id.get() as u32))
+}
+
+/// Flag cell (D14): `<flag emoji>-<ISO>` (5 cells) when the terminal renders
+/// regional-indicator emoji, bare `<ISO>` (2) when it does not. Unknown
+/// country = `—`.
+fn flag_cell(iso: Option<&str>) -> String {
+    match iso {
+        Some(iso) if flags_supported() => truncate_pad(&format!("{}-{iso}", iso_to_flag(iso)), 5),
+        Some(iso) => truncate_pad(iso, 5),
+        None => "—".to_string(),
+    }
+}
+
+/// Whitelist token cell (spec §7 col 6): `SNI` / `CIDR` / `SNI+CIDR` / `—`,
+/// 9 cells — the longest token sets the width (D8). The DNS-unresolved flag
+/// is gone: the Test cell's `[name]` marker already carries that fact.
+fn white_cell(cidr: bool, sni: bool) -> String {
+    let token = match (sni, cidr) {
+        (true, true) => "SNI+CIDR",
+        (true, false) => "SNI",
+        (false, true) => "CIDR",
+        (false, false) => "—",
     };
-    let suffix = if is_multi { '*' } else { ' ' };
-    format!("{digits:>6}{suffix}")
+    truncate_pad(token, 9)
+}
+
+/// Host cell (spec §8): a DNS name whose subdomain overflows keeps the
+/// registrable domain intact and elides the subdomain's tail
+/// (`verylongsub….example.com`). IP literals and overflowed hosts plain
+/// right-truncate with a trailing `…`.
+fn truncate_host(host: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if host.width() <= width {
+        return host.to_string();
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let dns_name = labels.len() > 2 && labels.iter().all(|l| !l.is_empty());
+    if dns_name {
+        let domain = labels[labels.len() - 2..].join(".");
+        let suffix = format!("….{domain}");
+        let budget = width.saturating_sub(suffix.width());
+        if budget >= 1 {
+            let mut out: String = host.chars().take(budget).collect();
+            out.push_str(&suffix);
+            return out;
+        }
+    }
+    // IP literal (or a pathological name): right-truncate with an ellipsis.
+    let mut out: String = host.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Does this terminal render regional-indicator (flag) emoji? Probed once:
+/// `LEAS_NO_FLAGS`/`NO_EMOJI` force the bare-ISO fallback, a UTF-8 locale gets
+/// the emoji form, anything else (ASCII locale, dumb term) gets bare ISO.
+fn flags_supported() -> bool {
+    use std::sync::OnceLock;
+    static FLAGS: OnceLock<bool> = OnceLock::new();
+    *FLAGS.get_or_init(|| {
+        let disabled = std::env::var_os("LEAS_NO_FLAGS").is_some()
+            || std::env::var_os("NO_EMOJI").is_some();
+        if disabled {
+            return false;
+        }
+        ["LC_ALL", "LANG", "LC_CTYPE"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .any(|v| v.to_ascii_uppercase().contains("UTF-8"))
+    })
 }
 
 /// Single-row Protocol Info cell: `protocol/transport/security` (e.g.
@@ -730,9 +826,10 @@ fn build_display_rows(
 
         let is_multi = state.multi_select.contains(&row.endpoint.id.get());
 
-        // The number is the row's position in the FEED, not in the loaded page:
-        // the page is a window, so its first row is `page_offset + 1`.
-        let idx_str = index_cell(state.page_offset + i + 1, is_multi);
+        // Row id: the representative link's hex id, or `*` under multi-select
+        // (D9/D10).
+        let dns_unresolved = crate::ops::profiles::endpoint_dns_unresolved(state, row);
+        let id_hex = link_id_cell(row, dns_unresolved, is_multi);
 
         let info = state.endpoint_info.get(&row.endpoint.id.get());
         // One resolution source: the loaded row's persisted addresses — the
@@ -742,37 +839,16 @@ fn build_display_rows(
         // endpoint, which is what let a row show `[name]` beside a live exit IP.
         let resolved = !crate::ops::profiles::endpoint_dns_unresolved(state, row);
 
-        let country_flag = info
-            .and_then(|i| i.country.as_deref())
-            .map_or_else(|| "\u{1F3F4}".to_string(), iso_to_flag);
-        let address_port_str = truncate_pad(
-            &format!(
-                " {}:{}",
-                row.endpoint.display_host(&row.resolved_ips),
-                row.endpoint.port
-            ),
-            34,
-        );
-        // Feature flags, one 2-cell slot each: IP (🏁 DNS unresolved, 🏳️
-        // IP/CIDR whitelisted) then SNI (🏳️ whitelisted).
-        let ip_feature = if row.endpoint.is_dns() && !resolved {
-            "\u{1F3C1}".to_string()
-        } else if info
-            .is_some_and(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted)
-        {
-            "\u{1F3F3}\u{FE0F}".to_string()
-        } else {
-            String::new()
-        };
-        let sni_feature = if info.and_then(|i| i.sni_whitelisted).unwrap_or(false) {
-            "\u{1F3F3}\u{FE0F}".to_string()
-        } else {
-            String::new()
-        };
-        let feat_str = format!(
-            "{}{}",
-            truncate_pad(&ip_feature, 2),
-            truncate_pad(&sni_feature, 2)
+        let inbound_flag = flag_cell(info.and_then(|i| i.country.as_deref()));
+        // Host and port are separate columns now (spec §7): the host keeps 33
+        // cells because the `+`/`-` marker owns the first one.
+        let address_str = truncate_host(&row.endpoint.display_host(&row.resolved_ips), 33);
+        let port_str = format!("{:>6}", row.endpoint.port);
+        // Whitelist tokens (spec §7 col 6); the DNS-unresolved flag moved to
+        // the Test cell's `[name]` marker, which already carried it.
+        let white_str = white_cell(
+            info.is_some_and(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted),
+            info.and_then(|i| i.sni_whitelisted).unwrap_or(false),
         );
         let (test_str, test_style) = compute_test_cell(row, resolved, theme);
 
@@ -805,11 +881,8 @@ fn build_display_rows(
         } else {
             (None, None)
         };
-        let outbound_addr = persisted_outbound.unwrap_or_else(|| "—".to_string());
-        let outbound_country = enriched_country.map_or_else(
-            || "—".to_string(),
-            |iso| truncate_pad(&format!("{} {iso}", iso_to_flag(&iso)), 7),
-        );
+        let outbound_addr = truncate_pad(&persisted_outbound.unwrap_or_else(|| "—".to_string()), 14);
+        let outbound_flag = flag_cell(enriched_country.as_deref());
 
         // Panel content
         let panel_ips = info
@@ -939,18 +1012,29 @@ fn build_display_rows(
         result.push(DisplayRowData {
             indicator,
             indicator_fg,
-            idx_str,
-            country_flag,
-            address_port_str,
-            feat_str,
+            id_hex,
+            inbound_flag,
+            address_str,
+            port_str,
+            white_str,
             protocol_info_str,
             test_str,
             test_style,
             outbound_addr,
-            outbound_country,
-            has_sub_rows: row.links.len() > 1,
+            outbound_flag,
+            expand_prefix: if row.links.len() > 1 {
+                if row.expanded { '-' } else { '+' }
+            } else {
+                ' '
+            },
             expanded: row.expanded,
             row_style: base_style,
+            id_style: ThemeStyles::hint(theme),
+            address_style: ThemeStyles::footer_value(theme),
+            port_style: ThemeStyles::hint(theme),
+            white_style: ThemeStyles::hint(theme),
+            protocol_style: ThemeStyles::footer_value(theme),
+            prefix_style: ThemeStyles::container_title(theme).add_modifier(Modifier::BOLD),
             panel_selected_style: ThemeStyles::panel_row_selected(theme),
             panel_selected: if i == selected {
                 state.selected_sub
@@ -986,58 +1070,57 @@ fn render_data_grid(
     state: &AppState,
     theme: &opaline::Theme,
 ) {
-    let block = Block::default()
-        .title(" Profiles ")
-        .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(theme))
-        .title_style(ThemeStyles::container_title(theme));
+    // Pane 1 supplies the frame (spec §6): the table renders frameless, inset
+    // one cell per side to preserve the geometry the old Block's border gave.
 
-    // Map sort state to DataTable column indices
-    let sort_column = Some(11);
+    // The arrow mirrors the page request's sort (D13): one shared constant
+    // from `PageRequest.sort` (fixed `PageSort::Test`, ascending), never a
+    // second literal. Test is column index 7 in the grid below.
+    let sort_column = Some(PROFILES_SORT_COLUMN);
     let sort_direction = SortDirection::Ascending;
 
-    // 16 fixed columns (118 cells total); headers carry only descriptive
-    // names (decorative separator cells have empty headers). Every label is
-    // styled with the header role, so the band reads as one row.
+    // 10 columns (spec §7): status, ID, Flag, Address, Port, White, Protocol,
+    // Test, Out, Exit. No decorative bracket or glyph cells; every label
+    // carries the header role.
     let header_style = ThemeStyles::table_header(theme);
     let columns = vec![
-        Column::new(Line::raw(""), ColumnWidth::Fixed(1)), // 0 — tree marker
-        Column::new(Line::raw(""), ColumnWidth::Fixed(2)), // 1 — indicator
+        Column::new(Line::raw(""), ColumnWidth::Fixed(2)), // 0 — status
         Column::new(
-            Line::from(Span::styled("#", header_style)),
-            ColumnWidth::Fixed(7),
-        ), // 2 — index (6 digits + gap)
-        Column::new(Line::raw(""), ColumnWidth::Fixed(1)), // 3 — [
-        Column::new(Line::raw(""), ColumnWidth::Fixed(4)), // 4 — country flag
+            Line::from(Span::styled("ID", header_style)),
+            ColumnWidth::Fixed(8),
+        ), // 1 — link id hex
+        Column::new(
+            Line::from(Span::styled("Flag", header_style)),
+            ColumnWidth::Fixed(5),
+        ), // 2 — inbound flag
         Column::new(
             Line::from(Span::styled("Address", header_style)),
             ColumnWidth::Fixed(34),
-        ), // 5
-        Column::new(Line::raw(""), ColumnWidth::Fixed(2)), // 6 — ][
+        ), // 3 — host (+ `+`/`-` prefix cell)
         Column::new(
-            Line::from(Span::styled("Feat", header_style)),
-            ColumnWidth::Fixed(4),
-        ), // 7 — IP+SNI flags
-        Column::new(Line::raw(""), ColumnWidth::Fixed(4)), // 8 — ]=>{
+            Line::from(Span::styled("Port", header_style)),
+            ColumnWidth::Fixed(6),
+        ), // 4 — port (right-aligned)
         Column::new(
-            Line::from(Span::styled("Protocol Info", header_style)),
+            Line::from(Span::styled("White", header_style)),
+            ColumnWidth::Fixed(9),
+        ), // 5 — whitelist tokens
+        Column::new(
+            Line::from(Span::styled("Protocol", header_style)),
             ColumnWidth::Fixed(24),
-        ), // 9 — protocol/transport/security
-        Column::new(Line::raw(""), ColumnWidth::Fixed(3)), // 10 — }=> arrow
+        ), // 6 — protocol/transport/security
         Column::new(
             Line::from(Span::styled("Test", header_style)),
             ColumnWidth::Fixed(7),
-        ), // 11 — [delay]/[name]/[fast]/[real] + `~` approximation
-        Column::new(Line::raw(""), ColumnWidth::Fixed(1)), // 12 — [ outbound opener
+        ), // 7 — delay/markers + fixed sort arrow
         Column::new(
-            Line::from(Span::styled("Outbound", header_style)),
-            ColumnWidth::Fixed(16),
-        ), // 13
+            Line::from(Span::styled("Out", header_style)),
+            ColumnWidth::Fixed(5),
+        ), // 8 — exit flag
         Column::new(
-            Line::from(Span::styled("Country", header_style)),
-            ColumnWidth::Fixed(7),
-        ), // 14
-        Column::new(Line::raw(""), ColumnWidth::Fixed(1)), // 15 — ]
+            Line::from(Span::styled("Exit", header_style)),
+            ColumnWidth::Fixed(14),
+        ), // 9 — exit IP
     ];
 
     // Scroll offset: keep the selected row roughly centered, in line units —
@@ -1053,7 +1136,6 @@ fn render_data_grid(
     let data_table = DataTable::new(columns, display_rows)
         .highlight_style(ThemeStyles::table_row_selected(theme))
         .column_spacing(0)
-        .block(block)
         .sort_column(sort_column, sort_direction)
         .total_rows(Some(scrollbar_total))
         .scrollbar_offset(Some(scrollbar_offset))
@@ -1068,7 +1150,13 @@ fn render_data_grid(
         multi_selected: std::collections::HashSet::new(),
     };
 
-    frame.render_stateful_widget(data_table, area, &mut table_state);
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    frame.render_stateful_widget(data_table, inner, &mut table_state);
 }
 
 /// First visible sub-row of a windowed panel: keeps the selected sub-row near
@@ -1435,40 +1523,16 @@ mod page_window_tests {
         (*build_display_rows(&rows, state.selected_index, state, theme)).clone()
     }
 
-    /// The `#` column carries the row's position in the FEED, not in the
-    /// loaded page: page 2 starts at 201.
-    #[tokio::test]
-    async fn numbering_is_absolute_across_pages() {
-        let mut state = two_page_state().await;
-        let first = display(&state);
-        assert_eq!(first[0].idx_str.trim(), "1");
-        assert_eq!(
-            first[PROFILES_PAGE_SIZE - 1].idx_str.trim(),
-            PROFILES_PAGE_SIZE.to_string()
-        );
-
-        state.selected_index = PROFILES_PAGE_SIZE - 1;
-        move_selection(&mut state, 1).await;
-        assert_eq!(state.page_offset, PROFILES_PAGE_SIZE, "page 2 loaded");
-
-        let second = display(&state);
-        assert_eq!(
-            second[0].idx_str.trim(),
-            (PROFILES_PAGE_SIZE + 1).to_string(),
-            "page 2 numbers continue the feed"
-        );
-    }
-
     /// Paging back onto a page whose rows are all already enriched (so the
     /// enrichment seeding marks nothing dirty) must still render that page.
     #[tokio::test]
     async fn returning_to_an_enriched_page_renders_it() {
         let mut state = two_page_state().await;
-        let first_address = display(&state)[0].address_port_str.trim().to_string();
+        let first_address = display(&state)[0].address_str.trim().to_string();
 
         state.selected_index = PROFILES_PAGE_SIZE - 1;
         move_selection(&mut state, 1).await; // page 2
-        let second_address = display(&state)[0].address_port_str.trim().to_string();
+        let second_address = display(&state)[0].address_str.trim().to_string();
         assert_ne!(first_address, second_address);
 
         state.selected_index = 0;
@@ -1476,7 +1540,7 @@ mod page_window_tests {
         assert_ne!(first_address, second_address);
         assert_eq!(state.page_offset, 0);
         assert_eq!(
-            display(&state)[0].address_port_str.trim(),
+            display(&state)[0].address_str.trim(),
             first_address,
             "page 1 must render again"
         );
@@ -1488,25 +1552,22 @@ mod page_window_tests {
     async fn page_change_refreshes_the_display_rows() {
         let mut state = two_page_state().await;
         let before = display(&state);
-        let before_addr = before[0].address_port_str.clone();
+        let before_addr = before[0].address_str.clone();
 
         state.selected_index = PROFILES_PAGE_SIZE - 1;
         move_selection(&mut state, 1).await;
 
         let after = display(&state);
         assert_ne!(
-            after[0].address_port_str, before_addr,
+            after[0].address_str, before_addr,
             "page 2's first row must not be page 1's cached row"
         );
         assert_eq!(
-            after[0].address_port_str.trim(),
-            format!(
-                "{}:{}",
-                state.endpoints[0]
-                    .endpoint
-                    .display_host(&state.endpoints[0].resolved_ips),
-                state.endpoints[0].endpoint.port
-            )
+            after[0].address_str.trim(),
+            state.endpoints[0]
+                .endpoint
+                .display_host(&state.endpoints[0].resolved_ips),
+            "the Address column carries the host only; port is its own column"
         );
     }
 }
@@ -1558,18 +1619,31 @@ mod tests {
         DisplayRowData {
             indicator: String::new(),
             indicator_fg: Style::default(),
-            idx_str: idx.to_string(),
-            country_flag: String::new(),
-            address_port_str: String::new(),
-            feat_str: String::new(),
+            id_hex: idx.to_string(),
+            inbound_flag: String::new(),
+            address_str: String::new(),
+            port_str: String::new(),
+            white_str: String::new(),
             protocol_info_str: String::new(),
             test_str: String::new(),
             test_style: Style::default(),
             outbound_addr: String::new(),
-            outbound_country: String::new(),
-            has_sub_rows: !panel_rows.is_empty(),
+            outbound_flag: String::new(),
+            expand_prefix: if panel_rows.is_empty() {
+                ' '
+            } else if expanded {
+                '-'
+            } else {
+                '+'
+            },
             expanded,
             row_style: Style::default(),
+            id_style: Style::default(),
+            address_style: Style::default(),
+            port_style: Style::default(),
+            white_style: Style::default(),
+            protocol_style: Style::default(),
+            prefix_style: Style::default(),
             panel_selected_style: Style::default(),
             panel_selected: None,
             panel_ips: String::new(),
@@ -1759,18 +1833,42 @@ mod tests {
     }
 
     #[test]
-    fn index_cell_fits_six_digit_rows() {
-        // 100000+ profiles: the number gets a 6-digit slot plus a trailing
-        // gap cell so it never bleeds into the next column.
-        assert_eq!(index_cell(100_000, false), "100000 ");
-        assert_eq!(index_cell(999_999, false), "999999 ");
-        assert_eq!(index_cell(1, false), "     1 ");
-        // Multi-select keeps the same width; the marker replaces the number.
-        assert_eq!(index_cell(12_345, true), "      *");
+    fn link_id_cell_prints_hex_or_marker() {
+        use crate::ops::profiles::test_support::fake_row;
+        let row = fake_row(42, "1.2.3.4", 1);
+        // The representative link's protocol id, 8 lowercase hex.
+        let expected = format!("{:08x}", row.links[0].protocol_id.get() as u32);
+        assert_eq!(link_id_cell(&row, false, false), expected);
+        // Multi-select: the marker replaces the id, both padded to 8 (D10).
+        assert_eq!(link_id_cell(&row, false, true), "       *");
         assert_eq!(
-            index_cell(12_345, true).len(),
-            index_cell(12_345, false).len()
+            link_id_cell(&row, false, true).len(),
+            link_id_cell(&row, false, false).len()
         );
+    }
+
+    #[test]
+    fn truncate_host_keeps_the_domain() {
+        // A long subdomain elides its tail; the registrable domain survives.
+        // 36-cell host, 33-cell column: 20 subdomain cells + `….example.com`.
+        assert_eq!(
+            truncate_host("abcdefghijklmnopqrstuvwxyz.example.com", 33),
+            "abcdefghijklmnopqrst….example.com"
+        );
+        // Fits: verbatim.
+        assert_eq!(truncate_host("edge-a.example", 33), "edge-a.example");
+        // IP literals right-truncate with an ellipsis.
+        assert_eq!(truncate_host("2001:db8::dead:beef", 10), "2001:db8:…");
+    }
+
+    #[test]
+    fn white_cell_spells_the_whitelist_tokens() {
+        assert_eq!(white_cell(false, false).trim(), "—");
+        assert_eq!(white_cell(true, false).trim(), "CIDR");
+        assert_eq!(white_cell(false, true).trim(), "SNI");
+        assert_eq!(white_cell(true, true).trim(), "SNI+CIDR");
+        // 9 cells: the longest token must fit unabbreviated.
+        assert_eq!(white_cell(true, true).len(), 9);
     }
 
     #[test]
@@ -1964,8 +2062,9 @@ mod tests {
         assert_eq!(buf[(0, 6)].symbol(), "\u{2570}"); // ╰
         // y=7 is the blank gap line — the next row must not start there.
         assert_eq!(buf[(0, 7)].symbol(), " ");
-        // Next row's content starts at y=8, untouched by the panel.
-        assert_eq!(buf[(2, 8)].symbol(), "1");
+        // Next row's content starts at y=8, untouched by the panel. The row id
+        // lives in column 1 now (the `#` slot was replaced by the hex id).
+        assert_eq!(buf[(1, 8)].symbol(), "1");
     }
 
     #[test]

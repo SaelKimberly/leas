@@ -518,6 +518,9 @@ fn apply_settings_fields(
 
 pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) -> SplitRightPane {
     let fields = build_settings_fields(state, section).await;
+    // Dirty-tracking snapshot (spec P3): Esc on a form compares live fields
+    // against what was loaded.
+    state.settings_form_snapshot = None;
     match section {
         SettingsSection::Routing => {
             state.reload_routing_rules().await;
@@ -548,12 +551,15 @@ pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) ->
                 form_errors: HashMap::new(),
             }
         }
-        _ => SplitRightPane::Form {
-            section,
-            fields,
-            focus_index: 0,
-            form_errors: HashMap::new(),
-        },
+        _ => {
+            state.settings_form_snapshot = Some(fields.clone());
+            SplitRightPane::Form {
+                section,
+                fields,
+                focus_index: 0,
+                form_errors: HashMap::new(),
+            }
+        }
     }
 }
 
@@ -563,6 +569,7 @@ pub fn save_settings_form(
     fields: &[(String, String)],
 ) {
     apply_settings_fields(state, section, fields);
+    state.settings_form_snapshot = None;
     // The scheduler limits are runtime-settable: apply the persisted values
     // so the next batch honors them without a restart. The DNS window goes
     // through the same clamp as config load — it is the same user setting, and

@@ -1,0 +1,155 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 470" font-family="monospace" font-size="13">
+  <defs><style>
+    .pane { fill: none; }
+    .a { fill: var(--accent); } .f { fill: var(--fg); } .m { fill: var(--muted); }
+    .b { stroke: var(--border); } .s { fill: var(--success); }
+    .w { fill: var(--warning); } .e { fill: var(--error); }
+    .sb { fill: var(--surface); }
+    text { white-space: pre; }
+    .u { text-decoration: underline; }
+  </style></defs>
+
+  <!-- ================= PANE 1 (focused: accent frame) ================= -->
+  <rect class="pane" x="6" y="8" width="968" height="238" stroke="var(--accent)" stroke-width="1.4"/>
+  <text class="a" x="16" y="28" font-weight="bold">1:</text>
+  <text class="a" x="36" y="28" font-weight="bold">[Profiles]</text>
+  <text class="m" x="128" y="28">Logs</text>
+  <text class="m" x="964" y="28" text-anchor="end">showing 1-200 of 7,486 · filter: none</text>
+  <line x1="8" y1="38" x2="972" y2="38" class="b"/>
+
+  <!-- column grid: status x16 (2c) | ID x32 (8c) | Flag x96 (5c) | Address x136 (flex) | Port end x480 (6c) | White x488 (9c) | Protocol x560 (24c) | Test x752 (6c) | Out x800 (5c) | Exit x840 (14c) -->
+  <text class="a" x="16" y="54" font-weight="bold">  </text>
+  <text class="a" x="32" y="54" font-weight="bold">ID</text>
+  <text class="a" x="96" y="54" font-weight="bold">Flag</text>
+  <text class="a" x="136" y="54" font-weight="bold">Address</text>
+  <text class="a" x="480" y="54" font-weight="bold" text-anchor="end">Port</text>
+  <text class="a" x="488" y="54" font-weight="bold">White</text>
+  <text class="a" x="560" y="54" font-weight="bold">Protocol</text>
+  <text class="a" x="752" y="54" font-weight="bold">Test ↑</text>
+  <text class="a" x="800" y="54" font-weight="bold">Out</text>
+  <text class="a" x="840" y="54" font-weight="bold">Exit</text>
+  <line x1="8" y1="62" x2="972" y2="62" class="b"/>
+
+  <!-- row 1: connected -->
+  <text class="s" x="16" y="80">●</text>
+  <text class="m" x="32" y="80">a1b2c3d4</text>
+  <text class="m" x="96" y="80">🇳🇱-NL</text>
+  <text class="f" x="136" y="80">edge-a.example</text>
+  <text class="m" x="480" y="80" text-anchor="end">443</text>
+  <text class="f" x="488" y="80">SNI</text>
+  <text class="f" x="560" y="80">vless/tcp/reality</text>
+  <text class="s" x="760" y="80">[ 12 ]</text>
+  <text class="m" x="800" y="80">🇩🇪-DE</text>
+  <text class="f" x="840" y="80">185.1.2.3</text>
+
+  <!-- row 2: multi-selected → * alone in ID cell; warn latency; unknown exit -->
+  <text class="f" x="16" y="100">○</text>
+  <text class="a" x="32" y="100" font-weight="bold">*</text>
+  <text class="m" x="96" y="100">🇩🇪-DE</text>
+  <text class="f" x="136" y="100">edge-b.example</text>
+  <text class="m" x="480" y="100" text-anchor="end">8443</text>
+  <text class="f" x="488" y="100">SNI+CIDR</text>
+  <text class="f" x="560" y="100">trojan/grpc/tls</text>
+  <text class="w" x="760" y="100">[ 620 ]</text>
+  <text class="m" x="800" y="100">—</text>
+  <text class="m" x="840" y="100">—</text>
+
+  <!-- row 3: long subdomain elided; unresolved; unknown country -->
+  <text class="f" x="16" y="120">○</text>
+  <text class="m" x="32" y="120">0f3e91ab</text>
+  <text class="m" x="96" y="120">—</text>
+  <text class="f" x="136" y="120"><tspan class="m">verylongsubdomain…</tspan>.example.com</text>
+  <text class="m" x="480" y="120" text-anchor="end">443</text>
+  <text class="m" x="488" y="120">—</text>
+  <text class="f" x="560" y="120">vmess/ws/tls</text>
+  <text class="e" x="760" y="120">[name]</text>
+  <text class="m" x="800" y="120">—</text>
+  <text class="m" x="840" y="120">—</text>
+
+  <!-- row 4 -->
+  <text class="s" x="16" y="140">●</text>
+  <text class="m" x="32" y="140">77c0de42</text>
+  <text class="m" x="96" y="140">🇫🇷-FR</text>
+  <text class="f" x="136" y="140">edge-c.example</text>
+  <text class="m" x="480" y="140" text-anchor="end">443</text>
+  <text class="f" x="488" y="140">CIDR</text>
+  <text class="f" x="560" y="140">ss2022/tcp</text>
+  <text class="s" x="760" y="140">[ 198 ]</text>
+  <text class="m" x="800" y="140">🇫🇷-FR</text>
+  <text class="f" x="840" y="140">51.15.2.7</text>
+
+  <!-- expandable affordance: bold +/- prefix (D11) -->
+  <text class="a" x="136" y="160" font-weight="bold">+</text>
+  <text class="f" x="152" y="160">edge-d.example</text>
+  <text class="m" x="284" y="160">+ collapsed / - expanded (bold prefix replaces ▶/▾)</text>
+  <line x1="8" y1="176" x2="972" y2="176" class="b"/>
+  <text class="m" x="16" y="196">↑↓ select · → expand · Enter connect · t test · x resolve · a add · e edit · d delete · , settings</text>
+  <text class="m" x="16" y="216">/ search · space multi-select · Ctrl+V import · Ctrl+E export · g subscriptions · ? help · q quit</text>
+  <text class="m" x="16" y="234">Tab focus pane · 1/2 jump pane · [ ] pane tabs · F1 compact · sort arrow fixed (PageSort::Test)</text>
+
+  <!-- ================= PANE 2 (unfocused: muted frame) ================= -->
+  <rect class="pane" x="6" y="256" width="968" height="132" stroke="var(--border)" stroke-width="1.4"/>
+  <text class="a" x="16" y="276" font-weight="bold">2:</text>
+  <text class="m" x="36" y="276">Details</text>
+  <text class="a" x="128" y="276" font-weight="bold">[Metrics]</text>
+  <text class="m" x="964" y="276" text-anchor="end">rows 12-40 of 96 · Alt+↑↓ resize</text>
+  <line x1="8" y1="286" x2="972" y2="286" class="b"/>
+
+  <text class="a" x="16" y="306" font-weight="bold">session</text>
+  <text class="f" x="100" y="306">↑1.2MB ↓3.4MB 340ms · exit 185.1.2.3 DE</text>
+  <text class="a" x="16" y="324" font-weight="bold">native</text>
+  <text class="f" x="100" y="324">4 open / 12 closed / 1 failed · [7] example.com:443 vless tls ↑12KB ↓34KB 120ms</text>
+  <text class="e" x="100" y="342">[8] wireguard handshake timeout (failed)</text>
+  <text class="a" x="16" y="360" font-weight="bold">sys</text>
+  <text class="f" x="100" y="360">cpu 3% mem 42MB uptime 1h12m · api 127.0.0.1:10085</text>
+  <text class="m" x="16" y="380">↑↓ scroll · Home/End · Metrics = statistics + native activity + counters</text>
+
+  <!-- ================= STATUS BAR ================= -->
+  <rect x="6" y="398" width="968" height="20" class="sb"/>
+  <text class="f" x="16" y="413"> Profiles │ conn: edge-a · xray 25.x │ theme: dracula │ F1 compact</text>
+
+  <!-- capability fallback note -->
+  <text class="m" x="16" y="440">fallback (no flag emoji): Flag cell = “NL” / Out cell = “DE”; unknown = “—” in both forms</text>
+
+  <!-- ================= SETTINGS POPUP (overlay stack top) ================= -->
+  <rect x="150" y="34" width="560" height="300" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.6"/>
+  <text class="a" x="166" y="56" font-weight="bold"> Settings * · ~/.config/leas/config.json</text>
+  <text class="m" x="694" y="56" text-anchor="end">←/→ pane · Enter edit · ^S save</text>
+  <line x1="152" y1="64" x2="708" y2="64" class="b"/>
+
+  <text class="a" x="166" y="82" font-weight="bold">› Core Settings</text>
+  <text class="m" x="306" y="82">binary paths, log level, default core</text>
+  <text class="f" x="166" y="98">  GUI Settings</text>
+  <text class="a" x="166" y="114" font-weight="bold">› DNS Settings</text>
+  <text class="m" x="306" y="114">servers, hosts, strategy, cache</text>
+  <text class="a" x="166" y="130" font-weight="bold">› Speed Test</text>
+  <text class="m" x="306" y="130">ping URL, provider, timeouts, concurrency</text>
+  <text class="f" x="166" y="146">  Subscriptions</text>
+  <line x1="152" y1="156" x2="330" y2="156" class="b"/>
+  <text class="m" x="166" y="172">Sections 5/14</text>
+  <line x1="335" y1="64" x2="335" y2="324" class="b"/>
+
+  <text class="a" x="348" y="82" font-weight="bold">test-url</text>
+  <text class="f" x="480" y="82">https://cp.cloudflare.com</text>
+  <text class="f" x="348" y="98">fast-ping-concurrency</text>
+  <text class="f" x="480" y="98">200</text>
+  <text class="f" x="348" y="114">error-ttl-hours</text>
+  <text class="f" x="480" y="114">24</text>
+  <text class="m" x="348" y="130">real-ping-retries</text>
+  <text class="m" x="480" y="130">3</text>
+  <text class="f" x="348" y="146">dns-failure-deferral</text>
+  <text class="f" x="480" y="146">true</text>
+  <line x1="338" y1="156" x2="708" y2="156" class="b"/>
+  <text class="m" x="348" y="172">Values 12/31</text>
+
+  <line x1="152" y1="256" x2="708" y2="256" class="b"/>
+  <text class="a" x="166" y="276" font-weight="bold">Description</text>
+  <text class="f" x="276" y="276">URL a real ping fetches through the proxy</text>
+  <text class="a" x="166" y="292" font-weight="bold">Values</text>
+  <text class="f" x="276" y="292">any http(s) URL · default https://www.gstatic.com/generate_204</text>
+  <text class="a" x="166" y="308" font-weight="bold">Source</text>
+  <text class="f" x="276" y="308">+ explicit override in config.json</text>
+  <text class="e" x="348" y="308">dirty: Esc asks discard y/n</text>
+  <text class="a" x="166" y="326" font-weight="bold">Legend</text>
+  <text class="m" x="276" y="326">· inherited default  + explicit override  * unsaved</text>
+</svg>

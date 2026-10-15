@@ -15,7 +15,7 @@ use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::progress::bar_cells;
 use crate::{
     AppMode, AppState, BackendUpdateStatus, SettingsMode, SettingsSection, SplitFocus,
-    SplitRightPane, Tab,
+    SplitRightPane,
 };
 use leas_core::CoreType;
 use ratatui_cheese::tree::{Tree, TreeState, TreeStyles};
@@ -140,6 +140,26 @@ fn section_from_selection(g: usize, child: Option<usize>) -> Option<SettingsSect
 }
 
 // ── Public entry points ─────────────────────────────────────────────────
+
+/// True when the open settings form differs from the snapshot taken when the
+/// pane was built (spec P3 — drives the popup title's `*` and the Esc guard).
+pub fn form_is_dirty(state: &AppState) -> bool {
+    match &state.mode {
+        AppMode::Settings {
+            mode:
+                SettingsMode::Split {
+                    right: SplitRightPane::Form { fields, .. },
+                    ..
+                },
+            ..
+        } => state
+            .settings_form_snapshot
+            .as_ref()
+            .is_some_and(|snap| *snap != *fields),
+        _ => false,
+    }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     if let AppMode::Settings {
         mode: SettingsMode::Split { tree, focus, right },
@@ -165,9 +185,9 @@ fn split_rect(area: Rect, left_w: u16) -> (Rect, Rect) {
         width: left_w.min(area.width.saturating_sub(gap)),
         ..area
     };
-    let right_x = left.x.saturating_add(left.width).saturating_add(gap);
+    let right_x = left.width.saturating_add(gap);
     let right = Rect {
-        x: right_x,
+        x: area.x.saturating_add(right_x),
         width: area.width.saturating_sub(right_x),
         ..area
     };
@@ -432,23 +452,11 @@ async fn handle_tree_key(state: &mut AppState, key: &KeyEvent) {
         return;
     }
 
-    // Handle Tab/BackTab to exit Settings mode and cycle tabs
+    // Tab/BackTab leave Settings. The tab cycle is gone (spec D2: Tab now
+    // moves pane focus, which is meaningless behind this screen), so the
+    // legacy "cycle tabs" behaviour collapses to closing settings.
     if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
         state.mode = AppMode::List;
-        let idx = Tab::ALL
-            .iter()
-            .position(|t| *t == state.current_tab)
-            .unwrap_or(0);
-        state.current_tab = match key.code {
-            KeyCode::Tab => Tab::ALL[(idx + 1) % Tab::ALL.len()],
-            _ => {
-                if idx == 0 {
-                    Tab::ALL[Tab::ALL.len() - 1]
-                } else {
-                    Tab::ALL[idx - 1]
-                }
-            }
-        };
         return;
     }
 
@@ -864,6 +872,12 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Esc => {
+            // Dirty form (spec P3): leaving without saving asks first.
+            if form_is_dirty(state) {
+                state.confirmation = Some(crate::ConfirmAction::DiscardSettings);
+                return;
+            }
+            state.settings_form_snapshot = None;
             if let AppMode::Settings {
                 mode: SettingsMode::Split { right, focus, .. },
             } = &mut state.mode

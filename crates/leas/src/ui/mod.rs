@@ -2,16 +2,17 @@ pub mod actions_log;
 pub mod add_server;
 pub mod export;
 pub mod logs;
+pub mod metrics;
 pub mod native_activity;
 pub mod profiles;
 pub mod settings;
-pub mod statistics;
 pub mod status_bar;
 pub mod theme;
 pub mod widgets;
 use crate::ui::theme::ThemeStyles;
-use crate::{AppMode, AppState, ConfirmAction, Tab};
+use crate::{AppMode, AppState, ConfirmAction};
 use crossterm::cursor::SetCursorStyle;
+use ratatui::style::{Modifier, Style};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
@@ -25,7 +26,7 @@ use leas_db::profiles_query::PlanScope;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::io;
 use std::sync::atomic::Ordering;
@@ -65,6 +66,7 @@ pub fn render_any_confirmation(frame: &mut Frame, area: Rect, state: &AppState) 
     let text = match state.confirmation {
         Some(crate::ConfirmAction::Quit) => " Quit? (y/N) ",
         Some(crate::ConfirmAction::ClearStats) => " Clear all stats? (y/N) ",
+        Some(crate::ConfirmAction::DiscardSettings) => " Discard unsaved settings? (y/N) ",
         Some(crate::ConfirmAction::ClearLogs) => " Clear logs? (y/N) ",
         Some(crate::ConfirmAction::PurgeLogsDatabase) => " Purge logs database? (y/N) ",
         _ => return,
@@ -212,7 +214,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         }
 
         // Lazy-load initial logs on first Logs tab access
-        if !state.logs_loaded && state.current_tab == Tab::Logs {
+        if !state.logs_loaded && matches!(state.pane1_tab, crate::Pane1Tab::Logs) {
             state.load_initial_logs().await;
             state.logs_loaded = true;
         }
@@ -227,7 +229,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             }
         }
 
-        if state.current_tab == Tab::Logs && state.log_scroll == 0 {
+        if matches!(state.pane1_tab, crate::Pane1Tab::Logs) && state.log_scroll == 0 {
             let now = std::time::Instant::now();
             if now.duration_since(state.last_heed_poll) >= std::time::Duration::from_millis(100) {
                 state.last_heed_poll = now;
@@ -374,6 +376,10 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 Some(ConfirmAction::ClearLogs) => state.clear_logs(),
                 Some(ConfirmAction::PurgeLogsDatabase) => state.purge_logs_database(),
                 Some(ConfirmAction::ClearStats) => state.clear_all_stats().await,
+                Some(ConfirmAction::DiscardSettings) => {
+                    state.settings_form_snapshot = None;
+                    state.mode = AppMode::List;
+                }
                 None => {}
             },
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
@@ -595,7 +601,10 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     }
 
     // Logs tab: route logs-specific keys (scroll, filter, copy, selection)
-    if state.current_tab == crate::Tab::Logs && matches!(state.mode, crate::AppMode::List) {
+    if matches!(state.pane1_tab, crate::Pane1Tab::Logs)
+        && matches!(state.focused_pane, crate::FocusedPane::Pane1)
+        && matches!(state.mode, crate::AppMode::List)
+    {
         let is_logs_key = matches!(
             key.code,
             KeyCode::Up
@@ -616,7 +625,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     }
 
     // NativeActivity tab: route scroll keys to the screen handler
-    if state.current_tab == crate::Tab::NativeActivity && matches!(state.mode, crate::AppMode::List)
+    if matches!(state.pane2_tab, crate::Pane2Tab::Metrics)
+        && matches!(state.focused_pane, crate::FocusedPane::Pane2)
+        && matches!(state.mode, crate::AppMode::List)
     {
         let is_native_activity_key = matches!(
             key.code,
@@ -673,83 +684,97 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.should_quit = true;
             }
         }
-        KeyCode::Tab => {
-            let idx = Tab::ALL
-                .iter()
-                .position(|t| *t == state.current_tab)
-                .unwrap_or(0);
-            state.current_tab = Tab::ALL[(idx + 1) % Tab::ALL.len()];
-            if state.current_tab == Tab::Settings && matches!(state.mode, AppMode::List) {
-                state.enter_settings();
-            }
+        // ── Pane shell keys (spec D2): app-level, before pane-scoped keys ──
+        KeyCode::Tab | KeyCode::BackTab => {
+            state.focused_pane = state.focused_pane.other();
         }
-        KeyCode::BackTab => {
-            let idx = Tab::ALL
-                .iter()
-                .position(|t| *t == state.current_tab)
-                .unwrap_or(0);
-            state.current_tab = if idx == 0 {
-                Tab::ALL[Tab::ALL.len() - 1]
-            } else {
-                Tab::ALL[idx - 1]
-            };
-            if state.current_tab == Tab::Settings && matches!(state.mode, AppMode::List) {
-                state.enter_settings();
-            }
+        KeyCode::Char('1') => {
+            state.focused_pane = crate::FocusedPane::Pane1;
         }
-        KeyCode::Up if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('2') => {
+            state.focused_pane = crate::FocusedPane::Pane2;
+        }
+        KeyCode::Char('[') => match state.focused_pane {
+            crate::FocusedPane::Pane1 => state.pane1_tab = state.pane1_tab.prev(),
+            crate::FocusedPane::Pane2 => state.pane2_tab = state.pane2_tab.prev(),
+        },
+        KeyCode::Char(']') => match state.focused_pane {
+            crate::FocusedPane::Pane1 => state.pane1_tab = state.pane1_tab.next(),
+            crate::FocusedPane::Pane2 => state.pane2_tab = state.pane2_tab.next(),
+        },
+        // Pane-2 height resize (spec D3): Alt+↑/↓, clamped 3..term/2.
+        KeyCode::Up
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(state.focused_pane, crate::FocusedPane::Pane2) =>
+        {
+            let h = state.pane2_rows().saturating_sub(2).max(3);
+            state.pane2_height = h;
+        }
+        KeyCode::Down
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(state.focused_pane, crate::FocusedPane::Pane2) =>
+        {
+            let h = (state.pane2_rows() + 2).min(state.term_height.get() / 2);
+            state.pane2_height = h;
+        }
+        // Settings popup (spec D5). Until P3 lands it still renders as a
+        // full screen; the key is the shell's entry point either way.
+        KeyCode::Char(',') if matches!(state.mode, AppMode::List) => {
+            state.enter_settings();
+        }
+        KeyCode::Up if state.profiles_active() => {
             if !state.nav_protocol_up() {
                 crate::ops::profiles::move_selection(state, -1).await;
             }
         }
-        KeyCode::Down if state.current_tab == Tab::Profiles => {
+        KeyCode::Down if state.profiles_active() => {
             if !state.nav_protocol_down() {
                 crate::ops::profiles::move_selection(state, 1).await;
             }
         }
-        KeyCode::Home if state.current_tab == Tab::Profiles => {
+        KeyCode::Home if state.profiles_active() => {
             crate::ops::profiles::goto_first(state).await;
         }
-        KeyCode::End if state.current_tab == Tab::Profiles => {
+        KeyCode::End if state.profiles_active() => {
             crate::ops::profiles::goto_last(state).await;
         }
-        KeyCode::PageUp if state.current_tab == Tab::Profiles => {
+        KeyCode::PageUp if state.profiles_active() => {
             let page = state.term_height.get().saturating_sub(5) as isize;
             state.selected_sub = None;
             crate::ops::profiles::move_selection(state, -page).await;
         }
-        KeyCode::PageDown if state.current_tab == Tab::Profiles => {
+        KeyCode::PageDown if state.profiles_active() => {
             let page = state.term_height.get().saturating_sub(5) as isize;
             state.selected_sub = None;
             crate::ops::profiles::move_selection(state, page).await;
         }
         KeyCode::Up
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             state.move_profile_up();
         }
         KeyCode::Down
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             state.move_profile_down();
         }
         KeyCode::Enter | KeyCode::Char('g')
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             if let Some(id) = state.selected_profile_id() {
                 state.connect_to_profile(id);
             }
         }
-        KeyCode::Right if state.current_tab == Tab::Profiles => {
+        KeyCode::Right if state.profiles_active() => {
             state.toggle_expand();
         }
-        KeyCode::Left if state.current_tab == Tab::Profiles => {
+        KeyCode::Left if state.profiles_active() => {
             state.collapse_expand();
         }
-        KeyCode::Enter if state.current_tab == Tab::Profiles => {
+        KeyCode::Enter if state.profiles_active() => {
             if state.is_on_sub_row() {
                 // Pin the selected protocol as the endpoint's default.
                 let ep_id = state.selected_profile_id();
@@ -761,10 +786,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.set_active(&id.to_string()).await;
             }
         }
-        KeyCode::Enter if state.current_tab == Tab::Settings => {
-            state.enter_settings();
-        }
-        KeyCode::Char(' ') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char(' ') if state.profiles_active() => {
             if let Some(id) = state.selected_profile_id() {
                 state.toggle_multi_select(id);
             }
@@ -772,7 +794,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         // Ctrl+A: select all filtered profiles
         KeyCode::Char('a')
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             let ids: Vec<i64> = state
                 .filtered_profiles()
@@ -785,11 +807,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         // Ctrl+G: deselect all (Ctrl+Shift+A is the same as Ctrl+A on most terminals)
         KeyCode::Char('g')
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             state.multi_select.clear();
         }
-        KeyCode::Char('/') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('/') if state.profiles_active() => {
             state.search_focused = true;
             state.search_query.clear();
             state.filter_cache_valid.set(false);
@@ -797,34 +819,34 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char('e')
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             state.mode = crate::AppMode::ExportScope { selected: 0 };
         }
         // Speed test menu
-        KeyCode::Char('t' | 'T') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('t' | 'T') if state.profiles_active() => {
             state.mode = crate::AppMode::SpeedTestMenu { selected: 0 };
         }
         // Stop current speed test
         KeyCode::Char('s' | 'S')
-            if state.current_tab == Tab::Profiles && !state.testing_profiles.is_empty() =>
+            if state.profiles_active() && !state.testing_profiles.is_empty() =>
         {
             state.stop_speed_test();
             state.log_trace("info", "tui::ui", "Speed test stopped by user");
         }
         // CRUD shortcuts (profiles tab)
-        KeyCode::Char('a' | 'A') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('a' | 'A') if state.profiles_active() => {
             state.start_add_server();
         }
         KeyCode::Char('e' | 'E')
             if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             if let Some(id) = state.selected_profile_id() {
                 state.start_edit_profile(&id.to_string()).await;
             }
         }
-        KeyCode::Char('g' | 'G') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('g' | 'G') if state.profiles_active() => {
             state.enter_settings();
             let pane = state
                 .build_right_pane(crate::SettingsSection::Subscriptions)
@@ -837,11 +859,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 *focus = crate::SplitFocus::Right;
             }
         }
-        KeyCode::Char('p' | 'P') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('p' | 'P') if state.profiles_active() => {
             state.cycle_purgatory_view();
             state.reload_profiles().await;
         }
-        KeyCode::Char('r' | 'R') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('r' | 'R') if state.profiles_active() => {
             if matches!(
                 state.purgatory_view,
                 leas_db::models::PurgatoryView::Purgatory
@@ -855,7 +877,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.reload_profiles().await;
             }
         }
-        KeyCode::Char('x' | 'X') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('x' | 'X') if state.profiles_active() => {
             // Manual DNS resolve (force — bypasses the TTL cache). No-op for
             // IP hosts (their address is already resolved).
             if let Some(ep_id) = state.selected_profile_id() {
@@ -869,7 +891,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.log_trace("info", "tui::ui", &format!("Resolving {host} …"));
             }
         }
-        KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('d' | 'D') if state.profiles_active() => {
             if state.multi_select.len() >= 2 {
                 let ids: Vec<i64> = state.multi_select.iter().copied().collect();
                 state.confirmation = Some(ConfirmAction::DeleteProfiles(ids));
@@ -879,7 +901,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char('c' | 'C')
             if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             if let Some(id) = state.selected_profile_id() {
                 state.clone_profile(id);
@@ -887,7 +909,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char('v')
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             let clipboard_text = crate::ops::clipboard::get_text().unwrap_or_default();
 
@@ -913,7 +935,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('S')
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && key.modifiers.contains(KeyModifiers::SHIFT)
-                && state.current_tab == Tab::Profiles =>
+                && state.profiles_active() =>
         {
             // Copy the active protocol's share URL. The typed
             // `format_share_url(&ParsedProto, &EndpointEssentials)` equivalent
@@ -962,132 +984,305 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     }
 }
 
-fn render(frame: &mut Frame, state: &AppState) {
-    const FULL_PANEL_HEIGHT: u16 = 8;
-    const SMALL_THRESH: u16 = 20;
-
-    let is_small = frame.area().height < SMALL_THRESH;
-    let overlay = !state.actions_compact && is_small;
-    let ph = if overlay {
-        0 // actions panel only useful on Profiles tab
-    } else if state.actions_compact {
-        1
-    } else {
-        FULL_PANEL_HEIGHT
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),  // 0: tabs
-            Constraint::Min(3),     // 1: content
-            Constraint::Length(ph), // 2: actions panel
-            Constraint::Length(1),  // 3: status bar
-        ])
-        .split(frame.area());
-
-    // Overlay mode: full panel replaces content area in small terminals
-    if overlay {
-        render_tabs(frame, chunks[0], state);
-        actions_log::render_full(frame, chunks[1], state);
-        render_any_confirmation(frame, chunks[1], state);
-        status_bar::render(frame, chunks[3], state);
-        return;
-    }
-
-    // Inline: render actions panel at bottom (chunks[2])
-    if state.actions_compact {
-        actions_log::render_compact(frame, chunks[2], state);
-    } else {
-        actions_log::render_full(frame, chunks[2], state);
-    }
-    let is_form_mode = matches!(
-        &state.mode,
+/// Screen-modes that still own the whole content area. Settings moved to a
+/// popup overlay in P3 (spec D5); Add/Edit/Import/Batch follow in the same
+/// pattern once their popup interiors are verified.
+const fn is_screen_mode(mode: &crate::AppMode) -> bool {
+    matches!(
+        mode,
         crate::AppMode::AddServer { .. }
             | crate::AppMode::EditServer { .. }
             | crate::AppMode::ImportUrl { .. }
             | crate::AppMode::BatchImport { .. }
-            | crate::AppMode::ExportScope { .. }
-            | crate::AppMode::ExportDestination { .. }
-            | crate::AppMode::ExportPath { .. }
-    );
-    if !is_form_mode {
-        render_tabs(frame, chunks[0], state);
+    )
+}
+
+/// Base content: one dispatch — a screen-mode owns the area, else the tab does.
+/// Replaces the three duplicated per-tab `match` blocks this render fn carried.
+fn render_base(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    match &state.mode {
+        crate::AppMode::AddServer { .. } | crate::AppMode::EditServer { .. } => {
+            add_server::render(frame, area, state);
+        }
+        crate::AppMode::ImportUrl { .. } => {
+            add_server::render_import_url(frame, area, state);
+        }
+        crate::AppMode::BatchImport { .. } => {
+            add_server::render_batch_import(frame, area, state);
+        }
+        crate::AppMode::Settings { .. } => {
+            settings::render(frame, area, state);
+        }
+        _ => render_pane1(frame, area, state),
     }
-    if !matches!(state.mode, crate::AppMode::List)
-        && matches!(
-            &state.mode,
-            crate::AppMode::ExportScope { .. }
-                | crate::AppMode::ExportDestination { .. }
-                | crate::AppMode::ExportPath { .. }
-        )
-    {
-        profiles::render(frame, chunks[1], state);
-        export::render(frame, chunks[1], state);
-        status_bar::render(frame, chunks[3], state);
+}
+
+/// Pane 1 content (spec §6): Profiles or Logs.
+fn render_pane1(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    match state.pane1_tab {
+        crate::Pane1Tab::Profiles => profiles::render(frame, area, state),
+        crate::Pane1Tab::Logs => logs::render_inner(frame, area, state),
+    }
+}
+
+/// Pane 2 content (spec §6): Details (actions log) or Metrics (merged
+/// statistics + native activity + traffic counters).
+fn render_pane2(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    match state.pane2_tab {
+        crate::Pane2Tab::Details => {
+            if state.actions_compact {
+                actions_log::render_compact(frame, area, state);
+            } else {
+                actions_log::render_full_inner(frame, area, state);
+            }
+        }
+        crate::Pane2Tab::Metrics => metrics::render(frame, area, state),
+    }
+}
+
+/// Pane border title with the inline tab bar (spec D6): `1: [Profiles] Logs` —
+/// active tab bracketed and accent-bold, inactive plain muted.
+fn pane_title(
+    index: &'static str,
+    tabs: &[(&'static str, bool)],
+    counter: Option<String>,
+    theme: &opaline::Theme,
+) -> Line<'static> {
+    let accent = ThemeStyles::container_title(theme);
+    let muted = ThemeStyles::hint(theme);
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(index.to_string(), accent.add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+    ];
+    for (i, (label, active)) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        if *active {
+            spans.push(Span::styled(
+                format!("[{label}]"),
+                accent.add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled((*label).to_string(), muted));
+        }
+    }
+    if let Some(counter) = counter {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(counter, muted));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+/// Overlays, in stack order (later draws on top). Precedence: a modal confirm
+/// outranks everything, then the transient pop-ups, then help. One list instead
+/// of per-mode early returns.
+fn overlay_stack(state: &AppState) -> Vec<OverlayKind> {
+    let mut kinds = Vec::new();
+    match &state.mode {
+        crate::AppMode::Settings { .. } => kinds.push(OverlayKind::Settings),
+        crate::AppMode::SpeedTestMenu { .. } => kinds.push(OverlayKind::SpeedTest),
+        crate::AppMode::TargetPicker { .. } => kinds.push(OverlayKind::TargetPicker),
+        crate::AppMode::Help => kinds.push(OverlayKind::Help),
+        crate::AppMode::ExportScope { .. }
+        | crate::AppMode::ExportDestination { .. }
+        | crate::AppMode::ExportPath { .. } => kinds.push(OverlayKind::Export),
+        _ => {}
+    }
+    if state.confirmation.is_some() {
+        kinds.push(OverlayKind::Confirmation);
+    }
+    kinds
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayKind {
+    Settings,
+    SpeedTest,
+    TargetPicker,
+    Export,
+    Help,
+    Confirmation,
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    async fn state_with(mode: crate::AppMode) -> crate::AppState {
+        let mut s = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        s.mode = mode;
+        s
+    }
+
+    #[tokio::test]
+    async fn confirmation_outranks_every_popup() {
+        let mut s = state_with(crate::AppMode::Help).await;
+        s.confirmation = Some(crate::ConfirmAction::Quit);
+        assert_eq!(
+            overlay_stack(&s),
+            vec![OverlayKind::Help, OverlayKind::Confirmation]
+        );
+    }
+
+    #[tokio::test]
+    async fn popups_are_ordered_and_exclusive_per_mode() {
+        assert_eq!(
+            overlay_stack(&state_with(crate::AppMode::Settings {
+                mode: crate::SettingsMode::Split {
+                    tree: std::cell::RefCell::new(ratatui_cheese::tree::TreeState::default()),
+                    focus: crate::SplitFocus::Tree,
+                    right: crate::SplitRightPane::Empty,
+                },
+            })
+            .await),
+            vec![OverlayKind::Settings]
+        );
+        assert_eq!(
+            overlay_stack(&state_with(crate::AppMode::SpeedTestMenu { selected: 0 }).await),
+            vec![OverlayKind::SpeedTest]
+        );
+        assert_eq!(
+            overlay_stack(&state_with(crate::AppMode::ExportScope { selected: 0 }).await),
+            vec![OverlayKind::Export]
+        );
+        assert_eq!(overlay_stack(&state_with(crate::AppMode::List).await), vec![]);
+    }
+
+    #[tokio::test]
+    async fn form_screen_modes_still_own_the_base_area() {
+        // Add/Edit/Import/Batch keep rendering as full screens (P3 moved only
+        // Settings to a popup).
+        assert_eq!(
+            overlay_stack(&state_with(crate::AppMode::ImportUrl {
+                input: String::new(),
+                error: None,
+            })
+            .await),
+            vec![]
+        );
+    }
+}
+
+fn render_overlay(
+    kind: OverlayKind,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    state: &AppState,
+) {
+    match kind {
+        OverlayKind::Settings => {
+            // Centered popup over the pane shell (spec D5 dims): width
+            // clamp(w-4, 50, 110), height clamp(h-2, 20, 40).
+            let w = area.width.saturating_sub(4).clamp(50, 110);
+            let h = area.height.saturating_sub(2).clamp(20, 40);
+            let x = area.x + (area.width.saturating_sub(w)) / 2;
+            let y = area.y + (area.height.saturating_sub(h)) / 2;
+            let popup = Rect::new(x, y, w, h);
+            // Reset the popup footprint so the pane content underneath never
+            // bleeds through (a bg-only Block styles cells but leaves their
+            // symbols in place).
+            frame.render_widget(ratatui::widgets::Clear, popup);
+            // Modal frame: title carries the dirty marker (spec D5/P3).
+            let dirty = if settings::form_is_dirty(state) {
+                " *"
+            } else {
+                ""
+            };
+            let theme = state.theme();
+            let outer = Block::default()
+                .title(format!(" Settings{dirty} "))
+                .borders(Borders::ALL)
+                .border_style(ThemeStyles::container_border_focused(theme))
+                .title_style(ThemeStyles::container_title(theme))
+                .style(Style::default().bg(theme.color("bg.surface").into()));
+            let inner = outer.inner(popup);
+            frame.render_widget(outer, popup);
+            settings::render(frame, inner, state);
+        }
+        OverlayKind::SpeedTest => render_speed_test_menu(frame, area, state),
+        OverlayKind::TargetPicker => logs::render_target_picker(frame, area, state),
+        OverlayKind::Export => export::render(frame, area, state),
+        OverlayKind::Help => render_help_overlay(frame, area, state),
+        OverlayKind::Confirmation => render_any_confirmation(frame, area, state),
+    }
+}
+
+fn render(frame: &mut Frame, state: &AppState) {
+    let area = frame.area();
+    let theme = state.theme();
+    let pane1_focused = matches!(state.focused_pane, crate::FocusedPane::Pane1);
+    let pane2_focused = matches!(state.focused_pane, crate::FocusedPane::Pane2);
+
+    // Screen-modes (Add/Edit/Import/Batch/Settings) still own the whole area
+    // until P3 moves them to popups.
+    if is_screen_mode(&state.mode) {
+        render_base(frame, area, state);
+        for kind in overlay_stack(state) {
+            render_overlay(kind, frame, area, state);
+        }
+        crate::ui::status_bar::render(frame, area, state);
         return;
     }
-    if !matches!(state.mode, crate::AppMode::List) {
-        if matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. }) {
-            profiles::render(frame, chunks[1], state);
-            render_speed_test_menu(frame, chunks[1], state);
-            render_any_confirmation(frame, chunks[1], state);
-            status_bar::render(frame, chunks[3], state);
-            return;
-        }
 
-        if matches!(&state.mode, crate::AppMode::TargetPicker { .. }) {
-            logs::render(frame, chunks[1], state);
-            logs::render_target_picker(frame, chunks[1], state);
-            render_any_confirmation(frame, chunks[1], state);
-            status_bar::render(frame, chunks[3], state);
-            return;
-        }
+    // Pane shell (spec §6): pane 1 (top, Min) / pane 2 (per-tab height) / status.
+    let pane2_rows = if state.actions_compact {
+        1
+    } else {
+        state.pane2_rows().min(area.height.saturating_sub(4))
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),          // 0: pane 1
+            Constraint::Length(pane2_rows), // 1: pane 2
+            Constraint::Length(1),       // 2: status bar
+        ])
+        .split(area);
 
-        if matches!(&state.mode, crate::AppMode::Help) {
-            match state.current_tab {
-                Tab::Profiles => profiles::render(frame, chunks[1], state),
-                Tab::Settings => settings::render(frame, chunks[1], state),
-                Tab::Logs => logs::render(frame, chunks[1], state),
-                Tab::Statistics => statistics::render(frame, chunks[1], state),
-                Tab::NativeActivity => native_activity::render(frame, chunks[1], state),
-                Tab::Actions => crate::ui::actions_log::render(frame, chunks[1], state),
-            }
-            render_help_overlay(frame, chunks[1], state);
-            render_any_confirmation(frame, chunks[1], state);
-            status_bar::render(frame, chunks[3], state);
-            return;
-        }
+    // Pane 1: framed, inline tab bar, content.
+    let p1_tabs: &[(&str, bool)] = &[
+        ("Profiles", matches!(state.pane1_tab, crate::Pane1Tab::Profiles)),
+        ("Logs", matches!(state.pane1_tab, crate::Pane1Tab::Logs)),
+    ];
+    let p1_border = if pane1_focused {
+        ThemeStyles::container_border_focused(theme)
+    } else {
+        ThemeStyles::container_border(theme)
+    };
+    let p1_block = Block::default()
+        .title(pane_title("1:", p1_tabs, None, theme))
+        .borders(Borders::ALL)
+        .border_style(p1_border);
+    let p1_inner = p1_block.inner(chunks[0]);
+    frame.render_widget(p1_block, chunks[0]);
+    render_pane1(frame, p1_inner, state);
 
-        match &state.mode {
-            crate::AppMode::AddServer { .. } | crate::AppMode::EditServer { .. } => {
-                add_server::render(frame, chunks[1], state);
-            }
-            crate::AppMode::ImportUrl { .. } => {
-                add_server::render_import_url(frame, chunks[1], state);
-            }
-            crate::AppMode::BatchImport { .. } => {
-                add_server::render_batch_import(frame, chunks[1], state);
-            }
-            crate::AppMode::Settings { .. } => {
-                settings::render(frame, chunks[1], state);
-            }
-            _ => {}
-        }
-        render_any_confirmation(frame, chunks[1], state);
-        status_bar::render(frame, chunks[3], state);
-        return;
+    // Pane 2: framed, tab bar + visible-rows counter; compact = 1 row.
+    let p2_tabs: &[(&str, bool)] = &[
+        ("Details", matches!(state.pane2_tab, crate::Pane2Tab::Details)),
+        ("Metrics", matches!(state.pane2_tab, crate::Pane2Tab::Metrics)),
+    ];
+    let p2_border = if pane2_focused {
+        ThemeStyles::container_border_focused(theme)
+    } else {
+        ThemeStyles::container_border(theme)
+    };
+    let p2_block = Block::default()
+        .title(pane_title("2:", p2_tabs, None, theme))
+        .borders(Borders::ALL)
+        .border_style(p2_border);
+    let p2_inner = p2_block.inner(chunks[1]);
+    frame.render_widget(p2_block, chunks[1]);
+    render_pane2(frame, p2_inner, state);
+
+    // Overlays paint over the whole shell (spec D1).
+    for kind in overlay_stack(state) {
+        render_overlay(kind, frame, area, state);
     }
-    match state.current_tab {
-        Tab::Profiles => profiles::render(frame, chunks[1], state),
-        Tab::Settings => settings::render(frame, chunks[1], state),
-        Tab::Logs => logs::render(frame, chunks[1], state),
-        Tab::Statistics => statistics::render(frame, chunks[1], state),
-        Tab::NativeActivity => native_activity::render(frame, chunks[1], state),
-        Tab::Actions => crate::ui::actions_log::render(frame, chunks[1], state),
-    }
-    render_any_confirmation(frame, chunks[1], state);
-    status_bar::render(frame, chunks[3], state);
+    crate::ui::status_bar::render(frame, chunks[2], state);
 }
 fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
     match &state.mode {
@@ -1097,8 +1292,8 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
             .cloned()
             .unwrap_or(AppMode::List)
         {
-            AppMode::List => match state.current_tab {
-                Tab::Profiles => vec![
+            AppMode::List => match state.pane1_tab {
+                crate::Pane1Tab::Profiles => vec![
                     ("↑↓ / PgUp PgDn", "Navigate profiles"),
                     ("← →", "Expand / collapse endpoint"),
                     ("↑↓ (expanded)", "Navigate protocol variants (panel)"),
@@ -1121,15 +1316,7 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
                 ],
-                Tab::Settings => vec![
-                    ("↑↓", "Navigate settings menu"),
-                    ("Enter", "Open selected section"),
-                    ("Esc", "Close settings"),
-                    ("Tab / Shift+Tab", "Cycle tabs"),
-                    ("?", "Toggle this help"),
-                    ("q / Ctrl+C", "Quit"),
-                ],
-                Tab::Logs => vec![
+                crate::Pane1Tab::Logs => vec![
                     ("↑↓", "Scroll logs"),
                     ("PgUp / PgDn", "Page up/down"),
                     ("Home / End", "Jump to oldest/newest"),
@@ -1137,20 +1324,6 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("Del", "Purge all logs from database"),
                     ("t", "Open target filter"),
                     ("d", "Dump DB query monitor"),
-                    ("Tab / Shift+Tab", "Cycle tabs"),
-                    ("?", "Toggle this help"),
-                    ("q / Ctrl+C", "Quit"),
-                ],
-                Tab::Statistics | Tab::Actions => vec![
-                    ("Tab / Shift+Tab", "Cycle tabs"),
-                    ("?", "Toggle this help"),
-                    ("q / Ctrl+C", "Quit"),
-                ],
-                Tab::NativeActivity => vec![
-                    ("↑↓", "Scroll connections"),
-                    ("PgUp / PgDn", "Page up/down"),
-                    ("Home / End", "Jump to oldest/newest"),
-                    ("Tab / Shift+Tab", "Cycle tabs"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
                 ],
@@ -1261,54 +1434,6 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         .style(ThemeStyles::dialog(theme));
     frame.render_widget(popup, area);
 }
-fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
-    let theme = state.theme();
-    // Split area into [indicator(3) | tabs]
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
-        .split(area);
-    // Connection indicator
-    let indicator = if state.connecting {
-        Span::styled(" ⟳", crate::ui::theme::ThemeStyles::spinner(theme))
-    } else if state.connected_core.is_some() {
-        Span::styled(" ●", crate::ui::theme::ThemeStyles::success(theme))
-    } else {
-        Span::styled(" ○", crate::ui::theme::ThemeStyles::hint(theme))
-    };
-    let indicator_para = Paragraph::new(Line::from(indicator));
-    frame.render_widget(indicator_para, chunks[0]);
-
-    let titles: Vec<Line> = Tab::ALL
-        .iter()
-        .map(|tab| {
-            let name = match tab {
-                Tab::Profiles => " Profiles ",
-                Tab::Settings => " Settings ",
-                Tab::Logs => " Logs ",
-                Tab::Statistics => " Statistics ",
-                Tab::NativeActivity => " Native Activity ",
-                Tab::Actions => " Actions ",
-            };
-            Line::from(Span::styled(
-                name,
-                crate::ui::theme::ThemeStyles::tab_deselected(theme),
-            ))
-        })
-        .collect();
-
-    let tabs = Tabs::new(titles)
-        .select(
-            Tab::ALL
-                .iter()
-                .position(|t| *t == state.current_tab)
-                .unwrap_or(0),
-        )
-        .highlight_style(crate::ui::theme::ThemeStyles::tab_selected(theme))
-        .divider(Span::raw(""));
-    frame.render_widget(tabs, chunks[1]);
-}
-
 pub fn render_placeholder_screen(
     frame: &mut Frame,
     area: Rect,

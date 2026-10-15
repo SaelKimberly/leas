@@ -202,7 +202,7 @@ fn build_hints(state: &AppState) -> String {
         crate::AppMode::Settings { mode } => match mode {
             crate::SettingsMode::Split { focus, right, .. } => match focus {
                 crate::SplitFocus::Tree => {
-                    " [↑↓] Navigate  [←→] Collapse  [Enter] Open  [Tab] Next tab  [Ctrl+W] Focus Form  [Esc] Close "
+                    " [↑↓] Navigate  [←→] Collapse  [Enter] Open  [Ctrl+W] Focus Form  [Tab] Close  [Esc] Close "
                         .to_string()
                 }
                 crate::SplitFocus::Right => match right {
@@ -227,13 +227,14 @@ fn build_hints(state: &AppState) -> String {
             },
         },
         _ => {
-            // Default tab-based hints for non-Settings modes
-            match state.current_tab {
-                crate::Tab::Profiles => {
+            // Pane-shell hints (spec D2): keys are pane-scoped.
+            match (state.focused_pane, state.pane1_tab) {
+                (crate::FocusedPane::Pane1, crate::Pane1Tab::Profiles) => {
                     if state.connected_core.is_some() {
-                        " [Ctrl+D] Disconnect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit ".to_string()
+                        " [Ctrl+D] Disconnect  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                            .to_string()
                     } else if state.connecting {
-                        " [Tab] Next  [?] Help  [q/Ctrl+C] Quit ".to_string()
+                        " [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit ".to_string()
                     } else if state.search_focused || !state.search_query.is_empty() {
                         // A prefix filter that matched nothing is not an empty
                         // store: say what filtered it out, and how to undo it.
@@ -243,22 +244,36 @@ fn build_hints(state: &AppState) -> String {
                                 state.search_query
                             )
                         } else {
-                            " [Esc] Clear filter  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
+                            " [Esc] Clear filter  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
                                 .to_string()
                         }
                     } else if state.endpoints.is_empty() {
                         // Nothing loaded: the row keys have nothing to act on.
-                        " [a] Add  [Ctrl+V] Import  [Tab] Next  [?] Help  [q/Ctrl+C] Quit ".to_string()
+                        " [a] Add  [Ctrl+V] Import  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                            .to_string()
                     } else {
-                        " [→] Expand  [↑↓] Variant  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit ".to_string()
+                        " [→] Expand  [↑↓] Variant  [Ctrl+Enter/Ctrl+G] Connect  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                            .to_string()
                     }
                 }
-                // The tab's own keys are the six scroll keys (documented in
-                // its manual section); the hints name what else is live here.
-                crate::Tab::NativeActivity => {
-                        " [F1] Actions Log  [?] Help  [q/Ctrl+C] Quit ".to_string()
+                (crate::FocusedPane::Pane1, crate::Pane1Tab::Logs) => {
+                    // The tab's own keys are the scroll keys (documented in its
+                    // manual section); the hints name what else is live here.
+                    " [↑↓] Scroll  [c] Clear  [t] Targets  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                        .to_string()
+                }
+                (crate::FocusedPane::Pane2, _) => {
+                    match state.pane2_tab {
+                        crate::Pane2Tab::Metrics => {
+                            " [↑↓] Scroll  [Alt+↑↓] Resize  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                                .to_string()
+                        }
+                        crate::Pane2Tab::Details => {
+                            " [↑↓] Scroll  [F1] Compact  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                                .to_string()
+                        }
                     }
-                _ => " [q/Ctrl+C] Quit ".to_string(),
+                }
             }
         }
     }

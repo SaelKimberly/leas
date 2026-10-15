@@ -3,7 +3,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use std::collections::{HashSet, VecDeque};
 
 use crate::AppState;
@@ -125,21 +125,20 @@ fn build_rows_viewport(cache: &[crate::LogLine], offset: usize, visible: usize) 
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+    render_inner(frame, area, state);
+}
+
+/// Pane-1 content: the pane frame supplies the border, so the log viewer
+/// renders frameless (spec §6 — no nested boxes).
+pub fn render_inner(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
-    let block = Block::default()
-        .title(" Logs ")
-        .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(theme))
-        .title_style(ThemeStyles::container_title(theme));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
     // Filter bar (1 line)
     let (filter_area, log_area) = {
         let rects = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(inner);
+            .split(area);
         (rects[0], rects[1])
     };
 

@@ -180,46 +180,67 @@ impl NativeActivityLog {
     }
 }
 
+/// Top pane's tabs (spec D2): the table and the log viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
+pub enum Pane1Tab {
     Profiles,
-    Settings,
     Logs,
-    Statistics,
-    NativeActivity,
-    Actions,
 }
 
-impl Tab {
-    pub const ALL: &[Self] = &[
-        Self::Profiles,
-        Self::Settings,
-        Self::Logs,
-        Self::Statistics,
-        Self::NativeActivity,
-        Self::Actions,
-    ];
+impl Pane1Tab {
+    pub const ALL: &'static [Self] = &[Self::Profiles, Self::Logs];
 
     #[must_use]
-    pub const fn next(&self) -> Self {
+    pub const fn next(self) -> Self {
         match self {
-            Self::Profiles => Self::Settings,
-            Self::Settings => Self::Logs,
-            Self::Logs => Self::Statistics,
-            Self::Statistics => Self::NativeActivity,
-            Self::NativeActivity => Self::Actions,
-            Self::Actions => Self::Profiles,
+            Self::Profiles => Self::Logs,
+            Self::Logs => Self::Profiles,
         }
     }
+
     #[must_use]
-    pub const fn prev(&self) -> Self {
+    pub const fn prev(self) -> Self {
+        self.next()
+    }
+}
+
+/// Bottom pane's tabs (spec D4): the actions log and the merged metrics view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane2Tab {
+    Details,
+    Metrics,
+}
+
+impl Pane2Tab {
+    pub const ALL: &'static [Self] = &[Self::Details, Self::Metrics];
+
+    #[must_use]
+    pub const fn next(self) -> Self {
         match self {
-            Self::Profiles => Self::Actions,
-            Self::Settings => Self::Profiles,
-            Self::Logs => Self::Settings,
-            Self::Statistics => Self::Logs,
-            Self::NativeActivity => Self::Statistics,
-            Self::Actions => Self::NativeActivity,
+            Self::Details => Self::Metrics,
+            Self::Metrics => Self::Details,
+        }
+    }
+
+    #[must_use]
+    pub const fn prev(self) -> Self {
+        self.next()
+    }
+}
+
+/// Which pane currently owns the keyboard (spec D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedPane {
+    Pane1,
+    Pane2,
+}
+
+impl FocusedPane {
+    #[must_use]
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Pane1 => Self::Pane2,
+            Self::Pane2 => Self::Pane1,
         }
     }
 }
@@ -613,6 +634,8 @@ pub enum ConfirmAction {
     PurgeLogsDatabase,
     ClearStats,
     Quit,
+    /// Settings popup holds unsaved form edits; `y` discards them and closes.
+    DiscardSettings,
 }
 
 /// Live meters for one probe level (fast or real): candidates known so far,

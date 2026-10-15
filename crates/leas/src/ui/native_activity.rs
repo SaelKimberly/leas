@@ -36,7 +36,7 @@ pub fn reset_scroll() {
 /// old `Home` sentinel `usize::MAX` — stalls `Down`/`PageDown`: they
 /// subtract from an offset the view never actually reached, so the window
 /// does not budge until the subtraction crosses `len`.
-fn clamp_scroll(len: usize) -> usize {
+pub fn scroll_offset(len: usize) -> usize {
     // Clamp and read in one RMW: this runs on every frame.
     let max = len.saturating_sub(1);
     SCROLL.fetch_min(max, Ordering::Relaxed).min(max)
@@ -99,12 +99,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     // only the visible slice is worth a `Line`.
     let height = chunks[1].height as usize;
     let total = log.entries.len();
-    let start = total.saturating_sub(height.saturating_add(clamp_scroll(total)));
+    let start = total.saturating_sub(height.saturating_add(scroll_offset(total)));
     let visible: Vec<Line> = log
         .entries
         .range(start..)
         .take(height)
-        .map(|entry| render_entry(entry, theme))
+        .map(|entry| entry_line(entry, theme))
         .collect();
     frame.render_widget(Paragraph::new(visible), chunks[1]);
 }
@@ -138,7 +138,8 @@ fn next_scroll(code: KeyCode, scroll: usize, page: usize, max: usize) -> Option<
 
 /// One line per connection:
 /// `[id] kind dest [protocol/transport] [security] up↑ down↓ dur err`.
-fn render_entry(entry: &NativeActivityEntry, theme: &opaline::Theme) -> Line<'static> {
+#[must_use]
+pub fn entry_line(entry: &NativeActivityEntry, theme: &opaline::Theme) -> Line<'static> {
     let mut text = format!(
         "[{}] {} {} [{}/{}] [{}] ↑{} ↓{} {}ms",
         entry.conn_id,

@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::widgets::{Block, Borders};
+
 
 fn connection_icon(state: &AppState) -> (&'static str, Style) {
     let theme = state.theme();
@@ -55,6 +55,12 @@ fn server_summary(state: &AppState) -> (String, String, u16, String) {
     )
 }
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+    render_full(frame, area, state);
+}
+
+/// Pane-2 Details content: the pane frame supplies the border, so the panel
+/// renders frameless (spec §6 — no nested boxes).
+pub fn render_full_inner(frame: &mut Frame, area: Rect, state: &AppState) {
     render_full(frame, area, state);
 }
 
@@ -230,13 +236,15 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         .unwrap_or_default();
     let row6 = Line::from(Span::styled(tui_log, ThemeStyles::footer_label(theme)));
 
-    let block = Block::default()
-        .title(" ⚙ Actions Log ")
-        .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(theme))
-        .title_style(ThemeStyles::container_title(theme));
-    let inner_area = block.inner(area);
-    frame.render_widget(block, area);
+    // Pane-2 Details content: the pane frame supplies the border, so the
+    // panel renders frameless (spec §6). Geometry is preserved by insetting
+    // one cell per side — the old Block's border.
+    let inner_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
     let available = inner_area.height as usize;
 
     // The batch's two levels share rows 3-4 with the statistics cells: the log

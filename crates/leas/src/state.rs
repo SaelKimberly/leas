@@ -25,8 +25,8 @@ use toasty::{Deferred, Json};
 use crate::BackendUpdateStatus;
 use crate::ops::{connect, events, ping, profiles, scheduler, settings, subscriptions, updates};
 use crate::types::{
-    AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, LogLine, NativeActivityLog,
-    SettingsSection, SplitRightPane, Tab,
+    AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, FocusedPane, LogLine,
+    NativeActivityLog, Pane1Tab, Pane2Tab, SettingsSection, SplitRightPane,
 };
 
 /// Global UI/connection state.
@@ -57,7 +57,17 @@ pub struct AppState {
     /// from. `AppState::current_palette()` and the `ratatui-cheese` bridge are
     /// gone — every style resolves from here.
     pub theme: opaline::Theme,
-    pub current_tab: Tab,
+    /// Pane shell state (spec D2): which pane owns the keyboard and each
+    /// pane's active tab. Replaces the old 6-entry `Tab` cycle.
+    pub focused_pane: FocusedPane,
+    pub pane1_tab: Pane1Tab,
+    pub pane2_tab: Pane2Tab,
+    /// Pane-2 height override (rows), 0 = per-tab default (Details 8 /
+    /// Metrics 14). Session-only, adjusted with `Alt+↑/↓` (spec D3).
+    pub pane2_height: u16,
+    /// Settings popup dirty-tracking (spec P3): the form values as loaded.
+    /// `None` when no form pane is open or the form is clean.
+    pub settings_form_snapshot: Option<Vec<(String, String)>>,
     /// The loaded Profiles page: the window the tab renders and indexes.
     /// `selected_index` indexes this vector, never the whole feed.
     pub endpoints: Vec<EndpointRow>,
@@ -213,6 +223,26 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Pane-1 Profiles keys are live only when pane 1 is focused and showing
+    /// Profiles (spec D2: keys are pane-scoped).
+    pub const fn profiles_active(&self) -> bool {
+        matches!(self.focused_pane, crate::types::FocusedPane::Pane1)
+            && matches!(self.pane1_tab, crate::types::Pane1Tab::Profiles)
+    }
+
+    /// Effective pane-2 height in rows: the user override, else the per-tab
+    /// default (Details 8 / Metrics 14 — spec D3).
+    pub const fn pane2_rows(&self) -> u16 {
+        if self.pane2_height > 0 {
+            self.pane2_height
+        } else {
+            match self.pane2_tab {
+                crate::types::Pane2Tab::Details => 8,
+                crate::types::Pane2Tab::Metrics => 14,
+            }
+        }
+    }
+
     /// ISO-3166 alpha-2 for an outbound IP from the in-memory cache (None =
     /// unknown/not yet looked up).
     pub fn outbound_country_for(&self, ip: &str) -> Option<String> {
@@ -538,7 +568,11 @@ impl AppState {
             scheduler: Arc::new(scheduler::TaskScheduler::new(queue_limit, dns_defer_secs)),
             link_stage,
             theme,
-            current_tab: Tab::Profiles,
+            focused_pane: FocusedPane::Pane1,
+            pane1_tab: Pane1Tab::Profiles,
+            pane2_tab: Pane2Tab::Details,
+            pane2_height: 0,
+            settings_form_snapshot: None,
             update_status: HashMap::new(),
             endpoints: Vec::new(),
             filter_cache_valid: Cell::new(true),

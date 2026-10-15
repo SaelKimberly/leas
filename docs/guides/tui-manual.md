@@ -14,6 +14,35 @@ and starts the other.
 
 ---
 
+## Shell — two panes, no top-level tabs
+
+The window is two framed panes plus a status bar:
+
+```
+┌ 1: [Profiles]  Logs ────────────────────────────────────┐
+│ …table or log viewer…                                    │
+├ 2: Details  [Metrics] ──────────────────────────────────┤
+│ …actions log / traffic+native+sys metrics…               │
+└ status bar ──────────────────────────────────────────────┘
+```
+
+- Each pane carries an inline tab bar in its border title: pane index (`1:`/`2:`)
+  accent-bold, the active tab bracketed and accent-bold (`[Profiles]`), inactive
+  tabs plain. Focused pane draws an accent border, the other a muted one.
+- **Pane 1 tabs**: `Profiles` (endpoint table) and `Logs` (live core log viewer).
+- **Pane 2 tabs**: `Details` (the Actions Log panel) and `Metrics` (traffic +
+  native-core connection ring + core system stats, one scrollable view).
+- **Pane keys**: `Tab`/`Shift+Tab` or `1`/`2` move focus; `[`/`]` cycle the focused
+  pane's tabs; `Alt+↑`/`Alt+↓` resize pane 2 (pane 2 focused; clamped 3..half the
+  terminal, session-only); `F1` toggles pane 2's compact one-line bar.
+- Settings is a **popup** (`,`) over both panes, not a tab. `Esc` closes it; an
+  unsaved form asks `y/n` before discarding.
+
+Overlays (help `?`, speed-test menu `t`, export `Ctrl+E`, add/edit/import forms,
+delete confirmation) render on top of the shell; only the top-most consumes keys.
+
+---
+
 ## Screens
 
 ### Profiles
@@ -22,28 +51,22 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 
 | Column       | Width | Content                                     |
 | ------------ | ----- | ------------------------------------------- |
-| (arrow)      | 1     | Expand/collapse indicator `▶`/`▾`           |
 | (status)     | 2     | Connection status or test indicator          |
-| `#`          | 7     | Row number, right-aligned in a 6-digit slot (`100000+` fits); `*` when multi-selected |
-| `[`          | 1     | Bracket decoration                          |
-| (country)    | 4     | Inbound country flag (region emoji, `🏴` unknown) |
-| `Address`    | 34    | `host:port` (flag sits inside the brackets) |
-| `][`         | 2     | Bracket decoration                          |
-| `Feat`       | 4     | Whitelist feature flags: `🏁` DNS unresolved, `🏳️` IP/CIDR whitelisted, `🏳️` SNI whitelisted |
-| `]=>{`       | 4     | Bracket decoration                          |
-| `Protocol Info` | 24 | `protocol/transport/security` (e.g. `vless/tcp/reality`), center-aligned — the old endpoint-level `Type` cell merged into it |
-| `}=>`        | 3     | Bracket decoration                          |
-| `Test`       | 6     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). The cell describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index`, the argmin of the ordering key), not `active_link()` — so the cell's content IS the row's tier band (0/1 → that link's delay, 2 → blank, 3/4 → the marker, 5 → `[name]`, 6 → the purge label). Labels come from the persisted per-link failure marker and survive restarts; the Speed Test `error_ttl_hours` setting clears them |
-| `[`          | 1     | Bracket decoration (Outbound opener)        |
-| `Outbound`   | 16    | Exit IP of the active link's persisted real ping (`—` none); survives reruns |
-| `Country`    | 7     | Exit country flag + ISO from the mmdb cache for the active link's exit IP (seeded at load — survives reruns; `—` none) |
-| `]`          | 1     | Bracket decoration                          |
+| `ID`         | 8     | Representative link's protocol id as 8 lowercase hex (`{:08x}`); `*` when multi-selected (the marker replaces the id, widths equal) |
+| `Flag`       | 5     | Inbound country: `<flag emoji>-<ISO>` (e.g. `🇳🇱-NL`) when the terminal renders flag emoji, bare `<ISO>` when it does not (`LEAS_NO_FLAGS`/`NO_EMOJI` force the fallback); `—` unknown |
+| `Address`    | 34    | Host. Multi-variant endpoints carry a bold `+` (collapsed) / `-` (expanded) prefix — the old `▶`/`▾` glyph is gone. A DNS name whose subdomain overflows elides the subdomain's tail, keeping the registrable domain: `jp-tyo-05….synthetic-node.example`. IP literals right-truncate with `…` |
+| `Port`       | 6     | Port, right-aligned                          |
+| `White`      | 9     | Whitelist membership tokens: `SNI` / `CIDR` / `SNI+CIDR` / `—` (replaces the old flag glyphs; DNS-unresolved lives in the Test cell's `[name]`) |
+| `Protocol`   | 24    | `protocol/transport/security` (e.g. `vless/tcp/reality`), center-aligned |
+| `Test`       | 7     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). The cell describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index`, the argmin of the ordering key) — the same link the `ID` column names, so the two cells cannot disagree. Labels survive restarts; the Speed Test `error_ttl_hours` setting clears them. The header's `↑` arrow is the fixed sort (`PageSort::Test`, ascending): sorting is deliberately not user-changeable, to avoid database contention |
+| `Out`        | 5     | Exit country flag, same `<flag>-<ISO>` idiom as `Flag`; `—` unknown |
+| `Exit`       | 14    | Exit IP of the active link's persisted real ping (`—` none); survives reruns |
 
-Headers carry only descriptive names; decorative separator cells have empty headers.
+Every label carries the header role; there are no decorative separator cells.
 Delay/Speed/Traffic/Outbound details live in the expanded panel (below).
 
-**Expandable endpoints**: Endpoints with multiple protocol variants show `▶`
-(collapsed) or `▾` (expanded). Press `→` to expand: a rounded panel appears
+**Expandable endpoints**: Endpoints with multiple protocol variants show a bold `+`
+before the host (collapsed) or `-` (expanded). Press `→` to expand: a rounded panel appears
 under the row with an `IPs:` line (resolved inbound addresses; `[?]` with an
 `(x resolve)` hint while the DNS name is unresolved) and a per-protocol
 sub-table: active marker, hex profile id, Last Seen, Last Used, Protocol Type,
@@ -74,10 +97,15 @@ address/port. `Esc` clears filter and exits search mode.
 
 ---
 
-### Settings
+### Settings (popup)
 
-A settings panel with a menu of 14 sections. Press `Enter` on a section to open its
-configuration form. A separator line visually groups the first 5 "active" sections
+Opened with `,` from anywhere in the shell: a centered modal (width
+`clamp(term-4, 50, 110)`, height `clamp(term-2, 20, 40)`) over both panes. Not a
+tab — the shell stays rendered behind it. `Esc` closes; a form with unsaved edits
+asks `Discard unsaved settings? (y/N)` first.
+
+Left side: a menu of 14 sections. Press `Enter` on a section to open its
+configuration form on the right. A separator line visually groups the first 5 "active" sections
 from the remaining "deferred" sections.
 
 **Menu items (in order):**
@@ -99,8 +127,9 @@ from the remaining "deferred" sections.
 
 **Form navigation within a section:**
 - `Tab` / `Shift+Tab` — move focus between fields
-- `Enter` — save and return to menu
-- `Esc` — cancel and return to menu
+- `Enter` — save the form
+- `Esc` — back to the menu; asks before discarding unsaved edits
+- `Tab` on the section tree — closes the popup
 
 **Routing Rules** (section 4) has a two-level UI:
 - Routing list: `↑↓` navigate, `Enter` edit, `a` add, `d` delete, `r` reorder
@@ -112,10 +141,10 @@ updates. `Esc` returns to menu.
 
 ---
 
-### Logs
+### Logs (pane 1 tab)
 
-A bordered container displaying live log output from the connected core process.
-When no core is running, shows:
+Live log output from the connected core process, rendered frameless inside pane 1
+(the pane supplies the frame). When no core is running, shows:
 
 ```
 ┌ Logs ───────────────────────────────────────────────────┐
@@ -136,45 +165,39 @@ The buffer holds the most recent 1000 log lines. Scrolling is bottom-anchored
 
 ---
 
-### Statistics
+### Metrics (pane 2 tab)
 
-When not connected to a server:
-
-```
-┌─ Statistics ─────────────────────────────────────────┐
-│                                                       │
-│               No data — connect to a server            │
-│                                                       │
-└───────────────────────────────────────────────────────┘
-```
-
-When connected: displays traffic stats (total upload/download, speed), system
-statistics (CPU/memory/uptime if available), and connection info (API endpoint,
-connection status). Data sourced from the backend's gRPC/V2Ray API when available.
-
----
-
-### Native Activity
-
-Live per-connection view for the in-process native core. Each accepted
-connection emits an open event; closing emits byte totals, lifetime, and an
-optional error. One line per connection:
+One scrollable view merging the former Statistics and Native Activity screens —
+the pane frame supplies the border; sections are flat labelled rows:
 
 ```
-[12] TCP example.com:443 [vless/tcp] [tls] ↑1.2KB ↓3.4KB 150ms
+session
+  edge-a.example:443 [xray]
+  today ↑1.0KB ↓2.1KB · total ↑9.8KB ↓19.5KB
+native
+  4 open · 12 closed · 1 failed
+  [7] example.com:443 [vless/tcp] [tls] ↑12KB ↓34KB 120ms
+core
+  mem 42MB / 64MB · routines 38 · uptime 1h12m
+  api http://127.0.0.1:62789
 ```
 
-The header shows session totals (upload/download), the open-connection count,
-and the failed-connection count. Connections that close with an error are
-highlighted as failures. When no native session is active, or nothing has
-been recorded yet, the screen shows an empty-state message instead of the list.
+- **session** — the CONNECTED profile's traffic (today/total, up/down from the
+  link's persisted `profile_stats` plus the session delta); `not connected —
+  select a profile and press Ctrl+Enter` when nothing is connected.
+- **native** — per-connection trace of the in-process native core: one line per
+  connection with byte totals and lifetime; failures render in the error colour.
+  With more rows than fit, a `rows N-M of T` line caps the window and `↑↓` scroll.
+- **core** — memory/routines/uptime from the backend's gRPC/V2Ray API and the API
+  endpoint (the native core reports an in-process event feed).
 
----
+`Alt+↑`/`Alt+↓` (pane 2 focused) resize the pane; `F1` collapses it to the
+one-line compact bar.
 
 ### Subscriptions (Settings)
 
-Group management lives in Settings → Subscriptions. Press `g` on the Profiles
-tab to jump straight there; `Esc` returns to the settings menu.
+Group management lives in the Settings popup → Subscriptions. Press `g` on pane 1
+(Profiles tab) to jump straight there; `Esc` returns to the settings menu.
 
 Lists subscription groups with columns: Name, URL (truncated), Enabled,
 Status, Last Updated.
@@ -344,12 +367,12 @@ keyboard shortcuts grouped by current context (Profiles, Settings, Statistics,
 Logs, or Native Activity). `Esc` or `?` closes.
 
 
-### Actions Log
+### Actions Log (pane 2 `Details` tab)
 
 A live state information panel showing current system state, connection info,
 test results, and recent log lines. Supports two views toggled with `F1`:
 
-**Compact bar** (1 line, default in terminals <20 rows tall):
+**Compact bar** (1 line):
 
 ```
 ⠋ VMess/my-server 1.2.3.4:443 | TCP:45ms RP:120ms SPD:15Mbps | ⬆1.2GB ⬇3.4GB | Info Xray 1.8.0 started
@@ -365,17 +388,15 @@ Connection indicators:
 Segments (compact): server info, test results (only when available), traffic,
 last core log snippet.
 
-**Full panel** (8 rows, default in terminals ≥20 rows tall):
+**Full panel** (8 rows; the pane-2 default height):
 
 ```
-┌─ ⚙ Actions Log ───────────────────────────────────────┐
-│ ● Connected [xray]                                      │
-│ 🖥 VLESS  us.example.com:443                            │
-│ ⏱ TCP:45ms  RP:120ms  SPD:15Mbps                       │
-│ 📊 ⬆1.2GB  ⬇3.4GB    💾 64.2MB                         │
-│ 📋 Core: [Info] Xray 1.8.0 started                      │
-│ 📋 TUI:  [Info] Connected [xray] (core)                 │
-└────────────────────────────────────────────────────────┘
+ ● Connected [xray]
+ 🖥 VLESS  us.example.com:443
+ ⏱ TCP:45ms  RP:120ms  SPD:15Mbps
+ 📊 ⬆1.2GB  ⬇3.4GB    💾 64.2MB
+ 📋 Core: [Info] Xray 1.8.0 started
+ 📋 TUI:  [Info] Connected [xray] (core)
 ```
 
 Rows:
@@ -387,18 +408,15 @@ Rows:
 6. Last TUI log line (from `tracing` events, with target tag)
 
 **Behavior:**
-- Default view depends on terminal height: compact if <20 rows, full if ≥20
 - `F1` toggles between compact and full at any time
-- In terminals <20 rows, full panel replaces content area as an overlay.
-  Press `F1` or `Esc` to close the overlay.
-- In normal terminals, full panel renders inline below the tab bar.
-  Content area adjusts automatically.
+- Pane 2's height follows the active tab (Details 8 rows, Metrics 14) plus any
+  `Alt+↑`/`Alt+↓` adjustment; the compact bar is 1 row.
 
 Tracing integration (backend logging):
 - TUI internals emit `tracing` events via `tracing-subscriber` with a
   custom `TuiLogLayer` that forwards events to the core event channel
 - Events carry a `target` field (`core`, `tui`, `speedtest`, `subscription`)
-- Viewable in the Actions Log panel, the Logs tab, and the configured log file
+- Viewable in the Actions Log pane, the Logs tab, and the configured log file
   (`logging.log_to_file` / `logging.log_file_path`)
 - **Stderr mirror is opt-in via `LEAS_STDERR_LOG`** — set it to anything
   other than empty/`0`/`false` to add a stderr `tracing` layer. `RUST_LOG`
@@ -409,6 +427,7 @@ Tracing integration (backend logging):
   Logs tab and log file capture everything regardless
 - Key operations (connect, disconnect, speed test, subscription updates)
   emit tracing events for real-time visibility
+
 ---
 
 ## Status Bar
@@ -443,15 +462,18 @@ appended when updates are available for installed backends.
 
 | Context                 | Hints                                    |
 | ----------------------- | ---------------------------------------- |
-| Profiles (disconnected) | `[→] Expand  [↑↓] Variant  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit` |
-| Profiles (connecting)   | `[Tab] Next  [?] Help  [q/Ctrl+C] Quit`  |
-| Profiles (connected)    | `[Ctrl+D] Disconnect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit` |
-| Settings menu (tree)    | `[↑↓] Navigate  [←→] Collapse  [Enter] Open  [Ctrl+W] Focus Form  [Esc] Close` |
-| Settings form           | `[Tab/Shift+Tab] Focus  [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back` |
-| Speed test menu         | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
-| Help overlay            | `[Esc] Close help`                       |
-| Native Activity         | `[F1] Actions Log  [?] Help  [q/Ctrl+C] Quit` |
-| Logs / Statistics       | `[q/Ctrl+C] Quit`                        |
+| Pane 1 · Profiles (disconnected) | `[a] Add  [Ctrl+V] Import  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 1 · Profiles (connecting)   | `[,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit`  |
+| Pane 1 · Profiles (connected)    | `[Ctrl+D] Disconnect  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 1 · Profiles (filtered-empty) | `No match for "<q>"  [Esc] Clear  [q/Ctrl+C] Quit` |
+| Pane 1 · Logs          | `[↑↓] Scroll  [c] Clear  [t] Targets  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 2 · Details       | `[↑↓] Scroll  [F1] Compact  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 2 · Metrics       | `[↑↓] Scroll  [Alt+↑↓] Resize  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Settings popup (tree)  | `[↑↓] Navigate  [←→] Collapse  [Enter] Open  [Ctrl+W] Focus Form  [Tab] Close  [Esc] Close` |
+| Settings popup (form)  | `[Tab/Shift+Tab] Focus  [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back` |
+| Confirm modal          | `[y] Confirm  [n/Esc] Cancel`             |
+| Speed test menu        | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
+| Help overlay           | `[Esc] Close help`                        |
 
 ## Keyboard Shortcuts — Full Reference
 
@@ -471,30 +493,30 @@ appended when updates are available for installed backends.
 | `e`              | Edit selected server                |
 | `d`              | Delete selected server(s)           |
 | `c`              | Clone selected server               |
-| `g`              | Open Subscriptions (Settings → Subscriptions) |
+| `g`              | Open Settings popup at Subscriptions |
 | `t`              | Open speed test menu                |
 | `x`              | Resolve DNS of selected endpoint    |
 | `p`              | Cycle view: Active → Purgatory → All |
-| `o`              | Cycle sort column (8 columns)       |
 | `/`              | Focus search/filter input           |
 | `Ctrl+V`         | Import share URL                    |
  | `Ctrl+Shift+S`   | Copy selected server's share URL    |
 | `Ctrl+↑`         | Move selected profile up            |
 | `Ctrl+↓`         | Move selected profile down          |
-| `Tab` / `Shift+Tab` | Cycle through tabs               |
+| `Tab` / `Shift+Tab` | Switch pane focus (or `1`/`2`)   |
 | `?`              | Toggle help overlay                 |
 | `q` / `Ctrl+C`   | Quit application                    |
-| `F1`             | Toggle actions log compact/full view |
+| `F1`             | Toggle pane 2 compact/full view     |
+| `,`              | Open Settings popup                |
  | `Ctrl+D`   | Disconnect from active server       |
 
-### Settings Tab
+### Settings Popup
 
 | Key               | Action                              |
 | ----------------- | ----------------------------------- |
 | `↑` / `↓`        | Navigate settings menu              |
 | `Enter`          | Open selected section               |
-| `Tab` / `Shift+Tab` | Cycle tabs                       |
-| `Esc`            | Close settings / return to menu     |
+| `Tab` / `Shift+Tab` | Close the popup                  |
+| `Esc`            | Close settings / back to menu (asks before discarding unsaved edits) |
 | `?`              | Toggle help overlay                 |
 | `q` / `Ctrl+C`   | Quit application                    |
 
