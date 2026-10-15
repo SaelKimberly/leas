@@ -529,8 +529,15 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     };
                     (pid, multi)
                 };
-                match selected {
-                    0 => {
+                let label = SPEED_TEST_MENU_ITEMS
+                    .get(selected)
+                    .and_then(|item| match item {
+                        SpeedTestMenuItem::Item(label) => Some(*label),
+                        SpeedTestMenuItem::Separator => None,
+                    })
+                    .unwrap_or_default();
+                match label {
+                    "Fast Ping (Selected)" => {
                         if on_sub || !multi {
                             if let Some(id) = proto_id {
                                 state.start_tcp_ping(ep_id.unwrap_or_default(), id);
@@ -539,7 +546,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                             state.start_endpoint_batch_ping();
                         }
                     }
-                    1 => {
+                    "Real Ping (Selected)" => {
                         if on_sub || !multi {
                             if let Some(id) = proto_id {
                                 state.start_real_ping(ep_id.unwrap_or_default(), id);
@@ -548,41 +555,33 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                             state.start_endpoint_batch_real_ping();
                         }
                     }
-                    2 => {
+                    "Speed Test (Selected)" => {
                         if let Some(id) = proto_id {
                             state.start_speed_test(ep_id.unwrap_or_default(), id);
                         }
                     }
-                    3 => {
+                    "UDP Test (Selected)" => {
                         if let Some(id) = proto_id {
                             state.start_udp_test(ep_id.unwrap_or_default(), id);
                         }
                     }
-                    5 => {
-                        state.start_batch_ping();
-                    }
-                    6 => {
-                        state.start_batch_then_real_ping();
-                    }
-                    7 => {
+                    "Fast Ping (All Profiles)" => state.start_batch_ping(),
+                    "Fast + Real Ping (All Profiles)" => state.start_batch_then_real_ping(),
+                    "Fast + Real Ping (Successful)" => {
                         state.start_batch_then_real_ping_scoped(PlanScope::Successful);
                     }
-                    8 => {
+                    "Fast + Real Ping (New)" => {
                         state.start_batch_then_real_ping_scoped(PlanScope::New);
                     }
-                    9 => {
+                    "Fast + Real Ping (Successful + New)" => {
                         state.start_batch_then_real_ping_scoped(PlanScope::SuccessfulAndNew);
                     }
-                    10 => {
+                    "Fast + Real Ping (Failed)" => {
                         state.start_batch_then_real_ping_scoped(PlanScope::Failed);
                     }
-                    12 => {
-                        state.remove_failed_servers().await;
-                    }
-                    14 => {
-                        state.stop_speed_test();
-                    }
-                    16 => {
+                    "Remove Bad Servers" => state.remove_failed_servers().await,
+                    "Stop Testing" => state.stop_speed_test(),
+                    "Clear All Stats" => {
                         state.confirmation = Some(crate::ConfirmAction::ClearStats);
                     }
                     _ => {}
@@ -1228,10 +1227,18 @@ fn render(frame: &mut Frame, state: &AppState) {
     }
 
     // Pane shell (spec §6): pane 1 (top, Min) / pane 2 (per-tab height) / status.
-    let pane2_rows = if state.actions_compact {
+    // Compact is decided per frame (tui-polish D6): terminals under 20 rows
+    // always collapse pane 2 to the one-line bar so the table keeps its
+    // viewport; otherwise F1's session toggle and the per-tab default apply.
+    let small = area.height < 20;
+    let pane2_rows = if state.actions_compact || small {
         1
     } else {
-        state.pane2_rows().min(area.height.saturating_sub(4))
+        // Leave pane 1 at least 6 rows (border + header + rows + footer).
+        state
+            .pane2_rows()
+            .min(area.height.saturating_sub(7))
+            .max(3)
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1260,7 +1267,9 @@ fn render(frame: &mut Frame, state: &AppState) {
     frame.render_widget(p1_block, chunks[0]);
     render_pane1(frame, p1_inner, state);
 
-    // Pane 2: framed, tab bar + visible-rows counter; compact = 1 row.
+    // Pane 2: framed with the tab bar, or — at one row (small terminal /
+    // F1) — a borderless compact bar so the frame does not eat the row.
+    let compact_p2 = pane2_rows <= 1;
     let p2_tabs: &[(&str, bool)] = &[
         ("Details", matches!(state.pane2_tab, crate::Pane2Tab::Details)),
         ("Metrics", matches!(state.pane2_tab, crate::Pane2Tab::Metrics)),
@@ -1270,13 +1279,17 @@ fn render(frame: &mut Frame, state: &AppState) {
     } else {
         ThemeStyles::container_border(theme)
     };
-    let p2_block = Block::default()
-        .title(pane_title("2:", p2_tabs, None, theme))
-        .borders(Borders::ALL)
-        .border_style(p2_border);
-    let p2_inner = p2_block.inner(chunks[1]);
-    frame.render_widget(p2_block, chunks[1]);
-    render_pane2(frame, p2_inner, state);
+    if compact_p2 {
+        actions_log::render_compact(frame, chunks[1], state);
+    } else {
+        let p2_block = Block::default()
+            .title(pane_title("2:", p2_tabs, None, theme))
+            .borders(Borders::ALL)
+            .border_style(p2_border);
+        let p2_inner = p2_block.inner(chunks[1]);
+        frame.render_widget(p2_block, chunks[1]);
+        render_pane2(frame, p2_inner, state);
+    }
 
     // Overlays paint over the whole shell (spec D1).
     for kind in overlay_stack(state) {
@@ -1305,13 +1318,14 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("a", "Add new server"),
                     ("e", "Edit selected server"),
                     ("d", "Delete selected server(s)"),
-                    ("g", "Open subscriptions settings"),
+                    ("g", "Open Settings popup at Subscriptions"),
                     ("t", "Open speed test menu (endpoint row = batch)"),
-                    ("o", "Cycle sort column"),
                     ("/", "Search/filter"),
                     ("Ctrl+V", "Import share URL"),
                     ("Ctrl+Shift+S", "Copy share URL"),
-                    ("Tab / Shift+Tab", "Cycle tabs"),
+                    ("Tab / Shift+Tab", "Switch pane focus (1 / 2 jump)"),
+                    ("[ / ]", "Cycle the focused pane's tabs"),
+                    (",", "Open Settings popup"),
                     ("Ctrl+D", "Disconnect"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
@@ -1385,7 +1399,6 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Fast + Real Ping (New)"),
     SpeedTestMenuItem::Item("Fast + Real Ping (Successful + New)"),
     SpeedTestMenuItem::Item("Fast + Real Ping (Failed)"),
-    SpeedTestMenuItem::Item("Sort by Test"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Separator,
     SpeedTestMenuItem::Item("Stop Testing"),
@@ -1429,7 +1442,7 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     let para = Paragraph::new(lines).alignment(Alignment::Left);
     let sized = KnownSizeWrapper::new(para, popup_width as usize, popup_height as usize);
     let popup = Popup::new(sized)
-        .title(" Server Tools ")
+        .title(" Speed Test ")
         .border_set(ratatui::symbols::border::ROUNDED)
         .style(ThemeStyles::dialog(theme));
     frame.render_widget(popup, area);

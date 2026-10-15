@@ -76,6 +76,10 @@ pub trait DataTableRow {
         &self,
         col_xs: &[u16],
         col_widths: &[u16],
+        // Positional -> logical column id: width-aware drops hide trailing
+        // columns; rows match content by LOGICAL id, so a dropped column never
+        // shifts another column's meaning.
+        col_order: &[usize],
         buf: &mut Buffer,
         y: u16,
         clip_bottom: u16,
@@ -100,6 +104,8 @@ pub struct DataTable<'a, R: DataTableRow> {
     pub columns: Vec<Column<'a>>,
     pub rows: &'a [R],
     pub highlight_style: Style,
+    /// Positional -> logical column id (default identity).
+    pub order: Vec<usize>,
     pub selection_style: Style,
     pub sort_column: Option<usize>,
     pub sort_direction: SortDirection,
@@ -119,6 +125,7 @@ pub struct DataTable<'a, R: DataTableRow> {
 impl<R: DataTableRow> Default for DataTable<'_, R> {
     fn default() -> Self {
         Self {
+            order: Vec::new(),
             columns: Vec::new(),
             rows: &[],
             highlight_style: Style::default().add_modifier(Modifier::REVERSED),
@@ -141,6 +148,7 @@ impl<'a, R: DataTableRow> DataTable<'a, R> {
     #[must_use]
     pub fn new(columns: Vec<Column<'a>>, rows: &'a [R]) -> Self {
         Self {
+            order: Vec::new(),
             columns,
             rows,
             ..Self::default()
@@ -156,6 +164,13 @@ impl<'a, R: DataTableRow> DataTable<'a, R> {
     #[must_use]
     pub const fn selection_style(mut self, style: Style) -> Self {
         self.selection_style = style;
+        self
+    }
+
+    /// Positional -> logical column ids for width-aware column drops.
+    #[must_use]
+    pub fn column_order(mut self, order: Vec<usize>) -> Self {
+        self.order = order;
         self
     }
 
@@ -451,6 +466,12 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
         // `bottom` (clip_bottom) instead of being skipped entirely, so a
         // partially-visible row still draws and never writes past the frame.
         let bottom = content_inner.bottom();
+        // Positional -> logical ids: identity unless a width-aware drop set one.
+        let order: Vec<usize> = if self.order.is_empty() {
+            (0..self.columns.len()).collect()
+        } else {
+            self.order.clone()
+        };
         let mut y = header_y;
         let mut row_idx = state.offset;
         while y < bottom && row_idx < total_rows {
@@ -480,7 +501,7 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
                 }
             }
 
-            self.rows[row_idx].render(col_xs, col_widths, buf, y, bottom);
+            self.rows[row_idx].render(col_xs, col_widths, &order, buf, y, bottom);
 
             y += rh;
             row_idx += 1;
@@ -539,6 +560,7 @@ mod tests {
             &self,
             col_xs: &[u16],
             col_widths: &[u16],
+            _col_order: &[usize],
             buf: &mut Buffer,
             y: u16,
             clip_bottom: u16,

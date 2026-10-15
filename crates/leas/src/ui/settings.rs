@@ -201,7 +201,7 @@ fn render_tree(
     focus: SplitFocus,
 ) {
     let block = Block::default()
-        .title(" Settings ")
+        .title(" Sections ")
         .borders(Borders::ALL)
         .border_style(ThemeStyles::container_border(theme));
     let inner = block.inner(area);

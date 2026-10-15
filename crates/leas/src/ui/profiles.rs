@@ -168,6 +168,7 @@ impl DataTableRow for DisplayRowData {
         &self,
         col_xs: &[u16],
         col_widths: &[u16],
+        col_order: &[usize],
         buf: &mut Buffer,
         y: u16,
         clip_bottom: u16,
@@ -177,7 +178,10 @@ impl DataTableRow for DisplayRowData {
             return;
         }
         for (i, &x) in col_xs.iter().enumerate() {
-            let (text, style) = match i {
+            // Match by LOGICAL column id: width-aware drops hide trailing
+            // columns without shifting another column's meaning.
+            let logical = col_order.get(i).copied().unwrap_or(i);
+            let (text, style) = match logical {
                 0 => (self.indicator.as_str(), self.indicator_fg),
                 1 => (self.id_hex.as_str(), self.id_style),
                 2 => (self.inbound_flag.as_str(), self.row_style),
@@ -191,13 +195,15 @@ impl DataTableRow for DisplayRowData {
                 _ => ("", self.row_style),
             };
             let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
-            if i == 3 {
+            if logical == 3 {
                 // The `+`/`-` marker takes the first cell; the host starts one
-                // cell in and is one cell narrower (D11).
+                // cell in and is one cell narrower (D11), elided by §8.
                 if self.expand_prefix != ' ' {
                     buf.set_stringn(x, y, self.expand_prefix.encode_utf8(&mut [0u8; 4]), 1, self.prefix_style);
                 }
-                buf.set_stringn(x + 1, y, text, max_w.saturating_sub(1), style);
+                let host_w = max_w.saturating_sub(1);
+                let host = truncate_host(text, host_w);
+                buf.set_stringn(x + 1, y, &host, host_w, style);
             } else {
                 buf.set_stringn(x, y, text, max_w, style);
             }
@@ -840,9 +846,10 @@ fn build_display_rows(
         let resolved = !crate::ops::profiles::endpoint_dns_unresolved(state, row);
 
         let inbound_flag = flag_cell(info.and_then(|i| i.country.as_deref()));
-        // Host and port are separate columns now (spec §7): the host keeps 33
-        // cells because the `+`/`-` marker owns the first one.
-        let address_str = truncate_host(&row.endpoint.display_host(&row.resolved_ips), 33);
+        // Host (raw): the Address column truncates at draw time (§8) so a
+        // width-shrunk column still elides the subdomain instead of
+        // hard-clipping through the domain.
+        let address_str = row.endpoint.display_host(&row.resolved_ips);
         let port_str = format!("{:>6}", row.endpoint.port);
         // Whitelist tokens (spec §7 col 6); the DNS-unresolved flag moved to
         // the Test cell's `[name]` marker, which already carried it.
@@ -1073,55 +1080,65 @@ fn render_data_grid(
     // Pane 1 supplies the frame (spec §6): the table renders frameless, inset
     // one cell per side to preserve the geometry the old Block's border gave.
 
-    // The arrow mirrors the page request's sort (D13): one shared constant
-    // from `PageRequest.sort` (fixed `PageSort::Test`, ascending), never a
-    // second literal. Test is column index 7 in the grid below.
-    let sort_column = Some(PROFILES_SORT_COLUMN);
-    let sort_direction = SortDirection::Ascending;
-
     // 10 columns (spec §7): status, ID, Flag, Address, Port, White, Protocol,
     // Test, Out, Exit. No decorative bracket or glyph cells; every label
     // carries the header role.
     let header_style = ThemeStyles::table_header(theme);
-    let columns = vec![
-        Column::new(Line::raw(""), ColumnWidth::Fixed(2)), // 0 — status
-        Column::new(
-            Line::from(Span::styled("ID", header_style)),
-            ColumnWidth::Fixed(8),
-        ), // 1 — link id hex
-        Column::new(
-            Line::from(Span::styled("Flag", header_style)),
-            ColumnWidth::Fixed(5),
-        ), // 2 — inbound flag
-        Column::new(
-            Line::from(Span::styled("Address", header_style)),
-            ColumnWidth::Fixed(34),
-        ), // 3 — host (+ `+`/`-` prefix cell)
-        Column::new(
-            Line::from(Span::styled("Port", header_style)),
-            ColumnWidth::Fixed(6),
-        ), // 4 — port (right-aligned)
-        Column::new(
-            Line::from(Span::styled("White", header_style)),
-            ColumnWidth::Fixed(9),
-        ), // 5 — whitelist tokens
-        Column::new(
-            Line::from(Span::styled("Protocol", header_style)),
-            ColumnWidth::Fixed(24),
-        ), // 6 — protocol/transport/security
-        Column::new(
-            Line::from(Span::styled("Test", header_style)),
-            ColumnWidth::Fixed(7),
-        ), // 7 — delay/markers + fixed sort arrow
-        Column::new(
-            Line::from(Span::styled("Out", header_style)),
-            ColumnWidth::Fixed(5),
-        ), // 8 — exit flag
-        Column::new(
-            Line::from(Span::styled("Exit", header_style)),
-            ColumnWidth::Fixed(14),
-        ), // 9 — exit IP
+    // Width-aware drop (tui-polish D7, re-derived for the §7 grid): the inner
+    // width decides which columns survive. `Test` is protected — a row without
+    // its verdict is useless. Drop order: Exit, Out, White; then Address
+    // shrinks toward a 12-cell floor. Surviving columns carry their LOGICAL id
+    // through `order`, so a drop never shifts another column's meaning.
+    let logical: [(usize, &str, u16); 10] = [
+        (0, "", 2),         // status
+        (1, "ID", 8),       // link id hex
+        (2, "Flag", 5),     // inbound flag
+        (3, "Address", 34), // host (+ `+`/`-` prefix cell)
+        (4, "Port", 6),     // port
+        (5, "White", 9),    // whitelist tokens
+        (6, "Protocol", 24),
+        (7, "Test", 7),     // + fixed sort arrow
+        (8, "Out", 5),      // exit flag
+        (9, "Exit", 14),    // exit IP
     ];
+    let mut widths: Vec<u16> = logical.iter().map(|(_, _, w)| *w).collect();
+    let inner_w = area.width.saturating_sub(2); // frameless inset
+    for &drop in &[9usize, 8, 5] {
+        if widths.iter().sum::<u16>() > inner_w {
+            widths[drop] = 0;
+        }
+    }
+    let excess = widths.iter().sum::<u16>().saturating_sub(inner_w);
+    if excess > 0 {
+        // Address shrinks toward a 12-cell floor; anything still over clips.
+        let shrink = excess.min(widths[3].saturating_sub(12));
+        widths[3] -= shrink;
+    }
+    let order: Vec<usize> = widths
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w > 0)
+        .map(|(i, _)| i)
+        .collect();
+    let columns: Vec<Column> = order
+        .iter()
+        .map(|&l| {
+            let (_, label, _) = logical[l];
+            if label.is_empty() {
+                Column::new(Line::raw(""), ColumnWidth::Fixed(widths[l]))
+            } else {
+                Column::new(
+                    Line::from(Span::styled(label, header_style)),
+                    ColumnWidth::Fixed(widths[l]),
+                )
+            }
+        })
+        .collect();
+
+    // The arrow follows the Test column's POSITION in the visible grid — a
+    // width-aware drop moves it (e.g. `Test ↑` once White drops).
+    let sort_column = order.iter().position(|&l| l == PROFILES_SORT_COLUMN);
+    let sort_direction = SortDirection::Ascending;
 
     // Scroll offset: keep the selected row roughly centered, in line units —
     // expanded rows are taller than 1, so row-index math would strand the
@@ -1136,6 +1153,7 @@ fn render_data_grid(
     let data_table = DataTable::new(columns, display_rows)
         .highlight_style(ThemeStyles::table_row_selected(theme))
         .column_spacing(0)
+        .column_order(order)
         .sort_column(sort_column, sort_direction)
         .total_rows(Some(scrollbar_total))
         .scrollbar_offset(Some(scrollbar_offset))
@@ -1927,7 +1945,7 @@ mod tests {
         }
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 20));
 
-        row.render(&col_xs, &col_widths, &mut buf, 0, 20);
+        row.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 0, 20);
 
         let line: String = (0..120).map(|x| buf[(x, 4)].symbol()).collect();
         assert!(
@@ -1967,7 +1985,7 @@ mod tests {
         }
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 20));
 
-        row.render(&col_xs, &col_widths, &mut buf, 0, 20);
+        row.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 0, 20);
 
         // Window = panel rows 5..13 (centered on the selected 9): the first
         // visible sub-row line carries row 5's id, not row 0's.
@@ -2018,7 +2036,7 @@ mod tests {
             }
         }
 
-        row.render(&col_xs, &col_widths, &mut buf, 0, 20);
+        row.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 0, 20);
 
         // Panel starts at y=1; sub-rows at y0+3 → sub-row 0 at y=4, sub-row 1
         // at y=5. x=1 is the panel's first inner cell.
@@ -2055,8 +2073,8 @@ mod tests {
         let col_widths = vec![1u16; 17];
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
 
-        row0.render(&col_xs, &col_widths, &mut buf, 0, 20);
-        row1.render(&col_xs, &col_widths, &mut buf, 8, 20);
+        row0.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 0, 20);
+        row1.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 8, 20);
 
         // Panel (height 6) sits at y=1..6: bottom-left corner at y=6.
         assert_eq!(buf[(0, 6)].symbol(), "\u{2570}"); // ╰

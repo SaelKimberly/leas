@@ -372,7 +372,8 @@ Logs, or Native Activity). `Esc` or `?` closes.
 A live state information panel showing current system state, connection info,
 test results, and recent log lines. Supports two views toggled with `F1`:
 
-**Compact bar** (1 line):
+**Compact bar** (1 line; also selected automatically in terminals under 20 rows
+so the table keeps its viewport):
 
 ```
 ⠋ VMess/my-server 1.2.3.4:443 | TCP:45ms RP:120ms SPD:15Mbps | ⬆1.2GB ⬇3.4GB | Info Xray 1.8.0 started
@@ -410,7 +411,11 @@ Rows:
 **Behavior:**
 - `F1` toggles between compact and full at any time
 - Pane 2's height follows the active tab (Details 8 rows, Metrics 14) plus any
-  `Alt+↑`/`Alt+↓` adjustment; the compact bar is 1 row.
+  `Alt+↑`/`Alt+↓` adjustment (clamped so pane 1 keeps ≥6 rows); the compact bar
+  is 1 row, and below 20 terminal rows it is always selected.
+- The table drops columns by width priority when the pane is narrow: `Exit`,
+  then `Out`, then `White` disappear, and `Address` shrinks toward a 12-cell
+  floor — `Test` (with the fixed sort arrow) is protected.
 
 Tracing integration (backend logging):
 - TUI internals emit `tracing` events via `tracing-subscriber` with a

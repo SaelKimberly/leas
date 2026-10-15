@@ -125,7 +125,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         },
         crate::AppMode::AddServer { .. } => " Add Server",
         crate::AppMode::EditServer { .. } => " Edit Server",
-        crate::AppMode::SpeedTestMenu { .. } => " Server Tools",
+        crate::AppMode::SpeedTestMenu { .. } => " Speed Test",
         crate::AppMode::ExportScope { .. } | crate::AppMode::ExportDestination { .. } => " Export",
         crate::AppMode::ExportPath { .. } => " Export File",
         crate::AppMode::BatchImport { .. } => " Batch Import",
@@ -136,7 +136,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let left_text = format!("{mode_prefix}{left_text}");
 
     // Dynamic right-side hints
-    let right_text = build_hints(state);
+    let budget = width_available(state, area.width as usize);
+    let right_text = fit_hints(build_hints(state), budget);
     let right_style = ThemeStyles::status_bar_hint(theme);
 
     let width = area.width as usize;
@@ -277,6 +278,51 @@ fn build_hints(state: &AppState) -> String {
             }
         }
     }
+}
+
+
+/// Width left for hints after the status segment and any indicators.
+fn width_available(state: &AppState, total: usize) -> usize {
+    let mut used = 12; // status segment reserve
+    if state.update_status.values().any(|s| s.update_available) {
+        used += 18;
+    }
+    total.saturating_sub(used).max(20)
+}
+
+/// Fit the hint segments into `budget` cells, dropping from the LEFT so the
+/// right-most group (`Quit`) always survives (tui-polish D7). A dropped
+/// prefix is marked with `…`.
+fn fit_hints(hints: String, budget: usize) -> String {
+    let segments: Vec<&str> = hints
+        .split("  ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let total: usize = segments.iter().map(|s| s.len() + 2).sum();
+    if total <= budget {
+        return hints;
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0;
+    for seg in segments.iter().rev() {
+        let cost = seg.len() + 2;
+        if used + cost > budget {
+            break;
+        }
+        kept.push(seg);
+        used += cost;
+    }
+    kept.reverse();
+    if kept.len() == segments.len() {
+        return hints;
+    }
+    let mut out = String::from("…");
+    for seg in kept {
+        out.push(' ');
+        out.push_str(seg);
+    }
+    out
 }
 
 const fn status_bar_section_label(section: SettingsSection) -> &'static str {

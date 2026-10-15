@@ -32,6 +32,7 @@ impl DataTableRow for LogRow<'_> {
         &self,
         col_xs: &[u16],
         col_widths: &[u16],
+        _col_order: &[usize],
         buf: &mut ratatui::buffer::Buffer,
         y: u16,
         clip_bottom: u16,
