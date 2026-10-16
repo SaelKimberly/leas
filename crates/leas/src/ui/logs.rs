@@ -202,6 +202,10 @@ pub fn render_inner(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Compute offset — during selection, pin viewport so entire range is visible
     let approx_visible = (log_area.height as usize).saturating_sub(2);
+    // Publish the viewport so the key handler pages by what is actually on
+    // screen. Pane 1 is a fraction of the terminal (pane 2 + status bar sit
+    // below it), so the old terminal-height estimate paged roughly double.
+    state.log_viewport_rows.set(approx_visible);
     let offset = state.log_select_anchor.map_or_else(
         || filtered_count.saturating_sub(state.log_scroll + approx_visible),
         |anchor| {
@@ -301,34 +305,46 @@ pub fn render_inner(frame: &mut Frame, area: Rect, state: &AppState) {
 
 /// Handle key events for the Logs tab.
 pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
-    let height = state.term_height.get().saturating_sub(5) as usize;
+    // Page by what the viewport can actually show. `log_viewport_rows` is
+    // published by the render pass; the fallback covers the first keypress
+    // before any frame has drawn.
+    let height = state.log_viewport_rows.get().max(1);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
         KeyCode::Up if shift => {
             state.log_select_anchor.get_or_insert(state.log_scroll);
             state.log_scroll = state.log_scroll.saturating_add(1);
+            clamp_log_scroll(state);
             try_load_older(state).await;
         }
         KeyCode::Down if shift => {
             state.log_select_anchor.get_or_insert(state.log_scroll);
             state.log_scroll = state.log_scroll.saturating_sub(1);
+            clamp_log_scroll(state);
         }
         KeyCode::Up => {
             state.log_scroll = state.log_scroll.saturating_add(1);
+            clamp_log_scroll(state);
             try_load_older(state).await;
         }
         KeyCode::Down => {
             state.log_scroll = state.log_scroll.saturating_sub(1);
+            clamp_log_scroll(state);
         }
         KeyCode::PageUp => {
             state.log_scroll = state.log_scroll.saturating_add(height);
+            clamp_log_scroll(state);
             try_load_older(state).await;
         }
         KeyCode::PageDown => {
             state.log_scroll = state.log_scroll.saturating_sub(height);
+            clamp_log_scroll(state);
         }
         KeyCode::Home => {
-            state.log_scroll = usize::MAX;
+            // Oldest loaded row, not `usize::MAX`: the seek path in
+            // `ui::run` walks the buffer to the true top and rewrites this,
+            // and the sentinel only ever needed clamping on the way back.
+            state.log_scroll = max_log_scroll(state);
             state.log_seek_home = state.log_has_older;
         }
         KeyCode::End => {
@@ -369,6 +385,29 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     }
 }
 
+/// Largest scroll offset the loaded buffer can express: one row past the
+/// oldest entry. The viewport is bottom-anchored, so the deepest legal
+/// position is `filtered_count - 1`.
+fn max_log_scroll(state: &AppState) -> usize {
+    count_filtered(state).saturating_sub(1)
+}
+
+/// Pull `log_scroll` (and a live selection anchor) back inside the loaded
+/// buffer.
+///
+/// This is the single owner of the bound. `log_scroll` used to grow without
+/// limit: `Up` past the oldest row kept incrementing while the render's
+/// `saturating_sub` pinned the viewport at row 0, so the screen looked frozen
+/// and `Down` had to walk back through the entire surplus one row per press.
+/// `Home` compounded it by writing `usize::MAX`.
+fn clamp_log_scroll(state: &mut AppState) {
+    let max = max_log_scroll(state);
+    state.log_scroll = state.log_scroll.min(max);
+    if let Some(anchor) = state.log_select_anchor {
+        state.log_select_anchor = Some(anchor.min(max));
+    }
+}
+
 /// Load older log entries from heed when scrolled near the top (async).
 pub(super) async fn try_load_older(state: &mut AppState) {
     if !state.log_has_older {
@@ -379,7 +418,12 @@ pub(super) async fn try_load_older(state: &mut AppState) {
         return;
     }
     let filtered_count = count_filtered(state);
-    let height = state.term_height.get().saturating_sub(5) as usize;
+    // Reach for older rows when the viewport is within one screen of the top
+    // of what is loaded. The threshold uses the REAL viewport height: the old
+    // `term_height - 5` guessed a pane roughly twice the current size, so the
+    // trigger fired long before the user reached the top and the fetch was
+    // wasted on every scroll keypress.
+    let height = state.log_viewport_rows.get().max(1);
     if state.log_scroll < filtered_count.saturating_sub(height) {
         return;
     }
@@ -417,7 +461,7 @@ pub(super) async fn try_load_older(state: &mut AppState) {
                 .collect();
             let n = new_lines.len();
             state.log_scroll = state.log_scroll.saturating_add(n);
-            if let Some(ref mut a) = state.log_select_anchor {
+            if let Some(a) = &mut state.log_select_anchor {
                 *a = a.saturating_add(n);
             }
             new_lines.append(&mut state.log_cache);
@@ -428,9 +472,12 @@ pub(super) async fn try_load_older(state: &mut AppState) {
             }
             let popped = before - state.log_cache.len();
             state.log_scroll = state.log_scroll.saturating_sub(popped);
-            if let Some(ref mut a) = state.log_select_anchor {
+            if let Some(a) = &mut state.log_select_anchor {
                 *a = a.saturating_sub(popped);
             }
+            // The trim can pull the buffer's start past the cursor; re-apply
+            // the bound so the viewport can never address a dropped row.
+            clamp_log_scroll(state);
         }
         Err(e) => {
             state.log_has_older = false;
@@ -504,13 +551,12 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
             timestamp_nanos: entry.timestamp_nanos as i64,
         });
     }
-    // Move scroll to show new entries if at bottom
-    if state.log_scroll == 0 {
-        // Scroll is at 0 (bottom), keep it there
-    } else {
-        // If not at bottom, adjust scroll by new entries count
+    // Follow the tail only while the user is already at the bottom; otherwise
+    // hold the viewport still by pushing the offset forward by the arrival
+    // count, so new lines do not yank the reader's position.
+    if state.log_scroll != 0 {
         state.log_scroll = state.log_scroll.saturating_add(new_count);
-        if let Some(ref mut a) = state.log_select_anchor {
+        if let Some(a) = &mut state.log_select_anchor {
             *a = a.saturating_add(new_count);
         }
     }
@@ -519,10 +565,12 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
         state.log_cache.drain(0..excess);
         if state.log_scroll > 0 {
             state.log_scroll = state.log_scroll.saturating_sub(excess);
-            if let Some(ref mut a) = state.log_select_anchor {
+            if let Some(a) = &mut state.log_select_anchor {
                 *a = a.saturating_sub(excess);
             }
         }
+        // The drain can pass the cursor's row; re-apply the bound.
+        clamp_log_scroll(state);
     }
 }
 
@@ -835,6 +883,9 @@ fn fmt_ts(ts_nanos: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use leas_config::AppConfig;
 
     fn make_line(s: &str) -> crate::LogLine {
         crate::LogLine {
@@ -844,6 +895,83 @@ mod tests {
             detail: None,
             timestamp_nanos: 0,
         }
+    }
+
+    /// A state with just enough to exercise the scroll bound; the log buffer
+    /// is the only thing these tests touch.
+    async fn scroll_state() -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            leas_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        AppState::new(db, AppConfig::default()).await
+    }
+
+    fn filled(state: &mut AppState, n: usize) {
+        state.log_cache = (0..n).map(|i| make_line(&format!("m{i}"))).collect();
+    }
+
+    /// A scroll offset past the loaded buffer must be pulled back, or the
+    /// viewport saturates at row 0 while `Down` walks the surplus away one row
+    /// per press — the frozen log pane.
+    #[tokio::test]
+    async fn scroll_clamps_to_loaded_buffer() {
+        let mut state = scroll_state().await;
+        filled(&mut state, 10);
+
+        state.log_scroll = 5;
+        clamp_log_scroll(&mut state);
+        assert_eq!(state.log_scroll, 5, "an in-range offset is untouched");
+
+        // What unbounded `Up` accumulation produced.
+        state.log_scroll = 10_000;
+        clamp_log_scroll(&mut state);
+        assert_eq!(
+            state.log_scroll, 9,
+            "clamped to the oldest row of a 10-entry buffer"
+        );
+    }
+
+    /// `Home` lands on the oldest LOADED row, not a sentinel only the seek
+    /// path could recover from — and `Down` from there must return to the
+    /// bottom in one press, not thousands.
+    #[tokio::test]
+    async fn home_lands_on_oldest_row_and_returns_in_one_press() {
+        let mut state = scroll_state().await;
+        filled(&mut state, 10);
+        state.log_scroll = max_log_scroll(&state);
+        assert_eq!(state.log_scroll, 9, "no usize::MAX sentinel survives");
+        state.log_scroll = state.log_scroll.saturating_sub(1);
+        clamp_log_scroll(&mut state);
+        assert_eq!(state.log_scroll, 8);
+    }
+
+    /// A live selection anchor addresses a row, so it is bound by the same
+    /// rule and cannot outlive the buffer.
+    #[tokio::test]
+    async fn selection_anchor_clamps_with_the_buffer() {
+        let mut state = scroll_state().await;
+        filled(&mut state, 10);
+        state.log_select_anchor = Some(usize::MAX);
+        clamp_log_scroll(&mut state);
+        assert_eq!(state.log_select_anchor, Some(9));
+    }
+
+    /// The target filter narrows the buffer, so the deepest legal offset
+    /// shrinks with it: an offset valid before filtering is not valid after.
+    #[tokio::test]
+    async fn filter_narrowing_tightens_the_bound() {
+        let mut state = scroll_state().await;
+        filled(&mut state, 20);
+        for (i, line) in state.log_cache.iter_mut().enumerate() {
+            line.target = if i % 2 == 0 { "xray" } else { "other" }.to_string();
+        }
+        state.log_scroll = 19;
+        state.selected_targets.insert("xray".to_string());
+        clamp_log_scroll(&mut state);
+        assert_eq!(state.log_scroll, 9, "10 of 20 entries match the filter");
     }
 
     #[test]

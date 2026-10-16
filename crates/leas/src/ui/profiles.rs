@@ -195,21 +195,24 @@ impl DataTableRow for DisplayRowData {
                 _ => ("", self.row_style),
             };
             let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
-            if logical == 3 {
-                // The `+`/`-` marker takes the first cell; the host starts one
-                // cell in and is one cell narrower (D11), elided by §8.
-                if self.expand_prefix != ' ' {
+            if logical == 0 {
+                // Column 0 is a 2-cell slot: the status glyph, then the gap
+                // cell. The expand chevron owns that gap, so it sits directly
+                // before the ID column and the host keeps its full width (it
+                // used to lose a cell to the `+`/`-` marker inside Address).
+                buf.set_stringn(x, y, text, max_w, style);
+                if self.expand_prefix != ' ' && max_w >= 2 {
                     buf.set_stringn(
-                        x,
+                        x + 1,
                         y,
                         self.expand_prefix.encode_utf8(&mut [0u8; 4]),
                         1,
                         self.prefix_style,
                     );
                 }
-                let host_w = max_w.saturating_sub(1);
-                let host = truncate_host(text, host_w);
-                buf.set_stringn(x + 1, y, &host, host_w, style);
+            } else if logical == 3 {
+                let host = truncate_host(text, max_w);
+                buf.set_stringn(x, y, &host, max_w, style);
             } else {
                 buf.set_stringn(x, y, text, max_w, style);
             }
@@ -1040,8 +1043,12 @@ fn build_display_rows(
             test_style,
             outbound_addr,
             outbound_flag,
+            // The same `▸`/`▾` chevrons the settings sections use, so the
+            // affordance reads identically in both surfaces. `+`/`-` was the
+            // near-invisible option: a 1-cell hairline glyph in a dim style
+            // against a 29-cell host column.
             expand_prefix: if row.links.len() > 1 {
-                if row.expanded { '-' } else { '+' }
+                if row.expanded { '▾' } else { '▸' }
             } else {
                 ' '
             },
@@ -1101,10 +1108,10 @@ fn render_data_grid(
     // shrinks toward a 12-cell floor. Surviving columns carry their LOGICAL id
     // through `order`, so a drop never shifts another column's meaning.
     let logical: [(usize, &str, u16); 10] = [
-        (0, "", 2),         // status
+        (0, "", 2),         // status glyph + expand chevron in the gap cell
         (1, "ID", 8),       // link id hex
         (2, "Flag", 5),     // inbound flag
-        (3, "Address", 29), // host (+ `+`/`-` prefix cell)
+        (3, "Address", 30), // host (full width; the chevron moved to column 0)
         (4, "Port", 6),     // port
         (5, "White", 9),    // whitelist tokens
         (6, "Protocol", 24),
@@ -1604,6 +1611,7 @@ mod page_window_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     /// The panel's stability cell (spec §8): a ratio when the link has samples,
     /// and the neutral marker — never a fake `0/0` — when it has none.
@@ -1661,9 +1669,9 @@ mod tests {
             expand_prefix: if panel_rows.is_empty() {
                 ' '
             } else if expanded {
-                '-'
+                '▾'
             } else {
-                '+'
+                '▸'
             },
             expanded,
             row_style: Style::default(),
@@ -2425,5 +2433,65 @@ mod tests {
         // DNS-unresolved stays the deepest state.
         let (t, _) = test_cell_content(true, false, true, None, None, None, &theme);
         assert_eq!(t, "[name]");
+    }
+
+    /// The expand affordance is a `▸`/`▾` chevron in column 0's gap cell —
+    /// immediately before the ID column, mirroring settings' `{marker}{chevron}
+    /// {name}`. It used to be a `+`/`-` inside the Address cell, which both
+    /// read as a near-invisible hairline and stole a cell from the host.
+    #[rstest]
+    #[case::collapsed('▸')]
+    #[case::expanded('▾')]
+    fn expand_chevron_sits_before_the_id_column(#[case] glyph: char) {
+        let mut row = sample_row(
+            glyph == '▾',
+            vec![sample_panel_row("●"), sample_panel_row("○")],
+            "aabbccdd",
+        );
+        row.indicator = "●".to_string();
+        row.address_str = "host.example.com".to_string();
+
+        // The real grid geometry: status 2, ID 8, Flag 5, Address 30.
+        let col_widths = vec![2u16, 8, 5, 30];
+        let mut col_xs = Vec::new();
+        let mut x = 0u16;
+        for (i, w) in col_widths.iter().enumerate() {
+            col_xs.push(x);
+            x += w;
+            if i + 1 < col_widths.len() {
+                x += 1; // column_spacing(1)
+            }
+        }
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 4));
+        row.render(
+            &col_xs,
+            &col_widths,
+            &(0..4).collect::<Vec<_>>(),
+            &mut buf,
+            0,
+            4,
+        );
+
+        let line: String = (0..60).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(
+            line.chars().nth(1),
+            Some(glyph),
+            "chevron in column 0's gap cell: {line:?}"
+        );
+        // It is a real chevron, never the old `+`/`-`.
+        assert!(
+            !line.contains('+') && !line.contains('-'),
+            "no ASCII +/- marker survives: {line:?}"
+        );
+        // The host keeps its full column: it starts at the column's own x,
+        // not one cell in.
+        assert!(
+            line.contains("host.example.com"),
+            "host renders at full width: {line:?}"
+        );
+        assert!(
+            !line.starts_with(" host.example.com"),
+            "host is no longer inset by the marker cell: {line:?}"
+        );
     }
 }

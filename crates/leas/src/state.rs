@@ -105,10 +105,23 @@ pub struct AppState {
     /// Optional protocol sub-row index for expanded endpoint tree navigation.
     pub selected_sub: Option<usize>,
     /// Scroll offset from the bottom of the log buffer (0 = newest visible).
+    ///
+    /// Always clamped to the loaded buffer by `clamp_log_scroll`: an
+    /// unbounded value made `Up` grow forever while the viewport saturated at
+    /// row 0 (a frozen screen), and `Down` then had to decrement through the
+    /// whole surplus before the view moved again.
     pub log_scroll: usize,
     /// Anchor for multi-line selection in logs tab (offset from bottom).
     /// `None` = no active selection.
     pub log_select_anchor: Option<usize>,
+    /// Rows the log viewport can actually show, published by the log render
+    /// pass each frame.
+    ///
+    /// The key handler needs this because pane 1 no longer owns the terminal:
+    /// it sits above pane 2 and the status bar, so the old `term_height - 5`
+    /// estimate paged by roughly double the visible rows and left the user
+    /// hunting for the cursor.
+    pub log_viewport_rows: Cell<usize>,
     pub search_query: String,
     pub search_focused: bool,
     pub connected_core: Option<CoreType>,
@@ -599,6 +612,7 @@ impl AppState {
             selected_index: 0,
             log_scroll: 0,
             log_select_anchor: None,
+            log_viewport_rows: Cell::new(0),
             search_query: String::new(),
             search_focused: false,
             log_cache: VecDeque::new(),

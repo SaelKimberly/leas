@@ -295,6 +295,21 @@ fn cycle_select(current: &str, options: &[String], forward: bool) -> String {
     options[next % options.len()].clone()
 }
 
+/// One step along a boolean, in either direction: `Space`/`Enter`/any printable
+/// key and `←`/`→` all land on the opposite value.
+///
+/// Read the stored value BEFORE overwriting it. The previous arm cleared the
+/// buffer first and then asked whether it read `"true"`, so the comparison
+/// always saw an empty string and every edit wrote `"true"` — a boolean could
+/// be set but never unset.
+const fn toggle_bool(current: &str) -> &'static str {
+    if current.eq_ignore_ascii_case("true") {
+        "false"
+    } else {
+        "true"
+    }
+}
+
 /// How a field's value renders in the list (spec D5).
 fn value_display(field_type: &str, value: &str) -> String {
     if field_type == "Boolean" {
@@ -1384,7 +1399,8 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
 
     // A selector advances on Space/Enter and wraps past its last option
     // (spec R2); `Ctrl+S` is the save key for every field type, since Enter no
-    // longer reaches the save on a selector. Enter still saves everywhere else.
+    // longer reaches the save on a selector or a boolean. Enter still saves
+    // everywhere else.
     let save_requested = if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
         let field_type = field_defs.get(*focus_index).map_or("", |def| def.2);
         if select_options(field_type).is_some() {
@@ -1395,7 +1411,17 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             }
             return;
         }
-        // Enter still saves on every field type that is not a selector.
+        // A boolean is a two-value selector: `Space`/`Enter` toggle it, the
+        // same gesture a select field uses to advance. `Enter` therefore must
+        // NOT also reach the save here, or one press would both flip the value
+        // and commit the form — the opposite of a toggle. `Ctrl+S` saves.
+        if field_type == "Boolean" {
+            if let Some((_, value)) = fields.get_mut(*focus_index) {
+                *value = toggle_bool(value).to_string();
+            }
+            return;
+        }
+        // Enter still saves on every field type that is neither.
         key.code == KeyCode::Enter
     } else {
         key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1435,8 +1461,10 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             if select_options(field_type).is_some() {
                 // A selector has no free text: Space/Enter/←→/→ move it.
             } else if field_type == "Boolean" {
-                val.clear();
-                val.push_str(if val == "true" { "false" } else { "true" });
+                // Any printable key toggles, reading the OLD value first: the
+                // previous `clear()`-then-compare order could only ever write
+                // `"true"`, so a `true` boolean was impossible to unset.
+                *val = toggle_bool(val).to_string();
             } else if field_type == "Number" {
                 if c.is_ascii_digit() || c == '-' {
                     val.push(c);
@@ -1445,10 +1473,21 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                 val.push(c);
             }
         }
+        // `←`/`→` step a selector or toggle a boolean in place; that dispatch
+        // lives in the arm below, which already owned these keys.
         KeyCode::Backspace => {
             if *focus_index < fields.len() {
+                let field_type = field_defs[*focus_index].2;
                 let (_, ref mut val) = fields[*focus_index];
-                val.pop();
+                // Backspace erases text. On a boolean it used to `pop()` the
+                // literal, turning `true` into the invalid `tru`; a two-value
+                // field has no tail to erase, so toggle it instead — the same
+                // gesture as `Space`, and the inverse of what it did before.
+                if field_type == "Boolean" {
+                    *val = toggle_bool(val).to_string();
+                } else if select_options(field_type).is_none() {
+                    val.pop();
+                }
             }
         }
         KeyCode::Enter | KeyCode::Char('s') if save_requested => {
@@ -1517,9 +1556,13 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             if *focus_index < field_defs.len() && *focus_index < fields.len() =>
         {
             let field_type = field_defs[*focus_index].2;
+            let (_, ref mut val) = fields[*focus_index];
             if let Some(options) = select_options(field_type) {
-                let (_, ref mut val) = fields[*focus_index];
                 *val = cycle_select(val, &options, key.code == KeyCode::Right);
+            } else if field_type == "Boolean" {
+                // A boolean has exactly two values, so stepping either
+                // direction is the same toggle.
+                *val = toggle_bool(val).to_string();
             }
         }
         KeyCode::Esc => {
@@ -1989,8 +2032,9 @@ async fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
             let field_type = def.2;
 
             if field_type == "Boolean" {
-                val.clear();
-                val.push_str(if val == "true" { "false" } else { "true" });
+                // Same owner-level fix as the settings form: read the old value
+                // before overwriting, or a `true` boolean can never be unset.
+                *val = toggle_bool(val).to_string();
             } else if field_type == "Number" {
                 if c.is_ascii_digit() || c == '-' {
                     val.push(c);
@@ -2001,8 +2045,13 @@ async fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Backspace => {
             if *focus_index < fields.len() {
+                let field_type = ROUTING_FIELD_DEFS[*focus_index].2;
                 let (_, ref mut val) = fields[*focus_index];
-                val.pop();
+                if field_type == "Boolean" {
+                    *val = toggle_bool(val).to_string();
+                } else {
+                    val.pop();
+                }
             }
         }
         KeyCode::Enter => {
@@ -2895,6 +2944,31 @@ mod section_list_tests {
     fn cycling_an_unknown_value_starts_at_the_first_option() {
         let options = vec!["en".to_string(), "zh".to_string()];
         assert_eq!(super::cycle_select("klingon", &options, true), "en");
+    }
+
+    /// The regression that made booleans one-way: the toggle arm cleared the
+    /// buffer BEFORE reading it, so the comparison always saw `""` and every
+    /// edit wrote `"true"`. A stored `true` could not be turned back off by
+    /// any gesture.
+    #[rstest]
+    #[case::true_to_false("true", "false")]
+    #[case::false_to_true("false", "true")]
+    #[case::uppercase_true("TRUE", "false")]
+    #[case::empty_becomes_true("", "true")]
+    #[case::garbage_becomes_true("tru", "true")]
+    fn toggling_a_boolean_reaches_both_values(#[case] current: &str, #[case] expected: &str) {
+        assert_eq!(super::toggle_bool(current), expected);
+    }
+
+    /// Toggling twice returns to the start, and round-tripping a real stored
+    /// value must be lossless — the invariant a one-way toggle breaks.
+    #[rstest]
+    #[case::stored_true("true")]
+    #[case::stored_false("false")]
+    fn boolean_toggle_round_trips(#[case] stored: &str) {
+        let once = super::toggle_bool(stored);
+        assert_ne!(once, stored, "one press must change the value");
+        assert_eq!(super::toggle_bool(once), stored, "two presses restore it");
     }
 
     #[test]

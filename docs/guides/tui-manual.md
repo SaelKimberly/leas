@@ -54,7 +54,7 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | (status)     | 2     | Connection status or test indicator          |
 | `ID`         | 8     | Representative link's protocol id as 8 lowercase hex (`{:08x}`); `*` when multi-selected (the marker replaces the id, widths equal) |
 | `Flag`       | 5     | Inbound country: `<flag emoji>-<ISO>` (e.g. `🇳🇱-NL`) when the terminal renders flag emoji, bare `<ISO>` when it does not (`LEAS_NO_FLAGS`/`NO_EMOJI` force the fallback); `—` unknown |
-| `Address`    | 34    | Host. Multi-variant endpoints carry a bold `+` (collapsed) / `-` (expanded) prefix — the old `▶`/`▾` glyph is gone. A DNS name whose subdomain overflows elides the subdomain's tail, keeping the registrable domain: `jp-tyo-05….synthetic-node.example`. IP literals right-truncate with `…` |
+| `Address`    | 30    | Host, full width. Multi-variant endpoints carry the expand chevron `▸` (collapsed) / `▾` (expanded) in the status column's gap cell — directly before `ID`, the same glyph the settings sections use. A DNS name whose subdomain overflows elides the subdomain's tail, keeping the registrable domain: `jp-tyo-05….synthetic-node.example`. IP literals right-truncate with `…` |
 | `Port`       | 6     | Port, right-aligned                          |
 | `White`      | 9     | Whitelist membership tokens: `SNI` / `CIDR` / `SNI+CIDR` / `—` (replaces the old flag glyphs; DNS-unresolved lives in the Test cell's `[name]`) |
 | `Protocol`   | 24    | `protocol/transport/security` (e.g. `vless/tcp/reality`), center-aligned |
@@ -65,8 +65,9 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 Every label carries the header role; there are no decorative separator cells.
 Delay/Speed/Traffic/Outbound details live in the expanded panel (below).
 
-**Expandable endpoints**: Endpoints with multiple protocol variants show a bold `+`
-before the host (collapsed) or `-` (expanded). Press `→` to expand: a rounded panel appears
+**Expandable endpoints**: Endpoints with multiple protocol variants carry a `▸`
+before the `ID` column (collapsed) or `▾` (expanded). Press `→` to expand: a
+rounded panel appears
 under the row with an `IPs:` line (resolved inbound addresses; `[?]` with an
 `(x resolve)` hint while the DNS name is unresolved) and a per-protocol
 sub-table: active marker, hex profile id, Last Seen, Last Used, Protocol Type,
@@ -180,10 +181,11 @@ you just picked.
 | `↑`/`↓` | either pane | move the selection / field focus |
 | `←` | Sections | collapse the selected section's group |
 | `→` | Sections | expand a collapsed group, else focus the Values pane |
-| `←`/`→` | Values | step a selector one option |
+| `←`/`→` | Values | step a selector one option; toggle a boolean |
 | `/` | Sections, or a list pane | focus the filter bar |
 | `Enter` | Sections | focus the selected section's fields (a collapsed group expands first) |
-| `Space` | Values | advance the focused selector (wraps) |
+| `Space` | Values | advance the focused selector (wraps); toggle a boolean |
+| `Backspace` | Values | erase text; on a boolean it toggles (no tail to erase) |
 | `Ctrl+S` | Values | validate and save the section |
 | `Tab`/`Shift+Tab` | Values | next / previous field |
 | `Ctrl+W` | anywhere | swap focus between Sections and Values |
@@ -306,8 +308,10 @@ on any key press), and select (cycle with `←`/`→` or any key press).
 - `Enter` — save and return to profile list
 - `Ctrl+S` — save (alternative)
 - `Esc` — cancel
-- `Backspace` — delete character before cursor
-- `Space` — type space
+- `Backspace` — delete character before cursor; on a boolean it toggles (there
+  is no tail to erase), same as `Space`
+- `Space` — type space; on a boolean or select it advances/toggles
+- `←` / `→` — step a select or toggle a boolean in place
 - `-` in number fields — negative sign
 
 ---
@@ -631,8 +635,8 @@ appended when updates are available for installed backends.
 | Key               | Action                              |
 | ----------------- | ----------------------------------- |
 | `↑` / `↓`        | Scroll logs                         |
-| `PgUp` / `PgDn`  | Page up/down (20 lines)            |
-| `Home`           | Jump to oldest log entry            |
+| `PgUp` / `PgDn`  | Page up/down by one viewport        |
+| `Home`           | Jump to the oldest loaded entry; loading continues to the true top |
 | `End`            | Jump to newest log entry            |
 | `Tab` / `Shift+Tab` | Cycle tabs                       |
 | `?`              | Toggle help overlay                 |
