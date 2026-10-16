@@ -10,7 +10,7 @@ tags: [settings, popup, filter, markers, help, resize]
 | Field | Value |
 |---|---|
 | Run at | 2026-10-16 09:30:00 +0500 |
-| App under test | leas 0.1.0, debug binary `target/debug/leas` (md5 `09ec04ef927c94d6c32e8adc420d1bd1` before the final hint-text edit; re-verified live after it) |
+| App under test | leas 0.1.0, debug binary `target/debug/leas`, md5 `fe4f62aa9f584fa6a8b5a2f89851cbe5` — **every frame below is from this build**; the earlier transcript mixes pre- and post-surface-fix frames and is superseded |
 | Launch command | `env TERM=xterm-256color LC_ALL=C XDG_CONFIG_HOME=/home/user/.cache/leas-tui/settings-parity/config target/debug/leas` |
 | Session / mode / size | `default` / buffer / 120x40, then resized to 80x24 |
 | Harness | mcp-tui-test (buffer mode, pyte) |
@@ -50,8 +50,15 @@ cp docs/guides/tui/fixtures/seeded/data.db "$R/config/leas/"   # 7 endpoints, sy
 | E7 | resize `80x24` | sections list scrolls to keep the selection visible (`Mux … DNS`), the `*` row stays visible, the footer drops from the left with a leading `…` and keeps `[Esc] Back` |
 | E8 | `Esc` (from a dirty form) | the app-level ` Confirm ` overlay appears above the popup with ` Discard unsaved settings? (y/N) `, and the status bar switches to `[y] Confirm  [n/Esc] Cancel` |
 | E9 | `get_cell_style` inside the popup, a section row and the help overlay | every one reports `bg=default` — the app background, no modal fill (D13/A11); text colours are the theme's (`f8f8f2` selected, `7c7f8f` group headers) |
-| E10 | launch at `54x24` (the popup's minimum width) | all four bands and the footer still render; pane titles drop the counter (`┌ Sections ────┐`, not a clipped `Sections · 2/`); the footer drops from the left with `…` and keeps `[Esc] Close` |
+| E10 | open Settings at `54x24` (the popup's minimum width) with Core Settings selected | all four bands and the footer render; `┌ Sections ────┐` drops the counter instead of clipping `2/20`; every label keeps a separating space at the 15-column value column (`Sing-Box Path —`, `Skip Cert Verify ✗`); the footer drops from the left and keeps `[Esc] Close` |
 | E11 | `Tab` in Sections, then `Tab` again | focus moves to the Values pane and back; the popup stays open, and the Sections border changes muted → accent (`6272a4` → `bd93f9`) |
+| E12 | `,` on a fresh launch | the Values pane is **already** `Values · 1/5` (Core Settings' fields) — there is no empty state (R1) |
+| E13 | one `down` | counter `2/20` → `3/20` (exactly one row) AND the pane becomes Protocol Core's `Values · 1/22` — the section loads on move (R1/A13) |
+| E14 | `←` then `→` then `→` | `←` collapses Core (`Sections · 1/18`, `› ▸ Core` carries the highlight); the first `→` expands it (`2/20`, `▾ Core`); the second `→` moves focus to Values (footer becomes the field hint set) (R4/A15) |
+| E15 | `→`, `down`, `Space` in Protocol Core | VMess advances `Auto` → the next option, marker flips to `*`; one `←` on a selector wraps past its last option back to the first (R2) |
+| E16 | `/gui` | sections narrow to the GUI group and the Values pane becomes GUI Settings' three fields — the filter does **not** filter fields (A16) |
+| E17 | `→`, `down`, `Space`, `Ctrl+S` on GUI Settings | Theme reads `< dracula >` (the theme in use), advances to another slug, and `Ctrl+S` saves: marker returns to `·`, the status band says `Saved GUI`, and the group-header colour changes with the new theme (`7c7f8f` → `cba6f7` for catppuccin-mocha) (R2/R3/A14) |
+| E18 | `/sub` | the Subscriptions row reads `      Default … never …` — one gutter, `never` in full, and the pane's right border intact (R5) |
 
 ## Observed
 
@@ -74,29 +81,52 @@ the same slice:
    `#808080` — over the entire modal. Removed: modals now share the app background, as the
    reference does (D13). A token audit across the workspace found no other unknown token.
 
+## Harness notes
+
+- Single-key calls are exact (`down` moves exactly one row). Sending a **list** of keys in
+  one call over-delivers — `send_special_keys([down]*6)` moved eight rows — so the script
+  below sends one key per call. `Esc` must go through `send_special_keys(["escape"])`:
+  the raw `\u001b` byte is swallowed and the keypress silently becomes the next `Enter`.
+- The scenario asserts outcomes, not presence: the filter's row-count delta (E2), `*` vs `·`
+  across an edit and a save (E5/E17), `—` on empty fields and `✗` on false booleans (E4),
+  the discard confirmation (E8), and the section-loads-on-move coupling (E13).
+
 ## Scenario script
 
 ```python
+# one key per call: a list of keys over-delivers (see Harness notes)
 launch("env TERM=xterm-256color LC_ALL=C XDG_CONFIG_HOME=/home/user/.cache/leas-tui/settings-parity/config target/debug/leas",
        mode="buffer", dimensions="120x40", timeout=60)
 send(",")
+expect("Values · 1/5")          # E12: the pane is never empty
 expect("Sections · 2/20")
-line(2)   # Search bar
-line(5)   # Sections · 2/20 / Select a section
-line(39)  # footer hints in the border
+line(2)                          # Search bar
+line(5)                          # Sections · 2/20 / Values · 1/5
+line(38)                         # footer hints in the modal border
 send("/dns")
-expect("Sections · 2/2")
+expect("Sections · 2/2")         # E2: filter narrows sections
 send_special("escape")
-expect("Press / to filter settings")
-send_special("down", times=12)
+expect("Press / to filter settings")   # E3: cancel clears the query
+for _ in range(12):
+    send_special("down")                # E13: one row per press, pane follows
+expect("Values · 7/7")                  # DNS has 7 fields -> selection reached it
 send_special("enter")
 expect("Values · 1/7")
 send("1.1.1.1")
-expect("Settings *")
+expect("Settings *")             # E5: unsaved edit marks the popup
 send_special("tab")
-expect("Values · 2/7")
+expect("Values · 2/7")           # E6: help follows the cursor
 resize("80x24")
-expect("Sections · 12/20")
+expect("Sections · 12/20")       # E7: list scrolls, footer drops from the left
 send_special("escape")
-expect("Discard unsaved settings?")
+expect("Discard unsaved settings?")     # E8
+# R1-R5 rows
+send_special("left")
+expect("Sections · 1/18")        # E14: collapsed group carries the highlight
+send_special("right"); expect("Sections · 2/20")
+send_special("right"); expect("Space] Advance")   # focus moved to the fields
+send_special("down"); send(" ")
+expect("*")                      # E15: selector advanced, marked unsaved
+send("/gui")
+expect("Values · 1/3")           # E16: filter does not filter fields
 ```

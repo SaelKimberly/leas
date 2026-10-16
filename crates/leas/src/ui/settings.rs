@@ -149,6 +149,15 @@ fn leaf_section(leaf: usize) -> Option<SettingsSection> {
     SETTINGS_TREE[group].items[child].section
 }
 
+/// The leaf index a section sits at, so an entry point that jumps to a
+/// section (`g` -> Subscriptions) can move the selection with it.
+#[must_use]
+pub fn section_leaf_index(section: SettingsSection) -> usize {
+    (0..leaf_count())
+        .find(|leaf| leaf_section(*leaf) == Some(section))
+        .unwrap_or(0)
+}
+
 fn leaf_group(leaf: usize) -> Option<usize> {
     leaf_position(leaf).map(|(group, _)| group)
 }
@@ -242,6 +251,50 @@ fn counter_label(row: usize, total: usize) -> String {
     format!("{}/{}", (row + 1).min(total), total)
 }
 
+/// The options a selector offers, in cycle order (spec R2).
+///
+/// `Select:a,b,c` is the static list; `SelectThemes` resolves the builtin
+/// opaline slugs at runtime, so the theme setting cannot name a theme the app
+/// cannot load — and the list grows with opaline instead of drifting from it.
+pub fn select_options(field_type: &str) -> Option<Vec<String>> {
+    if let Some(options) = field_type.strip_prefix("Select:") {
+        return Some(options.split(',').map(str::to_string).collect());
+    }
+    match field_type {
+        "SelectThemes" => {
+            let mut ids: Vec<String> = opaline::builtins::builtin_names()
+                .iter()
+                .map(|(id, _)| (*id).to_string())
+                .collect();
+            ids.sort_unstable();
+            Some(ids)
+        }
+        _ => None,
+    }
+}
+
+/// One step along a selector, wrapping past the last option back to the first
+/// (spec R2).
+///
+/// A stored value that is no longer offered (a theme removed from opaline, a
+/// config written by a newer build) lands on the first option going forward,
+/// the last going back — stepping "one past where it claims to be" would show
+/// the user the second option and look like a skip.
+fn cycle_select(current: &str, options: &[String], forward: bool) -> String {
+    if options.is_empty() {
+        return current.to_string();
+    }
+    let Some(index) = options.iter().position(|o| o == current) else {
+        return options[if forward { 0 } else { options.len() - 1 }].clone();
+    };
+    let next = if forward {
+        index + 1
+    } else {
+        (index + options.len() - 1) % options.len()
+    };
+    options[next % options.len()].clone()
+}
+
 /// How a field's value renders in the list (spec D5).
 fn value_display(field_type: &str, value: &str) -> String {
     if field_type == "Boolean" {
@@ -250,7 +303,7 @@ fn value_display(field_type: &str, value: &str) -> String {
     if value.is_empty() {
         return "—".to_string();
     }
-    if field_type.starts_with("Select:") {
+    if select_options(field_type).is_some() {
         return format!("< {value} >");
     }
     value.to_string()
@@ -272,16 +325,14 @@ fn field_accepts(field_type: &str) -> String {
         "Number" => "digits".to_string(),
         "Url" => "a URL".to_string(),
         "Duration" => "a duration, e.g. 5s, 1h30m".to_string(),
-        _ => field_type.strip_prefix("Select:").map_or_else(
-            || "free text".to_string(),
-            |options| {
-                options
-                    .split(',')
-                    .filter(|o| !o.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            },
+        // A 39-slug list is noise in a one-line box; the value already names
+        // the slug, so the box states the rule and the count.
+        "SelectThemes" => format!(
+            "a builtin theme slug ({} available)",
+            opaline::builtins::builtin_names().len()
         ),
+        _ => select_options(field_type)
+            .map_or_else(|| "free text".to_string(), |options| options.join(", ")),
     }
 }
 
@@ -292,7 +343,8 @@ fn field_type_label(field_type: &str) -> &'static str {
         "Number" => "Number",
         "Url" => "URL",
         "Duration" => "Duration",
-        _ if field_type.starts_with("Select:") => "Select",
+        "SelectThemes" => "Select",
+        _ if select_options(field_type).is_some() => "Select",
         _ => "Text",
     }
 }
@@ -396,6 +448,21 @@ fn render_input_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &opa
         _ => None,
     };
     let active = state.settings_search.active;
+    // The bar names the field you are editing only while the Values pane has
+    // focus; with Sections focused there is no cursor in a field.
+    let editing = if matches!(
+        &state.mode,
+        AppMode::Settings {
+            mode: SettingsMode::Split {
+                focus: SplitFocus::Right,
+                ..
+            },
+        }
+    ) {
+        editing
+    } else {
+        None
+    };
     let (title, body, body_style) = if active {
         let body = if state.settings_search.query.is_empty() {
             "Press / to filter settings".to_string()
@@ -408,8 +475,8 @@ fn render_input_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &opa
             ThemeStyles::footer_value(theme),
         )
     } else if let Some((_, label, field_type)) = editing {
-        let how = if field_type.starts_with("Select:") {
-            "type or [←→] to change · [Tab] next field"
+        let how = if select_options(field_type).is_some() {
+            "[Space]/[Enter] next value · [←→] step · [Tab] next field"
         } else if field_type == "Boolean" {
             "any key toggles · [Tab] next field"
         } else {
@@ -575,13 +642,6 @@ fn help_content(theme: &opaline::Theme, right: &SplitRightPane) -> (String, Vec<
                 ],
             )
         }
-        SplitRightPane::Empty => (
-            " Help ".to_string(),
-            vec![Line::styled(
-                " Pick a section on the left, then edit its fields on the right.".to_string(),
-                ThemeStyles::hint(theme),
-            )],
-        ),
         _ => (
             " Help ".to_string(),
             vec![
@@ -682,14 +742,13 @@ fn render_right_pane(
     // Form panes get the `Values · i/n` title of the reference (spec A2); the
     // routing/update panes keep their own names.
     let title = match right {
-        SplitRightPane::Empty => " Select a section ".to_string(),
         SplitRightPane::Form {
             section,
             focus_index,
             ..
         } => {
-            let rows = visible_field_rows(*section, *focus_index, &state.settings_search.query);
-            let position = rows.iter().position(|i| *i == *focus_index).unwrap_or(0);
+            let rows = visible_field_rows(*section);
+            let position = (*focus_index).min(rows.len().saturating_sub(1));
             if area.width >= 18 {
                 format!(" Values · {} ", counter_label(position, rows.len()))
             } else {
@@ -697,12 +756,8 @@ fn render_right_pane(
             }
         }
         SplitRightPane::GroupForm { focus_index, .. } => {
-            let rows = visible_field_rows(
-                SettingsSection::Subscriptions,
-                *focus_index,
-                &state.settings_search.query,
-            );
-            let position = rows.iter().position(|i| *i == *focus_index).unwrap_or(0);
+            let rows = visible_field_rows(SettingsSection::Subscriptions);
+            let position = (*focus_index).min(rows.len().saturating_sub(1));
             if area.width >= 18 {
                 format!(" Values · {} ", counter_label(position, rows.len()))
             } else {
@@ -738,7 +793,6 @@ fn render_right_pane(
                 *focus_index,
                 form_errors,
                 state.settings_form_snapshot.as_ref(),
-                &state.settings_search.query,
             );
         }
         SplitRightPane::RoutingList { selected } => {
@@ -786,10 +840,8 @@ fn render_right_pane(
                 *focus_index,
                 form_errors,
                 None,
-                &state.settings_search.query,
             );
         }
-        SplitRightPane::Empty => {}
     }
 }
 
@@ -808,7 +860,7 @@ const fn toggle_split_focus(state: &mut AppState) {
 async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
     // The filter bar owns the keyboard while it is active (spec §5).
     if state.settings_search.active {
-        handle_search_key(state, key);
+        handle_search_key(state, key).await;
         return;
     }
     // `/` opens the filter. It is only claimed where it cannot be text: a
@@ -822,22 +874,6 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
     }
     // Ctrl+W toggles focus between tree and right pane
     if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        toggle_split_focus(state);
-        return;
-    }
-    // With no form open the right pane has no field to advance to, so Tab is
-    // the pane switch its own hint promises (`[Tab] Sections`).
-    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-        && matches!(
-            &state.mode,
-            AppMode::Settings {
-                mode: SettingsMode::Split {
-                    focus: SplitFocus::Right,
-                    right: SplitRightPane::Empty,
-                },
-            }
-        )
-    {
         toggle_split_focus(state);
         return;
     }
@@ -857,7 +893,6 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
                 AppMode::Settings {
                     mode: SettingsMode::Split { right, .. },
                 } => match right {
-                    SplitRightPane::Empty => 0u8,
                     SplitRightPane::Form { .. } => 1,
                     SplitRightPane::RoutingList { .. } => 2,
                     SplitRightPane::RoutingForm { .. } => 3,
@@ -890,9 +925,7 @@ fn search_available(state: &AppState) -> bool {
             *focus == SplitFocus::Tree
                 || matches!(
                     right,
-                    SplitRightPane::Empty
-                        | SplitRightPane::RoutingList { .. }
-                        | SplitRightPane::GroupList { .. }
+                    SplitRightPane::RoutingList { .. } | SplitRightPane::GroupList { .. }
                 )
         }
         _ => false,
@@ -901,41 +934,62 @@ fn search_available(state: &AppState) -> bool {
 
 /// Keys while the filter bar is active: it consumes printable input, and
 /// `Enter` applies while `Esc` cancels (spec §5).
-fn handle_search_key(state: &mut AppState, key: &KeyEvent) {
+async fn handle_search_key(state: &mut AppState, key: &KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             state.settings_search.query.clear();
             state.settings_search.active = false;
-            snap_selection_to_filter(state);
         }
         KeyCode::Enter => {
             state.settings_search.active = false;
-            snap_selection_to_filter(state);
         }
         KeyCode::Backspace => {
             state.settings_search.query.pop();
-            snap_selection_to_filter(state);
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.settings_search.query.clear();
-            snap_selection_to_filter(state);
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.settings_search.query.push(c);
-            snap_selection_to_filter(state);
         }
-        _ => {}
+        _ => return,
+    }
+    // A filter can move the selection (R1), so the pane follows it — otherwise
+    // the highlight names one section while the fields show another.
+    if snap_selection_to_filter(state) {
+        load_selected_section(state).await;
     }
 }
 
-/// Keep the selection on a row the filter actually shows (spec D7).
-fn snap_selection_to_filter(state: &mut AppState) {
+/// Keep the selection on a row the filter actually shows (spec D7). Returns
+/// whether the selection moved.
+fn snap_selection_to_filter(state: &mut AppState) -> bool {
     let query = state.settings_search.query.clone();
     let visible = visible_leaves(&query, &state.settings_sections);
     if let Some(first) = visible.first()
         && !visible.contains(&state.settings_sections.selected)
     {
         state.settings_sections.selected = *first;
+        return true;
+    }
+    false
+}
+
+/// Load the selected section's pane into the Values side. Focus is untouched:
+/// moving the selection shows the settings, it does not jump the cursor there.
+async fn load_selected_section(state: &mut AppState) {
+    let Some(section) = leaf_section(state.settings_sections.selected) else {
+        return;
+    };
+    // A stale "Saved X" from the previous section would read as if the new one
+    // were saved.
+    state.settings_notice = None;
+    let pane = state.build_right_pane(section).await;
+    if let AppMode::Settings {
+        mode: SettingsMode::Split { right, .. },
+    } = &mut state.mode
+    {
+        *right = pane;
     }
 }
 
@@ -984,16 +1038,13 @@ async fn handle_sections_key(state: &mut AppState, key: &KeyEvent) {
             state.settings_sections.toggle_expanded(group);
             return;
         }
-        if let Some(section) = leaf_section(selected) {
-            state.settings_notice = None;
-            let pane = state.build_right_pane(section).await;
-            if let AppMode::Settings {
-                mode: SettingsMode::Split { right, focus },
-            } = &mut state.mode
-            {
-                *right = pane;
-                *focus = SplitFocus::Right;
-            }
+        load_selected_section(state).await;
+        if let AppMode::Settings {
+            mode: SettingsMode::Split { focus, .. },
+        } = &mut state.mode
+        {
+            // `Enter` is the only key that moves focus into the pane.
+            *focus = SplitFocus::Right;
         }
         return;
     }
@@ -1013,13 +1064,36 @@ async fn handle_sections_key(state: &mut AppState, key: &KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Up => step_selection(state, false),
-        KeyCode::Down => step_selection(state, true),
-        KeyCode::Left | KeyCode::Right => {
-            // Collapse/expand the group that owns the selection: the sections
-            // pane has no other horizontal affordance (spec D2).
+        // The selection's pane is loaded as it moves (spec R1): the reference
+        // shows a section's settings the moment you move onto it, so nothing
+        // waits for `Enter` and no two-step "move, then open" exists.
+        KeyCode::Up => {
+            step_selection(state, false);
+            load_selected_section(state).await;
+        }
+        KeyCode::Down => {
+            step_selection(state, true);
+            load_selected_section(state).await;
+        }
+        KeyCode::Left => {
+            // Collapse the group that owns the selection.
             if let Some(group) = leaf_group(state.settings_sections.selected) {
                 state.settings_sections.toggle_expanded(group);
+            }
+        }
+        // `→` is the way right: it expands a collapsed group first (there is
+        // nothing to show yet), then moves focus into the Values pane. Values
+        // keeps `←`/`→` for stepping a selector, which is what the cursor is
+        // doing there.
+        KeyCode::Right => {
+            let collapsed = leaf_group(state.settings_sections.selected)
+                .is_some_and(|group| !state.settings_sections.is_expanded(group));
+            if collapsed {
+                state
+                    .settings_sections
+                    .toggle_expanded(leaf_group(state.settings_sections.selected).unwrap_or(0));
+            } else {
+                toggle_split_focus(state);
             }
         }
         _ => {}
@@ -1075,7 +1149,10 @@ fn form_field_defs_for_section(
         ],
         SettingsSection::Gui => &[
             ("language", "Language", "Select:en,zh"),
-            ("theme", "Theme", "Text"),
+            // A selector over opaline's builtin slugs: as free text it could
+            // name a theme that does not exist, and `AppState::new` panics on
+            // an unknown `theme_name` at the NEXT launch.
+            ("theme", "Theme", "SelectThemes"),
             ("refresh_interval", "Refresh Interval", "Text"),
         ],
         SettingsSection::Inbound => &[
@@ -1187,14 +1264,11 @@ const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
 /// One row per field, as in the reference (spec D4/D5): `›` on the focused
 /// row, the provenance marker, the label in its own column, then the value.
 /// The caller provides the inner area (this draws no outer block).
-/// Field rows a section shows: filtered by the query, with the focused field
-/// always kept so the row being edited can never vanish under the cursor
-/// (spec D7). Shared by the renderer and the pane title's counter.
-fn visible_field_rows(section: SettingsSection, focus_index: usize, query: &str) -> Vec<usize> {
-    let field_defs = form_field_defs_for_section(section);
-    (0..field_defs.len())
-        .filter(|i| *i == focus_index || matches_filter(query, field_defs[*i].1))
-        .collect()
+/// Field rows a section shows: **all of them**. The `/` filter narrows the
+/// sections list only (R1) — the Values pane never hides part of the section the
+/// user is looking at, so `i/n` is a plain position within the section.
+fn visible_field_rows(section: SettingsSection) -> Vec<usize> {
+    (0..form_field_defs_for_section(section).len()).collect()
 }
 
 fn render_form_with_area(
@@ -1206,10 +1280,9 @@ fn render_form_with_area(
     focus_index: usize,
     form_errors: &HashMap<String, String>,
     snapshot: Option<&Vec<(String, String)>>,
-    query: &str,
 ) {
     let field_defs = form_field_defs_for_section(section);
-    let visible = visible_field_rows(section, focus_index, query);
+    let visible = visible_field_rows(section);
     let focused_row = visible.iter().position(|i| *i == focus_index);
     let height = area.height as usize;
     let start = focused_row
@@ -1246,8 +1319,15 @@ fn render_form_with_area(
         let mut spans = vec![
             Span::styled(if focused { "›" } else { " " }, label_style),
             Span::styled(format!("{marker} "), marker_style),
+            // A label longer than the column still gets one separating space,
+            // or the value collides with it at the narrow minimum
+            // (`Sing-Box Path—` at 54 columns).
             Span::styled(
-                format!("{label:<label_w$}", label_w = label_w as usize),
+                if label.chars().count() >= label_w as usize {
+                    format!("{label} ")
+                } else {
+                    format!("{label:<label_w$}", label_w = label_w as usize)
+                },
                 label_style,
             ),
         ];
@@ -1302,6 +1382,25 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         return;
     };
 
+    // A selector advances on Space/Enter and wraps past its last option
+    // (spec R2); `Ctrl+S` is the save key for every field type, since Enter no
+    // longer reaches the save on a selector. Enter still saves everywhere else.
+    let save_requested = if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
+        let field_type = field_defs.get(*focus_index).map_or("", |def| def.2);
+        if select_options(field_type).is_some() {
+            if let Some(options) = select_options(field_type)
+                && let Some((_, value)) = fields.get_mut(*focus_index)
+            {
+                *value = cycle_select(value, &options, key.code == KeyCode::Enter);
+            }
+            return;
+        }
+        // Enter still saves on every field type that is not a selector.
+        key.code == KeyCode::Enter
+    } else {
+        key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL)
+    };
+
     match key.code {
         KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             *focus_index = if *focus_index >= max_idx {
@@ -1333,8 +1432,8 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             let (_, ref mut val) = fields[*focus_index];
 
             let field_type = def.2;
-            if field_type.starts_with("Select:") {
-                // Select types only respond to Left/Right, not character input
+            if select_options(field_type).is_some() {
+                // A selector has no free text: Space/Enter/←→/→ move it.
             } else if field_type == "Boolean" {
                 val.clear();
                 val.push_str(if val == "true" { "false" } else { "true" });
@@ -1352,7 +1451,7 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                 val.pop();
             }
         }
-        KeyCode::Enter => {
+        KeyCode::Enter | KeyCode::Char('s') if save_requested => {
             form_errors.clear();
 
             // Validate each field based on its declared type
@@ -1374,6 +1473,15 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                             "Invalid duration — use e.g. '5s', '1h30m'".to_string(),
                         );
                     }
+                    field_type
+                        if select_options(field_type)
+                            .is_some_and(|options| !options.iter().any(|o| o == val)) =>
+                    {
+                        form_errors.insert(
+                            field_defs[i].0.to_string(),
+                            format!("`{val}` is not one of this field's options"),
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -1387,12 +1495,14 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                 }
                 // The status band reports the save, not just failures (spec A7).
                 state.settings_notice = Some(format!("Saved {}", section_name(section)));
-                // In Split mode, return focus to tree after saving
+                // Focus goes back to Sections; the pane stays on the section that
+                // was just saved, rebuilt so it shows the stored values (R1).
+                let pane = state.build_right_pane(section).await;
                 if let AppMode::Settings {
-                    mode: SettingsMode::Split { right, focus, .. },
+                    mode: SettingsMode::Split { right, focus },
                 } = &mut state.mode
                 {
-                    *right = SplitRightPane::Empty;
+                    *right = pane;
                     *focus = SplitFocus::Tree;
                 }
             }
@@ -1406,21 +1516,10 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         KeyCode::Left | KeyCode::Right
             if *focus_index < field_defs.len() && *focus_index < fields.len() =>
         {
-            let def = field_defs[*focus_index];
-            let field_type = def.2;
-            if let Some(options_csv) = field_type.strip_prefix("Select:") {
-                let options: Vec<&str> = options_csv.split(',').collect();
+            let field_type = field_defs[*focus_index].2;
+            if let Some(options) = select_options(field_type) {
                 let (_, ref mut val) = fields[*focus_index];
-                let current_idx = options.iter().position(|o| *o == val.as_str()).unwrap_or(0);
-                let new_idx = if key.code == KeyCode::Right {
-                    (current_idx + 1) % options.len()
-                } else if current_idx == 0 {
-                    options.len() - 1
-                } else {
-                    current_idx - 1
-                };
-                val.clear();
-                val.push_str(options[new_idx]);
+                *val = cycle_select(val, &options, key.code == KeyCode::Right);
             }
         }
         KeyCode::Esc => {
@@ -1431,10 +1530,9 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             }
             state.settings_form_snapshot = None;
             if let AppMode::Settings {
-                mode: SettingsMode::Split { right, focus, .. },
+                mode: SettingsMode::Split { focus, .. },
             } = &mut state.mode
             {
-                *right = SplitRightPane::Empty;
                 *focus = SplitFocus::Tree;
             }
         }
@@ -1511,10 +1609,9 @@ fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Esc => {
             if let AppMode::Settings {
-                mode: SettingsMode::Split { right, focus, .. },
+                mode: SettingsMode::Split { focus, .. },
             } = &mut state.mode
             {
-                *right = SplitRightPane::Empty;
                 *focus = SplitFocus::Tree;
             }
         }
@@ -1759,15 +1856,9 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Esc => {
             if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        ref mut right,
-                        ref mut focus,
-                        ..
-                    },
+                mode: SettingsMode::Split { ref mut focus, .. },
             } = state.mode
             {
-                *right = SplitRightPane::Empty;
                 *focus = SplitFocus::Tree;
             }
         }
@@ -2110,7 +2201,7 @@ fn render_routing_list_inner(
     selected: usize,
 ) {
     let rules = &state.routing_rules;
-    let list_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+    let list_area = area;
 
     // Build list items
     let items: Vec<RoutingRuleItem> = rules
@@ -2138,18 +2229,18 @@ fn render_routing_list_inner(
     // Render list widget
     let list = List::new(&items)
         .palette(crate::ui::theme::widget_palette(theme))
+        // The widget's default `│` gutter drew a second bar right after the
+        // pane's own border (`││  Default`); the selected row is marked by
+        // `sel_mark` inside the item instead.
+        .selection_indicator(" ")
         .show_paginator(false);
     let mut list_state = ListState::new(items.len());
     list_state.select(selected, items.len());
     frame.render_stateful_widget(list, list_area, &mut list_state);
 
-    // Footer with action hints
-    let footer_y = area.bottom().saturating_sub(1);
-    let footer = Paragraph::new(Line::from(Span::styled(
-        " [a] Add  [e] Edit  [d] Delete  [Ctrl+↑/↓] Reorder  [Esc] Back ",
-        Style::default().fg(theme.color("text.muted").into()),
-    )));
-    frame.render_widget(footer, Rect::new(area.x, footer_y, area.width, 1));
+    // No hint line of its own: the modal's bottom border already carries this
+    // pane's keys (`status_bar::settings_hints`), and printing them twice also
+    // overflowed the pane — the routing footer overwrote its right border.
 }
 
 // ── Render: Routing Form ────────────────────────────────────────────────
@@ -2224,10 +2315,31 @@ impl ListItem for GroupListItem {
     fn render(&self, area: Rect, buf: &mut Buffer, ctx: &ListItemContext) {
         let is_focused = ctx.selected;
         let sel_mark = if self.selected { " \u{2713} " } else { "   " };
-        let name_str = format!(" {:<20}", self.name);
-        let url_str = format!(" {:<40}", self.url);
-        let status_str = format!(" {:<10}", self.status);
+        // Columns sized from the pane, not from a wide-terminal guess: a fixed
+        // 20/40/10 split elided the status (`nev…`) in a normal popup while
+        // overrunning the pane in a narrow one.
+        let status_w = 10usize;
+        let name_w = ((area.width as usize) * 2 / 10).clamp(8, 20);
+        let url_w = (area.width as usize)
+            .saturating_sub(3 + name_w + status_w)
+            .max(8);
+        let name_str = format!(" {:<name_w$}", self.name, name_w = name_w);
+        let url_str = format!(" {:<url_w$}", self.url, url_w = url_w);
+        let status_str = format!(" {:<status_w$}", self.status, status_w = status_w);
         let line = format!("{sel_mark}{name_str}{url_str}{status_str}");
+        // The columns are padded for a wide pane; without a clamp the tail runs
+        // past the pane and paints over its right border.
+        let line = if unicode_width::UnicodeWidthStr::width(line.as_str()) > usize::from(area.width)
+        {
+            let keep = (area.width as usize).saturating_sub(1);
+            let mut trimmed = line;
+            while unicode_width::UnicodeWidthStr::width(trimmed.as_str()) > keep {
+                trimmed.pop();
+            }
+            format!("{trimmed}…")
+        } else {
+            line
+        };
         let style = if is_focused {
             Style::default()
                 .fg(ctx.palette.primary)
@@ -2249,7 +2361,7 @@ fn render_group_list_inner(
     selected_mask: &[bool],
 ) {
     let groups = &state.groups;
-    let list_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+    let list_area = area;
 
     // Build list items
     let items: Vec<GroupListItem> = groups
@@ -2292,18 +2404,17 @@ fn render_group_list_inner(
     // Render list widget
     let list = List::new(&items)
         .palette(crate::ui::theme::widget_palette(theme))
+        // The widget's default `│` gutter drew a second bar right after the
+        // pane's own border (`││  Default`); the selected row is marked by
+        // `sel_mark` inside the item instead.
+        .selection_indicator(" ")
         .show_paginator(false);
     let mut list_state = ListState::new(items.len());
     list_state.select(selected, items.len());
     frame.render_stateful_widget(list, list_area, &mut list_state);
 
     // Footer with action hints
-    let footer_y = area.bottom().saturating_sub(1);
-    let footer = Paragraph::new(Line::from(Span::styled(
-        " [Space] Toggle select  [a] Add  [e] Edit  [d] Delete selected  [u] Update  [Esc] Back ",
-        Style::default().fg(theme.color("text.muted").into()),
-    )));
-    frame.render_widget(footer, Rect::new(area.x, footer_y, area.width, 1));
+    // Keys live in the modal's bottom border (see the routing list).
 }
 
 async fn handle_group_list_key(state: &mut AppState, key: &KeyEvent) {
@@ -2441,15 +2552,9 @@ async fn handle_group_list_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Esc => {
             if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        ref mut right,
-                        ref mut focus,
-                        ..
-                    },
+                mode: SettingsMode::Split { ref mut focus, .. },
             } = state.mode
             {
-                *right = SplitRightPane::Empty;
                 *focus = SplitFocus::Tree;
             }
         }
@@ -2735,12 +2840,61 @@ mod section_list_tests {
     }
 
     #[test]
-    fn filter_never_hides_the_field_being_edited() {
-        // Core's fields do not contain "dns"; the focused row must survive.
-        let rows = visible_field_rows(SettingsSection::Core, 0, "dns");
-        assert_eq!(rows, vec![0]);
-        let all = visible_field_rows(SettingsSection::Core, 0, "");
-        assert_eq!(all.len(), 5);
+    fn the_values_pane_never_hides_part_of_the_selected_section() {
+        // The `/` filter narrows sections only (R1): Core's five fields are all
+        // listed whatever the query is.
+        assert_eq!(visible_field_rows(SettingsSection::Core).len(), 5);
+        assert_eq!(visible_field_rows(SettingsSection::Dns).len(), 7);
+    }
+
+    #[rstest]
+    #[case::static_list_has_two_options("Select:en,zh", Some(vec!["en", "zh"]))]
+    #[case::selector_is_none_for_text("Text", None)]
+    fn static_option_lists_come_from_the_field_type(
+        #[case] field_type: &str,
+        #[case] expected: Option<Vec<&'static str>>,
+    ) {
+        assert_eq!(
+            super::select_options(field_type),
+            expected.map(|v| v.into_iter().map(str::to_string).collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
+    fn theme_selector_offers_every_builtin_slug() {
+        let options = super::select_options("SelectThemes").expect("theme options");
+        assert_eq!(options.len(), opaline::builtins::builtin_names().len());
+        // Sorted and loadable: a theme the field offers is a theme the app can
+        // start with (`AppState::new` panics on an unknown `theme_name`).
+        let mut sorted = options.clone();
+        sorted.sort();
+        assert_eq!(options, sorted);
+        for slug in &options {
+            assert!(
+                crate::ui::theme::load(slug).is_ok(),
+                "selector offers `{slug}` but it does not load"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::forward_wraps("zh", true, "en")]
+    #[case::backward_wraps("en", false, "zh")]
+    #[case::forward_steps("en", true, "zh")]
+    #[case::backward_steps("zh", false, "en")]
+    fn cycling_wraps_past_the_last_option(
+        #[case] current: &str,
+        #[case] forward: bool,
+        #[case] expected: &str,
+    ) {
+        let options = vec!["en".to_string(), "zh".to_string()];
+        assert_eq!(super::cycle_select(current, &options, forward), expected);
+    }
+
+    #[test]
+    fn cycling_an_unknown_value_starts_at_the_first_option() {
+        let options = vec!["en".to_string(), "zh".to_string()];
+        assert_eq!(super::cycle_select("klingon", &options, true), "en");
     }
 
     #[test]

@@ -719,7 +719,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         // Settings popup (spec D5). Until P3 lands it still renders as a
         // full screen; the key is the shell's entry point either way.
         KeyCode::Char(',') if matches!(state.mode, AppMode::List) => {
-            state.enter_settings();
+            state.enter_settings().await;
         }
         KeyCode::Up if state.profiles_active() => {
             if !state.nav_protocol_up() {
@@ -837,12 +837,16 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
         }
         KeyCode::Char('g' | 'G') if state.profiles_active() => {
-            state.enter_settings();
+            // `g` opens Settings already on Subscriptions: the popup opens with
+            // a section loaded (R1), so the selection has to move with the pane.
+            state.enter_settings().await;
+            state.settings_sections.selected =
+                crate::ui::settings::section_leaf_index(crate::SettingsSection::Subscriptions);
             let pane = state
                 .build_right_pane(crate::SettingsSection::Subscriptions)
                 .await;
             if let crate::AppMode::Settings {
-                mode: crate::SettingsMode::Split { right, focus, .. },
+                mode: crate::SettingsMode::Split { right, focus },
             } = &mut state.mode
             {
                 *right = pane;
@@ -1122,7 +1126,12 @@ mod overlay_tests {
                 &state_with(crate::AppMode::Settings {
                     mode: crate::SettingsMode::Split {
                         focus: crate::SplitFocus::Tree,
-                        right: crate::SplitRightPane::Empty,
+                        right: crate::SplitRightPane::Form {
+                            section: crate::SettingsSection::Core,
+                            fields: Vec::new(),
+                            focus_index: 0,
+                            form_errors: std::collections::HashMap::new(),
+                        },
                     },
                 })
                 .await
@@ -1327,6 +1336,21 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
             .cloned()
             .unwrap_or(AppMode::List)
         {
+            // The Settings popup carries its own hints in its bottom border, but
+            // `?` inside it used to fall through to the generic rows, which
+            // promised "Cycle tabs" in the one screen that has no tabs.
+            AppMode::Settings { .. } => vec![
+                ("↑↓", "Navigate sections"),
+                ("←", "Collapse the section's group"),
+                ("→", "Expand a collapsed group, else focus the fields"),
+                ("Enter", "Focus the section's fields"),
+                ("Tab / Ctrl+W", "Move focus between Sections and Values"),
+                ("↑↓ (Values)", "Move between fields"),
+                ("Space / Enter", "Advance a selector (wraps)"),
+                ("← →", "Step a selector back / forward"),
+                ("Ctrl+S", "Save the section"),
+                ("Esc", "Back / cancel the filter / close"),
+            ],
             AppMode::List => match state.pane1_tab {
                 crate::Pane1Tab::Profiles => vec![
                     ("↑↓ / PgUp PgDn", "Navigate profiles"),

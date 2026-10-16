@@ -121,6 +121,11 @@ in its bottom border, so the app status bar shows only the mode.
 └────────────────────── [Enter] Open  [Esc] Close ────────┘
 ```
 
+The right pane is **never empty**: the popup opens with the first section's
+settings already on screen, and moving the selection loads that section
+immediately. `Enter` is not needed to see a section — it moves the cursor into
+its fields.
+
 **Bands, top to bottom.**
 
 1. **Filter / edit bar.** Idle it reads `Search` with `Press / to filter settings`;
@@ -143,10 +148,18 @@ in its bottom border, so the app status bar shows only the mode.
 has not been saved yet. Bools render `✓`/`✗`, an empty text field renders `—`,
 selects render `< option >`, and a focused row ends with a `█` cursor.
 
+**Selectors** (dropdown fields such as Log Level, the per-protocol core, and
+**Theme**) advance on `Space` or `Enter` and wrap past their last option back to
+the first; `←`/`→` step one option. Because `Enter` belongs to the selector on
+those fields, **`Ctrl+S` saves the section** (`Enter` still saves every other
+field type). Theme lists every builtin opaline slug, is bound to the theme the
+app actually loads, and applies on save — the whole app re-renders in the theme
+you just picked.
+
 **Menu items (in order):**
 
 1. Core Settings — binary paths, log level, default core type
-2. GUI Settings — language, theme, refresh interval
+2. GUI Settings — language, theme (a selector over every builtin theme slug), refresh interval
 3. Inbound Settings — ports, listen address, sniffing
 4. Routing Rules — add/edit/delete/reorder rules
 5. DNS Settings — servers, hosts, query strategy, cache
@@ -165,21 +178,24 @@ selects render `< option >`, and a focused row ends with a `█` cursor.
 | Key | Where | Action |
 | --- | --- | --- |
 | `↑`/`↓` | either pane | move the selection / field focus |
-| `←`/`→` | Sections | collapse/expand the group that owns the selection |
-| `←`/`→` | Values | cycle a `Select:` field's options |
+| `←` | Sections | collapse the selected section's group |
+| `→` | Sections | expand a collapsed group, else focus the Values pane |
+| `←`/`→` | Values | step a selector one option |
 | `/` | Sections, or a list pane | focus the filter bar |
-| `Enter` | Sections | open the selected section (a collapsed group expands first) |
-| `Enter` | Values | validate and save the section |
+| `Enter` | Sections | focus the selected section's fields (a collapsed group expands first) |
+| `Space` | Values | advance the focused selector (wraps) |
+| `Ctrl+S` | Values | validate and save the section |
 | `Tab`/`Shift+Tab` | Values | next / previous field |
 | `Ctrl+W` | anywhere | swap focus between Sections and Values |
 | `Esc` | popup | close (asks before discarding unsaved edits); while filtering, cancels the filter |
 
-**Filter.** `/` starts a case-insensitive substring filter: it keeps the sections whose
-name or group matches, and the field rows of the open section whose label matches. The
-field you are editing always stays visible. `Enter` applies (the query stays), `Esc`
-cancels (the query clears), `Ctrl+U` clears it. A query that matches nothing says so in
-the status band. A filtered list ignores collapsed groups, so a search always reveals
-its own matches.
+**Filter.** `/` starts a case-insensitive substring filter over the **section
+list** (a leaf name or its group name). It never touches the Values pane: the
+selected section keeps showing all of its fields. `Enter` applies (the query
+stays), `Esc` cancels (the query clears), `Ctrl+U` clears it. A query that
+matches nothing says so in the status band. A filtered list ignores collapsed
+groups, so a search always reveals its own matches, and a filter that moves the
+selection moves the Values pane with it.
 
 **Routing Rules** (section 4) has a two-level UI:
 - Routing list: `↑↓` navigate, `Enter` edit, `a` add, `d` delete, `r` reorder
@@ -524,8 +540,8 @@ appended when updates are available for installed backends.
 | Pane 1 · Logs          | `[↑↓] Scroll  [c] Clear  [t] Targets  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
 | Pane 2 · Details       | `[↑↓] Scroll  [F1] Compact  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
 | Pane 2 · Metrics       | `[↑↓] Scroll  [Alt+↑↓] Resize  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
-| Settings popup (sections) | `[↑↓] Navigate  [←→] Collapse  [/] Filter  [Enter] Open  [Tab] Fields  [Esc] Close` |
-| Settings popup (fields)   | `[Tab/Shift+Tab] Field  [Enter] Save  [/] Filter  [Esc] Back` |
+| Settings popup (sections) | `[↑↓] Navigate  [←] Collapse  [→] Fields  [/] Filter  [Enter] Open  [Esc] Close` |
+| Settings popup (fields)   | `[Tab/Shift+Tab] Field  [Space] Advance  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back` |
 | Settings popup (filtering) | `[type] Filter  [Enter] Apply  [Ctrl+U] Clear  [Esc] Cancel` |
 | Settings popup (routing list) | `[↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Sections  [Esc] Back` |
 | Settings popup (routing form) | `[Enter] Save  [Ctrl+W] Sections  [Esc] Back` |
@@ -573,10 +589,11 @@ appended when updates are available for installed backends.
 
 | Key               | Action                              |
 | ----------------- | ----------------------------------- |
-| `↑` / `↓`        | Navigate the section list           |
-| `←` / `→`        | Collapse / expand the selected section's group |
-| `/`              | Filter sections and fields          |
-| `Enter`          | Open the selected section           |
+| `↑` / `↓`        | Navigate the section list (the Values pane follows) |
+| `←`              | Collapse the selected section's group |
+| `→`              | Expand a collapsed group, else focus the Values pane |
+| `/`              | Filter the section list              |
+| `Enter`          | Focus the selected section's fields  |
 | `Tab` / `Shift+Tab` | Move focus into the Values pane |
 | `Ctrl+W`         | Toggle focus between the two panes  |
 | `Esc`            | Close settings (asks before discarding unsaved edits) |

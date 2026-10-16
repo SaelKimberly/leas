@@ -43,6 +43,14 @@
 - Popup rect clamped to the live area; help band yields rows first; pane counters drop below 18 columns (a clipped `2/` reads as a broken number); `Tab` moves focus to the Values pane instead of silently closing the popup; `Tab` from an empty Values pane returns to Sections (its own hint promised it).
 - **Exit:** `get_cell_style` shows `bg=default` inside the popup, the help overlay, and the pane; the token audit reports 0 unknown sites.
 
+### P5c — user-directed rounds R1-R5 (second pass)
+- **R1** `SplitRightPane::Empty` deleted: `enter_settings` is async and opens with the first section's fields loaded; ↑/↓ and a filter's snap load the selected section; `Enter` only moves the cursor into the fields; a save keeps the section on screen (rebuilt from the stored values).
+- **R2** Selectors advance on `Space`/`Enter` and wrap; `Ctrl+S` saves; a selector value that is not one of its options is rejected on save (the theme slug would otherwise panic the next launch).
+- **R3** Theme is a selector over opaline's builtin slugs bound to `config.theme_name` (the field used to read/write `gui.theme`, which nothing consumes) and applied live on save.
+- **R4** `→` expands a collapsed group, then moves focus to Values; `←` collapses.
+- **R5** Both list panes lost their duplicated hint line and gained pane-sized columns; the cheese list's `│` gutter no longer doubles the pane border. The `/` filter narrows sections only.
+- **Exit:** 8 new unit tests (option lists, theme slugs load, cycle/wrap, unknown-value landing, no-field-filtering) plus live captures of each row.
+
 ### P6 — docs + verification
 - `docs/guides/tui-manual.md`: Settings popup section rewritten (bands, markers, `/`, counters, footer hints).
 - `docs/aegis/INDEX.md`: spec + plan rows.

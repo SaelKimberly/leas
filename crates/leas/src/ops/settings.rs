@@ -11,17 +11,25 @@ pub fn cancel_form(state: &mut AppState) {
     state.mode = AppMode::List;
 }
 
-pub fn enter_settings(state: &mut AppState) {
-    // Selection starts on the first leaf and all groups are expanded, so the
-    // first `Enter` opens a section (tui-polish §5.4). The list, the search bar
-    // and the status message are session state and never resume stale values.
+/// Open the Settings popup with the first section selected and its settings
+/// already on screen (R1).
+///
+/// There is no "nothing selected" state: the right pane is never empty while
+/// the popup is open, so a user cannot land on a blank form and have to
+/// discover the `Enter` that fills it.
+pub async fn enter_settings(state: &mut AppState) {
+    // Selection starts on the first leaf and all groups are expanded. The
+    // list, the search bar and the status message are session state and never
+    // resume stale values.
     state.settings_sections = crate::types::SectionList::default();
     state.settings_search = crate::types::SettingsSearch::default();
     state.settings_notice = None;
+    let section = crate::SettingsSection::Core;
+    let right = state.build_right_pane(section).await;
     state.mode = AppMode::Settings {
         mode: SettingsMode::Split {
             focus: SplitFocus::Tree,
-            right: SplitRightPane::Empty,
+            right,
         },
     };
 }
@@ -59,10 +67,11 @@ pub async fn build_settings_fields(
         Gui => {
             vec![
                 ("language".into(), state.config.gui.language.clone()),
-                (
-                    "theme".into(),
-                    state.config.gui.theme.clone().unwrap_or_default(),
-                ),
+                // `theme_name` is the key the app actually reads (it loads the
+                // theme from it at startup). The GUI form used to read and write
+                // `gui.theme`, which nothing consumes — so this field showed a
+                // value that had no effect.
+                ("theme".into(), state.config.theme_name.clone()),
                 (
                     "refresh_interval".into(),
                     humantime::format_duration(*state.config.gui.refresh_interval_secs).to_string(),
@@ -399,7 +408,22 @@ fn apply_settings_fields(
         }
         Gui => {
             state.config.gui.language = get("language");
-            state.config.gui.theme = get_opt("theme");
+            let theme_slug = get_str("theme");
+            if !theme_slug.is_empty() && state.config.theme_name != theme_slug {
+                // Apply live, so the popup (and everything behind it) re-renders
+                // in the theme the user just picked.
+                match crate::ui::theme::load(theme_slug) {
+                    Ok(theme) => {
+                        theme_slug.clone_into(&mut state.config.theme_name);
+                        state.theme = theme;
+                    }
+                    Err(error) => state.log_trace(
+                        "error",
+                        "tui::ops::settings",
+                        &format!("theme `{theme_slug}` rejected: {error}"),
+                    ),
+                }
+            }
             if let Ok(d) = humantime::parse_duration(get_str("refresh_interval")) {
                 *state.config.gui.refresh_interval_secs = d;
             }

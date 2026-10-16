@@ -257,7 +257,6 @@ pub struct LogLine {
 /// Right pane content in the Settings split view.
 #[derive(Debug, Clone)]
 pub enum SplitRightPane {
-    Empty,
     Form {
         section: SettingsSection,
         fields: Vec<(String, String)>,

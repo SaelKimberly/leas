@@ -1,177 +1,151 @@
 # Transcript: settings-xrat-parity
 
-Raw captures from the run described in
+Raw captures for
 [2026-10-16-093000-scenario-settings-xrat-parity.md](2026-10-16-093000-scenario-settings-xrat-parity.md).
-Session `default`, buffer mode, 120x40 then 80x24. Fixture:
-`/home/user/.cache/leas-tui/settings-parity` (7 synthetic endpoints).
 
-## Step 1 — `,` at 120x40 (E1)
+**Binary: `target/debug/leas` md5 `fe4f62aa9f584fa6a8b5a2f89851cbe5`.** Every frame below was captured from that build
+in one session; no frame is carried over from an earlier binary.
 
-```
-┌ 1: [Profiles]  Logs ─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Vie┌ Settings ──────────────────────────────────────────────────────────────────────────────────────────────────┐    │
-│    │ ┌ Search ────────────────────────────────────────────────────────────────────────────────────────────────┐ │    │
-│    │ │Press / to filter settings                                                                              │ │    │
-│    │ └────────────────────────────────────────────────────────────────────────────────────────────────────────┘ │    │
-│    │ ┌ Sections · 2/20 ────────────┐ ┌ Select a section ──────────────────────────────────────────────────────┐ │    │
-│    │ │  ▾ Core                     │ │                                                                        │ │    │
-│    │ │›    Core Settings           │ │                                                                        │ │    │
-│    │ │     Protocol Core           │ │                                                                        │ │    │
-│    │ │  ▾ Connection               │ │                                                                        │ │    │
-│    │ │     Inbound                 │ │                                                                        │ │    │
-│    │ │     System Proxy            │ │                                                                        │ │    │
-│    │ │     TUN                     │ │                                                                        │ │    │
-│    │ │     Mux                     │ │                                                                        │ │    │
-│    │ │  ▾ Routing                  │ │                                                                        │ │    │
-│    │ │     Routing Rules           │ │                                                                        │ │    │
-│    │ │     Probe Hosts             │ │                                                                        │ │    │
-│    │ │     DNS                     │ │                                                                        │ │    │
-│    │ │  ▾ GUI                      │ │                                                                        │ │    │
-│    │ │     GUI Settings            │ │                                                                        │ │    │
-│    │ │  ▾ Advanced                 │ │                                                                        │ │    │
-│    │ │     Statistics              │ │                                                                        │ │    │
-│    │ │     Updates                 │ │                                                                        │ │    │
-│    │ │     Speed Test              │ │                                                                        │ │    │
-│    │ │     Logging                 │ │                                                                        │ │    │
-│    │ │     Subscriptions           │ │                                                                        │ │    │
-│    │ └─────────────────────────────┘ └────────────────────────────────────────────────────────────────────────┘ │    │
-│    │ ┌ Help ──────────────────────────────────────────────────────────────────────────────────────────────────┐ │    │
-│ Ser│ │Pick a section on the left, then edit its fields on the right.                                          │ │    │
-│    │ └────────────────────────────────────────────────────────────────────────────────────────────────────────┘ │    │
-└────└──────────────────────── [↑↓] Navigate  [←→] Collapse  [/] Filter  [Enter] Open  [Ctrl+W] Form  [Esc] Close ┘────┘
- Settings Disconnected
-```
+Fixture: `/home/user/.cache/leas-tui/settings-parity` (7 synthetic endpoints). Session
+`default`, buffer mode, 120x40 unless stated. One key per call (see Harness notes).
 
-## Step 2 — `/dns` (E2), region rows 1-7
+## E1 / E12 — `,` on a fresh launch: the Values pane is never empty
 
 ```
-│ Vie┌ Settings ──────────────────────────────────────────────────────────────────────────────────────────────────┐    │
-│    │ ┌ Filter ────────────────────────────────────────────────────────────────────────────────────────────────┐ │    │
-│    │ │dns█                                                                                                    │ │    │
-│    │ └────────────────────────────────────────────────────────────────────────────────────────────────────────┘ │    │
-│    │ ┌ Sections · 2/2 ─────────────┐ ┌ Select a section ──────────────────────────────────────────────────────┐ │    │
-│    │ │  ▾ Routing                  │ │                                                                        │ │    │
-│    │ │›    DNS                     │ │                                                                        │ │    │
+┌ Settings ──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ┌ Search ────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│ │Press / to filter settings                                                                              │ │
+│ └────────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│ ┌ Sections · 2/20 ────────────┐ ┌ Values · 1/5 ──────────────────────────────────────────────────────────┐ │
+│ │  ▾ Core                     │ │›· Xray Path               —█                                           │ │
+│ │›    Core Settings           │ │ · Sing-Box Path           —                                            │ │
+│ │     Protocol Core           │ │ · Log Level               < warning >                                  │ │
+│ │  ▾ Connection               │ │ · Skip Cert Verify        ✗                                            │ │
+│ │     Inbound                 │ │ · Clash Mixin (JSON/YAML) —                                            │ │
+│ │     System Proxy            │ │                                                                        │ │
+│ │     TUN                     │ │                                                                        │ │
+│ │     Mux                     │ │                                                                        │ │
+│ │  ▾ Routing                  │ │                                                                        │ │
+│ │     Routing Rules           │ │                                                                        │ │
+│ │     Probe Hosts             │ │                                                                        │ │
+│ │     DNS                     │ │                                                                        │ │
+│ │  ▾ GUI                      │ │                                                                        │ │
+│ │     GUI Settings            │ │                                                                        │ │
+│ │  ▾ Advanced                 │ │                                                                        │ │
+│ │     Statistics              │ │                                                                        │ │
+│ │     Updates                 │ │                                                                        │ │
+│ │     Speed Test              │ │                                                                        │ │
+│ │     Logging                 │ │                                                                        │ │
+│ │     Subscriptions           │ │                                                                        │ │
+│ ┌ Help · Core ───────────────────────────────────────────────────────────────────────────────────────────┐ │
+│ │Field    Xray Path                                                                                      │ │
+│ │Type     Text                                                                                           │ │
+│ │Accepts  free text                                                                                      │ │
+│ │Current  —                                                                                              │ │
+│ │Keys     · saved   * unsaved   › selected                                                               │ │
+└──────────────────────────── [↑↓] Navigate  [←] Collapse  [→] Fields  [/] Filter  [Enter] Open  [Esc] Close ┘
+ Settings > Core Disconnected
 ```
 
-## Step 3 — `Esc` (E3), region rows 2-3
+`Values · 1/5` on open — no empty state (R1). `—` on empty fields, `✗` on a false boolean,
+`< warning >` on a selector, `·` = saved.
+
+## E13 — one `down`: exactly one row, and the pane follows
 
 ```
-│    │ ┌ Search ────────────────────────────────────────────────────────────────────────────────────────────────┐ │    │
-│    │ │Press / to filter settings                                                                              │ │    │
+│ ┌ Sections · 3/20 ────────────┐ ┌ Values · 1/22 ─────────────────────────────────────────────────────────┐ │
+│ │  ▾ Core                     │ │›· VMess                   < Auto >█                                    │ │
+│ │     Core Settings           │ │ · VLESS                   < Auto >                                     │ │
+│ │›    Protocol Core           │ │ · Shadowsocks             < Auto >                                     │ │
 ```
 
-## Step 4 — `↓`x12, `Enter` (E4), region rows 1-23
+## E14 — `←` collapses (the header carries the highlight), `→` expands, `→` then moves focus
 
 ```
-│ Vie┌ Settings ──────────────────────────────────────────────────────────────────────────────────────────────────┐    │
-│    │ ┌ Edit Servers (JSON) · Text ────────────────────────────────────────────────────────────────────────────┐ │    │
-│    │ │type to change · [Backspace] erase · [Tab] next field                                                   │ │    │
-│    │ └────────────────────────────────────────────────────────────────────────────────────────────────────────┘ │    │
-│    │ ┌ Sections · 12/20 ───────────┐ ┌ Values · 1/7 ──────────────────────────────────────────────────────────┐ │    │
-│    │ │  ▾ Core                     │ │›· Servers (JSON)          —█                                           │ │    │
-│    │ │     Core Settings           │ │ · Hosts (JSON)            —                                            │ │    │
-│    │ │     Protocol Core           │ │ · Query Strategy          —                                            │ │    │
-│    │ │  ▾ Connection               │ │ · Disable Cache           ✗                                            │ │    │
-│    │ │     Inbound                 │ │ · Disable Fallback        ✗                                            │ │    │
-│    │ │     System Proxy            │ │ · Client IP               —                                            │ │    │
-│    │ │     TUN                     │ │ · DNS Cache TTL (secs)    —                                            │ │    │
-│    │ │     Mux                     │ │                                                                        │ │    │
-│    │ │  ▾ Routing                  │ │                                                                        │ │    │
-│    │ │     Routing Rules           │ │                                                                        │ │    │
-│    │ │     Probe Hosts             │ │                                                                        │ │    │
-│    │ │›    DNS                     │ │                                                                        │ │    │
+│ ┌ Sections · 1/18 ────────────┐ ┌ Values · 1/22 ─────────────────────────────────────────────────────────┐ │
+│ │› ▸ Core                     │ │›· VMess                   < Auto >█                                    │ │
+│ │  ▾ Connection               │ │ · VLESS                   < Auto >                                     │ │
 ```
 
-(The help box, the status band and the footer were asserted in the same capture; the full
-frame at this state is reproduced in step 6 below, which is the same screen one `Tab` later.)
-
-## Step 5 — type `1.1.1.1` (E5), region rows 5-25
+After the two `→` presses the footer is the field set:
 
 ```
-│    │ ┌ Sections · 12/20 ───────────┐ ┌ Values · 1/7 ──────────────────────────────────────────────────────────┐ │    │
-│    │ │  ▾ Core                     │ │›* Servers (JSON)          1.1.1.1█                                     │ │    │
-│    │ │     Core Settings           │ │ · Hosts (JSON)            —                                            │ │    │
-│    │ │     Protocol Core           │ │ · Query Strategy          —                                            │ │    │
+└────└────────────────────── [Tab/Shift+Tab] Field  [Space] Advance  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back ┘────┘
 ```
 
-Popup title at this point: `│ Vie┌ Settings * ───…───┐    │`.
-
-## Step 6 — `Tab`, then resize 80x24 (E6/E7)
+## E15 — a selector advances, steps back, and wraps
 
 ```
-┌ 1: [Profiles]  Logs ─────────────────────────────────────────────────────────┐
-│ ┌ Settings * ──────────────────────────────────────────────────────────────┐ │
-│ │ ┌ Edit Hosts (JSON) · Text ────────────────────────────────────────────┐ │ │
-│ │ │type to change · [Backspace] erase · [Tab] next field                 │ │ │
-│ │ └──────────────────────────────────────────────────────────────────────┘ │ │
-│ │ ┌ Sections · 12/20 ─────┐ ┌ Values · 2/7 ──────────────────────────────┐ │ │
-│ │ │     Mux               │ │ * Servers (JSON)          1.1.1.1          │ │ │
-│ │ │  ▾ Routing            │ │›· Hosts (JSON)            —█               │ │ │
-│ │ │     Routing Rules     │ │ · Query Strategy          —                │ │ │
-│ │ │     Probe Hosts       │ │ · Disable Cache           ✗                │ │ │
-│ │ │›    DNS               │ │ · Disable Fallback        ✗                │ │ │
-│ │ └───────────────────────┘ └────────────────────────────────────────────┘ │ │
-│ │ ┌ Help · DNS ──────────────────────────────────────────────────────────┐ │ │
-│ │ │Field    Hosts (JSON)                                                 │ │ │
-│ │ │Type     Text                                                         │ │ │
-│ │ │Accepts  free text                                                    │ │ │
-│ │ │Current  —                                                            │ │ │
-│ │ │Keys     · saved   * unsaved   › selected                             │ │ │
-│ │ └──────────────────────────────────────────────────────────────────────┘ │ │
-└─└───────────────────────────… [←→] Cycle [Enter] Save [/] Filter [Esc] Back┘─┘
- Settings > DNS Disconnected
+Space   : ›* VMess   < Auto >█     →  ›* VMess   < SingBox >█
+←       :                            →  ›* VMess   < Xray >█
+←       :                            →  ›* VMess   < Auto >█
+←       :                            →  ›* VMess   < SingBox >█      (wrap past the first option)
 ```
 
-## Step 7 — `Esc` from the dirty form (E8)
+## E16 / E17 — `/gui` narrows sections only; the theme selector saves and repaints
 
 ```
-│    │ │                             │ │  ╭ Confirm ──────────────────────────╮                                 │ │  █ │
-│    │ │                             │ │  │  Discard unsaved settings? (y/N)  │                                 │ │  █ │
-│    │ │                             │ │  ╰───────────────────────────────────╯                                 │ │  █ │
- Settings > DNS Disconnected                                                                [y] Confirm  [n/Esc] Cancel
+│ ┌ Sections · 2/2 ─────────────┐ ┌ Values · 1/3 ──────────────────────────────────────────────────────────┐ │
+│ │  ▾ GUI                      │ │›· Language                < en >█                                      │ │
+│ │›    GUI Settings            │ │ · Theme                   < catppuccin-mocha >                         │ │
+│ │                             │ │ · Refresh Interval        5s                                           │ │
 ```
 
-## Step 8 — modal surface (E9), `get_cell_style` after the D13 fix
+All three fields are listed while the filter is live (`Values · 1/3`): the filter narrows the
+section list only. Theme is a selector bound to `config.theme_name`; `Space` + `Ctrl+S` wrote
+the new slug, reloaded the theme and persisted it — this run's first launch started on
+`dracula`, and the next one starts on `catppuccin-mocha`.
+
+## E9 — modal surface: one background everywhere
 
 ```
-Style at (6, 20):  char=' ' fg=default bg=default     # inside the popup
-Style at (8, 41):  char=' ' fg=default bg=default     # a section row
-Style at (8, 8):   char=' ' fg=f8f8f2 bg=default     # selected row text
-Style at (9, 12):  char='C' fg=7c7f8f bg=default     # group header text
+get_cell_style inside the popup (6,20)   : fg=default bg=default
+get_cell_style a section row (8,8)        : fg=f8f8f2  bg=default   (selected row)
+get_cell_style a group header (9,12)      : fg=7c7f8f  bg=default
+get_cell_style inside the help overlay   : fg=7c7f8f  bg=default
 ```
 
-The popup, the app canvas and the help overlay all report `bg=default` — one background,
-borders only. Before the fix the popup reported `bg=808080` (opaline's
-`OpalineColor::FALLBACK`, the grey that `bg.surface` resolved to), and the help overlay
-reported `bg=44475a` (`bg.elevated`). Both fills are gone.
+Before the D13 fix the popup reported `bg=808080` (opaline's `OpalineColor::FALLBACK`, the
+grey that the non-existent `bg.surface` token resolved to) and the dialogs `bg=44475a`
+(`bg.elevated`). Both fills are gone.
 
-## Step 9 — popup minimum width (E10), 54x24
+## E10 — popup minimum width, 54x24 (Core Settings open, no filter)
 
 ```
+┌ 1: [Profiles]  Logs ───────────────────────────────┐
 │ ┌ Settings ──────────────────────────────────────┐ │
 │ │ ┌ Search ────────────────────────────────────┐ │ │
 │ │ │Press / to filter settings                  │ │ │
 │ │ └────────────────────────────────────────────┘ │ │
-│ │ ┌ Sections ────┐ ┌ Select a section ─────────┐ │ │
-│ │ │  ▾ Core      │ │                           │ │ │
-│ │ │›    Core Sett│ │                           │ │ │
-│ │ │     Protocol │ │                           │ │ │
+│ │ ┌ Sections ────┐ ┌ Values · 1/5 ─────────────┐ │ │
+│ │ │  ▾ Core      │ │›· Xray Path    —█         │ │ │
+│ │ │›    Core Sett│ │ · Sing-Box Path —         │ │ │
+│ │ │     Protocol │ │ · Log Level    < warning >│ │ │
+│ │ │  ▾ Connection│ │ · Skip Cert Verify ✗      │ │ │
+│ │ │     Inbound  │ │ · Clash Mixin (JSON/YAML) │ │ │
 │ │ └──────────────┘ └───────────────────────────┘ │ │
-└─└─────────… [Enter] Open [Tab] Fields [Esc] Close┘─┘
+│ │ ┌ Help · Core ───────────────────────────────┐ │ │
+│ │ │Field    Xray Path                          │ │ │
+│ │ │Type     Text                               │ │ │
+│ │ │Accepts  free text                          │ │ │
+│ │ └────────────────────────────────────────────┘ │ │
+└───────────… [/] Filter [Enter] Open [Esc] Close┘─┘
+ Settings > Core Disconnected
 ```
 
-No clipped counter, footer keeps its tail, popup fits the live area.
+Three things this row asserts, all visible above:
 
-## Step 10 — `Tab` focus round-trip (E11)
+- `Sections` **drops its counter** rather than clipping `2/20` into `2/` at 16 columns.
+- Every label keeps a separating space at the 15-column value column: `Sing-Box Path —`,
+  `Skip Cert Verify ✗`, and the 22-character `Clash Mixin (JSON/YAML)` gets its space and its
+  value is simply cut by the pane edge — a truncation, not the `Sing-Box Path—` collision the
+  pre-fix build rendered.
+- The footer drops from the left (`… [/] Filter [Enter] Open [Esc] Close`) and keeps
+  `[Esc] Close`.
 
-```
-Style at (5, 4): fg=6272a4   # Sections border while the Values pane has focus (muted)
-Style at (5, 5): fg=bd93f9   # Sections border after Tab brings focus back (accent)
-```
+## Harness notes
 
-## Not covered by this transcript
-
-- The save notice band (`Saved Core`) and the filter-miss line
-  (`No settings match "zzzz" — [Ctrl+U] clear  [Esc] cancel`) were captured during
-  development and are covered by the unit tests plus the two behaviours above.
+- One key per call. `send_special_keys(["down"] * 6)` moved **eight** rows; a single call moves
+  exactly one (E13).
+- `Esc` must use `send_special_keys(["escape"])`: a raw `\u001b` is swallowed and the press
+  turns into the following `Enter`, which reads as a filter that "did not cancel".

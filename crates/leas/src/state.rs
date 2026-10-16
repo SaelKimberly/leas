@@ -918,8 +918,8 @@ impl AppState {
 
     // ── Settings helpers ──────────────────────────────────────────────────
 
-    pub fn enter_settings(&mut self) {
-        settings::enter_settings(self);
+    pub async fn enter_settings(&mut self) {
+        settings::enter_settings(self).await;
     }
 
     pub async fn build_right_pane(&mut self, section: SettingsSection) -> SplitRightPane {

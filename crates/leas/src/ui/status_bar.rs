@@ -114,7 +114,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let mode_prefix = match &state.mode {
         crate::AppMode::Settings { mode } => match mode {
             crate::SettingsMode::Split { right, .. } => match right {
-                crate::SplitRightPane::Empty => " Settings",
                 crate::SplitRightPane::Form { section, .. } => status_bar_section_label(*section),
                 crate::SplitRightPane::RoutingList { .. }
                 | crate::SplitRightPane::RoutingForm { .. } => " Settings > Routing",
@@ -276,15 +275,15 @@ pub(crate) fn settings_hints(state: &AppState) -> String {
     let crate::SettingsMode::Split { focus, right } = mode;
     match focus {
         crate::SplitFocus::Tree => {
-            " [↑↓] Navigate  [←→] Collapse  [/] Filter  [Enter] Open  [Tab] Fields  [Esc] Close "
+            " [↑↓] Navigate  [←] Collapse  [→] Fields  [/] Filter  [Enter] Open  [Esc] Close "
                 .to_string()
         }
         crate::SplitFocus::Right => match right {
-            crate::SplitRightPane::Empty => " [Tab] Sections".to_string(),
-            // No `[←→] Cycle` here: that key only acts on a `Select:` field, and
-            // the edit bar says so for those fields.
+            // `Space/Enter` advance a selector, so the save key is named
+            // explicitly and `Enter` keeps saving only on non-selector fields.
             crate::SplitRightPane::Form { .. } | crate::SplitRightPane::GroupForm { .. } => {
-                " [Tab/Shift+Tab] Field  [Enter] Save  [Ctrl+W] Sections  [Esc] Back ".to_string()
+                " [Tab/Shift+Tab] Field  [Space] Advance  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back "
+                    .to_string()
             }
             crate::SplitRightPane::RoutingList { .. } => {
                 " [↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Sections  [Esc] Back "
