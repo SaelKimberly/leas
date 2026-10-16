@@ -24,7 +24,22 @@ struct LogRow<'a> {
     target_style: Style,
     level: &'a str,
     level_style: Style,
-    msg: &'a str,
+    /// The message split into display lines, each fitting the Message column.
+    /// Index 0 is the first line; the rest are wrapped continuations.
+    msg_lines: Vec<String>,
+}
+
+impl LogRow<'_> {
+    /// Width of the Message column, matching the fixed column spec:
+    /// Time=Fixed(25), Target=Ratio(1), Lvl=Fixed(5), Message=Ratio(4),
+    /// with `column_spacing=1` (3 gaps).
+    const fn msg_col_width(content_width: u16) -> u16 {
+        let fixed: u16 = 25 + 5;
+        let gaps: u16 = 3;
+        let remaining = content_width.saturating_sub(fixed + gaps);
+        // Ratio split 1:4 → Message gets 4/5 of the remaining width.
+        remaining * 4 / 5
+    }
 }
 
 impl DataTableRow for LogRow<'_> {
@@ -40,8 +55,6 @@ impl DataTableRow for LogRow<'_> {
         if col_xs.len() < 4 {
             return;
         }
-        // A multi-line log row may start below the clip line; its first
-        // visible line would be past the frame, so draw nothing.
         if y >= clip_bottom {
             return;
         }
@@ -66,25 +79,52 @@ impl DataTableRow for LogRow<'_> {
             col_widths[2] as usize,
             self.level_style,
         );
-        buf.set_stringn(
-            col_xs[3],
-            y,
-            self.msg,
-            col_widths[3] as usize,
-            Style::default(),
-        );
+        // Paint every wrapped line — the old code drew only the first and left
+        // the continuation blank, which is why paged-up panes looked half empty.
+        let msg_col = col_widths[3] as usize;
+        for (i, line) in self.msg_lines.iter().enumerate() {
+            let row_y = y + i as u16;
+            if row_y >= clip_bottom {
+                break;
+            }
+            buf.set_stringn(col_xs[3], row_y, line, msg_col, Style::default());
+        }
     }
 
-    fn height(&self, available_width: u16) -> u16 {
-        let text_width = unicode_width::UnicodeWidthStr::width(self.msg);
-        let msg_width = available_width.saturating_sub(25).max(1);
-        1 + (text_width as u16).saturating_sub(1) / msg_width
+    fn height(&self, _available_width: u16) -> u16 {
+        self.msg_lines.len() as u16
     }
 }
 
 /// Narrow a [`crate::LogLine`] to its [`LogRow`] display form (borrows the
 /// line; allocates only the formatted timestamp).
-fn log_row_from<'a>(log: &'a crate::LogLine, theme: &opaline::Theme) -> LogRow<'a> {
+/// Split `text` into display lines of at most `width` columns, breaking on
+/// character boundaries (log messages are plain text; no word-wrap needed).
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for ch in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w + w > width && !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(ch);
+        cur_w += w;
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+fn log_row_from<'a>(
+    log: &'a crate::LogLine,
+    theme: &opaline::Theme,
+    content_width: u16,
+) -> LogRow<'a> {
     let target_style = if log.target.starts_with("xray") {
         ThemeStyles::log_info(theme)
     } else if log.target.starts_with("sing") {
@@ -100,14 +140,99 @@ fn log_row_from<'a>(log: &'a crate::LogLine, theme: &opaline::Theme) -> LogRow<'
         "debug" | "trace" => ThemeStyles::hint(theme),
         _ => Style::default(),
     };
+    let msg_width = LogRow::msg_col_width(content_width) as usize;
     LogRow {
         ts: fmt_ts(log.timestamp_nanos),
         target: &log.target,
         target_style,
         level: &log.level,
         level_style,
-        msg: &log.message,
+        msg_lines: wrap_text(&log.message, msg_width),
     }
+}
+
+/// Materialize the visible window by LINE BUDGET, not row count: rows
+/// wrap to multiple lines, so a fixed row count either under-fills the
+/// pane (wrapped rows) or overflows it (short rows). Walk forward from
+/// `offset`, accumulating each row's height until the viewport is full.
+fn build_window<'a>(
+    cache: &'a VecDeque<crate::LogLine>,
+    log_scroll: usize,
+    line_budget: usize,
+    content_width: u16,
+    theme: &'a opaline::Theme,
+    selected_targets: &std::collections::HashSet<String>,
+) -> (Vec<LogRow<'a>>, usize) {
+    let no_filter = selected_targets.is_empty();
+    let matches = |l: &crate::LogLine| no_filter || selected_targets.contains(&l.target);
+    let filtered = cache.iter().filter(|l| matches(l)).count();
+    if filtered == 0 || line_budget == 0 {
+        return (Vec::new(), 0);
+    }
+
+    // `log_scroll` is offset from the bottom, so the window's exclusive end
+    // row is `filtered - log_scroll` (at least 1, so the pane is never empty).
+    let end = filtered.saturating_sub(log_scroll).max(1).min(filtered);
+
+    // Walk BACKWARD from the bottom row, accumulating each row's height until
+    // the line budget is spent. This is what anchors the newest lines at the
+    // pane's bottom edge: sizing the window in ROWS (the old `filtered -
+    // viewport` offset) started too early once messages wrapped, clipping the
+    // tail and leaving the lower half of the pane blank.
+    let mut rows_rev: Vec<LogRow> = Vec::new();
+    let mut used = 0usize;
+    let mut idx = filtered;
+    for log in cache.iter().rev() {
+        if !matches(log) {
+            continue;
+        }
+        idx -= 1;
+        if idx >= end {
+            continue;
+        }
+        let row = log_row_from(log, theme, content_width);
+        let h = row.msg_lines.len();
+        if used + h > line_budget && !rows_rev.is_empty() {
+            break;
+        }
+        used += h;
+        rows_rev.push(row);
+        if used >= line_budget {
+            break;
+        }
+    }
+    rows_rev.reverse();
+
+    // Reached the oldest loaded row without filling the pane (the buffer is
+    // shorter than the viewport, or the user is at the very top): continue
+    // FORWARD past `end` so the window still fills downward.
+    if used < line_budget {
+        let mut idx = 0usize;
+        for log in cache {
+            if !matches(log) {
+                continue;
+            }
+            if idx < end {
+                idx += 1;
+                continue;
+            }
+            let row = log_row_from(log, theme, content_width);
+            let h = row.msg_lines.len();
+            if used + h > line_budget {
+                break;
+            }
+            used += h;
+            rows_rev.push(row);
+            if used >= line_budget {
+                break;
+            }
+            idx += 1;
+        }
+    }
+
+    // Window start in filtered space, for selection/cursor mapping.
+    let start = end.saturating_sub(rows_rev.len().min(end));
+    (rows_rev, start)
 }
 
 /// Materialize row data only for `cache[offset..offset + visible]` — the old
@@ -121,7 +246,7 @@ fn build_rows_viewport(cache: &[crate::LogLine], offset: usize, visible: usize) 
         .get(offset..end)
         .unwrap_or(&[])
         .iter()
-        .map(|log| log_row_from(log, &theme))
+        .map(|log| log_row_from(log, &theme, 120))
         .collect()
 }
 
@@ -200,50 +325,21 @@ pub fn render_inner(frame: &mut Frame, area: Rect, state: &AppState) {
         Column::new("Message", ColumnWidth::Ratio(4)),
     ];
 
-    // Compute offset — during selection, pin viewport so entire range is visible
-    let approx_visible = (log_area.height as usize).saturating_sub(2);
-    // Publish the viewport so the key handler pages by what is actually on
-    // screen. Pane 1 is a fraction of the terminal (pane 2 + status bar sit
-    // below it), so the old terminal-height estimate paged roughly double.
-    state.log_viewport_rows.set(approx_visible);
-    let offset = state.log_select_anchor.map_or_else(
-        || filtered_count.saturating_sub(state.log_scroll + approx_visible),
-        |anchor| {
-            let oldest_row = filtered_count.saturating_sub(state.log_scroll.max(anchor) + 1);
-            let newest_row = filtered_count.saturating_sub(state.log_scroll.min(anchor) + 1);
-            let range_height = newest_row.saturating_sub(oldest_row).saturating_add(1);
-            if range_height <= approx_visible {
-                oldest_row
-            } else {
-                filtered_count.saturating_sub(state.log_scroll + approx_visible)
-            }
-        },
-    );
-    // The DataTable receives ONLY the visible slice with offset 0; a window
-    // starting past the last row would render an empty table (the old full-
-    // slice path clamped internally). Clamp here so at least one row shows.
-    let offset = offset.min(filtered_count.saturating_sub(1));
+    // The viewport's LINE budget: rows wrap, so this is lines, not rows.
+    let line_budget = (log_area.height as usize).saturating_sub(2);
+    // Publish it so the key handler pages by what is actually on screen.
+    state.log_viewport_rows.set(line_budget);
 
-    // Materialize ONLY the visible window of the filtered stream: rows borrow
-    // the cache lines, and the pass stops as soon as the window is filled.
-    // Multi-line (wrapped) rows can exceed the area height, so build one row
-    // of slack; the DataTable clips whatever overflows.
-    let visible = approx_visible.saturating_add(1);
-    let no_filter = state.selected_targets.is_empty();
-    let mut log_rows: Vec<LogRow> = Vec::with_capacity(visible);
-    let mut rank = 0usize;
-    for log in &state.log_cache {
-        if !no_filter && !state.selected_targets.contains(&log.target) {
-            continue;
-        }
-        if rank >= offset {
-            log_rows.push(log_row_from(log, theme));
-            if log_rows.len() >= visible {
-                break;
-            }
-        }
-        rank += 1;
-    }
+    // Bottom-anchored window: newest rows at the pane's bottom edge, walking
+    // backward by line budget so wrapped rows cannot clip the tail.
+    let (log_rows, offset) = build_window(
+        &state.log_cache,
+        state.log_scroll,
+        line_budget,
+        log_area.width,
+        theme,
+        &state.selected_targets,
+    );
 
     // Build multi-selection set from anchor range (offset-from-bottom),
     // translated into visible-window row indices (the slice starts at `offset`
@@ -1046,6 +1142,73 @@ mod tests {
         assert!(
             state.log_scroll < 500,
             "the cursor must stay inside the buffer"
+        );
+    }
+
+    /// A wrapped message must paint every continuation line, not just the
+    /// first. The old `render` drew one line and left the rest blank, so a
+    /// paged-up pane looked half empty — the user-visible defect.
+    #[test]
+    fn wrapped_message_paints_every_continuation_line() {
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        // 200 chars in a 69-column Message column → 3 lines.
+        let long = "x".repeat(200);
+        let log_line = crate::LogLine {
+            level: "info".to_string(),
+            target: "tui".to_string(),
+            message: long,
+            detail: None,
+            timestamp_nanos: 1_700_000_000_000_000_000,
+        };
+        let row = log_row_from(&log_line, &theme, 120);
+        assert_eq!(row.msg_lines.len(), 3, "200 chars in 69 cols = 3 lines");
+
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 120, 8));
+        let col_xs = [0u16, 26, 60, 66];
+        let col_widths = [25u16, 33, 5, 60];
+        row.render(&col_xs, &col_widths, &[0, 1, 2, 3], &mut buf, 0, 8);
+
+        // Every one of the 3 lines must be painted in the Message column.
+        for i in 0..3u16 {
+            let cell = buf[(66, i)].clone();
+            assert_eq!(cell.symbol(), "x", "line {i} of the wrap must be painted");
+        }
+        // And nothing below the row.
+        assert_eq!(buf[(66, 3)].symbol(), " ");
+    }
+
+    /// The window must be filled by LINE BUDGET: with wrapped rows the pane
+    /// holds fewer rows but no blank tail. A fixed row count is what left the
+    /// bottom half empty after `PageUp`.
+    #[test]
+    fn window_fills_by_line_budget_not_row_count() {
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        // 10 rows, each wrapping to 2 lines (122 chars in a 69-col Message
+        // column); the viewport holds 10 lines.
+        let cache: Vec<_> = (0..10)
+            .map(|i| crate::LogLine {
+                level: "info".to_string(),
+                target: "tui".to_string(),
+                message: format!("{} {}", "y".repeat(120), i),
+                detail: None,
+                timestamp_nanos: 1_700_000_000_000_000_000 + i64::from(i),
+            })
+            .collect();
+        let cache: VecDeque<_> = cache.into();
+        let (rows, _) = build_window(
+            &cache,
+            0,
+            10,
+            120,
+            &theme,
+            &std::collections::HashSet::new(),
+        );
+        // 10 lines / 2 per row = 5 rows, not 10.
+        assert_eq!(rows.len(), 5, "line budget, not row count");
+        assert_eq!(
+            rows.iter().map(|r| r.msg_lines.len()).sum::<usize>(),
+            10,
+            "total height must exactly fill the viewport"
         );
     }
 

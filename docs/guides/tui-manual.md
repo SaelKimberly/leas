@@ -228,8 +228,13 @@ log lines appear in real time. Log levels are color-coded:
 - **info** — default terminal color
 - **debug/trace** — gray (`Theme::HINT`)
 
-The buffer holds the most recent 1000 log lines. Scrolling is bottom-anchored
-(0 = newest line visible at bottom of viewport).
+The buffer holds the most recent 1000 log lines (older rows load on demand as you
+scroll up). Scrolling is bottom-anchored: `log_scroll` counts rows up from the
+newest line, and the viewport is filled by a LINE budget — a message longer than
+the Message column wraps onto continuation lines, and the window walks backward
+from the anchor until the pane's lines are spent. So the pane always fills from
+its anchor edge and the newest lines stay visible at the bottom; `PageUp` pages
+by the real pane height, not the terminal's.
 
 ---
 
