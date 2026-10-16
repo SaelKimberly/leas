@@ -96,23 +96,56 @@ impl DataTableRow for LogRow<'_> {
     }
 }
 
-/// Narrow a [`crate::LogLine`] to its [`LogRow`] display form (borrows the
-/// line; allocates only the formatted timestamp).
+/// Most lines a single log entry may occupy in the pane.
+///
+/// A core can emit a "slow query" line far longer than the whole viewport;
+/// rendering it would push every other row out of view for no benefit, so a
+/// message is capped here and the last line is elided.
+const MAX_LOG_LINES: usize = 3;
+
 /// Split `text` into display lines of at most `width` columns, breaking on
 /// character boundaries (log messages are plain text; no word-wrap needed).
+///
+/// At most [`MAX_LOG_LINES`] lines are produced. When the text overflows, the
+/// final line is truncated to fit and ends with `...` so the elision is
+/// visible rather than looking like the message simply ended.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
+    let mut truncated = false;
     for ch in text.chars() {
         let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w + w > width && !cur.is_empty() {
+            // Starting a 4th line means the message does not fit the cap.
+            if lines.len() + 1 == MAX_LOG_LINES {
+                truncated = true;
+                break;
+            }
             lines.push(std::mem::take(&mut cur));
             cur_w = 0;
         }
         cur.push(ch);
         cur_w += w;
+    }
+    if truncated {
+        // Reserve room for the marker so the line still fits the column.
+        let marker = "...";
+        let keep = width.saturating_sub(marker.len());
+        let mut clipped = String::new();
+        let mut w = 0usize;
+        for ch in cur.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > keep {
+                break;
+            }
+            clipped.push(ch);
+            w += cw;
+        }
+        clipped.push_str(marker);
+        lines.push(clipped);
+        return lines;
     }
     if !cur.is_empty() || lines.is_empty() {
         lines.push(cur);
@@ -1175,6 +1208,41 @@ mod tests {
         }
         // And nothing below the row.
         assert_eq!(buf[(66, 3)].symbol(), " ");
+    }
+
+    /// A message longer than [`MAX_LOG_LINES`] lines is capped and marked: a
+    /// "slow query" line can exceed the whole pane, and rendering all of it
+    /// would push every other row out of view for no benefit.
+    #[rstest::rstest]
+    #[case::short(2, 2, false)] // 2*69 = 138 chars → 2 lines, no marker
+    #[case::exactly_three(3, 3, false)] // 3*69 = 207 chars → exactly 3 lines
+    #[case::over_cap(50, 3, true)] // 3450 chars → capped at 3, elided
+    fn long_messages_are_capped_and_elided(
+        #[case] lines: usize,
+        #[case] expected_lines: usize,
+        #[case] expect_marker: bool,
+    ) {
+        let width = 69;
+        let text = "x".repeat(width * lines);
+        let out = wrap_text(&text, width);
+        assert_eq!(
+            out.len(),
+            expected_lines,
+            "line count for {lines} input lines"
+        );
+        assert_eq!(
+            out.last().unwrap().ends_with("..."),
+            expect_marker,
+            "elision marker for {lines} input lines: {:?}",
+            out.last().unwrap()
+        );
+        // No line may exceed the column, marker included.
+        for l in &out {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l.as_str()) <= width,
+                "line fits the column: {l:?}"
+            );
+        }
     }
 
     /// The window must be filled by LINE BUDGET: with wrapped rows the pane

@@ -236,6 +236,10 @@ from the anchor until the pane's lines are spent. So the pane always fills from
 its anchor edge and the newest lines stay visible at the bottom; `PageUp` pages
 by the real pane height, not the terminal's.
 
+A single entry occupies at most **3 lines**. A core can emit a "slow query"
+line longer than the whole pane; rendering it in full would push every other
+row out of view, so the third line is truncated to fit and ends with `...`.
+
 ---
 
 ### Metrics (pane 2 tab)
