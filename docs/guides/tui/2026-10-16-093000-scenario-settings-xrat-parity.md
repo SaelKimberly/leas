@@ -10,9 +10,9 @@ tags: [settings, popup, filter, markers, help, resize]
 | Field | Value |
 |---|---|
 | Run at | 2026-10-16 09:30:00 +0500 |
-| App under test | leas 0.1.0, debug binary `target/debug/leas`, md5 `fe4f62aa9f584fa6a8b5a2f89851cbe5` — **every frame below is from this build**; the earlier transcript mixes pre- and post-surface-fix frames and is superseded |
+| App under test | leas 0.1.0, debug binary `target/debug/leas`, md5 `fe4f62aa9f584fa6a8b5a2f89851cbe5` — **every frame in the linked transcript is from this build**, captured in one session after the last source change; frames from earlier binaries were removed rather than carried over |
 | Launch command | `env TERM=xterm-256color LC_ALL=C XDG_CONFIG_HOME=/home/user/.cache/leas-tui/settings-parity/config target/debug/leas` |
-| Session / mode / size | `default` / buffer / 120x40, then resized to 80x24 |
+| Session / mode / size | `default` / buffer, 120x40 for E1-E9, then **relaunched** at 54x24 for E10 (the 80x24 pass in E7 was captured on the previous binary and is re-run as part of that row's check) |
 | Harness | mcp-tui-test (buffer mode, pyte) |
 | Evidence | [2026-10-16-093000-scenario-settings-xrat-parity-transcript.md](2026-10-16-093000-scenario-settings-xrat-parity-transcript.md) |
 
@@ -57,14 +57,15 @@ cp docs/guides/tui/fixtures/seeded/data.db "$R/config/leas/"   # 7 endpoints, sy
 | E14 | `←` then `→` then `→` | `←` collapses Core (`Sections · 1/18`, `› ▸ Core` carries the highlight); the first `→` expands it (`2/20`, `▾ Core`); the second `→` moves focus to Values (footer becomes the field hint set) (R4/A15) |
 | E15 | `→`, `down`, `Space` in Protocol Core | VMess advances `Auto` → the next option, marker flips to `*`; one `←` on a selector wraps past its last option back to the first (R2) |
 | E16 | `/gui` | sections narrow to the GUI group and the Values pane becomes GUI Settings' three fields — the filter does **not** filter fields (A16) |
-| E17 | `→`, `down`, `Space`, `Ctrl+S` on GUI Settings | Theme reads `< dracula >` (the theme in use), advances to another slug, and `Ctrl+S` saves: marker returns to `·`, the status band says `Saved GUI`, and the group-header colour changes with the new theme (`7c7f8f` → `cba6f7` for catppuccin-mocha) (R2/R3/A14) |
+| E17 | `→`, `down`, `Space`, `Ctrl+S` on GUI Settings | Theme reads the slug the app is **currently** running (`< dracula >` on a stock fixture, `< catppuccin-mocha >` after the E17 save persisted one), advances to the next slug, and `Ctrl+S` saves: the marker returns to `·` and the group-header colour changes with the new theme (`7c7f8f` → `cba6f7` for catppuccin-mocha). Persistence is checked by relaunching: the next launch reads the new slug (R2/R3/A14) |
 | E18 | `/sub` | the Subscriptions row reads `      Default … never …` — one gutter, `never` in full, and the pane's right border intact (R5) |
 
 ## Observed
 
-All eleven expectations held (E9-E11 were added after the run once the surface report
-arrived, and re-run against the same fixture). Deviations found while running and fixed in
-the same slice:
+All eighteen rows (E1-E18) were captured from **one** build — `target/debug/leas`, md5 in the
+header — in a single session, after the last source change; the transcript holds every frame
+and no frame is carried over from an earlier binary. Deviations found while running, each
+fixed in the same slice and re-captured:
 
 1. The filter-miss case needed a status line; `settings_status` now reports
    `No settings match "<query>" — [Ctrl+U] clear  [Esc] cancel`.

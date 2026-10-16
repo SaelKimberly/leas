@@ -3,11 +3,57 @@
 Raw captures for
 [2026-10-16-093000-scenario-settings-xrat-parity.md](2026-10-16-093000-scenario-settings-xrat-parity.md).
 
-**Binary: `target/debug/leas` md5 `fe4f62aa9f584fa6a8b5a2f89851cbe5`.** Every frame below was captured from that build
-in one session; no frame is carried over from an earlier binary.
+**Binary: `target/debug/leas` md5 `fe4f62aa9f584fa6a8b5a2f89851cbe5`.** Every frame below was captured
+from that build, in sessions started after the last source change; no frame is carried over from
+an earlier binary.
 
 Fixture: `/home/user/.cache/leas-tui/settings-parity` (7 synthetic endpoints). Session
-`default`, buffer mode, 120x40 unless stated. One key per call (see Harness notes).
+`default`, buffer mode, 120x40 unless a heading says otherwise. One key per call (see
+Harness notes).
+
+## E5 / E8 — an unsaved edit, then the discard confirmation (120x40)
+
+```
+│ ┌ Sections · 2/20 ────────────┐ ┌ Values · 1/5 ──────────────────────────────────────────────────────────┐ │
+│ │  ▾ Core                     │ │›* Xray Path               1.1.1.1█                                     │ │
+│ │›    Core Settings           │ │ · Sing-Box Path           —                                            │ │
+│ │     Protocol Core           │ │ · Log Level               < warning >                                  │ │
+│ │  ▾ Connection               │ │ · Skip Cert Verify        ✗                                            │ │
+│ │     Inbound                 │ │ · Clash Mixin (JSON/YAML) —                                            │ │
+│ │  ▾ GUI                      │ │  ╭ Confirm ──────────────────────────╮                                 │ │
+│ │     GUI Settings            │ │  │  Discard unsaved settings? (y/N)  │                                 │ │
+```
+
+`Esc` on a dirty form asks before discarding; the status bar switches to `[y] Confirm  [n/Esc] Cancel`.
+
+## E7 — the same state at 80x24 (live resize)
+
+```
+┌ 1: [Profiles]  Logs ─────────────────────────────────────────────────────────┐
+│ ┌ Settings * ──────────────────────────────────────────────────────────────┐ │
+│ │ ┌ Edit Xray Path · Text ───────────────────────────────────────────────┐ │ │
+│ │ │type to change · [Backspace] erase · [Tab] next field                 │ │ │
+│ │ └──────────────────────────────────────────────────────────────────────┘ │ │
+│ │ ┌ Sections · 2/20 ──────┐ ┌ Values · 1/5 ──────────────────────────────┐ │ │
+│ │ │  ▾ Core               │ │›* Xray Path               1.1.1.1█         │ │ │
+│ │ │›    Core Settings     │ │ · Sing-Box Path           —                │ │ │
+│ │ │     Protocol Core     │ │ · Log Level               < warning >      │ │ │
+│ │ │  ▾ Connection         │ │ · Skip Cert Verify        ✗                │ │ │
+│ │ │     Inbound     ╭ Confirm ──────────────────────────╮                │ │ │
+│ │ └─────────────────│  Discard unsaved settings? (y/N)  │────────────────┘ │ │
+│ │ ┌ Help · Core ────│                                   │────────────────┐ │ │
+│ │ │Field    Xray Pat│                                   │                │ │ │
+└─│ │Type     Text    ╰───────────────────────────────────╯                │ │─┘
+┌ │ │Accepts  free text                                                    │ │─┐
+│ │ │Current  1.1.1.1                                                      │ │ │
+│ │ │Keys     · saved   * unsaved   › selected                             │ │ │
+│ └──────────────────────────────────────────────────────────────────────┘ │ │
+└─└──────────────… [Space] Advance [Ctrl+S] Save [Ctrl+W] Sections [Esc] Back┘─┘
+ Settings > Core Disconnected                       [y] Confirm  [n/Esc] Cancel
+```
+
+The popup stays framed, the sections list scrolls to keep the selection visible, the `*` row
+stays visible, and the footer drops from the left (`…`) while keeping `[Esc] Back`.
 
 ## E1 / E12 — `,` on a fresh launch: the Values pane is never empty
 
