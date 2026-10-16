@@ -199,7 +199,13 @@ impl DataTableRow for DisplayRowData {
                 // The `+`/`-` marker takes the first cell; the host starts one
                 // cell in and is one cell narrower (D11), elided by §8.
                 if self.expand_prefix != ' ' {
-                    buf.set_stringn(x, y, self.expand_prefix.encode_utf8(&mut [0u8; 4]), 1, self.prefix_style);
+                    buf.set_stringn(
+                        x,
+                        y,
+                        self.expand_prefix.encode_utf8(&mut [0u8; 4]),
+                        1,
+                        self.prefix_style,
+                    );
                 }
                 let host_w = max_w.saturating_sub(1);
                 let host = truncate_host(text, host_w);
@@ -622,7 +628,9 @@ fn link_id_cell(row: &EndpointRow, dns_unresolved: bool, is_multi: bool) -> Stri
     }
     row.representative_link_index(dns_unresolved)
         .and_then(|idx| row.links.get(idx))
-        .map_or_else(String::new, |l| format!("{:08x}", l.protocol_id.get() as u32))
+        .map_or_else(String::new, |l| {
+            format!("{:08x}", l.protocol_id.get() as u32)
+        })
 }
 
 /// Flag cell (D14): `<flag emoji>-<ISO>` (5 cells) when the terminal renders
@@ -683,8 +691,8 @@ fn flags_supported() -> bool {
     use std::sync::OnceLock;
     static FLAGS: OnceLock<bool> = OnceLock::new();
     *FLAGS.get_or_init(|| {
-        let disabled = std::env::var_os("LEAS_NO_FLAGS").is_some()
-            || std::env::var_os("NO_EMOJI").is_some();
+        let disabled =
+            std::env::var_os("LEAS_NO_FLAGS").is_some() || std::env::var_os("NO_EMOJI").is_some();
         if disabled {
             return false;
         }
@@ -854,7 +862,9 @@ fn build_display_rows(
         // Whitelist tokens (spec §7 col 6); the DNS-unresolved flag moved to
         // the Test cell's `[name]` marker, which already carried it.
         let white_str = white_cell(
-            info.is_some_and(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted),
+            info.is_some_and(|i| {
+                i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted
+            }),
             info.and_then(|i| i.sni_whitelisted).unwrap_or(false),
         );
         let (test_str, test_style) = compute_test_cell(row, resolved, theme);
@@ -888,7 +898,8 @@ fn build_display_rows(
         } else {
             (None, None)
         };
-        let outbound_addr = truncate_pad(&persisted_outbound.unwrap_or_else(|| "—".to_string()), 14);
+        let outbound_addr =
+            truncate_pad(&persisted_outbound.unwrap_or_else(|| "—".to_string()), 14);
         let outbound_flag = flag_cell(enriched_country.as_deref(), flags_supported());
 
         // Panel content
@@ -1097,9 +1108,9 @@ fn render_data_grid(
         (4, "Port", 6),     // port
         (5, "White", 9),    // whitelist tokens
         (6, "Protocol", 24),
-        (7, "Test", 7),     // + fixed sort arrow
-        (8, "Out", 5),      // exit flag
-        (9, "Exit", 14),    // exit IP
+        (7, "Test", 7),  // + fixed sort arrow
+        (8, "Out", 5),   // exit flag
+        (9, "Exit", 14), // exit IP
     ];
     let mut widths: Vec<u16> = logical.iter().map(|(_, _, w)| *w).collect();
     let inner_w = area.width.saturating_sub(2); // frameless inset
@@ -1955,7 +1966,14 @@ mod tests {
         }
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 20));
 
-        row.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 0, 20);
+        row.render(
+            &col_xs,
+            &col_widths,
+            &(0..col_xs.len()).collect::<Vec<_>>(),
+            &mut buf,
+            0,
+            20,
+        );
 
         let line: String = (0..120).map(|x| buf[(x, 4)].symbol()).collect();
         assert!(
@@ -1995,7 +2013,14 @@ mod tests {
         }
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 20));
 
-        row.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 0, 20);
+        row.render(
+            &col_xs,
+            &col_widths,
+            &(0..col_xs.len()).collect::<Vec<_>>(),
+            &mut buf,
+            0,
+            20,
+        );
 
         // Window = panel rows 5..13 (centered on the selected 9): the first
         // visible sub-row line carries row 5's id, not row 0's.
@@ -2046,7 +2071,14 @@ mod tests {
             }
         }
 
-        row.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 0, 20);
+        row.render(
+            &col_xs,
+            &col_widths,
+            &(0..col_xs.len()).collect::<Vec<_>>(),
+            &mut buf,
+            0,
+            20,
+        );
 
         // Panel starts at y=1; sub-rows at y0+3 → sub-row 0 at y=4, sub-row 1
         // at y=5. x=1 is the panel's first inner cell.
@@ -2083,8 +2115,22 @@ mod tests {
         let col_widths = vec![1u16; 17];
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
 
-        row0.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 0, 20);
-        row1.render(&col_xs, &col_widths, &(0..col_xs.len()).collect::<Vec<_>>(), &mut buf, 8, 20);
+        row0.render(
+            &col_xs,
+            &col_widths,
+            &(0..col_xs.len()).collect::<Vec<_>>(),
+            &mut buf,
+            0,
+            20,
+        );
+        row1.render(
+            &col_xs,
+            &col_widths,
+            &(0..col_xs.len()).collect::<Vec<_>>(),
+            &mut buf,
+            8,
+            20,
+        );
 
         // Panel (height 6) sits at y=1..6: bottom-left corner at y=6.
         assert_eq!(buf[(0, 6)].symbol(), "\u{2570}"); // ╰

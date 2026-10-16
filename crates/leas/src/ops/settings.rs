@@ -1,10 +1,8 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use leas_config::IpProvider;
 use leas_core::CoreType;
 use leas_db::models::RoutingRule;
-use ratatui_cheese::tree::TreeState;
 
 use crate::AppState;
 use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
@@ -14,14 +12,14 @@ pub fn cancel_form(state: &mut AppState) {
 }
 
 pub fn enter_settings(state: &mut AppState) {
-    // Select the first LEAF, not the group header: on a group row `Enter`
-    // collapses the group, so the first press would never open a form
-    // (tui-polish §5.4). `all_expanded(5)`'s default selection is (0, None).
-    let mut tree = TreeState::all_expanded(5);
-    tree.select(0, Some(0));
+    // Selection starts on the first leaf and all groups are expanded, so the
+    // first `Enter` opens a section (tui-polish §5.4). The list, the search bar
+    // and the status message are session state and never resume stale values.
+    state.settings_sections = crate::types::SectionList::default();
+    state.settings_search = crate::types::SettingsSearch::default();
+    state.settings_notice = None;
     state.mode = AppMode::Settings {
         mode: SettingsMode::Split {
-            tree: RefCell::new(tree),
             focus: SplitFocus::Tree,
             right: SplitRightPane::Empty,
         },

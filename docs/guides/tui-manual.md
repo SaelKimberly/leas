@@ -102,11 +102,46 @@ address/port. `Esc` clears filter and exits search mode.
 Opened with `,` from anywhere in the shell: a centered modal (width
 `clamp(term-4, 50, 110)`, height `clamp(term-2, 20, 40)`) over both panes. Not a
 tab — the shell stays rendered behind it. `Esc` closes; a form with unsaved edits
-asks `Discard unsaved settings? (y/N)` first.
+asks `Discard unsaved settings? (y/N)` first. The popup carries its own key hints
+in its bottom border, so the app status bar shows only the mode.
 
-Left side: a menu of 14 sections. Press `Enter` on a section to open its
-configuration form on the right. A separator line visually groups the first 5 "active" sections
-from the remaining "deferred" sections.
+```
+┌ Settings * ─────────────────────────────────────────────┐
+│ ┌ Search ─────────────────────────────────────────────┐ │   filter / edit bar
+│ │Press / to filter settings                          │ │
+│ └─────────────────────────────────────────────────────┘ │
+│ ┌ Sections · 2/20 ─────────┐ ┌ Values · 1/2 ──────────┐ │   section list / fields
+│ │  ▾ Core                  │ │›* Servers (JSON)   x█  │ │
+│ │›    Core Settings        │ │ · DNS Cache TTL    —   │ │
+│ └──────────────────────────┘ └────────────────────────┘ │
+│ ┌ Help · DNS ─────────────────────────────────────────┐ │   field help
+│ │Type     Text                                        │ │
+│ └─────────────────────────────────────────────────────┘ │
+│ Saved DNS                                                │   status (errors/notice)
+└────────────────────── [Enter] Open  [Esc] Close ────────┘
+```
+
+**Bands, top to bottom.**
+
+1. **Filter / edit bar.** Idle it reads `Search` with `Press / to filter settings`;
+   while filtering the title is `Filter` and the body is your query behind a `█`
+   cursor; with a field focused it names what you are editing (`Edit Servers (JSON) · Text`).
+   Its border is accented while it is active.
+2. **Sections** (left, 30 %) and **Values** (right). The titles count where you are:
+   `Sections · n/N` counts rows (group headers included), `Values · i/n` counts the
+   field rows of the open section. A group header carries `▾` when expanded and `▸`
+   when collapsed; `←`/`→` toggles the group that owns the selection, and a collapsed
+   group's header carries the highlight.
+3. **Help** names the field under the cursor: `Field`, `Type`, `Accepts`, `Current`,
+   plus the marker legend. It yields rows first on a short terminal, so the lists keep
+   their viewport.
+4. **Status** appears only when it has something to say: the first validation error,
+   a filter that matched nothing, or the last save.
+
+**Value rows** are `›` (focused) + a provenance marker + the label + the value:
+`·` for a value that matches what the section was loaded with, `*` for an edit that
+has not been saved yet. Bools render `✓`/`✗`, an empty text field renders `—`,
+selects render `< option >`, and a focused row ends with a `█` cursor.
 
 **Menu items (in order):**
 
@@ -125,11 +160,26 @@ from the remaining "deferred" sections.
 13. Subscriptions — group list, add/edit/delete/update (`g` from Profiles jumps here)
 14. Updates — check and install backend updates
 
-**Form navigation within a section:**
-- `Tab` / `Shift+Tab` — move focus between fields
-- `Enter` — save the form
-- `Esc` — back to the menu; asks before discarding unsaved edits
-- `Tab` on the section tree — closes the popup
+**Keys.**
+
+| Key | Where | Action |
+| --- | --- | --- |
+| `↑`/`↓` | either pane | move the selection / field focus |
+| `←`/`→` | Sections | collapse/expand the group that owns the selection |
+| `←`/`→` | Values | cycle a `Select:` field's options |
+| `/` | Sections, or a list pane | focus the filter bar |
+| `Enter` | Sections | open the selected section (a collapsed group expands first) |
+| `Enter` | Values | validate and save the section |
+| `Tab`/`Shift+Tab` | Values | next / previous field |
+| `Ctrl+W` | anywhere | swap focus between Sections and Values |
+| `Esc` | popup | close (asks before discarding unsaved edits); while filtering, cancels the filter |
+
+**Filter.** `/` starts a case-insensitive substring filter: it keeps the sections whose
+name or group matches, and the field rows of the open section whose label matches. The
+field you are editing always stays visible. `Enter` applies (the query stays), `Esc`
+cancels (the query clears), `Ctrl+U` clears it. A query that matches nothing says so in
+the status band. A filtered list ignores collapsed groups, so a search always reveals
+its own matches.
 
 **Routing Rules** (section 4) has a two-level UI:
 - Routing list: `↑↓` navigate, `Enter` edit, `a` add, `d` delete, `r` reorder
@@ -474,8 +524,13 @@ appended when updates are available for installed backends.
 | Pane 1 · Logs          | `[↑↓] Scroll  [c] Clear  [t] Targets  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
 | Pane 2 · Details       | `[↑↓] Scroll  [F1] Compact  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
 | Pane 2 · Metrics       | `[↑↓] Scroll  [Alt+↑↓] Resize  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
-| Settings popup (tree)  | `[↑↓] Navigate  [←→] Collapse  [Enter] Open  [Ctrl+W] Focus Form  [Tab] Close  [Esc] Close` |
-| Settings popup (form)  | `[Tab/Shift+Tab] Focus  [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back` |
+| Settings popup (sections) | `[↑↓] Navigate  [←→] Collapse  [/] Filter  [Enter] Open  [Tab] Fields  [Esc] Close` |
+| Settings popup (fields)   | `[Tab/Shift+Tab] Field  [Enter] Save  [/] Filter  [Esc] Back` |
+| Settings popup (filtering) | `[type] Filter  [Enter] Apply  [Ctrl+U] Clear  [Esc] Cancel` |
+| Settings popup (routing list) | `[↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Sections  [Esc] Back` |
+| Settings popup (routing form) | `[Enter] Save  [Ctrl+W] Sections  [Esc] Back` |
+| Settings popup (updates) | `[C] Check  [D] Download  [Ctrl+W] Sections  [Esc] Back` |
+| Settings popup (subscriptions) | `[↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Sections  [Esc] Back` |
 | Confirm modal          | `[y] Confirm  [n/Esc] Cancel`             |
 | Speed test menu        | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
 | Help overlay           | `[Esc] Close help`                        |
@@ -518,11 +573,13 @@ appended when updates are available for installed backends.
 
 | Key               | Action                              |
 | ----------------- | ----------------------------------- |
-| `↑` / `↓`        | Navigate settings menu              |
-| `Enter`          | Open selected section               |
-| `Tab` / `Shift+Tab` | Close the popup                  |
-| `Esc`            | Close settings / back to menu (asks before discarding unsaved edits) |
-| `?`              | Toggle help overlay                 |
+| `↑` / `↓`        | Navigate the section list           |
+| `←` / `→`        | Collapse / expand the selected section's group |
+| `/`              | Filter sections and fields          |
+| `Enter`          | Open the selected section           |
+| `Tab` / `Shift+Tab` | Move focus into the Values pane |
+| `Ctrl+W`         | Toggle focus between the two panes  |
+| `Esc`            | Close settings (asks before discarding unsaved edits) |
 | `q` / `Ctrl+C`   | Quit application                    |
 
 ### Settings Forms

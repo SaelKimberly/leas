@@ -9,7 +9,6 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-
 fn connection_icon(state: &AppState) -> (&'static str, Style) {
     let theme = state.theme();
     if state.connecting {

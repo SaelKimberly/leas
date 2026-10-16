@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -9,7 +8,6 @@ use leas_core::CoreType;
 use leas_core::grpc_client;
 use leas_core::speed_test::TestType;
 use leas_native::telemetry::{TraceEvent, TraceKind, TraceSecurity};
-use ratatui_cheese::tree::TreeState;
 
 /// Re-export `EndpointRow` as `EndpointRow` for backward compatibility.
 pub use leas_db::models::EndpointRow;
@@ -302,25 +300,50 @@ pub enum SplitFocus {
 }
 
 /// Sub-modes for the Settings panel.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SettingsMode {
     Split {
-        tree: RefCell<TreeState>,
         focus: SplitFocus,
         right: SplitRightPane,
     },
 }
 
-impl Clone for SettingsMode {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Split { tree, focus, right } => Self::Split {
-                tree: RefCell::new(tree.borrow().clone()),
-                focus: *focus,
-                right: right.clone(),
-            },
-        }
+/// The Settings section list (spec D2): a flat, filterable row list.
+///
+/// `selected` is an index into the `SETTINGS_TREE` leaves in document order,
+/// so expansion and filtering never move the selection onto a different
+/// section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SectionList {
+    /// Selected leaf, as a `SETTINGS_TREE` leaf index.
+    pub selected: usize,
+    /// Per-group expansion; a missing entry means expanded.
+    pub expanded: Vec<bool>,
+}
+
+impl SectionList {
+    /// A group is expanded unless it was explicitly collapsed.
+    #[must_use]
+    pub fn is_expanded(&self, group: usize) -> bool {
+        self.expanded.get(group).copied().unwrap_or(true)
     }
+
+    /// Toggle one group's expansion.
+    pub fn toggle_expanded(&mut self, group: usize) {
+        let current = self.is_expanded(group);
+        if self.expanded.len() <= group {
+            self.expanded.resize(group + 1, true);
+        }
+        self.expanded[group] = !current;
+    }
+}
+
+/// The Settings search bar (spec D8): the query and whether the bar owns the
+/// keyboard. Session-only; reset by `enter_settings`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsSearch {
+    pub query: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -113,10 +113,13 @@ pub fn with_app_roles(mut theme: Theme) -> Theme {
         "app.statusbar_hint",
         OpalineStyle::fg(hint_fg).with_bg(status_bg),
     );
-    theme.register_default_style(
-        "app.dialog",
-        OpalineStyle::fg(theme.color("text.primary")).with_bg(theme.color("bg.elevated")),
-    );
+    // Modals share the APP background — no fill of their own — as in the
+    // reference, where `theme::clear()` paints every modal and the app with
+    // one `palette.background`; the border is what separates them. An earlier
+    // `bg.elevated` fill here (and a `bg.surface` token that was not an
+    // opaline token at all, resolving to fallback grey #808080) made dialogs
+    // and the settings popup read as slabs of colour.
+    theme.register_default_style("app.dialog", OpalineStyle::fg(theme.color("text.primary")));
     theme.register_default_style(
         "app.table_row_alt",
         OpalineStyle::fg(theme.color("text.primary")).with_bg(theme.color("bg.panel")),

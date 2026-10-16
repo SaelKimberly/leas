@@ -12,7 +12,6 @@ pub mod widgets;
 use crate::ui::theme::ThemeStyles;
 use crate::{AppMode, AppState, ConfirmAction};
 use crossterm::cursor::SetCursorStyle;
-use ratatui::style::{Modifier, Style};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
@@ -25,8 +24,9 @@ use leas_config::subscription::subscription_url_split;
 use leas_db::profiles_query::PlanScope;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::io;
 use std::sync::atomic::Ordering;
@@ -747,21 +747,16 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.selected_sub = None;
             crate::ops::profiles::move_selection(state, page).await;
         }
-        KeyCode::Up
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.profiles_active() =>
-        {
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() => {
             state.move_profile_up();
         }
         KeyCode::Down
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.profiles_active() =>
+            if key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() =>
         {
             state.move_profile_down();
         }
         KeyCode::Enter | KeyCode::Char('g')
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.profiles_active() =>
+            if key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() =>
         {
             if let Some(id) = state.selected_profile_id() {
                 state.connect_to_profile(id);
@@ -792,8 +787,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         // Ctrl+A: select all filtered profiles
         KeyCode::Char('a')
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.profiles_active() =>
+            if key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() =>
         {
             let ids: Vec<i64> = state
                 .filtered_profiles()
@@ -805,8 +799,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         // Ctrl+G: deselect all (Ctrl+Shift+A is the same as Ctrl+A on most terminals)
         KeyCode::Char('g')
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.profiles_active() =>
+            if key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() =>
         {
             state.multi_select.clear();
         }
@@ -817,8 +810,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             let _ = execute!(std::io::stdout(), SetCursorStyle::BlinkingBlock);
         }
         KeyCode::Char('e')
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.profiles_active() =>
+            if key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() =>
         {
             state.mode = crate::AppMode::ExportScope { selected: 0 };
         }
@@ -838,8 +830,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.start_add_server();
         }
         KeyCode::Char('e' | 'E')
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.profiles_active() =>
+            if !key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() =>
         {
             if let Some(id) = state.selected_profile_id() {
                 state.start_edit_profile(&id.to_string()).await;
@@ -899,16 +890,14 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
         }
         KeyCode::Char('c' | 'C')
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.profiles_active() =>
+            if !key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() =>
         {
             if let Some(id) = state.selected_profile_id() {
                 state.clone_profile(id);
             }
         }
         KeyCode::Char('v')
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.profiles_active() =>
+            if key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() =>
         {
             let clipboard_text = crate::ops::clipboard::get_text().unwrap_or_default();
 
@@ -1129,14 +1118,15 @@ mod overlay_tests {
     #[tokio::test]
     async fn popups_are_ordered_and_exclusive_per_mode() {
         assert_eq!(
-            overlay_stack(&state_with(crate::AppMode::Settings {
-                mode: crate::SettingsMode::Split {
-                    tree: std::cell::RefCell::new(ratatui_cheese::tree::TreeState::default()),
-                    focus: crate::SplitFocus::Tree,
-                    right: crate::SplitRightPane::Empty,
-                },
-            })
-            .await),
+            overlay_stack(
+                &state_with(crate::AppMode::Settings {
+                    mode: crate::SettingsMode::Split {
+                        focus: crate::SplitFocus::Tree,
+                        right: crate::SplitRightPane::Empty,
+                    },
+                })
+                .await
+            ),
             vec![OverlayKind::Settings]
         );
         assert_eq!(
@@ -1147,7 +1137,10 @@ mod overlay_tests {
             overlay_stack(&state_with(crate::AppMode::ExportScope { selected: 0 }).await),
             vec![OverlayKind::Export]
         );
-        assert_eq!(overlay_stack(&state_with(crate::AppMode::List).await), vec![]);
+        assert_eq!(
+            overlay_stack(&state_with(crate::AppMode::List).await),
+            vec![]
+        );
     }
 
     #[tokio::test]
@@ -1155,11 +1148,13 @@ mod overlay_tests {
         // Add/Edit/Import/Batch keep rendering as full screens (P3 moved only
         // Settings to a popup).
         assert_eq!(
-            overlay_stack(&state_with(crate::AppMode::ImportUrl {
-                input: String::new(),
-                error: None,
-            })
-            .await),
+            overlay_stack(
+                &state_with(crate::AppMode::ImportUrl {
+                    input: String::new(),
+                    error: None,
+                })
+                .await
+            ),
             vec![]
         );
     }
@@ -1175,14 +1170,21 @@ fn render_overlay(
         OverlayKind::Settings => {
             // Centered popup over the pane shell (spec D5 dims): width
             // clamp(w-4, 50, 110), height clamp(h-2, 20, 40).
-            let w = area.width.saturating_sub(4).clamp(50, 110);
-            let h = area.height.saturating_sub(2).clamp(20, 40);
+            let w = area.width.saturating_sub(4).clamp(50, 110).min(area.width);
+            // Clamp to the live area: on a screen shorter than the minimum the
+            // frame used to be clipped, losing its own border (spec D1).
+            let h = area.height.saturating_sub(2).clamp(20, 40).min(area.height);
             let x = area.x + (area.width.saturating_sub(w)) / 2;
             let y = area.y + (area.height.saturating_sub(h)) / 2;
             let popup = Rect::new(x, y, w, h);
             // Reset the popup footprint so the pane content underneath never
             // bleeds through (a bg-only Block styles cells but leaves their
-            // symbols in place).
+            // symbols in place). No background fill of its own: the settings
+            // surface shares the app background, as in the reference, where
+            // `theme::clear()` paints every modal AND the app with one
+            // `palette.background`. The previous `bg.surface` fill was not an
+            // opaline token at all — it resolved to the fallback grey
+            // (#808080), a grey slab whose text colours were then unreadable.
             frame.render_widget(ratatui::widgets::Clear, popup);
             // Modal frame: title carries the dirty marker (spec D5/P3).
             let dirty = if settings::form_is_dirty(state) {
@@ -1191,12 +1193,20 @@ fn render_overlay(
                 ""
             };
             let theme = state.theme();
+            // Hints live in the popup's bottom border (spec D9), as in the
+            // reference; the app status bar drops its own settings hints.
+            let hints = settings::footer_hints(state, popup.width);
             let outer = Block::default()
                 .title(format!(" Settings{dirty} "))
+                .title_bottom(
+                    Line::from(hints)
+                        .alignment(Alignment::Right)
+                        .style(ThemeStyles::hint(theme)),
+                )
                 .borders(Borders::ALL)
                 .border_style(ThemeStyles::container_border_focused(theme))
                 .title_style(ThemeStyles::container_title(theme))
-                .style(Style::default().bg(theme.color("bg.surface").into()));
+                .padding(Padding::horizontal(1));
             let inner = outer.inner(popup);
             frame.render_widget(outer, popup);
             settings::render(frame, inner, state);
@@ -1241,23 +1251,23 @@ fn render(frame: &mut Frame, state: &AppState) {
         1
     } else {
         // Leave pane 1 at least 6 rows (border + header + rows + footer).
-        state
-            .pane2_rows()
-            .min(area.height.saturating_sub(7))
-            .max(3)
+        state.pane2_rows().min(area.height.saturating_sub(7)).max(3)
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(6),          // 0: pane 1
+            Constraint::Min(6),             // 0: pane 1
             Constraint::Length(pane2_rows), // 1: pane 2
-            Constraint::Length(1),       // 2: status bar
+            Constraint::Length(1),          // 2: status bar
         ])
         .split(area);
 
     // Pane 1: framed, inline tab bar, content.
     let p1_tabs: &[(&str, bool)] = &[
-        ("Profiles", matches!(state.pane1_tab, crate::Pane1Tab::Profiles)),
+        (
+            "Profiles",
+            matches!(state.pane1_tab, crate::Pane1Tab::Profiles),
+        ),
         ("Logs", matches!(state.pane1_tab, crate::Pane1Tab::Logs)),
     ];
     let p1_border = if pane1_focused {
@@ -1277,8 +1287,14 @@ fn render(frame: &mut Frame, state: &AppState) {
     // F1) — a borderless compact bar so the frame does not eat the row.
     let compact_p2 = pane2_rows <= 1;
     let p2_tabs: &[(&str, bool)] = &[
-        ("Details", matches!(state.pane2_tab, crate::Pane2Tab::Details)),
-        ("Metrics", matches!(state.pane2_tab, crate::Pane2Tab::Metrics)),
+        (
+            "Details",
+            matches!(state.pane2_tab, crate::Pane2Tab::Details),
+        ),
+        (
+            "Metrics",
+            matches!(state.pane2_tab, crate::Pane2Tab::Metrics),
+        ),
     ];
     let p2_border = if pane2_focused {
         ThemeStyles::container_border_focused(theme)
@@ -1349,7 +1365,7 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                 ],
             },
             _ => vec![
-                ("Tab / Shift+Tab", "Cycle tabs"),
+                ("Tab / Shift+Tab", "Move focus"),
                 ("?", "Toggle this help"),
                 ("q / Ctrl+C", "Quit"),
             ],

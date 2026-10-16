@@ -1,27 +1,23 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui_cheese::field::ValidationKind;
 use ratatui_cheese::input::{Input, InputState};
 use ratatui_cheese::list::{List, ListItem, ListItemContext, ListState};
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::progress::bar_cells;
 use crate::{
-    AppMode, AppState, BackendUpdateStatus, SettingsMode, SettingsSection, SplitFocus,
+    AppMode, AppState, BackendUpdateStatus, SectionList, SettingsMode, SettingsSection, SplitFocus,
     SplitRightPane,
 };
 use leas_core::CoreType;
-use ratatui_cheese::tree::{Tree, TreeState, TreeStyles};
-// ── Settings tree — data source for the left panel tree ─────────────────
-
-use ratatui_cheese::tree as cheese_tree;
+// ── Settings section data — the source of the left list and its filter ──
 
 struct SettingsTreeNode {
     name: &'static str,
@@ -119,24 +115,206 @@ const SETTINGS_TREE: &[SettingsTreeGroup] = &[
     },
 ];
 
-fn build_tree_groups() -> Vec<cheese_tree::TreeGroup> {
+/// Leaves of `SETTINGS_TREE` in document order: the index space that
+/// `SectionList::selected` lives in, so filtering or collapsing the list never
+/// moves the selection onto a different section (spec D2/D4).
+fn leaf_count() -> usize {
+    SETTINGS_TREE.iter().map(|g| g.items.len()).sum()
+}
+
+/// Flat leaf index of `(group, child)`.
+fn leaf_index(group: usize, child: usize) -> usize {
     SETTINGS_TREE
         .iter()
-        .map(|g| {
-            cheese_tree::TreeGroup::new(cheese_tree::TreeItem::new(g.name)).children(
-                g.items
-                    .iter()
-                    .map(|item| cheese_tree::TreeItem::new(item.name))
-                    .collect(),
-            )
+        .take(group)
+        .map(|g| g.items.len())
+        .sum::<usize>()
+        + child
+}
+
+/// `(group, child)` of a flat leaf index.
+fn leaf_position(leaf: usize) -> Option<(usize, usize)> {
+    let mut start = 0usize;
+    for (group, g) in SETTINGS_TREE.iter().enumerate() {
+        if leaf < start + g.items.len() {
+            return Some((group, leaf - start));
+        }
+        start += g.items.len();
+    }
+    None
+}
+
+fn leaf_section(leaf: usize) -> Option<SettingsSection> {
+    let (group, child) = leaf_position(leaf)?;
+    SETTINGS_TREE[group].items[child].section
+}
+
+fn leaf_group(leaf: usize) -> Option<usize> {
+    leaf_position(leaf).map(|(group, _)| group)
+}
+
+fn leaf_name(leaf: usize) -> Option<&'static str> {
+    let (group, child) = leaf_position(leaf)?;
+    Some(SETTINGS_TREE[group].items[child].name)
+}
+
+/// Case-insensitive substring match; an empty query matches everything.
+fn matches_filter(query: &str, text: &str) -> bool {
+    query.is_empty() || text.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// A leaf matches on its own name or on its group's name (spec D7).
+fn leaf_matches(leaf: usize, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let Some(group) = leaf_group(leaf) else {
+        return false;
+    };
+    matches_filter(query, SETTINGS_TREE[group].name)
+        || leaf_name(leaf).is_some_and(|name| matches_filter(query, name))
+}
+
+/// Leaves the list shows, in document order: filtered, and hidden by collapse
+/// unless a filter is active (a search always reveals its own matches).
+fn visible_leaves(query: &str, sections: &SectionList) -> Vec<usize> {
+    (0..leaf_count())
+        .filter(|leaf| {
+            leaf_matches(*leaf, query)
+                && (!query.is_empty() || leaf_group(*leaf).is_some_and(|g| sections.is_expanded(g)))
         })
         .collect()
 }
 
-fn section_from_selection(g: usize, child: Option<usize>) -> Option<SettingsSection> {
-    let group = SETTINGS_TREE.get(g)?;
-    let item = group.items.get(child?)?;
-    item.section
+/// One display row of the sections pane.
+enum SectionRow {
+    /// A group header. When the selected leaf is hidden inside a collapsed
+    /// group, the header's row carries the highlight instead.
+    Group {
+        group: usize,
+        collapsed: bool,
+    },
+    Leaf {
+        leaf: usize,
+    },
+}
+
+/// Build the sections pane's rows plus the row index that carries the
+/// highlight (spec D2/D4).
+fn section_rows(query: &str, sections: &SectionList) -> (Vec<SectionRow>, Option<usize>) {
+    let visible: HashSet<usize> = visible_leaves(query, sections).into_iter().collect();
+    let selected_group = leaf_group(sections.selected);
+    let mut rows = Vec::new();
+    let mut selected_row = None;
+    for (group, g) in SETTINGS_TREE.iter().enumerate() {
+        let collapsed = query.is_empty() && !sections.is_expanded(group);
+        let holds_selection = collapsed && selected_group == Some(group);
+        let children: Vec<usize> = (0..g.items.len())
+            .map(|child| leaf_index(group, child))
+            .filter(|leaf| visible.contains(leaf))
+            .collect();
+        if children.is_empty() && !holds_selection {
+            continue;
+        }
+        rows.push(SectionRow::Group { group, collapsed });
+        if holds_selection {
+            selected_row = Some(rows.len() - 1);
+        }
+        if collapsed {
+            continue;
+        }
+        for leaf in children {
+            if leaf == sections.selected {
+                selected_row = Some(rows.len());
+            }
+            rows.push(SectionRow::Leaf { leaf });
+        }
+    }
+    (rows, selected_row)
+}
+
+/// `n/N` for a pane title: 1-based, clamped, `0/0` when the pane is empty
+/// (spec D3).
+fn counter_label(row: usize, total: usize) -> String {
+    if total == 0 {
+        return "0/0".to_string();
+    }
+    format!("{}/{}", (row + 1).min(total), total)
+}
+
+/// How a field's value renders in the list (spec D5).
+fn value_display(field_type: &str, value: &str) -> String {
+    if field_type == "Boolean" {
+        return if value == "true" { "✓" } else { "✗" }.to_string();
+    }
+    if value.is_empty() {
+        return "—".to_string();
+    }
+    if field_type.starts_with("Select:") {
+        return format!("< {value} >");
+    }
+    value.to_string()
+}
+
+/// Provenance marker: `*` when the field differs from the values the pane was
+/// built with, `·` otherwise (spec D4).
+fn provenance_marker(snapshot: Option<&str>, current: &str) -> char {
+    match snapshot {
+        Some(base) if base != current => '*',
+        _ => '·',
+    }
+}
+
+/// What the field accepts, for the help box (spec D10).
+fn field_accepts(field_type: &str) -> String {
+    match field_type {
+        "Boolean" => "true / false".to_string(),
+        "Number" => "digits".to_string(),
+        "Url" => "a URL".to_string(),
+        "Duration" => "a duration, e.g. 5s, 1h30m".to_string(),
+        _ => field_type.strip_prefix("Select:").map_or_else(
+            || "free text".to_string(),
+            |options| {
+                options
+                    .split(',')
+                    .filter(|o| !o.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        ),
+    }
+}
+
+/// The type as a word, for the help box.
+fn field_type_label(field_type: &str) -> &'static str {
+    match field_type {
+        "Boolean" => "Boolean",
+        "Number" => "Number",
+        "Url" => "URL",
+        "Duration" => "Duration",
+        _ if field_type.starts_with("Select:") => "Select",
+        _ => "Text",
+    }
+}
+
+const fn section_name(section: SettingsSection) -> &'static str {
+    match section {
+        SettingsSection::Core => "Core",
+        SettingsSection::Gui => "GUI",
+        SettingsSection::Inbound => "Inbound",
+        SettingsSection::Routing => "Routing",
+        SettingsSection::Dns => "DNS",
+        SettingsSection::SystemProxy => "System Proxy",
+        SettingsSection::Tun => "TUN",
+        SettingsSection::Mux => "Mux",
+        SettingsSection::Stats => "Statistics",
+        SettingsSection::Subscriptions => "Subscriptions",
+        SettingsSection::ProtocolCore => "Protocol Core",
+        SettingsSection::SpeedTest => "Speed Test",
+        SettingsSection::Logging => "Logging",
+        SettingsSection::Updates => "Updates",
+        SettingsSection::RouteProbes => "Probe Hosts",
+    }
 }
 
 // ── Public entry points ─────────────────────────────────────────────────
@@ -160,18 +338,318 @@ pub fn form_is_dirty(state: &AppState) -> bool {
     }
 }
 
+/// Four bands, as in the reference (spec §4): bar / split / help / status.
+///
+/// The footer hints live in the popup's bottom border (spec D9), so
+/// `ui::status_bar` drops its own settings hints while this popup is open.
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
-    if let AppMode::Settings {
-        mode: SettingsMode::Split { tree, focus, right },
+    let AppMode::Settings {
+        mode: SettingsMode::Split { focus, right },
     } = &state.mode
-    {
-        let theme = state.theme();
-        let left_pct = if area.width < 80 { 0.35 } else { 0.30 };
-        let left_w = (f64::from(area.width) * left_pct) as u16;
-        let (left_area, right_area) = split_rect(area, left_w);
-        render_tree(frame, left_area, theme, tree, *focus);
-        render_right_pane(frame, right_area, state, theme, right, *focus);
+    else {
+        return;
+    };
+    let theme = state.theme();
+    let status_rows = u16::from(settings_status(state).is_some());
+    // The help band yields before the sections/values split does, so a short
+    // terminal loses help rows rather than the list itself (spec §4).
+    let help_rows = 10u16.min(area.height.saturating_sub(3 + 7 + status_rows));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(7),
+            Constraint::Length(help_rows),
+            Constraint::Length(status_rows),
+        ])
+        .split(area);
+    render_input_bar(frame, rows[0], state, theme);
+    let left_pct = if rows[1].width < 80 { 0.35 } else { 0.30 };
+    let left_w = (f64::from(rows[1].width) * left_pct) as u16;
+    let (left_area, right_area) = split_rect(rows[1], left_w);
+    render_sections(frame, left_area, state, theme, *focus);
+    render_right_pane(frame, right_area, state, theme, right, *focus);
+    render_help(frame, rows[2], theme, right);
+    if status_rows > 0 {
+        render_status(frame, rows[3], state, theme);
     }
+}
+
+/// The input bar: the filter while it is active, what is being edited
+/// otherwise (spec §4 band 0).
+fn render_input_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline::Theme) {
+    let editing = match &state.mode {
+        AppMode::Settings {
+            mode:
+                SettingsMode::Split {
+                    right:
+                        SplitRightPane::Form {
+                            section,
+                            focus_index,
+                            ..
+                        },
+                    ..
+                },
+        } => form_field_defs_for_section(*section)
+            .get(*focus_index)
+            .copied(),
+        _ => None,
+    };
+    let active = state.settings_search.active;
+    let (title, body, body_style) = if active {
+        let body = if state.settings_search.query.is_empty() {
+            "Press / to filter settings".to_string()
+        } else {
+            format!("{}█", state.settings_search.query)
+        };
+        (
+            " Filter ".to_string(),
+            body,
+            ThemeStyles::footer_value(theme),
+        )
+    } else if let Some((_, label, field_type)) = editing {
+        let how = if field_type.starts_with("Select:") {
+            "type or [←→] to change · [Tab] next field"
+        } else if field_type == "Boolean" {
+            "any key toggles · [Tab] next field"
+        } else {
+            "type to change · [Backspace] erase · [Tab] next field"
+        };
+        (
+            format!(" Edit {label} · {} ", field_type_label(field_type)),
+            how.to_string(),
+            ThemeStyles::footer_label(theme),
+        )
+    } else {
+        (
+            " Search ".to_string(),
+            "Press / to filter settings".to_string(),
+            ThemeStyles::hint(theme),
+        )
+    };
+    let border = if active || editing.is_some() {
+        ThemeStyles::container_border_focused(theme)
+    } else {
+        ThemeStyles::container_border(theme)
+    };
+    let bar = Paragraph::new(Line::styled(body, body_style)).block(
+        Block::default()
+            .title(title)
+            .title_style(ThemeStyles::container_title(theme))
+            .borders(Borders::ALL)
+            .border_style(border),
+    );
+    frame.render_widget(bar, area);
+}
+
+/// The sections list (spec D2): group headers with `▾`/`▸`, leaves indented,
+/// the selected row marked `›`, counters in the title (spec D3).
+fn render_sections(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &opaline::Theme,
+    focus: SplitFocus,
+) {
+    let query = state.settings_search.query.as_str();
+    let (rows, selected_row) = section_rows(query, &state.settings_sections);
+    // A counter that does not fit is clipped mid-number ("2/" at 50 cols),
+    // which reads as a broken value; drop it on a narrow pane instead.
+    let title = if area.width >= 18 {
+        format!(
+            " Sections · {} ",
+            counter_label(selected_row.unwrap_or(0), rows.len())
+        )
+    } else {
+        " Sections ".to_string()
+    };
+    let block = Block::default()
+        .title(title)
+        .title_style(ThemeStyles::container_title(theme))
+        .borders(Borders::ALL)
+        .border_style(if focus == SplitFocus::Tree {
+            ThemeStyles::container_border_focused(theme)
+        } else {
+            ThemeStyles::container_border(theme)
+        });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let height = inner.height as usize;
+    // Keep the highlighted row on screen; the list is short, so this is the
+    // only scroll that matters (no stored offset to keep in step).
+    let start = selected_row
+        .unwrap_or(0)
+        .saturating_sub(height.saturating_sub(1))
+        .min(rows.len().saturating_sub(height));
+    let lines: Vec<Line> = rows
+        .iter()
+        .skip(start)
+        .take(height)
+        .enumerate()
+        .map(|(offset, row)| {
+            let selected = Some(start + offset) == selected_row;
+            let marker = if selected { "› " } else { "  " };
+            let style = if selected {
+                ThemeStyles::table_row_selected(theme).add_modifier(Modifier::BOLD)
+            } else {
+                match row {
+                    SectionRow::Group { .. } => {
+                        ThemeStyles::footer_label(theme).add_modifier(Modifier::BOLD)
+                    }
+                    SectionRow::Leaf { .. } => ThemeStyles::table_row_normal(theme),
+                }
+            };
+            let text = match row {
+                SectionRow::Group {
+                    group, collapsed, ..
+                } => {
+                    let chevron = if *collapsed { "▸" } else { "▾" };
+                    format!("{marker}{chevron} {}", SETTINGS_TREE[*group].name)
+                }
+                SectionRow::Leaf { leaf } => {
+                    format!("{marker}   {}", leaf_name(*leaf).unwrap_or_default())
+                }
+            };
+            Line::styled(text, style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The help band (spec D10): what the focused field is, and the marker legend.
+fn render_help(frame: &mut Frame, area: Rect, theme: &opaline::Theme, right: &SplitRightPane) {
+    let (title, lines) = help_content(theme, right);
+    let block = Block::default()
+        .title(title)
+        .title_style(ThemeStyles::container_title(theme))
+        .borders(Borders::ALL)
+        .border_style(ThemeStyles::container_border(theme));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn help_content(theme: &opaline::Theme, right: &SplitRightPane) -> (String, Vec<Line<'static>>) {
+    let label = ThemeStyles::footer_label(theme).add_modifier(Modifier::BOLD);
+    let value = ThemeStyles::footer_value(theme);
+    let row = |name: &str, text: String| {
+        Line::from(vec![
+            Span::styled(format!("{name:<9}"), label),
+            Span::styled(text, value),
+        ])
+    };
+    let legend = "· saved   * unsaved   › selected".to_string();
+    match right {
+        SplitRightPane::Form {
+            section,
+            fields,
+            focus_index,
+            ..
+        } => {
+            let defs = form_field_defs_for_section(*section);
+            let Some((_, field_label, field_type)) = defs.get(*focus_index).copied() else {
+                return (
+                    format!(" Help · {} ", section_name(*section)),
+                    vec![Line::styled(
+                        " No field selected — [Tab] moves between fields.".to_string(),
+                        ThemeStyles::hint(theme),
+                    )],
+                );
+            };
+            let current = fields
+                .get(*focus_index)
+                .map_or("", |(_, v)| v.as_str())
+                .to_string();
+            (
+                format!(" Help · {} ", section_name(*section)),
+                vec![
+                    row("Field", (*field_label).to_string()),
+                    row("Type", field_type_label(field_type).to_string()),
+                    row("Accepts", field_accepts(field_type)),
+                    row("Current", value_display(field_type, &current)),
+                    row("Keys", legend),
+                ],
+            )
+        }
+        SplitRightPane::Empty => (
+            " Help ".to_string(),
+            vec![Line::styled(
+                " Pick a section on the left, then edit its fields on the right.".to_string(),
+                ThemeStyles::hint(theme),
+            )],
+        ),
+        _ => (
+            " Help ".to_string(),
+            vec![
+                row(
+                    "Keys",
+                    "[/] filter this pane   [Tab] focus   [Esc] back".to_string(),
+                ),
+                row("Legend", legend),
+            ],
+        ),
+    }
+}
+
+/// What the status band shows (spec A7).
+enum SettingsStatus {
+    Error(String),
+    Notice(String),
+    Hint(String),
+}
+
+/// The status band (spec A7): a validation error, the filter-miss line, or the
+/// last notice. `None` collapses the band.
+fn settings_status(state: &AppState) -> Option<SettingsStatus> {
+    if let AppMode::Settings {
+        mode:
+            SettingsMode::Split {
+                right: SplitRightPane::Form { form_errors, .. },
+                ..
+            },
+    } = &state.mode
+        && let Some(message) = form_errors.values().next()
+    {
+        let count = form_errors.len();
+        let prefix = if count > 1 {
+            format!("{count} fields need attention — ")
+        } else {
+            String::new()
+        };
+        return Some(SettingsStatus::Error(format!("⚠ {prefix}{message}")));
+    }
+    let query = state.settings_search.query.as_str();
+    if !query.is_empty() && visible_leaves(query, &state.settings_sections).is_empty() {
+        return Some(SettingsStatus::Hint(format!(
+            "No settings match \"{query}\" — [Ctrl+U] clear  [Esc] cancel"
+        )));
+    }
+    state.settings_notice.clone().map(SettingsStatus::Notice)
+}
+
+fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline::Theme) {
+    let Some(status) = settings_status(state) else {
+        return;
+    };
+    let (text, style) = match status {
+        SettingsStatus::Error(text) => (text, ThemeStyles::error(theme)),
+        SettingsStatus::Notice(text) => (text, ThemeStyles::success(theme)),
+        SettingsStatus::Hint(text) => (text, ThemeStyles::warning(theme)),
+    };
+    frame.render_widget(Paragraph::new(Line::styled(text, style)), area);
+}
+
+/// The popup's footer hints (spec D9), owned by `ui::status_bar` so the modal
+/// border and the app status bar can never drift apart.
+pub fn footer_hints(state: &AppState, popup_width: u16) -> String {
+    crate::ui::status_bar::fit_hints(
+        crate::ui::status_bar::settings_hints(state),
+        popup_width.saturating_sub(2).max(20) as usize,
+    )
 }
 pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     handle_split_key(state, key).await;
@@ -193,50 +671,6 @@ fn split_rect(area: Rect, left_w: u16) -> (Rect, Rect) {
     };
     (left, right)
 }
-fn render_tree(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &opaline::Theme,
-    tree_state: &RefCell<TreeState>,
-    focus: SplitFocus,
-) {
-    let block = Block::default()
-        .title(" Sections ")
-        .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(theme));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut styles = TreeStyles {
-        parent: ThemeStyles::table_row_normal(theme),
-        child: ThemeStyles::hint(theme),
-        selected: Style::default()
-            .fg(theme.color("bg.selection").into())
-            .bg(theme.color("accent.primary").into())
-            .add_modifier(Modifier::BOLD),
-        chevron: ThemeStyles::hint(theme),
-        chevron_active: ThemeStyles::spinner(theme),
-        chevron_dim: ThemeStyles::hint(theme),
-        count: ThemeStyles::footer_label(theme),
-        icon: Style::default(),
-    };
-
-    // Dim selection when focus is on right pane
-    if focus == SplitFocus::Right {
-        styles.selected = ThemeStyles::hint(theme);
-    }
-
-    let groups = build_tree_groups();
-    let tree = Tree::default()
-        .groups(groups)
-        .styles(styles)
-        .chevron_collapsed("▸")
-        .chevron_expanded("▾")
-        .highlight_full_row(true);
-
-    // Borrow mutably for render_stateful_widget (updates scroll offset)
-    frame.render_stateful_widget(tree, inner, &mut tree_state.borrow_mut());
-}
 fn render_right_pane(
     frame: &mut Frame,
     area: Rect,
@@ -245,14 +679,40 @@ fn render_right_pane(
     right: &SplitRightPane,
     _focus: SplitFocus,
 ) {
+    // Form panes get the `Values · i/n` title of the reference (spec A2); the
+    // routing/update panes keep their own names.
     let title = match right {
-        SplitRightPane::Empty => " Select a section ",
-        SplitRightPane::Form { section, .. } => form_title_for_section(*section),
-        SplitRightPane::RoutingList { .. } => " Routing Rules ",
-        SplitRightPane::RoutingForm { .. } => " Routing Rule ",
-        SplitRightPane::UpdateForm { .. } => " Updates ",
-        SplitRightPane::GroupList { .. } => " Subscriptions ",
-        SplitRightPane::GroupForm { .. } => " Edit Group ",
+        SplitRightPane::Empty => " Select a section ".to_string(),
+        SplitRightPane::Form {
+            section,
+            focus_index,
+            ..
+        } => {
+            let rows = visible_field_rows(*section, *focus_index, &state.settings_search.query);
+            let position = rows.iter().position(|i| *i == *focus_index).unwrap_or(0);
+            if area.width >= 18 {
+                format!(" Values · {} ", counter_label(position, rows.len()))
+            } else {
+                " Values ".to_string()
+            }
+        }
+        SplitRightPane::GroupForm { focus_index, .. } => {
+            let rows = visible_field_rows(
+                SettingsSection::Subscriptions,
+                *focus_index,
+                &state.settings_search.query,
+            );
+            let position = rows.iter().position(|i| *i == *focus_index).unwrap_or(0);
+            if area.width >= 18 {
+                format!(" Values · {} ", counter_label(position, rows.len()))
+            } else {
+                " Values ".to_string()
+            }
+        }
+        SplitRightPane::RoutingList { .. } => " Routing Rules ".to_string(),
+        SplitRightPane::RoutingForm { .. } => " Routing Rule ".to_string(),
+        SplitRightPane::UpdateForm { .. } => " Updates ".to_string(),
+        SplitRightPane::GroupList { .. } => " Subscriptions ".to_string(),
     };
     let block = Block::default()
         .title(title)
@@ -277,6 +737,8 @@ fn render_right_pane(
                 fields.as_slice(),
                 *focus_index,
                 form_errors,
+                state.settings_form_snapshot.as_ref(),
+                &state.settings_search.query,
             );
         }
         SplitRightPane::RoutingList { selected } => {
@@ -323,6 +785,8 @@ fn render_right_pane(
                 fields.as_slice(),
                 *focus_index,
                 form_errors,
+                None,
+                &state.settings_search.query,
             );
         }
         SplitRightPane::Empty => {}
@@ -342,8 +806,38 @@ const fn toggle_split_focus(state: &mut AppState) {
 }
 
 async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
+    // The filter bar owns the keyboard while it is active (spec §5).
+    if state.settings_search.active {
+        handle_search_key(state, key);
+        return;
+    }
+    // `/` opens the filter. It is only claimed where it cannot be text: a
+    // text field on the right pane keeps its own slash.
+    if key.code == KeyCode::Char('/')
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && search_available(state)
+    {
+        state.settings_search.active = true;
+        return;
+    }
     // Ctrl+W toggles focus between tree and right pane
     if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        toggle_split_focus(state);
+        return;
+    }
+    // With no form open the right pane has no field to advance to, so Tab is
+    // the pane switch its own hint promises (`[Tab] Sections`).
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+        && matches!(
+            &state.mode,
+            AppMode::Settings {
+                mode: SettingsMode::Split {
+                    focus: SplitFocus::Right,
+                    right: SplitRightPane::Empty,
+                },
+            }
+        )
+    {
         toggle_split_focus(state);
         return;
     }
@@ -357,7 +851,7 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
     };
 
     match focus {
-        SplitFocus::Tree => handle_tree_key(state, key).await,
+        SplitFocus::Tree => handle_sections_key(state, key).await,
         SplitFocus::Right => {
             let pane_type = match &state.mode {
                 AppMode::Settings {
@@ -386,97 +880,149 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
     }
 }
 
-const fn form_title_for_section(section: SettingsSection) -> &'static str {
-    match section {
-        SettingsSection::Core => " Core Settings ",
-        SettingsSection::Gui => " GUI Settings ",
-        SettingsSection::Inbound => " Inbound Settings ",
-        SettingsSection::Dns => " DNS Settings ",
-        SettingsSection::SystemProxy => " System Proxy ",
-        SettingsSection::Tun => " TUN Mode ",
-        SettingsSection::Mux => " Mux / Fragment ",
-        SettingsSection::Stats => " Statistics ",
-        SettingsSection::Subscriptions => " Subscriptions ",
-        SettingsSection::ProtocolCore => " Protocol Core ",
-        SettingsSection::SpeedTest => " Speed Test Settings ",
-        SettingsSection::Logging => " Logging ",
-        SettingsSection::Updates => " Updates ",
-        SettingsSection::Routing => " Routing Rules ",
-        SettingsSection::RouteProbes => " Probe Hosts ",
+/// True where `/` cannot collide with text entry (spec §5): the sections
+/// pane, an empty right pane, or one of the right pane's list modes.
+fn search_available(state: &AppState) -> bool {
+    match &state.mode {
+        AppMode::Settings {
+            mode: SettingsMode::Split { focus, right },
+        } => {
+            *focus == SplitFocus::Tree
+                || matches!(
+                    right,
+                    SplitRightPane::Empty
+                        | SplitRightPane::RoutingList { .. }
+                        | SplitRightPane::GroupList { .. }
+                )
+        }
+        _ => false,
     }
 }
 
-async fn handle_tree_key(state: &mut AppState, key: &KeyEvent) {
-    // Esc exits Settings mode — the help overlay advertises "Esc — Close settings",
-    // and previously Esc was a dead key while the tree had focus.
+/// Keys while the filter bar is active: it consumes printable input, and
+/// `Enter` applies while `Esc` cancels (spec §5).
+fn handle_search_key(state: &mut AppState, key: &KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            state.settings_search.query.clear();
+            state.settings_search.active = false;
+            snap_selection_to_filter(state);
+        }
+        KeyCode::Enter => {
+            state.settings_search.active = false;
+            snap_selection_to_filter(state);
+        }
+        KeyCode::Backspace => {
+            state.settings_search.query.pop();
+            snap_selection_to_filter(state);
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.settings_search.query.clear();
+            snap_selection_to_filter(state);
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.settings_search.query.push(c);
+            snap_selection_to_filter(state);
+        }
+        _ => {}
+    }
+}
+
+/// Keep the selection on a row the filter actually shows (spec D7).
+fn snap_selection_to_filter(state: &mut AppState) {
+    let query = state.settings_search.query.clone();
+    let visible = visible_leaves(&query, &state.settings_sections);
+    if let Some(first) = visible.first()
+        && !visible.contains(&state.settings_sections.selected)
+    {
+        state.settings_sections.selected = *first;
+    }
+}
+
+/// Move the selection by one visible row, in either direction, clamping at
+/// the ends (spec D2).
+fn step_selection(state: &mut AppState, forward: bool) {
+    let query = state.settings_search.query.clone();
+    let visible = visible_leaves(&query, &state.settings_sections);
+    let Some(last) = visible.len().checked_sub(1) else {
+        return;
+    };
+    let current = state.settings_sections.selected;
+    let next = match visible.iter().position(|leaf| *leaf == current) {
+        Some(position) if forward => visible[(position + 1).min(last)],
+        Some(position) => visible[position.saturating_sub(1)],
+        None if forward => visible
+            .iter()
+            .find(|leaf| **leaf > current)
+            .copied()
+            .unwrap_or(visible[last]),
+        None => visible
+            .iter()
+            .rev()
+            .find(|leaf| **leaf < current)
+            .copied()
+            .unwrap_or(visible[0]),
+    };
+    state.settings_sections.selected = next;
+}
+
+async fn handle_sections_key(state: &mut AppState, key: &KeyEvent) {
+    // Esc exits Settings mode — the help overlay advertises "Esc — Close
+    // settings", and previously Esc was a dead key while the list had focus.
     if key.code == KeyCode::Esc {
         state.mode = AppMode::List;
         return;
     }
 
-    let groups = build_tree_groups();
-
-    // Handle Enter separately — needs to release borrow before async call
     if key.code == KeyCode::Enter {
-        let (g, child) = {
-            let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        tree: tree_state, ..
-                    },
-            } = &mut state.mode
-            else {
-                return;
-            };
-
-            tree_state.borrow().selected()
-        };
-        if let Some(section) = section_from_selection(g, child) {
+        let selected = state.settings_sections.selected;
+        // A collapsed group holds the highlight: the first `Enter` expands it
+        // rather than opening a section the user cannot see (spec D4).
+        if let Some(group) = leaf_group(selected)
+            && !state.settings_sections.is_expanded(group)
+        {
+            state.settings_sections.toggle_expanded(group);
+            return;
+        }
+        if let Some(section) = leaf_section(selected) {
+            state.settings_notice = None;
             let pane = state.build_right_pane(section).await;
             if let AppMode::Settings {
-                mode: SettingsMode::Split { right, focus, .. },
+                mode: SettingsMode::Split { right, focus },
             } = &mut state.mode
             {
                 *right = pane;
                 *focus = SplitFocus::Right;
             }
-        } else {
-            // Group header selected — toggle expand/collapse
-            if let AppMode::Settings {
-                mode: SettingsMode::Split { tree, .. },
-            } = &mut state.mode
-            {
-                tree.borrow_mut().toggle_selected();
-            }
         }
         return;
     }
 
-    // Tab/BackTab leave Settings. The tab cycle is gone (spec D2: Tab now
-    // moves pane focus, which is meaningless behind this screen), so the
-    // legacy "cycle tabs" behaviour collapses to closing settings.
+    // Tab moves focus into the Values pane (spec §5): a key that silently
+    // closed the popup was a trap — nothing on screen said so — and the pane
+    // pair is what Tab means everywhere else in the shell. `Ctrl+W` keeps
+    // toggling, so the two agree.
     if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
-        state.mode = AppMode::List;
+        if let AppMode::Settings {
+            mode: SettingsMode::Split { focus, .. },
+        } = &mut state.mode
+        {
+            *focus = SplitFocus::Right;
+        }
         return;
     }
 
-    // Handle navigation keys — brief borrow
-    if let AppMode::Settings {
-        mode: SettingsMode::Split { tree, .. },
-    } = &mut state.mode
-    {
-        let mut ts = tree.borrow_mut();
-        match key.code {
-            KeyCode::Up => ts.select_prev(&groups),
-            KeyCode::Down => ts.select_next(&groups),
-            KeyCode::Left | KeyCode::Right => {
-                let (_, child) = ts.selected();
-                if child.is_none() {
-                    ts.toggle_selected();
-                }
+    match key.code {
+        KeyCode::Up => step_selection(state, false),
+        KeyCode::Down => step_selection(state, true),
+        KeyCode::Left | KeyCode::Right => {
+            // Collapse/expand the group that owns the selection: the sections
+            // pane has no other horizontal affordance (spec D2).
+            if let Some(group) = leaf_group(state.settings_sections.selected) {
+                state.settings_sections.toggle_expanded(group);
             }
-            _ => {}
         }
+        _ => {}
     }
 }
 
@@ -638,7 +1184,19 @@ const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
 
 /// Render form fields in horizontal layout (label left, value right).
 /// Used by both the Split right pane and the old full-screen form path.
-/// Does NOT draw an outer block — the caller provides the inner area.
+/// One row per field, as in the reference (spec D4/D5): `›` on the focused
+/// row, the provenance marker, the label in its own column, then the value.
+/// The caller provides the inner area (this draws no outer block).
+/// Field rows a section shows: filtered by the query, with the focused field
+/// always kept so the row being edited can never vanish under the cursor
+/// (spec D7). Shared by the renderer and the pane title's counter.
+fn visible_field_rows(section: SettingsSection, focus_index: usize, query: &str) -> Vec<usize> {
+    let field_defs = form_field_defs_for_section(section);
+    (0..field_defs.len())
+        .filter(|i| *i == focus_index || matches_filter(query, field_defs[*i].1))
+        .collect()
+}
+
 fn render_form_with_area(
     frame: &mut Frame,
     area: Rect,
@@ -647,75 +1205,67 @@ fn render_form_with_area(
     fields: &[(String, String)],
     focus_index: usize,
     form_errors: &HashMap<String, String>,
+    snapshot: Option<&Vec<(String, String)>>,
+    query: &str,
 ) {
     let field_defs = form_field_defs_for_section(section);
-    let mut y = area.y;
-    let max_y = area.bottom();
+    let visible = visible_field_rows(section, focus_index, query);
+    let focused_row = visible.iter().position(|i| *i == focus_index);
+    let height = area.height as usize;
+    let start = focused_row
+        .unwrap_or(0)
+        .saturating_sub(height.saturating_sub(1))
+        .min(visible.len().saturating_sub(height.max(1)));
 
-    let label_w = ((f64::from(area.width) * 0.30) as u16).clamp(15, 25);
-    let value_x = area.x + label_w + 2;
-    let value_w = area.width.saturating_sub(label_w + 2);
-
-    for (i, (key, label, field_type)) in field_defs.iter().enumerate() {
-        if y >= max_y {
-            break;
-        }
-
-        let is_focused = i == focus_index;
-        let val = fields.get(i).map_or("", |(_, v)| v.as_str());
-
-        // Label style
-        let label_style = if is_focused {
-            Style::default()
-                .fg(theme.color("accent.primary").into())
-                .bg(theme.color("bg.selection").into())
-                .add_modifier(Modifier::BOLD)
+    let label_w = area.width.saturating_sub(14).clamp(12, 24);
+    for (y, (offset, index)) in
+        (area.y..area.bottom()).zip(visible.iter().skip(start).take(height).enumerate())
+    {
+        let focused = Some(start + offset) == focused_row;
+        let (key, label, field_type) = field_defs[*index];
+        let current = fields.get(*index).map_or("", |(_, v)| v.as_str());
+        let base = snapshot
+            .and_then(|snap| snap.get(*index))
+            .map(|(_, v)| v.as_str());
+        let marker = provenance_marker(base, current);
+        let marker_style = if marker == '*' {
+            ThemeStyles::warning(theme)
         } else {
-            Style::default().fg(theme.color("text.primary").into())
+            ThemeStyles::hint(theme)
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(*label, label_style))),
-            Rect::new(area.x, y, label_w, 1),
-        );
-
-        // Separator
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::raw(":"))),
-            Rect::new(area.x + label_w, y, 1, 1),
-        );
-
-        // Value display
-        let display_val = field_type.strip_prefix("Select:").map_or_else(
-            || {
-                if *field_type == "Boolean" {
-                    if val == "true" {
-                        "[X]".into()
-                    } else {
-                        "[ ]".into()
-                    }
-                } else if val.is_empty() {
-                    "(empty)".into()
-                } else {
-                    val.to_string()
-                }
-            },
-            |_options_csv| format!("< {val} >"),
-        );
-
-        let input = Input::new("");
-        let mut input_state = InputState::new();
-        input_state.set_value(display_val);
-        input_state.set_focused(is_focused);
-
-        if let Some(error) = form_errors.get(*key) {
-            input_state.set_validation(Some((ValidationKind::Error, error.clone())));
+        let label_style = if focused {
+            ThemeStyles::table_row_selected(theme).add_modifier(Modifier::BOLD)
+        } else {
+            ThemeStyles::table_row_normal(theme)
+        };
+        let value_style = if focused {
+            ThemeStyles::footer_value(theme)
+        } else {
+            ThemeStyles::hint(theme)
+        };
+        let mut spans = vec![
+            Span::styled(if focused { "›" } else { " " }, label_style),
+            Span::styled(format!("{marker} "), marker_style),
+            Span::styled(
+                format!("{label:<label_w$}", label_w = label_w as usize),
+                label_style,
+            ),
+        ];
+        let mut value = value_display(field_type, current);
+        if focused {
+            value.push('█');
         }
-
-        let has_error = u16::from(input_state.validation().is_some());
-        let field_height = 2 + has_error;
-        let field_area = Rect::new(value_x, y, value_w, field_height.min(max_y - y));
-        frame.render_stateful_widget(&input, field_area, &mut input_state);
-        y += field_height;
+        spans.push(Span::styled(value, value_style));
+        if let Some(error) = form_errors.get(key) {
+            spans.push(Span::styled(
+                format!("  ⚠ {error}"),
+                ThemeStyles::error(theme),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, y, area.width, 1),
+        );
     }
 }
 
@@ -835,6 +1385,8 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                 } else {
                     state.save_settings_form(section, &saved_fields);
                 }
+                // The status band reports the save, not just failures (spec A7).
+                state.settings_notice = Some(format!("Saved {}", section_name(section)));
                 // In Split mode, return focus to tree after saving
                 if let AppMode::Settings {
                     mode: SettingsMode::Split { right, focus, .. },
@@ -2098,13 +2650,164 @@ fn progress_bar_line(downloaded: u64, total: u64, style: &Style) -> Line<'static
 }
 
 #[cfg(test)]
+mod section_list_tests {
+    use super::{
+        SectionRow, counter_label, field_accepts, leaf_matches, provenance_marker, section_rows,
+        value_display, visible_field_rows, visible_leaves,
+    };
+    use crate::types::{SectionList, SettingsSection};
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::empty_pane(0, 0, "0/0")]
+    #[case::first_row(0, 20, "1/20")]
+    #[case::last_row(19, 20, "20/20")]
+    #[case::out_of_range_clamps(25, 20, "20/20")]
+    fn counter_labels_are_one_based_and_clamped(
+        #[case] row: usize,
+        #[case] total: usize,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(counter_label(row, total), expected);
+    }
+
+    #[rstest]
+    #[case::bool_true("Boolean", "true", "✓")]
+    #[case::bool_false("Boolean", "false", "✗")]
+    #[case::empty_text("Text", "", "—")]
+    #[case::select_keeps_angle_brackets("Select:debug,info", "info", "< info >")]
+    #[case::text_verbatim("Number", "443", "443")]
+    fn values_render_per_field_type(
+        #[case] field_type: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(value_display(field_type, value), expected);
+    }
+
+    #[rstest]
+    #[case::no_snapshot(None, "x", '·')]
+    #[case::unchanged(Some("x"), "x", '·')]
+    #[case::changed(Some("x"), "xy", '*')]
+    fn provenance_marks_only_unsaved_edits(
+        #[case] snapshot: Option<&str>,
+        #[case] current: &str,
+        #[case] expected: char,
+    ) {
+        assert_eq!(provenance_marker(snapshot, current), expected);
+    }
+
+    #[test]
+    fn filter_matches_leaf_or_its_group_name() {
+        // Leaf 8 is DNS; leaf 0 is Core Settings (group "Core").
+        assert!(leaf_matches(8, "dns"));
+        assert!(leaf_matches(0, "core"));
+        assert!(leaf_matches(7, "probe"));
+        assert!(!leaf_matches(8, "zszs"));
+        // An empty query keeps every leaf.
+        assert!(leaf_matches(0, ""));
+    }
+
+    #[test]
+    fn collapsed_group_hides_its_leaves_but_a_filter_reveals_them() {
+        // 15 leaves, all visible with no filter.
+        let list = SectionList::default();
+        assert_eq!(visible_leaves("", &list).len(), 15);
+        let mut collapsed = SectionList::default();
+        collapsed.toggle_expanded(0);
+        assert_eq!(visible_leaves("", &collapsed).len(), 13);
+        // A filter always shows what it matched, collapse or not.
+        assert_eq!(visible_leaves("core settings", &collapsed).len(), 1);
+    }
+
+    #[test]
+    fn collapsed_group_holds_the_highlight() {
+        let mut list = SectionList::default();
+        list.toggle_expanded(0);
+        let (rows, selected) = section_rows("", &list);
+        assert!(matches!(
+            rows[selected.expect("the collapsed group carries the highlight")],
+            SectionRow::Group {
+                collapsed: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn filter_never_hides_the_field_being_edited() {
+        // Core's fields do not contain "dns"; the focused row must survive.
+        let rows = visible_field_rows(SettingsSection::Core, 0, "dns");
+        assert_eq!(rows, vec![0]);
+        let all = visible_field_rows(SettingsSection::Core, 0, "");
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn select_accepts_lists_its_options_without_the_empty_one() {
+        assert_eq!(
+            field_accepts("Select:debug,info,warning,error"),
+            "debug, info, warning, error"
+        );
+        assert_eq!(field_accepts("Boolean"), "true / false");
+        assert_eq!(field_accepts("Text"), "free text");
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::{snap_selection_to_filter, step_selection};
+    use crate::AppState;
+
+    async fn state() -> AppState {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = std::sync::Arc::new(
+            leas_db::Database::open(dir.path().join("nav.db"))
+                .await
+                .expect("database"),
+        );
+        AppState::new(db, leas_config::AppConfig::default()).await
+    }
+
+    #[tokio::test]
+    async fn selection_walks_visible_rows_and_clamps_at_the_ends() {
+        let mut app = state().await;
+        // 15 leaves, all visible.
+        assert_eq!(app.settings_sections.selected, 0);
+        step_selection(&mut app, false);
+        assert_eq!(app.settings_sections.selected, 0, "clamps at the first row");
+        step_selection(&mut app, true);
+        assert_eq!(app.settings_sections.selected, 1);
+        for _ in 0..40 {
+            step_selection(&mut app, true);
+        }
+        assert_eq!(app.settings_sections.selected, 14, "clamps at the last row");
+    }
+
+    #[tokio::test]
+    async fn collapsed_group_is_skipped_and_a_filter_snaps_the_selection() {
+        let mut app = state().await;
+        // Collapsing "Core" hides leaves 0 and 1.
+        app.settings_sections.toggle_expanded(0);
+        app.settings_sections.selected = 0;
+        step_selection(&mut app, true);
+        assert_eq!(
+            app.settings_sections.selected, 2,
+            "a hidden leaf is skipped, not selected"
+        );
+        // A filter that hides the selection moves it to the first match.
+        app.settings_search.query = "dns".to_string();
+        snap_selection_to_filter(&mut app);
+        assert_eq!(app.settings_sections.selected, 8, "DNS is the only match");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::handle_form_key;
     use crate::AppState;
     use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui_cheese::tree::TreeState;
-    use std::cell::RefCell;
     use std::collections::HashMap;
 
     /// Regression: pressing Right on the Protocol Core form panicked
@@ -2124,7 +2827,6 @@ mod tests {
         // Pre-fix failure state: Protocol Core form with empty stored fields.
         state.mode = AppMode::Settings {
             mode: SettingsMode::Split {
-                tree: RefCell::new(TreeState::all_expanded(5)),
                 focus: SplitFocus::Right,
                 right: SplitRightPane::Form {
                     section: SettingsSection::ProtocolCore,

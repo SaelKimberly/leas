@@ -10,6 +10,7 @@ One row per scenario document (the `*-transcript.md` files are its evidence, not
 - [tiny-80x14](2026-10-14-132534-scenario-tiny-80x14.md) — leas at 80x14 — the compact one-line actions bar the <20-row layout selects, a table viewport that clips one endpoint, and F1's overlay that replaces the content area · verdict 4 PASS / 1 PARTIAL / 0 FAIL
 - [colour-focus-audit](2026-10-14-144700-scenario-colour-focus-audit.md) — leas colour and focus audit with get_cell_style/screenshot — the Dracula palette as actually emitted (tabs, selection, failure marker, chrome), the hardcoded popup/status colours that ignore the theme, and the same cells under a light theme · verdict 9 PASS / 1 PARTIAL / 3 FAIL
 - [live-resize](2026-10-14-144700-scenario-live-resize.md) — leas driven through live resizes with the resize tool — 120x40 to 80x24 to 80x19 (the overlay branch a fresh small launch never reaches) back to 120x40, checking the layout and any residue · verdict 7 PASS / 0 PARTIAL / 0 FAIL
+- [settings-xrat-parity](2026-10-16-093000-scenario-settings-xrat-parity.md) — the Settings popup's xrat-parity reskin — the four bands, `Sections · n/N` / `Values · i/n`, the `/` filter lifecycle, `*`/`·` provenance after an edit, the help box following the cursor, hints in the modal border, the shared (no-fill) modal background, and 80x24 / 54x24 · verdict 11 PASS / 0 PARTIAL / 0 FAIL
 
 ## Related
 

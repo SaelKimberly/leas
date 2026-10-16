@@ -26,7 +26,8 @@ use crate::BackendUpdateStatus;
 use crate::ops::{connect, events, ping, profiles, scheduler, settings, subscriptions, updates};
 use crate::types::{
     AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, FocusedPane, LogLine,
-    NativeActivityLog, Pane1Tab, Pane2Tab, SettingsSection, SplitRightPane,
+    NativeActivityLog, Pane1Tab, Pane2Tab, SectionList, SettingsSearch, SettingsSection,
+    SplitRightPane,
 };
 
 /// Global UI/connection state.
@@ -68,6 +69,12 @@ pub struct AppState {
     /// Settings popup dirty-tracking (spec P3): the form values as loaded.
     /// `None` when no form pane is open or the form is clean.
     pub settings_form_snapshot: Option<Vec<(String, String)>>,
+    /// Settings section list: selection and per-group expansion (spec D2/D4).
+    pub settings_sections: SectionList,
+    /// Settings search bar state (spec D8).
+    pub settings_search: SettingsSearch,
+    /// Transient settings message for the popup's status row (spec A7).
+    pub settings_notice: Option<String>,
     /// The loaded Profiles page: the window the tab renders and indexes.
     /// `selected_index` indexes this vector, never the whole feed.
     pub endpoints: Vec<EndpointRow>,
@@ -573,6 +580,9 @@ impl AppState {
             pane2_tab: Pane2Tab::Details,
             pane2_height: 0,
             settings_form_snapshot: None,
+            settings_sections: SectionList::default(),
+            settings_search: SettingsSearch::default(),
+            settings_notice: None,
             update_status: HashMap::new(),
             endpoints: Vec::new(),
             filter_cache_valid: Cell::new(true),

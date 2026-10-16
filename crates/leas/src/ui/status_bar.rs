@@ -207,33 +207,10 @@ fn build_hints(state: &AppState) -> String {
             overwrite: true, ..
         } => " [Y] Overwrite  [N] Cancel ".to_string(),
         crate::AppMode::ExportPath { .. } => " [Enter] Write  [Esc] Cancel ".to_string(),
-        crate::AppMode::Settings { mode } => match mode {
-            crate::SettingsMode::Split { focus, right, .. } => match focus {
-                crate::SplitFocus::Tree => {
-                    " [↑↓] Navigate  [←→] Collapse  [Enter] Open  [Ctrl+W] Focus Form  [Tab] Close  [Esc] Close "
-                        .to_string()
-                }
-                crate::SplitFocus::Right => match right {
-                    crate::SplitRightPane::Empty => " [Ctrl+W] Focus Tree ".to_string(),
-                    crate::SplitRightPane::Form { .. }
-                    | crate::SplitRightPane::GroupForm { .. } => {
-                        " [Tab/Shift+Tab] Focus  [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back ".to_string()
-                    }
-                    crate::SplitRightPane::RoutingList { .. } => {
-                        " [↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Focus Tree  [Esc] Back ".to_string()
-                    }
-                    crate::SplitRightPane::RoutingForm { .. } => {
-                        " [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back ".to_string()
-                    }
-                    crate::SplitRightPane::UpdateForm { .. } => {
-                        " [C] Check  [D] Download  [Ctrl+W] Focus Tree  [Esc] Back ".to_string()
-                    }
-                    crate::SplitRightPane::GroupList { .. } => {
-                        " [↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Focus Tree  [Esc] Back ".to_string()
-                    }
-                },
-            },
-        },
+        // The Settings popup carries its own hints in its bottom border
+        // (spec D9), so the app status bar does not repeat them.
+        crate::AppMode::Settings { .. } => String::new(),
+
         _ => {
             // Pane-shell hints (spec D2): keys are pane-scoped.
             match (state.focused_pane, state.pane1_tab) {
@@ -287,6 +264,45 @@ fn build_hints(state: &AppState) -> String {
     }
 }
 
+/// The Settings popup's hint set (spec D9). Owned here so the modal's bottom
+/// border and the app status bar can never advertise different keys.
+pub(crate) fn settings_hints(state: &AppState) -> String {
+    let crate::AppMode::Settings { mode } = &state.mode else {
+        return String::new();
+    };
+    if state.settings_search.active {
+        return " [type] Filter  [Enter] Apply  [Ctrl+U] Clear  [Esc] Cancel ".to_string();
+    }
+    let crate::SettingsMode::Split { focus, right } = mode;
+    match focus {
+        crate::SplitFocus::Tree => {
+            " [↑↓] Navigate  [←→] Collapse  [/] Filter  [Enter] Open  [Tab] Fields  [Esc] Close "
+                .to_string()
+        }
+        crate::SplitFocus::Right => match right {
+            crate::SplitRightPane::Empty => " [Tab] Sections".to_string(),
+            // No `[←→] Cycle` here: that key only acts on a `Select:` field, and
+            // the edit bar says so for those fields.
+            crate::SplitRightPane::Form { .. } | crate::SplitRightPane::GroupForm { .. } => {
+                " [Tab/Shift+Tab] Field  [Enter] Save  [Ctrl+W] Sections  [Esc] Back ".to_string()
+            }
+            crate::SplitRightPane::RoutingList { .. } => {
+                " [↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Sections  [Esc] Back "
+                    .to_string()
+            }
+            crate::SplitRightPane::RoutingForm { .. } => {
+                " [Enter] Save  [Ctrl+W] Sections  [Esc] Back ".to_string()
+            }
+            crate::SplitRightPane::UpdateForm { .. } => {
+                " [C] Check  [D] Download  [Ctrl+W] Sections  [Esc] Back ".to_string()
+            }
+            crate::SplitRightPane::GroupList { .. } => {
+                " [↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Sections  [Esc] Back "
+                    .to_string()
+            }
+        },
+    }
+}
 
 /// Width left for hints after the status segment and any indicators.
 fn width_available(state: &AppState, total: usize) -> usize {
@@ -300,7 +316,7 @@ fn width_available(state: &AppState, total: usize) -> usize {
 /// Fit the hint segments into `budget` cells, dropping from the LEFT so the
 /// right-most group (`Quit`) always survives (tui-polish D7). A dropped
 /// prefix is marked with `…`.
-fn fit_hints(hints: String, budget: usize) -> String {
+pub(crate) fn fit_hints(hints: String, budget: usize) -> String {
     let segments: Vec<&str> = hints
         .split("  ")
         .map(str::trim)
