@@ -51,6 +51,7 @@ impl DataTableRow for LogRow<'_> {
         buf: &mut ratatui::buffer::Buffer,
         y: u16,
         clip_bottom: u16,
+        _content_right: u16,
     ) {
         if col_xs.len() < 4 {
             return;
@@ -1199,7 +1200,7 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 120, 8));
         let col_xs = [0u16, 26, 60, 66];
         let col_widths = [25u16, 33, 5, 60];
-        row.render(&col_xs, &col_widths, &[0, 1, 2, 3], &mut buf, 0, 8);
+        row.render(&col_xs, &col_widths, &[0, 1, 2, 3], &mut buf, 0, 8, 120);
 
         // Every one of the 3 lines must be painted in the Message column.
         for i in 0..3u16 {

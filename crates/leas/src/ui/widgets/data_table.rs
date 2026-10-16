@@ -83,6 +83,10 @@ pub trait DataTableRow {
         buf: &mut Buffer,
         y: u16,
         clip_bottom: u16,
+        // Right edge (exclusive) of the table's CONTENT area — the inner area
+        // minus the scrollbar column. A row that draws wider than its own
+        // cells (the profiles expansion panel) must stay inside this.
+        content_right: u16,
     );
 
     /// Row height in lines (default 1).
@@ -501,7 +505,15 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
                 }
             }
 
-            self.rows[row_idx].render(col_xs, col_widths, &order, buf, y, bottom);
+            self.rows[row_idx].render(
+                col_xs,
+                col_widths,
+                &order,
+                buf,
+                y,
+                bottom,
+                content_inner.right(),
+            );
 
             y += rh;
             row_idx += 1;
@@ -564,6 +576,7 @@ mod tests {
             buf: &mut Buffer,
             y: u16,
             clip_bottom: u16,
+            _content_right: u16,
         ) {
             self.clip_seen.set(clip_bottom);
             if y >= clip_bottom {

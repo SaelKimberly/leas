@@ -70,11 +70,14 @@ before the `ID` column (collapsed) or `▾` (expanded). Press `→` to expand: a
 rounded panel appears
 under the row with an `IPs:` line (resolved inbound addresses; `[?]` with an
 `(x resolve)` hint while the DNS name is unresolved) and a per-protocol
-sub-table: active marker, hex profile id, Last Seen, Last Used, Protocol Type,
-config type (transport/security), delay, speed, traffic, outbound address,
-outbound country. The panel shows at most 8 sub-rows; longer variant lists
-scroll — the window follows the selected sub-row and the separator shows the
-visible range (`6-13/23`). `←` collapses.
+sub-table. The sub-table's column labels sit on the separator line under the
+IPs row — `ID`, `Last Seen`, `Last Used`, `Protocol`, `Config`, `Delay`,
+`Speed`, `Traffic`, `Outbound`, `Exit`, `Stab` — so each field below reads as
+a named column. The panel border is widened past the endpoint grid to fit
+them; on a narrow pane the trailing columns drop whole (never half-drawn) and
+the border follows the last one shown. The panel shows at most 8 sub-rows;
+longer variant lists scroll — the window follows the selected sub-row and the
+separator shows the visible range (`6-13/23`). `←` collapses.
 Expanding lands on the **first sub-row**; `↑`/`↓` then walk the variants.
 `↑` at the first sub-row returns to the full endpoint row; `↓` at the last
 sub-row moves to the next profile; `↓` from the full row of an expanded

@@ -82,6 +82,32 @@ const PANEL_MAX_ROWS: usize = 8;
 /// Width of the single-row Protocol Info cell (`protocol/transport/security`).
 const PROTOCOL_INFO_WIDTH: usize = 24;
 
+/// Sub-table geometry inside an expanded panel: (offset within the panel
+/// interior, width, header label). One owner for both the header row and the
+/// data rows, so a column can never drift from its label.
+const PANEL_COLS: [(usize, usize, &str); 12] = [
+    (0, 3, ""),   // active marker
+    (3, 9, "ID"), // protocol id hex
+    (12, 20, "Last Seen"),
+    (32, 11, "Last Used"),
+    (43, 11, "Protocol"),
+    (54, 14, "Config"),
+    (69, 8, "Delay"), // 1-cell gap after Config
+    (77, 7, "Speed"),
+    (84, 10, "Traffic"),
+    (94, 16, "Outbound"), // 1-cell gap before Exit
+    (110, 5, "Exit"),
+    (115, 7, "Stab"), // successes/attempts
+];
+
+/// Interior width the sub-table needs: the end of its last column plus a
+/// one-cell pad, so the right border never lands on the `Stab` label.
+///
+/// The panel border is widened to cover this even when the endpoint grid is
+/// narrower, because the panel's columns are absolute offsets — a border sized
+/// to the grid clipped `Exit` and `Stab` off entirely.
+const PANEL_INNER_W: usize = 123;
+
 /// Column the fixed sort arrow points at (D13): the page request orders by
 /// `PageSort::Test`, which is column 7 in the §7 grid. Derived from the sort
 /// the page asks for — not a second magic number.
@@ -157,6 +183,8 @@ pub struct DisplayRowData {
     protocol_style: Style,
     prefix_style: Style,
     panel_selected_style: Style,
+    /// Header role for the sub-table's column labels.
+    panel_header_style: Style,
     panel_selected: Option<usize>,
     panel_ips: String,
     panel_resolve_hint: bool,
@@ -172,6 +200,7 @@ impl DataTableRow for DisplayRowData {
         buf: &mut Buffer,
         y: u16,
         clip_bottom: u16,
+        content_right: u16,
     ) {
         // A row that starts past the clip line has nothing visible to draw.
         if y >= clip_bottom {
@@ -219,7 +248,36 @@ impl DataTableRow for DisplayRowData {
         }
 
         if self.expanded {
-            let total_w: u16 = col_widths.iter().sum();
+            // The panel carries the sub-table's own columns, which are wider
+            // than the endpoint grid. Its width is the widest of:
+            //   * the grid (so the panel is never narrower than the row),
+            //   * the last sub-table column that FITS the pane.
+            // A label is never clipped: when the pane cannot hold all twelve
+            // columns, the trailing ones drop (as the grid drops its own
+            // columns), and the border follows the last one shown.
+            let grid_w: u16 =
+                col_widths.iter().sum::<u16>() + col_widths.len().saturating_sub(1) as u16;
+            // Clamp to the table's CONTENT area — the buffer minus the
+            // scrollbar column the table reserves at its right edge — not to
+            // the grid's own width. The grid is narrower than the panel needs
+            // (its columns are a different set), so capping at the grid left
+            // the sub-table's trailing columns unrenderable.
+            // `content_right` is the table's own content edge (already
+            // excluding the scrollbar column), so the panel can never paint
+            // over the scrollbar or past the pane.
+            let avail = content_right.saturating_sub(col_xs[0]);
+            let max_inner = avail.saturating_sub(2) as usize;
+            let inner = PANEL_INNER_W.min(max_inner);
+            let fitting = panel_cols_fitting(inner);
+            let last_end = if fitting == 0 {
+                0
+            } else {
+                let (off, w, _) = PANEL_COLS[fitting - 1];
+                off + w
+            };
+            // One trailing pad so the border never lands on the last label.
+            let want = (last_end + 1 + 2) as u16;
+            let total_w = grid_w.max(want).min(avail);
             // Panel is 2 lines shorter than the row: it starts one line below
             // the endpoint and leaves one blank line (gap) after its bottom
             // border so it never touches the next row.
@@ -229,6 +287,7 @@ impl DataTableRow for DisplayRowData {
                 y + 1,
                 self.height(0) - 2,
                 total_w,
+                fitting,
                 self.row_style,
                 clip_bottom,
             );
@@ -260,6 +319,7 @@ impl DisplayRowData {
         y0: u16,
         panel_height: u16,
         panel_w: u16,
+        fitting: usize,
         row_style: Style,
         clip_bottom: u16,
     ) {
@@ -300,15 +360,30 @@ impl DisplayRowData {
         let visible = total.min(PANEL_MAX_ROWS);
         let win = panel_window(total, self.panel_selected, PANEL_MAX_ROWS);
 
-        // Separator
+        // Header line: the sub-table's column labels sit ON the separator
+        // under the IP list, so the fields below read as named columns.
         if y0 + 2 < clip_bottom {
             let sep_x = inner_x;
             let sep_y = y0 + 2;
-            let sep_line = "─".repeat(inner_w);
+            let sep_line = "\u{2500}".repeat(inner_w);
             buf.set_stringn(sep_x, sep_y, &sep_line, inner_w, Style::default());
+            for (off, w, label) in PANEL_COLS.iter().take(fitting) {
+                let (off, w) = (*off, *w);
+                if label.is_empty() || off >= inner_w {
+                    continue;
+                }
+                buf.set_stringn(
+                    sep_x + off as u16,
+                    sep_y,
+                    label,
+                    w.min(inner_w - off),
+                    self.panel_header_style,
+                );
+            }
             if total > visible {
                 // Windowed: the separator carries the visible range (rows N-M
                 // of T) so the panel signals the rows scrolled out of view.
+                // It owns the panel's right edge, past the last column.
                 let label = format!(" {}-{}/{} ", win + 1, win + visible, total);
                 let lx = inner_x + (inner_w.saturating_sub(label.len())) as u16;
                 buf.set_stringn(lx, sep_y, &label, label.len(), row_style);
@@ -320,20 +395,7 @@ impl DisplayRowData {
         // are absolute within the panel interior — the untouched cell after
         // config (68) and the one in outbound's 16th cell are deliberate gaps
         // so a clipped/full-width value never blends into the next column.
-        let cols: [(usize, usize); 12] = [
-            (0, 3),   // marker
-            (3, 9),   // id
-            (12, 20), // last_seen
-            (32, 11), // last_used (relative)
-            (43, 11), // protocol type
-            (54, 14), // config (transport/security)
-            (69, 8),  // delay (1-cell gap after config)
-            (77, 7),  // speed
-            (84, 10), // traffic
-            (94, 16), // outbound (1-cell gap before country)
-            (110, 5), // country
-            (115, 7), // stability (successes/attempts)
-        ];
+        let cols = PANEL_COLS;
         for n in 0..visible {
             let pr = &self.panel_rows[win + n];
             let selected = self.panel_selected == Some(win + n);
@@ -370,7 +432,7 @@ impl DisplayRowData {
                 pr.outbound_country.as_str(),
                 pr.stab.as_str(),
             ];
-            for ((off, w), text) in cols.iter().zip(cell_texts.iter()) {
+            for ((off, w, _), text) in cols.iter().take(fitting).zip(cell_texts.iter()) {
                 buf.set_stringn(inner_x + *off as u16, y, text, *w, style);
             }
         }
@@ -1061,6 +1123,7 @@ fn build_display_rows(
             protocol_style: ThemeStyles::footer_value(theme),
             prefix_style: ThemeStyles::container_title(theme).add_modifier(Modifier::BOLD),
             panel_selected_style: ThemeStyles::panel_row_selected(theme),
+            panel_header_style: ThemeStyles::table_header(theme),
             panel_selected: if i == selected {
                 state.selected_sub
             } else {
@@ -1193,6 +1256,17 @@ fn render_data_grid(
         height: area.height.saturating_sub(2),
     };
     frame.render_stateful_widget(data_table, inner, &mut table_state);
+}
+
+/// How many of [`PANEL_COLS`] fit inside an interior width of `inner`.
+///
+/// Columns are absolute offsets, so a column is shown only when its whole
+/// width fits — a half-drawn header (`St`) reads as a different field.
+fn panel_cols_fitting(inner: usize) -> usize {
+    PANEL_COLS
+        .iter()
+        .take_while(|(off, w, _)| off + w <= inner)
+        .count()
 }
 
 /// First visible sub-row of a windowed panel: keeps the selected sub-row near
@@ -1682,6 +1756,7 @@ mod tests {
             protocol_style: Style::default(),
             prefix_style: Style::default(),
             panel_selected_style: Style::default(),
+            panel_header_style: Style::default(),
             panel_selected: None,
             panel_ips: String::new(),
             panel_resolve_hint: false,
@@ -1981,6 +2056,7 @@ mod tests {
             &mut buf,
             0,
             20,
+            120,
         );
 
         let line: String = (0..120).map(|x| buf[(x, 4)].symbol()).collect();
@@ -2028,6 +2104,7 @@ mod tests {
             &mut buf,
             0,
             20,
+            120,
         );
 
         // Window = panel rows 5..13 (centered on the selected 9): the first
@@ -2086,6 +2163,7 @@ mod tests {
             &mut buf,
             0,
             20,
+            40,
         );
 
         // Panel starts at y=1; sub-rows at y0+3 → sub-row 0 at y=4, sub-row 1
@@ -2130,6 +2208,7 @@ mod tests {
             &mut buf,
             0,
             20,
+            40,
         );
         row1.render(
             &col_xs,
@@ -2138,6 +2217,7 @@ mod tests {
             &mut buf,
             8,
             20,
+            125,
         );
 
         // Panel (height 6) sits at y=1..6: bottom-left corner at y=6.
@@ -2470,6 +2550,7 @@ mod tests {
             &mut buf,
             0,
             4,
+            125,
         );
 
         let line: String = (0..60).map(|x| buf[(x, 0)].symbol()).collect();
