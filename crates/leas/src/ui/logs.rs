@@ -314,8 +314,8 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
         KeyCode::Up if shift => {
             state.log_select_anchor.get_or_insert(state.log_scroll);
             state.log_scroll = state.log_scroll.saturating_add(1);
-            clamp_log_scroll(state);
             try_load_older(state).await;
+            clamp_log_scroll(state);
         }
         KeyCode::Down if shift => {
             state.log_select_anchor.get_or_insert(state.log_scroll);
@@ -324,8 +324,8 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Up => {
             state.log_scroll = state.log_scroll.saturating_add(1);
-            clamp_log_scroll(state);
             try_load_older(state).await;
+            clamp_log_scroll(state);
         }
         KeyCode::Down => {
             state.log_scroll = state.log_scroll.saturating_sub(1);
@@ -333,8 +333,8 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::PageUp => {
             state.log_scroll = state.log_scroll.saturating_add(height);
-            clamp_log_scroll(state);
             try_load_older(state).await;
+            clamp_log_scroll(state);
         }
         KeyCode::PageDown => {
             state.log_scroll = state.log_scroll.saturating_sub(height);
@@ -385,11 +385,19 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     }
 }
 
-/// Largest scroll offset the loaded buffer can express: one row past the
-/// oldest entry. The viewport is bottom-anchored, so the deepest legal
-/// position is `filtered_count - 1`.
+/// Largest scroll offset the loaded buffer can express.
+///
+/// The viewport is bottom-anchored: the render places `approx_visible` rows
+/// ABOVE the cursor, so the deepest legal position keeps the oldest visible
+/// row at the TOP of the window — `filtered_count - viewport` when the buffer
+/// is longer than a page. Bound at `filtered_count - 1` (one past the oldest
+/// row) would let the cursor sit below the whole buffer, which pins the render
+/// at row 0 and leaves a nearly blank pane — the "only a few lines on top"
+/// symptom a user sees after repeated `PageUp`.
 fn max_log_scroll(state: &AppState) -> usize {
-    count_filtered(state).saturating_sub(1)
+    let filtered = count_filtered(state);
+    let viewport = state.log_viewport_rows.get().max(1);
+    filtered.saturating_sub(viewport.saturating_sub(1))
 }
 
 /// Pull `log_scroll` (and a live selection anchor) back inside the loaded
@@ -398,7 +406,7 @@ fn max_log_scroll(state: &AppState) -> usize {
 /// This is the single owner of the bound. `log_scroll` used to grow without
 /// limit: `Up` past the oldest row kept incrementing while the render's
 /// `saturating_sub` pinned the viewport at row 0, so the screen looked frozen
-/// and `Down` had to walk back through the entire surplus one row per press.
+/// and `Down` had to walk back through the whole surplus one row per press.
 /// `Home` compounded it by writing `usize::MAX`.
 fn clamp_log_scroll(state: &mut AppState) {
     let max = max_log_scroll(state);
@@ -418,23 +426,22 @@ pub(super) async fn try_load_older(state: &mut AppState) {
         return;
     }
     let filtered_count = count_filtered(state);
-    // Reach for older rows when the viewport is within one screen of the top
-    // of what is loaded. The threshold uses the REAL viewport height: the old
-    // `term_height - 5` guessed a pane roughly twice the current size, so the
-    // trigger fired long before the user reached the top and the fetch was
-    // wasted on every scroll keypress.
     let height = state.log_viewport_rows.get().max(1);
-    if state.log_scroll < filtered_count.saturating_sub(height) {
+    // `log_scroll` is offset FROM BOTTOM: the viewport covers rows
+    // `filtered_count - (log_scroll + viewport)` .. `filtered_count - log_scroll`.
+    // The user is at the top when `log_scroll + viewport >= filtered_count`,
+    // so the old `filtered_count - height` threshold had the comparison
+    // backwards and fired one full page before reaching the top (or never, once
+    // the viewport was already capping the screen) — repeated PageUp did
+    // nothing visible because has_older stayed false.
+    if !state.log_has_older || state.log_scroll + height < filtered_count {
         return;
     }
-
-    let oldest_ts = state.log_cache[0].timestamp_nanos;
-
     let heed = match &state.heed_storage {
         Some(h) => h.clone(),
         None => return,
     };
-
+    let oldest_ts = state.log_cache[0].timestamp_nanos;
     let entries = heed.read_older_than_async(oldest_ts as u64, 500).await;
 
     match entries {
@@ -475,9 +482,18 @@ pub(super) async fn try_load_older(state: &mut AppState) {
             if let Some(a) = &mut state.log_select_anchor {
                 *a = a.saturating_sub(popped);
             }
-            // The trim can pull the buffer's start past the cursor; re-apply
-            // the bound so the viewport can never address a dropped row.
-            clamp_log_scroll(state);
+            // NO clamp on the normal path. The prepend grew `filtered_count`
+            // and `log_scroll` by the same `n`, so the view is unchanged and
+            // the offset is already legal. The caller clamps once after this
+            // returns; doing it here as well would let the bound
+            // (`filtered_count - viewport + 1`) bite before the key's own
+            // `+= height` is accounted for, undoing the page.
+            //
+            // A drain is the exception: rows the cursor pointed at are gone,
+            // so the offset can now exceed the buffer and must be pulled back.
+            if popped > 0 {
+                clamp_log_scroll(state);
+            }
         }
         Err(e) => {
             state.log_has_older = false;
@@ -920,17 +936,18 @@ mod tests {
     async fn scroll_clamps_to_loaded_buffer() {
         let mut state = scroll_state().await;
         filled(&mut state, 10);
+        state.log_viewport_rows.set(5);
 
-        state.log_scroll = 5;
+        state.log_scroll = 3;
         clamp_log_scroll(&mut state);
-        assert_eq!(state.log_scroll, 5, "an in-range offset is untouched");
+        assert_eq!(state.log_scroll, 3, "an in-range offset is untouched");
 
         // What unbounded `Up` accumulation produced.
         state.log_scroll = 10_000;
         clamp_log_scroll(&mut state);
         assert_eq!(
-            state.log_scroll, 9,
-            "clamped to the oldest row of a 10-entry buffer"
+            state.log_scroll, 6,
+            "clamped so the oldest row is at the top of a 5-row viewport"
         );
     }
 
@@ -941,11 +958,12 @@ mod tests {
     async fn home_lands_on_oldest_row_and_returns_in_one_press() {
         let mut state = scroll_state().await;
         filled(&mut state, 10);
+        state.log_viewport_rows.set(5);
         state.log_scroll = max_log_scroll(&state);
-        assert_eq!(state.log_scroll, 9, "no usize::MAX sentinel survives");
+        assert_eq!(state.log_scroll, 6, "no usize::MAX sentinel survives");
         state.log_scroll = state.log_scroll.saturating_sub(1);
         clamp_log_scroll(&mut state);
-        assert_eq!(state.log_scroll, 8);
+        assert_eq!(state.log_scroll, 5);
     }
 
     /// A live selection anchor addresses a row, so it is bound by the same
@@ -954,9 +972,10 @@ mod tests {
     async fn selection_anchor_clamps_with_the_buffer() {
         let mut state = scroll_state().await;
         filled(&mut state, 10);
+        state.log_viewport_rows.set(5);
         state.log_select_anchor = Some(usize::MAX);
         clamp_log_scroll(&mut state);
-        assert_eq!(state.log_select_anchor, Some(9));
+        assert_eq!(state.log_select_anchor, Some(6));
     }
 
     /// The target filter narrows the buffer, so the deepest legal offset
@@ -968,10 +987,66 @@ mod tests {
         for (i, line) in state.log_cache.iter_mut().enumerate() {
             line.target = if i % 2 == 0 { "xray" } else { "other" }.to_string();
         }
+        state.log_viewport_rows.set(5);
         state.log_scroll = 19;
         state.selected_targets.insert("xray".to_string());
         clamp_log_scroll(&mut state);
-        assert_eq!(state.log_scroll, 9, "10 of 20 entries match the filter");
+        assert_eq!(state.log_scroll, 6, "10 of 20 entries match the filter");
+    }
+
+    /// A page up near the top loads 500 older rows and shifts `log_scroll`
+    /// forward by the same count. Every consumer reads `log_scroll` as
+    /// offset-from-bottom, so the two adjustments cancel and the viewport must
+    /// NOT move — but only if the clamp permits the full shift.
+    ///
+    /// It did not: `clamp_log_scroll` capped the shift at `filtered_count - 1`
+    /// of the PREPENDED buffer, so a load at the top pushed the cursor far
+    /// below the oldest row and the render pinned the window at the bottom —
+    /// repeated `PageUp` then did nothing visible.
+    #[tokio::test]
+    async fn loading_older_rows_keeps_the_viewport_still() {
+        let mut state = scroll_state().await;
+        filled(&mut state, 500);
+        state.log_viewport_rows.set(20);
+
+        // Sit one viewport from the top, as a `PageUp` would.
+        state.log_scroll = 480;
+        clamp_log_scroll(&mut state);
+        assert_eq!(state.log_scroll, 480);
+
+        // Simulate a 500-row older prepend, which is what `try_load_older` does.
+        for i in (0..500).rev() {
+            state.log_cache.push_front(make_line(&format!("old{i}")));
+        }
+        state.log_scroll = state.log_scroll.saturating_add(500);
+        clamp_log_scroll(&mut state);
+
+        assert_eq!(
+            state.log_scroll, 980,
+            "the shift must survive the clamp, or the page is undone"
+        );
+    }
+
+    /// The render window must stay inside the buffer at the deepest legal
+    /// offset: the cursor sits `viewport - 1` rows above the oldest row, so
+    /// `filtered_count - (log_scroll + viewport)` reaches 0 and the whole
+    /// window is addressable. A tighter bound strands the cursor below the
+    /// oldest row, blanks the pane, and freezes `PageUp`.
+    #[tokio::test]
+    async fn deepest_offset_keeps_the_window_inside_the_buffer() {
+        let mut state = scroll_state().await;
+        filled(&mut state, 500);
+        state.log_viewport_rows.set(20);
+        state.log_scroll = max_log_scroll(&state);
+        assert_eq!(state.log_scroll, 481, "oldest row at the top of the pane");
+        assert!(
+            state.log_scroll + 20 >= 500,
+            "the render window must reach the top of the buffer"
+        );
+        assert!(
+            state.log_scroll < 500,
+            "the cursor must stay inside the buffer"
+        );
     }
 
     #[test]
