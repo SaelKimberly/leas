@@ -189,6 +189,13 @@ fn build_hints(state: &AppState) -> String {
         return " [Esc] Close help ".to_string();
     }
     match &state.mode {
+        // Form modes own the keyboard: their field keys, not the pane's.
+        crate::AppMode::AddServer { .. }
+        | crate::AppMode::EditServer { .. }
+        | crate::AppMode::ImportUrl { .. }
+        | crate::AppMode::BatchImport { .. } => {
+            " [Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel  [q/Ctrl+C] Quit ".to_string()
+        }
         // One string for every list-shaped overlay: the keys are the same, so
         // splitting them into arms only invites the two copies to drift.
         crate::AppMode::SpeedTestMenu { .. }

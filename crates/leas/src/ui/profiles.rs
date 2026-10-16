@@ -628,9 +628,9 @@ fn link_id_cell(row: &EndpointRow, dns_unresolved: bool, is_multi: bool) -> Stri
 /// Flag cell (D14): `<flag emoji>-<ISO>` (5 cells) when the terminal renders
 /// regional-indicator emoji, bare `<ISO>` (2) when it does not. Unknown
 /// country = `—`.
-fn flag_cell(iso: Option<&str>) -> String {
+fn flag_cell(iso: Option<&str>, flags_ok: bool) -> String {
     match iso {
-        Some(iso) if flags_supported() => truncate_pad(&format!("{}-{iso}", iso_to_flag(iso)), 5),
+        Some(iso) if flags_ok => truncate_pad(&format!("{}-{iso}", iso_to_flag(iso)), 5),
         Some(iso) => truncate_pad(iso, 5),
         None => "—".to_string(),
     }
@@ -845,7 +845,7 @@ fn build_display_rows(
         // endpoint, which is what let a row show `[name]` beside a live exit IP.
         let resolved = !crate::ops::profiles::endpoint_dns_unresolved(state, row);
 
-        let inbound_flag = flag_cell(info.and_then(|i| i.country.as_deref()));
+        let inbound_flag = flag_cell(info.and_then(|i| i.country.as_deref()), flags_supported());
         // Host (raw): the Address column truncates at draw time (§8) so a
         // width-shrunk column still elides the subdomain instead of
         // hard-clipping through the domain.
@@ -889,7 +889,7 @@ fn build_display_rows(
             (None, None)
         };
         let outbound_addr = truncate_pad(&persisted_outbound.unwrap_or_else(|| "—".to_string()), 14);
-        let outbound_flag = flag_cell(enriched_country.as_deref());
+        let outbound_flag = flag_cell(enriched_country.as_deref(), flags_supported());
 
         // Panel content
         let panel_ips = info
@@ -1093,7 +1093,7 @@ fn render_data_grid(
         (0, "", 2),         // status
         (1, "ID", 8),       // link id hex
         (2, "Flag", 5),     // inbound flag
-        (3, "Address", 34), // host (+ `+`/`-` prefix cell)
+        (3, "Address", 29), // host (+ `+`/`-` prefix cell)
         (4, "Port", 6),     // port
         (5, "White", 9),    // whitelist tokens
         (6, "Protocol", 24),
@@ -1152,7 +1152,7 @@ fn render_data_grid(
     let scrollbar_offset = state.page_offset.saturating_add(data_offset);
     let data_table = DataTable::new(columns, display_rows)
         .highlight_style(ThemeStyles::table_row_selected(theme))
-        .column_spacing(0)
+        .column_spacing(1)
         .column_order(order)
         .sort_column(sort_column, sort_direction)
         .total_rows(Some(scrollbar_total))
@@ -1877,6 +1877,16 @@ mod tests {
         assert_eq!(truncate_host("edge-a.example", 33), "edge-a.example");
         // IP literals right-truncate with an ellipsis.
         assert_eq!(truncate_host("2001:db8::dead:beef", 10), "2001:db8:…");
+    }
+
+    #[test]
+    fn flag_cell_pins_both_capability_forms() {
+        // Emoji form: `<flag>-<ISO>`, 5 cells (D14). Fallback: bare ISO.
+        assert_eq!(flag_cell(Some("NL"), true), "🇳🇱-NL");
+        assert_eq!(flag_cell(Some("NL"), false), "NL   ");
+        // Unknown country is the neutral glyph in both forms.
+        assert_eq!(flag_cell(None, true), "—");
+        assert_eq!(flag_cell(None, false), "—");
     }
 
     #[test]

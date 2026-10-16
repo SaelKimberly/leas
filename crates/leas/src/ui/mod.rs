@@ -1218,11 +1218,17 @@ fn render(frame: &mut Frame, state: &AppState) {
     // Screen-modes (Add/Edit/Import/Batch/Settings) still own the whole area
     // until P3 moves them to popups.
     if is_screen_mode(&state.mode) {
-        render_base(frame, area, state);
+        // Screen modes own the content area; the status bar still gets its
+        // own bottom row (it used to receive the whole area).
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(area);
+        render_base(frame, rows[0], state);
         for kind in overlay_stack(state) {
-            render_overlay(kind, frame, area, state);
+            render_overlay(kind, frame, rows[0], state);
         }
-        crate::ui::status_bar::render(frame, area, state);
+        crate::ui::status_bar::render(frame, rows[1], state);
         return;
     }
 

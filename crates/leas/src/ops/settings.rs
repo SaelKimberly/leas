@@ -14,9 +14,14 @@ pub fn cancel_form(state: &mut AppState) {
 }
 
 pub fn enter_settings(state: &mut AppState) {
+    // Select the first LEAF, not the group header: on a group row `Enter`
+    // collapses the group, so the first press would never open a form
+    // (tui-polish §5.4). `all_expanded(5)`'s default selection is (0, None).
+    let mut tree = TreeState::all_expanded(5);
+    tree.select(0, Some(0));
     state.mode = AppMode::Settings {
         mode: SettingsMode::Split {
-            tree: RefCell::new(TreeState::all_expanded(5)),
+            tree: RefCell::new(tree),
             focus: SplitFocus::Tree,
             right: SplitRightPane::Empty,
         },
