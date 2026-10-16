@@ -59,19 +59,71 @@ pub fn render_confirmation_overlay(
     frame.render_widget(popup, area);
 }
 
-/// Render the correct confirmation text for any `ConfirmAction` variant.
-/// Call once per render path instead of duplicating per-variant checks.
+/// The single owner of confirmation text: every `ConfirmAction` variant's
+/// prompt, and the only place a confirmation is drawn.
+///
+/// It used to be three owners — this one (5 variants), a block inside the Logs
+/// pane renderer, and a block inside the profiles renderer. A Logs `Del` is
+/// raised while the profiles pane is also rendering, so two of them drew the
+/// SAME confirmation twice, offset, with different wording ("Purge logs
+/// database?" and "Purge entire log database?"). Keeping the text here means a
+/// new variant cannot silently render nothing, and no render path can draw a
+/// second copy.
 pub fn render_any_confirmation(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
-    let text = match state.confirmation {
-        Some(crate::ConfirmAction::Quit) => " Quit? (y/N) ",
-        Some(crate::ConfirmAction::ClearStats) => " Clear all stats? (y/N) ",
-        Some(crate::ConfirmAction::DiscardSettings) => " Discard unsaved settings? (y/N) ",
-        Some(crate::ConfirmAction::ClearLogs) => " Clear logs? (y/N) ",
-        Some(crate::ConfirmAction::PurgeLogsDatabase) => " Purge logs database? (y/N) ",
-        _ => return,
+    let Some(text) = confirmation_text(state) else {
+        return;
     };
-    render_confirmation_overlay(frame, area, text, theme);
+    render_confirmation_overlay(frame, area, &text, theme);
+}
+
+/// The prompt for the active confirmation, or `None` when none is pending.
+///
+/// Split out from the draw so the text is testable without a terminal, and so
+/// every variant must be covered here rather than silently rendering nothing.
+#[must_use]
+pub fn confirmation_text(state: &AppState) -> Option<String> {
+    let text = match &state.confirmation {
+        Some(crate::ConfirmAction::Quit) => " Quit? (y/N) ".to_string(),
+        Some(crate::ConfirmAction::ClearStats) => " Clear all stats? (y/N) ".to_string(),
+        Some(crate::ConfirmAction::DiscardSettings) => {
+            " Discard unsaved settings? (y/N) ".to_string()
+        }
+        Some(crate::ConfirmAction::ClearLogs) => " Clear logs? (y/N) ".to_string(),
+        Some(crate::ConfirmAction::PurgeLogsDatabase) => " Purge logs database? (y/N) ".to_string(),
+        Some(crate::ConfirmAction::DeleteProfile(id)) => {
+            // The prompt names the endpoint being deleted, so a mistyped `y`
+            // is checkable against the row that was selected.
+            let name = state
+                .endpoints
+                .iter()
+                .find(|r| r.endpoint.id.get() == *id)
+                .map(|r| {
+                    format!(
+                        "{}:{}",
+                        r.endpoint.display_host(&r.resolved_ips),
+                        r.endpoint.port
+                    )
+                })
+                .unwrap_or_default();
+            format!(" Delete \"{name}\"? (y/N) ")
+        }
+        Some(crate::ConfirmAction::DeleteProfiles(ids)) => {
+            format!(" Delete {} profiles? (y/N) ", ids.len())
+        }
+        Some(crate::ConfirmAction::DeleteGroup(_)) => " Delete group? (y/N) ".to_string(),
+        Some(crate::ConfirmAction::ClearGroup(group_id)) => {
+            let group_name = state
+                .groups
+                .iter()
+                .find(|g| g.id == *group_id)
+                .and_then(|g| g.name.as_deref())
+                .unwrap_or("unknown");
+            format!(" Clear all profiles in \"{group_name}\"? (y/N) ")
+        }
+        None => return None,
+    };
+    Some(text)
 }
 // ── Entry point ───────────────────────────────────────────────────────
 
@@ -1536,5 +1588,50 @@ mod tests {
         handle_event(&f1(KeyEventKind::Press), &mut state).await;
         handle_event(&f1(KeyEventKind::Release), &mut state).await;
         assert!(!state.actions_compact);
+    }
+
+    /// Every `ConfirmAction` variant must have prompt text, and the stack must
+    /// yield exactly ONE confirmation overlay.
+    ///
+    /// The text used to live in three places (here, the Logs pane renderer, and
+    /// the profiles renderer). A Logs `Del` renders while the profiles pane is
+    /// also drawing, so two owners drew the SAME confirmation twice, offset,
+    /// with different wording. A variant with no arm here would render nothing
+    /// at all, which is the other half of the same defect.
+    #[tokio::test]
+    async fn every_confirmation_has_exactly_one_prompt() {
+        use crate::ConfirmAction;
+
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        let variants = [
+            ConfirmAction::Quit,
+            ConfirmAction::ClearStats,
+            ConfirmAction::DiscardSettings,
+            ConfirmAction::ClearLogs,
+            ConfirmAction::PurgeLogsDatabase,
+            ConfirmAction::DeleteProfile(1),
+            ConfirmAction::DeleteProfiles(vec![1, 2]),
+            ConfirmAction::DeleteGroup("g".to_string()),
+            ConfirmAction::ClearGroup("g".to_string()),
+        ];
+        for action in variants {
+            state.confirmation = Some(action.clone());
+            // The overlay stack carries the confirmation exactly once…
+            let kinds = overlay_stack(&state);
+            assert_eq!(
+                kinds
+                    .iter()
+                    .filter(|k| **k == OverlayKind::Confirmation)
+                    .count(),
+                1,
+                "one confirmation overlay for {action:?}"
+            );
+            // …and it resolves to prompt text (a missing arm would draw none).
+            let text = confirmation_text(&state).unwrap_or_default();
+            assert!(
+                text.contains("(y/N)"),
+                "{action:?} must render a prompt, got {text:?}"
+            );
+        }
     }
 }

@@ -6,12 +6,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
-use crate::ui::render_confirmation_overlay;
 use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::data_table::{
     Column, ColumnWidth, DataTable, DataTableRow, DataTableState, SortDirection,
 };
-use crate::{AppState, ConfirmAction, EndpointRow, format_relative_ts, format_ts, iso_to_flag};
+use crate::{AppState, EndpointRow, format_relative_ts, format_ts, iso_to_flag};
 
 // ── Display-row cache (part-2 runtime bounds) ────────────────────────────
 //
@@ -476,7 +475,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     render_data_grid(frame, chunks[1], &display_rows, selected, state, theme);
     render_footer(frame, chunks[2], state, theme);
-    render_confirmation_overlays(frame, area, &rows, state);
 }
 
 const fn test_glyph(test_type: TestType) -> &'static str {
@@ -1476,58 +1474,6 @@ fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     let line = Line::from(vec![view_span, Span::raw("  "), search_span]);
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
-}
-
-fn render_confirmation_overlays(
-    frame: &mut Frame,
-    area: Rect,
-    rows: &[&EndpointRow],
-    state: &AppState,
-) {
-    match state.confirmation {
-        Some(ConfirmAction::DeleteProfile(ref delete_id)) => {
-            let profile_name = rows
-                .iter()
-                .find(|r| r.endpoint.id.get() == *delete_id)
-                .map(|r| {
-                    format!(
-                        "{}:{}",
-                        r.endpoint.display_host(&r.resolved_ips),
-                        r.endpoint.port
-                    )
-                })
-                .unwrap_or_default();
-            render_confirmation_overlay(
-                frame,
-                area,
-                &format!(" Delete \"{profile_name}\"? (y/N) "),
-                state.theme(),
-            );
-        }
-        Some(ConfirmAction::DeleteProfiles(ref ids)) => {
-            render_confirmation_overlay(
-                frame,
-                area,
-                &format!(" Delete {} profiles? (y/N) ", ids.len()),
-                state.theme(),
-            );
-        }
-        Some(ConfirmAction::ClearGroup(ref group_id)) => {
-            let group_name = state
-                .groups
-                .iter()
-                .find(|g| g.id == *group_id)
-                .and_then(|g| g.name.as_deref())
-                .unwrap_or("unknown");
-            render_confirmation_overlay(
-                frame,
-                area,
-                &format!(" Clear all profiles in \"{group_name}\"? (y/N) "),
-                state.theme(),
-            );
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]

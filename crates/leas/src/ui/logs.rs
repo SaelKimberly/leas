@@ -7,7 +7,6 @@ use ratatui::widgets::Paragraph;
 use std::collections::{HashSet, VecDeque};
 
 use crate::AppState;
-use crate::ui::render_confirmation_overlay;
 use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::{Column, ColumnWidth, DataTable, DataTableRow, DataTableState};
 use tui_popup::{KnownSizeWrapper, Popup};
@@ -417,20 +416,9 @@ pub fn render_inner(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     frame.render_stateful_widget(data_table, log_area, &mut dt_state);
 
-    if matches!(state.confirmation, Some(crate::ConfirmAction::ClearLogs)) {
-        render_confirmation_overlay(frame, area, " Clear all logs? (y/N) ", state.theme());
-    }
-    if matches!(
-        state.confirmation,
-        Some(crate::ConfirmAction::PurgeLogsDatabase)
-    ) {
-        render_confirmation_overlay(
-            frame,
-            area,
-            " Purge entire log database? (y/N) ",
-            state.theme(),
-        );
-    }
+    // Confirmation text is owned by `ui::render_any_confirmation`, drawn once
+    // from the overlay stack. The Logs pane used to draw its own copy here,
+    // which put two prompts on screen whenever another pane rendered too.
 }
 
 /// Handle key events for the Logs tab.
