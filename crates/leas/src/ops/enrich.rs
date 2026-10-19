@@ -446,7 +446,7 @@ pub fn spawn_dns_resolve_host(
                                         Arc::clone(&RESOLVE_SEM).acquire_owned().await.ok()?;
                                     Some(permit)
                                 };
-                                Some(r.lookup_ip(&host, false).await)
+                                Some(r.lookup_ip(&host, true).await)
                             };
                             match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, bounded).await {
                                 // `Some(...)` means the permit was taken and the

@@ -136,7 +136,7 @@ fn parse_dnscrypt_lines(text: &str) -> Vec<NameServerConfig> {
     text.lines()
         .filter(|s| s.starts_with("sdns://"))
         .filter_map(|s| s.parse::<url::Url>().ok())
-        .filter_map(|url| sdns_to_nsc(&url, false))
+        .filter_map(|url| sdns_to_nsc(&url, true))
         .collect()
 }
 
@@ -304,8 +304,7 @@ impl DnsResolver {
 
     /// Resolves `hostname`, returning all addresses as a boxed slice — one
     /// contiguous allocation, no growth headroom, so cache and callers hold
-    /// exactly the answer. IPv6 results are filtered out unless
-    /// `allow_ipv6`.
+    /// exactly the answer. IPv6 results are included when `allow_ipv6`.
     pub async fn lookup_ip(
         &self,
         hostname: &str,
@@ -388,15 +387,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_dnscrypt_lines_skips_garbage_and_ipv6_stamps() {
+    fn parse_dnscrypt_lines_includes_ipv6_stamps() {
         // dns.aa.net.uk published as an IPv4 DoH stamp and as an IPv6 DoH
-        // stamp; the IPv6-only entry must be filtered out (allow_ipv6=false).
+        // stamp; with allow_ipv6=true both parse.
         let text = format!(
             "# DNSCrypt resolver list (markdown header)\n{STAMP_IPV4}\nnot a stamp\n{STAMP_IPV6}\n"
         );
         let parsed = parse_dnscrypt_lines(&text);
-        assert_eq!(parsed.len(), 1, "only the IPv4 stamp should parse");
+        assert_eq!(parsed.len(), 2, "both IPv4 and IPv6 stamps should parse");
         assert!(parsed[0].ip.is_ipv4());
+        assert!(parsed[1].ip.is_ipv6());
     }
 
     /// The stamp address policy must match the config layer's host policy:
