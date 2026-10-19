@@ -28,6 +28,14 @@ The invariants a change must respect. Detail lives in the sibling `reference/` p
 - **Country writes are queued** — one owner, one transaction per drain (`WriteBehind<CountrySpec>`, 15 s staleness deadline).
 - **Every network path has a hard deadline.** A hang is a bug.
 - **Import feed ceilings are configuration** (`AppConfig.import`, `0` = unbounded; defaults equal the previously hard-coded values).
+- **The subscription decoder is chunking-invariant.** `StreamingDecoder` output
+  depends only on the input bytes, never on how they are split across `feed()`
+  calls: encoding detection buffers a head until it is decisive, base64 is
+  normalized to one alphabet (whitespace dropped, so MIME-wrapped and URL-safe
+  input decode alike), and line assembly runs on bytes so a line ends only at
+  its `\n`. A single line is capped (`MAX_LINE`); a longer one is cut at the
+  last scheme start, and a single over-long URL is dropped and counted, never
+  silently truncated.
 
 ## Native core & TLS
 

@@ -525,13 +525,6 @@ pub async fn create_stats_provider(core_type: CoreType) -> Result<Box<dyn StatsP
 
 Helpers: `format_bytes(i64) -> String`, `format_uptime(u32) -> String`.
 
----
-
-**`subscription.rs`** — Subscription download and parsing
-```rust
-pub async fn update_subscription(url: &str, proxy: Option<&str>) -> Result<Vec<Profile>>;
-```
-Parses base64-encoded share URLs, plain URL lists, v2rayN subscription formats, and sing-box format.
 
 **`updater.rs`** — Backend binary auto-update
 Functions: `get_current_version()` (run `{core} version`, parse output), `get_latest_version()` (GitHub releases API), `download_release()` (streaming download via reqwest, progress tracking), `install_binary()` (extract archive → verify binary runs → .bak existing → copy all files → remove .bak on success, restore from .bak on failure).
@@ -547,6 +540,29 @@ pub fn export_client_config(profile: &Profile) -> Result<String>;
 Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI formats.
 
 ---
+
+### leas-config (library crate)
+
+`crates/leas-config/src/lib.rs` — configuration and parsing: `AppConfig`
+load/save (serde JSON on disk), `import_export` (share-URL parse/export, per-batch
+`ValidationSummary`), `forms`, `permissive_json`, `duration_or_secs`, `base64_util`.
+It owns the URL-parsing half of the import path; the DB half is `leas-db`.
+
+**`subscription.rs`** — subscription decoding: `StreamingDecoder` (bytes →
+base64|raw → lines → share URLs) feeding `subscription_url_chunks` /
+`parse_subscription_data` / `parse_url_batch`.
+
+The decoding pipeline is **chunking-invariant**: its output depends only on the
+input bytes, never on how the caller splits them across
+`StreamingDecoder::feed()`. Encoding detection buffers a head until 16 significant
+base64-only bytes make it decisive, so plain-text bodies (whose scheme carries `:`)
+are never misread as base64; base64 is normalized to the standard alphabet with
+whitespace dropped, so MIME-wrapped and URL-safe input decode alike. Line assembly
+runs on bytes, so a line ends only at its `\n` and a multi-byte codepoint
+straddling a feed boundary is never replaced with `U+FFFD`. A single line is capped
+at 256 KiB; a longer one is cut at the last scheme start, and a single over-long URL
+is dropped and counted (`overlong_lines()`), surfaced by the import run rather than
+silently lost.
 
 ### leas-native (library crate)
 

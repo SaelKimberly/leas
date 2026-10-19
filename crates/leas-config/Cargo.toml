@@ -28,7 +28,6 @@ humantime.workspace = true
 base64-simd.workspace = true
 escape8259.workspace = true
 urlencoding.workspace = true
-simdutf8 = "0.1.5"
 url.workspace = true
 
 # ============ Enum Utilities ============

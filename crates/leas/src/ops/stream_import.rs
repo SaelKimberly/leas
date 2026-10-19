@@ -60,8 +60,7 @@ pub struct ImportOutcome {
 ///
 /// HTTP subscriptions wrap `Response::chunk()`; a Telegram-channel source
 /// later wraps its update poller. Each `next_chunk` returns an arbitrarily
-/// sized piece of the logical stream (bounded above by the source, not by
-/// the decoder — the batcher re-chunks).
+/// sized piece of the logical stream; the decoder accepts any size.
 pub trait UrlSource: Send {
     fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<SourceBatch>> + Send + '_>>;
 }
@@ -98,33 +97,28 @@ struct UrlBatcher {
     decoder: leas_config::subscription::StreamingDecoder,
     queue: std::collections::VecDeque<String>,
     batch_size: usize,
-    /// Staging buffer: the decoder's encoding auto-detection locks state on
-    /// its first aligned segment, so it must see LARGE feeds — a tiny feed
-    /// like `vmes` is valid base64 and would corrupt plain-text decoding.
-    /// Feeding whole `INPUT_CHUNK_SIZE` slices reproduces the buffered
-    /// path's behavior exactly.
-    staging: Vec<u8>,
 }
 
 impl UrlBatcher {
-    fn new(batch_size: usize) -> Self {
+    const fn new(batch_size: usize) -> Self {
         Self {
             decoder: leas_config::subscription::StreamingDecoder::new(),
             queue: std::collections::VecDeque::new(),
             batch_size,
-            staging: Vec::with_capacity(leas_config::subscription::INPUT_CHUNK_SIZE * 2),
         }
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Result<(), String> {
-        self.staging.extend_from_slice(chunk);
-        let feed_size = leas_config::subscription::INPUT_CHUNK_SIZE;
-        while self.staging.len() >= feed_size {
-            let urls = self.decoder.feed(&self.staging[..feed_size])?;
-            self.queue.extend(urls);
-            self.staging.drain(..feed_size);
-        }
+        // Fed straight through: the decoder is chunking-invariant, so there is
+        // no reason to stage a copy of the whole body first.
+        let urls = self.decoder.feed(chunk)?;
+        self.queue.extend(urls);
         Ok(())
+    }
+
+    /// Single URLs the decoder dropped for exceeding its line cap.
+    const fn overlong_lines(&self) -> usize {
+        self.decoder.overlong_lines()
     }
 
     /// Drain one batch of complete URLs (shorter only at end-of-stream).
@@ -136,13 +130,8 @@ impl UrlBatcher {
         Some(self.queue.drain(..take).collect())
     }
 
-    /// Flush the staging remainder + decoder carry-over at end-of-stream.
+    /// Flush the decoder's carry-over at end-of-stream.
     fn finalize(&mut self) -> Result<(), String> {
-        if !self.staging.is_empty() {
-            let urls = self.decoder.feed(&self.staging)?;
-            self.queue.extend(urls);
-            self.staging.clear();
-        }
         let urls = self.decoder.finalize()?;
         self.queue.extend(urls);
         Ok(())
@@ -347,6 +336,21 @@ where
             "{dropped_total} URL(s) were parsed but NOT stored: every retry of their batch failed",
         );
         let base = format!("{dropped_total} URL(s) dropped after failed persists");
+        ended_early = Some(
+            ended_early.map_or_else(|| base.clone(), |reason| format!("{reason}; plus {base}")),
+        );
+    }
+
+    // Single URLs longer than the decoder's line cap are dropped by the
+    // decoder itself (never parsed), so they are not in `dropped_total` above.
+    // A silent drop is data loss, so name it in `ended_early` too.
+    let overlong = batcher.overlong_lines();
+    if overlong > 0 {
+        tracing::warn!(
+            target: "tui::ops::subscriptions",
+            "{overlong} single URL(s) exceeded the decoder's line cap and were dropped",
+        );
+        let base = format!("{overlong} over-long URL(s) dropped");
         ended_early = Some(
             ended_early.map_or_else(|| base.clone(), |reason| format!("{reason}; plus {base}")),
         );
@@ -1024,6 +1028,40 @@ mod tests {
             message.contains("stored"),
             "the message must say what survived, not imply a full feed: {message}"
         );
+    }
+
+    /// A single URL longer than the decoder's line cap is dropped by the
+    /// decoder, so it never reaches the parse loop and is invisible to
+    /// `dropped_total`. The run must still REPORT it rather than look clean.
+    #[tokio::test]
+    async fn an_over_long_url_is_reported_not_silently_dropped() {
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let validation = ValidationSettings::default();
+        // One URL over the 256 KiB line cap, between two that must survive.
+        let big = format!("vless://u@x.example:443?p={}#big", "a".repeat(300_000));
+        let body = format!("trojan://pw@a.example:443#a\n{big}\ntrojan://pw@c.example:443#c\n");
+        let mut source = ScriptedSource {
+            chunks: std::iter::once(Ok(bytes::Bytes::from(body))),
+        };
+        let outcome = run_streaming_import(
+            &mut source,
+            &db,
+            None,
+            &validation,
+            2,
+            None::<&fn(usize)>,
+            leas_config::app_config::ImportConfig::default(),
+        )
+        .await;
+
+        let reason = outcome
+            .ended_early
+            .expect("a dropped over-long URL must be reported");
+        assert!(
+            reason.contains("over-long"),
+            "the reason must name the drop: {reason}",
+        );
+        assert_eq!(outcome.links, 2, "the neighbouring URLs still import");
     }
 
     /// F2 (final review 2026-10-05): the import stages onto a LIVE flush task,

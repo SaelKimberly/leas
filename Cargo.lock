@@ -3281,7 +3281,6 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
- "simdutf8",
  "smallvec",
  "strum 0.28.0",
  "thiserror 2.0.21",
