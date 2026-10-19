@@ -3,8 +3,8 @@
 use crate::import_export::{
     ImportError, ParsedProfile, ValidationSettings, ValidationSummary, parse_share_url,
 };
-use aho_corasick::AhoCorasick;
 use base64_simd::STANDARD_NO_PAD;
+use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder, MatchKind};
 use leas_proto::proto_spec::{ProtoSpec, SecurityConfig};
 
 /// Bounded feed step for [`StreamingDecoder::feed`].
@@ -138,12 +138,17 @@ impl LineStage {
     /// the last scheme start — an ASCII boundary, so UTF-8 stays intact — and
     /// emit the part before it. A single URL longer than [`MAX_LINE`] has no
     /// such boundary: drop it, and count it rather than silently shrinking it.
+    ///
+    /// The scheme machine is ASCII-case-insensitive; since `self.line` is raw
+    /// bytes, fold a copy (`[u8]::to_ascii_lowercase`, byte-length-preserving)
+    /// so cut offsets map 1:1 onto `self.line`. This path only runs past
+    /// `MAX_LINE`, so the copy never touches the per-line hot loop.
     fn enforce_limit(&mut self, out: &mut Vec<String>) {
         if self.line.len() <= MAX_LINE {
             return;
         }
         if let Some(cut) = SCHEMA_AC
-            .find_iter(&self.line[..])
+            .leftmost_find_iter(&self.line[..].to_ascii_lowercase())
             .map(|m| m.start())
             .filter(|&s| s > 0)
             .last()
@@ -375,32 +380,32 @@ fn detect(head: &[u8], eof: bool) -> Option<Mode> {
 }
 
 /// Scheme prefixes that start a share URL, matched case-insensitively.
-static SCHEMA_AC: std::sync::LazyLock<AhoCorasick> = std::sync::LazyLock::new(|| {
-    AhoCorasick::builder()
-        .ascii_case_insensitive(true)
-        .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-        .build([
-            "vmess://",
-            "vless://",
-            "trojan://",
-            "ss://",
-            "ssr://",
-            "hysteria2://",
-            "hysteria://",
-            "hy2://",
-            "hy://",
-            "tuic://",
-            "socks://",
-            "socks5://",
-            "http://",
-            "naive+https://",
-            "naive+quic://",
-            "anytls://",
-            "shadowtls://",
-            "wireguard://",
-        ])
-        .expect("static scheme patterns")
-});
+static SCHEMA_AC: std::sync::LazyLock<DoubleArrayAhoCorasick<u32>> =
+    std::sync::LazyLock::new(|| {
+        DoubleArrayAhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build([
+                "vmess://",
+                "vless://",
+                "trojan://",
+                "ss://",
+                "ssr://",
+                "hysteria2://",
+                "hysteria://",
+                "hy2://",
+                "hy://",
+                "tuic://",
+                "socks://",
+                "socks5://",
+                "http://",
+                "naive+https://",
+                "naive+quic://",
+                "anytls://",
+                "shadowtls://",
+                "wireguard://",
+            ])
+            .expect("static scheme patterns")
+    });
 
 /// Standard `process_text`: append every URL in `data` (newline-separated, then
 /// scheme-split within each line) to `out`.
@@ -488,7 +493,17 @@ fn file_profile(
 fn subscription_url_split_into(text: &str, out: &mut Vec<String>) {
     let mut last_start: Option<usize> = None;
 
-    for m in SCHEMA_AC.find_iter(text) {
+    // daachorse has no `ascii_case_insensitive` option; the fold runs on a
+    // copy. `to_ascii_lowercase` is byte-length-preserving (non-ASCII passes
+    // through), so byte ranges stay valid on the original `text`. The borrowed
+    // arm avoids a copy for the (common) already-lowercase input.
+    let lowered: std::borrow::Cow<'_, str> = if text.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(text.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+
+    for m in SCHEMA_AC.leftmost_find_iter(lowered.as_ref()) {
         if let Some(start) = last_start.take() {
             let end = m.start();
             out.push(text[start..end].to_string());
@@ -622,6 +637,23 @@ mod tests {
         assert!(urls[0].starts_with("vmess://"));
         assert!(urls[1].starts_with("vless://"));
         assert!(urls[2].starts_with("trojan://"));
+    }
+
+    /// Case-insensitive scheme matching: uppercase and mixed-case schemes split
+    /// exactly like lowercase ones, and the chunks keep the ORIGINAL casing
+    /// (the ASCII fold happens on a lowered copy; slicing uses `text`).
+    #[test]
+    fn test_subscription_url_split_matching_is_ascii_case_insensitive() {
+        let urls = subscription_url_split("VMESS://abc12");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "VMESS://abc12");
+
+        let urls = subscription_url_split("VMeSs...");
+        assert_eq!(urls.len(), 0);
+
+        let input = "VMESS://PayLoadVlEsS://xY";
+        let urls = subscription_url_split(input);
+        assert_eq!(urls, vec!["VMESS://PayLoad", "VlEsS://xY"]);
     }
 
     #[test]

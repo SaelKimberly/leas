@@ -19,7 +19,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 # ============ Text / Search / Hash ============
-aho-corasick.workspace = true
+daachorse.workspace = true
 regex = "1.13.1"
 parking_lot.workspace = true
 tokio = { workspace = true, features = ["sync"] }

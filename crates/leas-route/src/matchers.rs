@@ -2,7 +2,7 @@
 
 use crate::addr::{Cidr, prefix_match};
 use crate::error::RouteError;
-use aho_corasick::AhoCorasick;
+use daachorse::DoubleArrayAhoCorasick;
 use regex::RegexSet;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -31,7 +31,10 @@ pub fn empty_spec() -> DomainRulesSpec {
 pub struct CompiledDomain {
     exact: HashSet<String>,
     suffix: HashSet<String>,
-    keywords: AhoCorasick,
+    // Boxed: daachorse's automaton is 168 bytes inline (vs aho-corasick's
+    // 24-byte internal box), which alone pushed `ItemMatcher::Domain` over the
+    // `large_size_differences_between_variants` gate.
+    keywords: Box<DoubleArrayAhoCorasick<u32>>,
     /// Whether any keyword pattern exists: an empty automaton still costs a
     /// call per evaluation, and most rules carry no keywords.
     has_keywords: bool,
@@ -66,11 +69,13 @@ impl CompiledDomain {
             suffix.insert(format!(".{s}"));
         }
         let keyword_pats = lower_all(&spec.keywords);
-        let keywords = AhoCorasick::new(&keyword_pats).map_err(|e| RouteError::Parse {
-            rule_index: 0,
-            field: "keyword",
-            message: e.to_string(),
-        })?;
+        let keywords = Box::new(DoubleArrayAhoCorasick::<u32>::new(&keyword_pats).map_err(
+            |e| RouteError::Parse {
+                rule_index: 0,
+                field: "keyword",
+                message: e.to_string(),
+            },
+        )?);
         let regex_pats = lower_all(&spec.regexes);
         let regexes = RegexSet::new(&regex_pats).map_err(|e| RouteError::Parse {
             rule_index: 0,
@@ -110,7 +115,7 @@ impl CompiledDomain {
         if self.suffix.iter().any(|s| host.ends_with(s.as_str())) {
             return true;
         }
-        if self.has_keywords && self.keywords.is_match(host) {
+        if self.has_keywords && self.keywords.find_iter(host).next().is_some() {
             return true;
         }
         self.has_regexes && self.regexes.is_match(host)

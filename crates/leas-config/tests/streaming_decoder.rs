@@ -183,3 +183,26 @@ fn overlong_single_url_is_dropped_and_counted() {
     assert_eq!(out.len(), 2, "{out:?}");
     assert_eq!(decoder.overlong_lines(), 1);
 }
+
+/// The overlong-line cut machine matches schemes ASCII-case-insensitively: an
+/// overlong line whose only repeating boundary is an UPPERCASE scheme is cut
+/// at every URL, not dropped. A case-sensitive search on the raw bytes would
+/// find no qualifying cut (>0) and drop the whole line as overlong.
+#[test]
+fn overlong_line_cut_is_ascii_case_insensitive() {
+    let lower = "trojan://pw@h.example:443#z";
+    let upper = "VMESS://eyJ2IjoiMiIsInBzIjoidCIsImFkZCI6IjEuMi4zLjQifQ==";
+    let count = 10_000; // ~500 KiB on one line
+    let all = format!("{lower}{}", upper.repeat(count)); // single line, no `\n`
+    let chunks: Vec<&[u8]> = all.as_bytes().chunks(INPUT_CHUNK_SIZE).collect();
+    let mut decoder = StreamingDecoder::new();
+    let mut out = Vec::new();
+    for chunk in &chunks {
+        out.extend(decoder.feed(chunk).expect("feed"));
+    }
+    out.extend(decoder.finalize().expect("finalize"));
+    assert_eq!(out.len(), count + 1, "{out:?}");
+    assert_eq!(out[0], lower);
+    assert!(out[1..].iter().all(|u| u == upper), "{out:?}");
+    assert_eq!(decoder.overlong_lines(), 0, "cut, never dropped");
+}

@@ -34,7 +34,7 @@ url.workspace = true
 strum = { version = "0.28.0", default-features = false, features = ["derive"] }
 
 # ============ Text / Search / Hash ============
-	aho-corasick.workspace = true
+	daachorse.workspace = true
 memchr.workspace = true
 
 # ============ Memory ============

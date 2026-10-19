@@ -1,6 +1,6 @@
 use std::{borrow::Cow, str::FromStr, sync::LazyLock};
 
-use aho_corasick::AhoCorasick;
+use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder, MatchKind};
 
 use super::TinyText;
 
@@ -76,10 +76,9 @@ impl SchemeX {
     }
 
     pub fn slice_input(s: &str) -> Vec<(Self, Cow<'_, str>)> {
-        static SCHEMA_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
-            AhoCorasick::builder()
-                .ascii_case_insensitive(true)
-                .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+        static SCHEMA_AC: LazyLock<DoubleArrayAhoCorasick<u32>> = LazyLock::new(|| {
+            DoubleArrayAhoCorasickBuilder::new()
+                .match_kind(MatchKind::LeftmostFirst)
                 .build([
                     "vless://",
                     "vmess://",
@@ -105,29 +104,34 @@ impl SchemeX {
                     "shadowtls://",
                     "tuic://",
                 ])
-                .expect("valid AhoCorasick patterns")
+                .expect("valid daachorse patterns")
         });
 
         let mut last = None;
 
         let mut chunks = Vec::new();
-        for m in SCHEMA_AC.find_iter(s) {
+        // daachorse has no `ascii_case_insensitive` option; matches are found on
+        // an ASCII-folded copy instead. The fold preserves byte length (non-ASCII
+        // passes through), so every range stays valid on the original `s`.
+        let lowered: Cow<'_, str> = if s.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(s.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(s)
+        };
+        for m in SCHEMA_AC.leftmost_find_iter(lowered.as_ref()) {
+            let (cur_start, cur_end) = (m.start(), m.end());
             let schema_area = s
-                .get(m.range())
-                .expect("AhoCorasick range should be valid")
+                .get(cur_start..cur_end)
+                .expect("daachorse range should be valid")
                 .split_once("://")
                 .expect("schema pattern always contains ://")
                 .0;
             let Ok(schema) = Self::from_str(schema_area);
 
-            if let Some((schema, begin)) = last.replace((schema, m.range().start)) {
-                let end = m.range().start;
+            if let Some((schema, prev_start)) = last.replace((schema, cur_start)) {
                 chunks.push((
                     schema,
-                    Cow::Borrowed(
-                        s.get(begin..end)
-                            .expect("contiguous range from AhoCorasick"),
-                    ),
+                    Cow::Borrowed(s.get(prev_start..cur_start).expect("contiguous range")),
                 ));
             }
         }
@@ -135,7 +139,7 @@ impl SchemeX {
         if let Some((schema, begin)) = last.take() {
             chunks.push((
                 schema,
-                Cow::Borrowed(s.get(begin..).expect("remaining range from AhoCorasick")),
+                Cow::Borrowed(s.get(begin..).expect("remaining range from daachorse")),
             ));
         }
         if chunks.is_empty() {
@@ -214,5 +218,58 @@ impl std::str::FromStr for SchemeX {
         );
 
         Ok(scheme)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SchemeX;
+    use rstest::rstest;
+
+    use std::borrow::Cow;
+
+    /// Case-insensitive prefix detection: the automaton matches on an
+    /// ASCII-folded copy while every returned chunk spans the ORIGINAL `s`,
+    /// so uppercase payload bytes must reach the caller untouched.
+    #[rstest]
+    #[case::uppercase_schemes("VLESS://PayloadVMESS://rest")]
+    #[case::mixed_case_scheme("vMeSs://ahttps://b")]
+    #[case::lower_scheme_upcased_payload("vmess://PAYLOAD")]
+    fn ascii_fold_only_folds_detection_not_output(#[case] input: &str) {
+        let chunks = SchemeX::slice_input(input);
+        for (_, area) in &chunks {
+            assert!(matches!(area, Cow::Borrowed(_)), "{input}: {area:?}");
+            assert!(input.contains(area.as_ref()), "{input}: {area:?}");
+        }
+    }
+
+    #[test]
+    fn uppercase_two_schemes_split_like_lowercase() {
+        let chunks = SchemeX::slice_input("VLESS://PayloadVMESS://rest");
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks[0].0, SchemeX::Vless);
+        assert_eq!(chunks[0].1.as_ref(), "VLESS://Payload");
+        assert_eq!(chunks[1].0, SchemeX::Vmess);
+        assert_eq!(chunks[1].1.as_ref(), "VMESS://rest");
+    }
+
+    #[test]
+    fn lowercase_scheme_with_uppercase_payload_single_url() {
+        let chunks = SchemeX::slice_input("vmess://PAYLOAD");
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        assert_eq!(chunks[0].0, SchemeX::Vmess);
+        assert_eq!(chunks[0].1.as_ref(), "vmess://PAYLOAD");
+    }
+
+    /// Lowered haystack ranges map 1:1 onto `s`: non-ASCII bytes (never folded
+    /// by `to_ascii_lowercase`) keep their length, so slicing stays byte-correct.
+    #[test]
+    fn multibyte_non_ascii_payload_keeps_byte_ranges() {
+        let chunks = SchemeX::slice_input("Vmess://条件条件Anytls://x");
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks[0].0, SchemeX::Vmess);
+        assert_eq!(chunks[0].1.as_ref(), "Vmess://条件条件");
+        assert_eq!(chunks[1].0, SchemeX::AnyTLS);
+        assert_eq!(chunks[1].1.as_ref(), "Anytls://x");
     }
 }

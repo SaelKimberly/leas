@@ -71,7 +71,10 @@ uuid = { version = "1.26.1", features = ["v4"] }
 # ============ Encoding ============
 escape8259 = "0.5.3"
 urlencoding = "2.1.3"
-aho-corasick = "1.1.5"
+# daachorse (Double-Array Aho-Corasick) has no `ascii_case_insensitive` build
+# option; call sites that need it lowercase the haystack with
+# `to_ascii_lowercase` (byte-length-preserving, so match ranges map 1:1).
+daachorse = "5.1.0"
 memchr = "2.8.3"
 smallvec = { version = "1.16.2", default-features = false, features = ["const_new"] }
 
