@@ -132,11 +132,20 @@ fn sdns_to_nsc(url: &url::Url, allow_ipv6: bool) -> Option<NameServerConfig> {
 /// Parses `DNSCrypt` resolver list text (fetched markdown or cache file) into
 /// name server configs. Lines that are not `sdns://` stamps, or that do not
 /// decode to a usable resolver, are skipped.
+///
+/// Stamp addresses stay IPv4-only (`allow_ipv6 = false`): a stamp is the
+/// client-side transport to the DNS server itself, so an unreachable family
+/// there is a pure latency tax — 467 of 893 published stamps are IPv6-only, and
+/// with no IPv6 route each one burns a dial timeout inside hickory's rotation
+/// (~10 s per lookup, over enrich's 8 s deadline). This is deliberately narrower
+/// than `lookup_ip(allow_ipv6)`: there the flag gates which ANSWER families a
+/// host's records may carry — a server the app dials is the lookup's subject,
+/// not its transport.
 fn parse_dnscrypt_lines(text: &str) -> Vec<NameServerConfig> {
     text.lines()
         .filter(|s| s.starts_with("sdns://"))
         .filter_map(|s| s.parse::<url::Url>().ok())
-        .filter_map(|url| sdns_to_nsc(&url, true))
+        .filter_map(|url| sdns_to_nsc(&url, false))
         .collect()
 }
 
@@ -387,16 +396,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_dnscrypt_lines_includes_ipv6_stamps() {
+    fn parse_dnscrypt_lines_skips_garbage_and_ipv6_stamps() {
         // dns.aa.net.uk published as an IPv4 DoH stamp and as an IPv6 DoH
-        // stamp; with allow_ipv6=true both parse.
+        // stamp; the IPv6-only entry must be filtered out (allow_ipv6=false).
         let text = format!(
             "# DNSCrypt resolver list (markdown header)\n{STAMP_IPV4}\nnot a stamp\n{STAMP_IPV6}\n"
         );
         let parsed = parse_dnscrypt_lines(&text);
-        assert_eq!(parsed.len(), 2, "both IPv4 and IPv6 stamps should parse");
+        assert_eq!(parsed.len(), 1, "only the IPv4 stamp should parse");
         assert!(parsed[0].ip.is_ipv4());
-        assert!(parsed[1].ip.is_ipv6());
     }
 
     /// The stamp address policy must match the config layer's host policy:
