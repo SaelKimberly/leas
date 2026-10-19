@@ -28,7 +28,7 @@ The invariants a change must respect. Detail lives in the sibling `reference/` p
 - **Country writes are queued** — one owner, one transaction per drain (`WriteBehind<CountrySpec>`, 15 s staleness deadline).
 - **Every network path has a hard deadline.** A hang is a bug.
 - **Import feed ceilings are configuration** (`AppConfig.import`, `0` = unbounded; defaults equal the previously hard-coded values).
-- **IPv6 is enabled by default for DNS resolution.** `DnsResolver::lookup_ip` and the DNSCrypt resolver-list parser (`sdns_to_nsc`) both pass `allow_ipv6=true` at every production call site. The host-features whitelist (`leas-host-features`) remains IPv4-only by design — the upstream data files (`ipwhitelist.txt`, `cidrwhitelist.txt`) contain only IPv4 entries.
+- **IPv6 answers are enabled by default; DNS stamp transport stays IPv4-only.** DNS lookups pass `allow_ipv6=true` (`ops/enrich.rs`) — the answer-family property of the server being dialed. The DNSCrypt resolver-list parser (`parse_dnscrypt_lines` → `sdns_to_nsc`) is deliberately `allow_ipv6=false`: a stamp is the client's transport to the DNS server itself, and admitting the 467 IPv6-only published stamps made every pool lookup crawl unreachable v6 dials on hosts without an IPv6 route (~10 s per lookup, over the enrich 8 s deadline). The host-features whitelist (`leas-host-features`) remains IPv4-only by design — the upstream data files (`ipwhitelist.txt`, `cidrwhitelist.txt`) contain only IPv4 entries.
 - **The subscription decoder is chunking-invariant.** `StreamingDecoder` output
   depends only on the input bytes, never on how they are split across `feed()`
   calls: encoding detection buffers a head until it is decisive, base64 is
