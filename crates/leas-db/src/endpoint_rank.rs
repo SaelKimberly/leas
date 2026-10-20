@@ -97,18 +97,17 @@ pub const fn weight_u64(weight: ConfigWeight) -> u64 {
 pub type LinkKey = (u8, u8, u64, i64, i64);
 
 /// The ONE statement of the live-first representative rule (spec
-/// `2026-10-20-stab-alive-design` D3): the min-key link among links whose
-/// NEWEST ring sample succeeded and that carry no purge verdict; when no link
+/// `2026-10-20-stab-alive-design` D3).
+///
+/// The rule: the min-key link among links whose NEWEST ring sample succeeded
+/// and that carry no purge verdict; when no link
 /// is live, the plain min-key link. Every representative choice — the stored
 /// rank keys and the typed in-memory panel — reads this, so the panel order,
 /// the stored keys, and the parity golden cannot drift apart.
 ///
 /// Returns the chosen link's index and its key.
 #[must_use]
-pub fn representative_index(
-    links: &[RankLink],
-    dns_unresolved: bool,
-) -> Option<(usize, LinkKey)> {
+pub fn representative_index(links: &[RankLink], dns_unresolved: bool) -> Option<(usize, LinkKey)> {
     let live = |(_, l): &(usize, &RankLink)| !l.purged && l.latest_ok == Some(true);
     links
         .iter()
@@ -234,15 +233,6 @@ impl RankLink {
             Some(true) => delay_bin(self.delay),
             Some(false) => 6 + delay_bin(self.delay),
             None => 12,
-        }
-    }
-
-    /// "Measured" rank of the display preference: real (0) before fast (1).
-    const fn display_rank(&self) -> Option<u8> {
-        match self.measured {
-            Some(true) => Some(0),
-            Some(false) => Some(1),
-            None => None,
         }
     }
 }
@@ -393,15 +383,18 @@ pub const fn stab_bin(mask: u64, len: u8) -> u8 {
     }
 }
 
-/// Whether the link's window holds at least one success — the link-level `proven`
-/// fact. Derived from the ring, never a separate durable bit, so a full window
+/// Whether the link's window holds at least one success.
+///
+/// The link-level `proven` fact. Derived from the ring, never a separate durable bit, so a full window
 /// of failures retires a link from `Successful` on its own.
 #[must_use]
 pub const fn stab_proven(mask: u64, len: u8) -> bool {
     stab_successes(mask, len) > 0
 }
 
-/// Whether the NEWEST sample in the window succeeded — the link-level "live"
+/// Whether the NEWEST sample in the window succeeded.
+///
+/// The link-level "live"
 /// fact (spec `2026-10-20-stab-alive-design` D3). The newest sample is always
 /// the top live bit (`bit len-1`): below the window the new sample enters as
 /// the newest with every existing bit keeping its index; at the window it
@@ -521,8 +514,7 @@ pub fn compute_rank(
     // `representative_index`. Its OWN stab is what the stored column reports —
     // the same link the bin/weight came from, so the stored stab and the
     // stored key cannot describe different links.
-    let (bin, stab, neg_weight, _, _) =
-        representative_index(links, dns_unresolved)?.1;
+    let (bin, stab, neg_weight, _, _) = representative_index(links, dns_unresolved)?.1;
     // `proven` is ENDPOINT-level and NOT the representative's: a link that has
     // worked in its window keeps the endpoint in `Successful` even when a
     // sibling is the representative (an untested sibling outranks a failed
@@ -1786,9 +1778,27 @@ mod tests {
     #[case::no_error_fast_is_its_delay_bin(Some(false), 300, None, false, 6 + 3)]
     #[case::no_error_untested_is_twelve(None, i32::MAX, None, false, 12)]
     #[case::real_err_never_succeeded_is_thirteen(None, i32::MAX, Some(ProfileErr::Real), false, 13)]
-    #[case::real_err_short_failure_ring_is_thirteen(Some(false), 300, Some(ProfileErr::Real), false, 13)]
-    #[case::real_err_full_dead_window_is_thirteen(Some(true), 40, Some(ProfileErr::Real), false, 13)]
-    #[case::real_err_proven_no_latency_is_thirteen(None, i32::MAX, Some(ProfileErr::Real), true, 13)]
+    #[case::real_err_short_failure_ring_is_thirteen(
+        Some(false),
+        300,
+        Some(ProfileErr::Real),
+        false,
+        13
+    )]
+    #[case::real_err_full_dead_window_is_thirteen(
+        Some(true),
+        40,
+        Some(ProfileErr::Real),
+        false,
+        13
+    )]
+    #[case::real_err_proven_no_latency_is_thirteen(
+        None,
+        i32::MAX,
+        Some(ProfileErr::Real),
+        true,
+        13
+    )]
     #[case::real_err_proven_keeps_its_real_delay(Some(true), 40, Some(ProfileErr::Real), true, 0)]
     #[case::real_err_proven_fast_latency_uses_stored_latency(Some(false), 300, Some(ProfileErr::Real), true, 6 + 3)]
     #[case::name_err_without_success_is_thirteen(None, i32::MAX, Some(ProfileErr::Name), false, 13)]
@@ -1879,6 +1889,9 @@ mod tests {
             &[purged, failing],
         )
         .expect("rank");
-        assert_eq!(row.rank.bin, 13, "the failing sibling represents, not the purged link");
+        assert_eq!(
+            row.rank.bin, 13,
+            "the failing sibling represents, not the purged link"
+        );
     }
 }

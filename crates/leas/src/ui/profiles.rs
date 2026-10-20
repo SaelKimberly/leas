@@ -224,9 +224,9 @@ impl DataTableRow for DisplayRowData {
                 5 => (self.white_str.as_str(), self.white_style),
                 6 => (self.protocol_info_str.as_str(), self.protocol_style),
                 7 => (self.test_str.as_str(), self.test_style),
-                8 => (self.outbound_flag.as_str(), self.row_style),
-                9 => (self.outbound_addr.as_str(), self.address_style),
-                10 => (self.stab_str.as_str(), self.stab_style),
+                8 => (self.stab_str.as_str(), self.stab_style),
+                9 => (self.outbound_flag.as_str(), self.row_style),
+                10 => (self.outbound_addr.as_str(), self.address_style),
                 _ => ("", self.row_style),
             };
             let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
@@ -1195,6 +1195,25 @@ fn build_display_rows(
     std::rc::Rc::clone(&cache.rows)
 }
 
+/// The endpoint grid's columns (spec §7 + `2026-10-20-stab-alive-design` D5):
+/// logical id, header label, width. One owner for the header row, the width
+/// drops, and the row-cell match — a label or order change lands here once.
+/// `Stab` sits directly after `Test`: the two cells describe the SAME
+/// representative link, and the spec requires them adjacent.
+const GRID_COLUMNS: [(usize, &str, u16); 11] = [
+    (0, "", 2),         // status glyph + expand chevron in the gap cell
+    (1, "ID", 8),       // link id hex
+    (2, "Flag", 5),     // inbound flag
+    (3, "Address", 30), // host (full width; the chevron moved to column 0)
+    (4, "Port", 6),     // port
+    (5, "White", 9),    // whitelist tokens
+    (6, "Protocol", 24),
+    (7, "Test", 7),   // + fixed sort arrow
+    (8, "Stab", 7),   // representative link's ring, successes/attempts
+    (9, "Out", 5),    // exit flag
+    (10, "Exit", 14), // exit IP
+];
+
 fn render_data_grid(
     frame: &mut Frame,
     area: Rect,
@@ -1206,31 +1225,16 @@ fn render_data_grid(
     // Pane 1 supplies the frame (spec §6): the table renders frameless, inset
     // one cell per side to preserve the geometry the old Block's border gave.
 
-    // 11 columns (spec §7 + `2026-10-20-stab-alive-design` D5): status, ID,
-    // Flag, Address, Port, White, Protocol, Test, Out, Exit, Stab. No
-    // decorative bracket or glyph cells; every label carries the header role.
     let header_style = ThemeStyles::table_header(theme);
     // Width-aware drop (tui-polish D7, re-derived for the §7 grid): the inner
     // width decides which columns survive. `Test` is protected — a row without
     // its verdict is useless. Drop order: Exit, Out, White, Stab; then Address
     // shrinks toward a 12-cell floor. Surviving columns carry their LOGICAL id
     // through `order`, so a drop never shifts another column's meaning.
-    let logical: [(usize, &str, u16); 11] = [
-        (0, "", 2),         // status glyph + expand chevron in the gap cell
-        (1, "ID", 8),       // link id hex
-        (2, "Flag", 5),     // inbound flag
-        (3, "Address", 30), // host (full width; the chevron moved to column 0)
-        (4, "Port", 6),     // port
-        (5, "White", 9),    // whitelist tokens
-        (6, "Protocol", 24),
-        (7, "Test", 7),  // + fixed sort arrow
-        (8, "Out", 5),   // exit flag
-        (9, "Exit", 14), // exit IP
-        (10, "Stab", 7), // representative link's ring, successes/attempts
-    ];
+    let logical: &[(usize, &str, u16); 11] = &GRID_COLUMNS;
     let mut widths: Vec<u16> = logical.iter().map(|(_, _, w)| *w).collect();
     let inner_w = area.width.saturating_sub(2); // frameless inset
-    for &drop in &[9usize, 8, 5, 10] {
+    for &drop in &[10usize, 9, 5, 8] {
         if widths.iter().sum::<u16>() > inner_w {
             widths[drop] = 0;
         }
@@ -1701,6 +1705,25 @@ mod tests {
         // A corrupt stored len is clamped, not panicked on.
         link.stab_len = 999;
         assert_eq!(stability_ratio(&link), "16/16");
+    }
+
+    /// The grid's header order (spec `2026-10-20-stab-alive-design` D5):
+    /// `Stab` sits directly AFTER `Test` — the two cells describe the same
+    /// representative link, and the adjacency is the product requirement.
+    #[test]
+    fn the_grid_puts_stab_right_after_test() {
+        let labels: Vec<&str> = GRID_COLUMNS.iter().map(|&(_, label, _)| label).collect();
+        assert_eq!(
+            labels,
+            [
+                "", "ID", "Flag", "Address", "Port", "White", "Protocol", "Test", "Stab", "Out",
+                "Exit"
+            ],
+            "Stab must sit immediately after Test"
+        );
+        let test_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Test");
+        let stab_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Stab");
+        assert_eq!(stab_pos, test_pos.map(|p| p + 1), "adjacency, numerically");
     }
 
     /// The row's Stab cell (spec `2026-10-20-stab-alive-design` D5) describes
