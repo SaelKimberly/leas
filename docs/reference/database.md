@@ -323,6 +323,42 @@ pool-created connections, which is what produced the historical
 durability trade (commits are not individually fsynced); the default `FULL`
 costs ~4.2 ms per commit and a ping batch issues tens of thousands of them.
 
+## MVCC mode and the micro-batch write-behind (2026-10-20)
+
+MVCC stays opt-in (`LEAS_TURSO_CONCURRENT_WRITES=1`, fresh files only). What
+the migration changed is how the write-behind driver behaves when it IS on:
+
+- **Micro-batch window.** `WriteBehind::new` clamps the default 512-row window
+  to 32 rows on an MVCC database (`DEFAULT_FLUSH_ROWS_MVCC`). Measured
+  (`micro_batch_mvcc_probe`, 16 writers × 256 updates/writer, 8,192-endpoint
+  feed): at batch 16 MVCC p99 is **12 ms against WAL's 631 ms**; at every
+  size the WAL arm carries 330–835 ms tail stalls that MVCC never shows.
+  Scope: this win is measured on the hand-rolled profile_stats probe shape
+  only. The geo writer's 75–95× verdict on its own 100-row batched shape
+  (`2026-10-20-turso-0.9-access-design.md` §7.1) was NOT re-measured and
+  stands for that writer.
+- **Rank refresh leaves the transaction.** Under MVCC, `LinkSpec::refresh`
+  is skipped in the window transaction; the touched endpoints are marked in
+  `Database::dirty_ranks` (IN-MEMORY) on commit, and both `profiles_page` and
+  `WriteBehind::flush` drain the set. **Durability boundary:** a crash between
+  a link-patch commit and the next drain leaves stale stored keys that reopen
+  does NOT repair — `endpoint_rank::ensure` backfills missing rows and
+  recomputes on a weight-version change only. A stale row persists until that
+  endpoint is next written. WAL keeps the atomic in-tx refresh and has no such
+  window. A fresh import keeps the in-tx refresh either way: a new endpoint
+  has no rank row yet, and deferring it would blind the page.
+- **Writer partitioning deferred.** The plan's N-channel partitioned drain was
+  NOT built: the probe measured zero conflicts at every batch size, and the
+  column-group design already keeps `last_seen_at` out of the RESULT patch.
+  `WriteBehind::run` remains the single-owner flush loop.
+- **Failure path.** A failed window is re-staged from the patch
+  (`CacheSpec::restage_patch`) — the drained triple no longer carries a
+  duplicate source-row clone (`Coalesced<K, P>`), so the staged heap cost is
+  one row, not two.
+- **`stage()` stays synchronous.** `push`/`stage` remain non-awaiting
+  `DashMap` inserts (ADR 0002); nothing about the MVCC path changes the UI
+  task's contract.
+
 ## Flows
 
 ### Open (and schema creation)

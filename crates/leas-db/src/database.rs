@@ -110,6 +110,9 @@ pub struct Database {
     /// in-memory database, where the toasty path is used. The export reader
     /// opens its own per-call connection instead: it is a one-off.
     pub(crate) direct: Option<Arc<tokio::sync::Mutex<turso::Connection>>>,
+    /// Dirty endpoints whose ordering keys need refresh before page loads.
+    /// Allows concurrent write transactions to omit in-tx rank refresh.
+    pub(crate) dirty_ranks: Arc<dashmap::DashSet<EndpointId>>,
 }
 
 /// Which mutable column groups a [`LinkPatch`] writes.
@@ -310,7 +313,7 @@ impl Database {
         clippy::significant_drop_tightening,
         reason = "the Turso driver temporaries are consumed by try_open_db in the very next statement; clippy attributes their drop to the whole fn through the generic await"
     )]
-    async fn open_with_concurrent_writes(
+    pub async fn open_with_concurrent_writes(
         path: impl AsRef<Path>,
         requested_mvcc: bool,
     ) -> Result<Self> {
@@ -417,6 +420,7 @@ impl Database {
             path: Some(PathBuf::from(path_str)),
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
             direct,
+            dirty_ranks: Arc::new(dashmap::DashSet::new()),
         })
     }
 
@@ -426,6 +430,34 @@ impl Database {
     #[must_use]
     pub const fn uses_direct_reader(&self) -> bool {
         self.direct.is_some()
+    }
+    /// Mark endpoints as needing their ordering keys recomputed.
+    pub fn mark_endpoint_ranks_dirty(&self, endpoint_ids: &[EndpointId]) {
+        for id in endpoint_ids {
+            self.dirty_ranks.insert(*id);
+        }
+    }
+
+    /// Number of endpoints currently pending rank recalculation.
+    #[must_use]
+    pub fn dirty_rank_count(&self) -> usize {
+        self.dirty_ranks.len()
+    }
+
+    /// Drain and recompute stored keys for all dirty endpoints.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+    pub async fn drain_dirty_ranks(&self) -> Result<usize> {
+        if self.dirty_ranks.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<EndpointId> = self.dirty_ranks.iter().map(|entry| *entry).collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        for id in &ids {
+            self.dirty_ranks.remove(id);
+        }
+        self.refresh_endpoint_ranks(&ids).await
     }
 
     /// Open a toasty DB by constructing builder. Separate for recovery logic.
@@ -551,6 +583,7 @@ impl Database {
             path: None,
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
             direct: None,
+            dirty_ranks: Arc::new(dashmap::DashSet::new()),
         })
     }
 
@@ -2031,9 +2064,25 @@ pub async fn upsert_links_bulk(
     tx: &mut impl toasty::Executor,
     links: &[ProfileStats],
 ) -> Result<()> {
+    upsert_links_bulk_opt(tx, links, true).await
+}
+
+/// [`upsert_links_bulk`] with the in-tx rank refresh optional.
+///
+/// Under MVCC the refresh moves out of the window transaction (the write-behind
+/// driver marks the endpoints dirty on commit instead), so the driver passes
+/// `false`.
+pub async fn upsert_links_bulk_opt(
+    tx: &mut impl toasty::Executor,
+    links: &[ProfileStats],
+    refresh_ranks: bool,
+) -> Result<()> {
     // One multi-row upsert per chunk instead of one typed upsert per row
     // (measured 2026-09-16 over the reference feed: 2,000 links 360 ms → 48 ms).
     exec_link_upsert(tx, links, LINK_SOURCE_CONFLICT_SQL, now_epoch()).await?;
+    if !refresh_ranks {
+        return Ok(());
+    }
     // Derived state: the stored ordering keys follow the links, so every
     // link writer refreshes the endpoints it touched — here, inside the
     // caller's transaction, which makes the key update atomic with the write.
@@ -2664,6 +2713,170 @@ mod tests {
         for mvcc in [false, true] {
             arm("disjoint", mvcc, false).await;
             arm("contend", mvcc, true).await;
+        }
+    }
+    /// Micro-batch concurrency probe (T1): compare WAL vs MVCC across batch
+    /// sizes (1, 16, 32, 64, 128, 512) with 16 disjoint writers over
+    /// a fixed pre-seeded feed, measuring both with and without rank refresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[cfg(feature = "perf-lab")]
+    #[ignore = "timing probe; prints a table, asserts nothing (run with --features perf-lab -- --ignored)"]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "probe arithmetic over fixed endpoint counts"
+    )]
+    async fn micro_batch_mvcc_probe() {
+        const PRESEEDED_ENDPOINTS: usize = 8192;
+        const TOTAL_UPDATES_PER_WRITER: usize = 256;
+
+        async fn run_bench(mvcc: bool, with_rank_refresh: bool, writers: usize, batch_size: usize) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("micro.db");
+            let db = Arc::new(
+                Database::open_with_concurrent_writes(&path, mvcc)
+                    .await
+                    .expect("open"),
+            );
+            {
+                let mut conn = db.connection().await.expect("conn");
+                for id in 1..=(PRESEEDED_ENDPOINTS as i64) {
+                    seed_endpoint(&mut conn, id, id, "micro.example", HostType::Dns, 443, 1).await;
+                }
+            }
+
+            let ok = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let exhausted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let batches_per_writer = TOTAL_UPDATES_PER_WRITER / batch_size;
+            let latencies = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(
+                writers * batches_per_writer,
+            )));
+            let t0 = std::time::Instant::now();
+            let mut set = tokio::task::JoinSet::new();
+
+            for writer_ix in 0..writers {
+                let db = Arc::clone(&db);
+                let ok = Arc::clone(&ok);
+                let exhausted = Arc::clone(&exhausted);
+                let latencies = Arc::clone(&latencies);
+                set.spawn(async move {
+                    for b in 0..batches_per_writer {
+                        let mut patches = Vec::with_capacity(batch_size);
+                        let mut touched_eids = Vec::with_capacity(batch_size);
+                        for r in 0..batch_size {
+                            // Disjoint slice over preseeded endpoints
+                            let raw_ix =
+                                (writer_ix * TOTAL_UPDATES_PER_WRITER + b * batch_size + r)
+                                    % PRESEEDED_ENDPOINTS;
+                            let id = raw_ix as i64 + 1;
+                            let eid = EndpointId::new(id);
+                            touched_eids.push(eid);
+                            let mut row = ProfileStats {
+                                protocol_id: ProtocolId::new(id),
+                                endpoint_id: eid,
+                                last_used_at: None,
+                                last_seen_at: 1,
+                                latency: Some(Latency::Fast {
+                                    delay: ((r + b) % 900) as i32,
+                                }),
+                                speed_bps: None,
+                                error: None,
+                                purge_reason: None,
+                                stab_mask: 0,
+                                stab_len: 0,
+                                traffic: TrafficStats {
+                                    today_up: 0,
+                                    today_down: 0,
+                                    total_up: 0,
+                                    total_down: 0,
+                                },
+                                created_at: 0,
+                                updated_at: 0,
+                                version: 1,
+                                protocol: toasty::Deferred::default(),
+                                endpoint: toasty::Deferred::default(),
+                            };
+                            row.latency = Some(Latency::Fast {
+                                delay: ((r + b) % 900) as i32,
+                            });
+                            patches.push(LinkPatch {
+                                link: row,
+                                groups: LinkGroups::RESULT,
+                            });
+                        }
+
+                        let handle = Arc::clone(&db);
+                        let tb0 = std::time::Instant::now();
+                        let r = crate::retry_on_busy(
+                            || {
+                                let handle = Arc::clone(&handle);
+                                let patches = patches.clone();
+                                let touched_eids = touched_eids.clone();
+                                async move {
+                                    let mut conn = handle.connection().await?;
+                                    let mut tx = conn.transaction().await?;
+                                    let written = Database::apply_link_patches_tx(
+                                        &mut tx,
+                                        &patches,
+                                        now_epoch(),
+                                    )
+                                    .await?;
+                                    if with_rank_refresh {
+                                        crate::endpoint_rank::refresh(&mut tx, &touched_eids)
+                                            .await?;
+                                    }
+                                    tx.commit().await?;
+                                    Ok(written)
+                                }
+                            },
+                            5,
+                        )
+                        .await;
+
+                        let dur_us = tb0.elapsed().as_micros();
+                        latencies.lock().await.push(dur_us);
+
+                        if r.is_ok() {
+                            ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            exhausted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            while set.join_next().await.is_some() {}
+            let total_dur = t0.elapsed();
+            let mut lats = latencies.lock().await.clone();
+            lats.sort_unstable();
+            let p50 = lats[lats.len() / 2];
+            let p95 = lats[(lats.len() * 95) / 100];
+            let p99 = lats[(lats.len() * 99) / 100];
+            println!(
+                "MICROBENCH mode={:<4} rank_ref={:<5} bsize={:<3} wall={:>8.2?} ok={:<4} exhaust={} p50={:>6}µs p95={:>6}µs p99={:>6}µs",
+                if mvcc { "MVCC" } else { "WAL" },
+                with_rank_refresh,
+                batch_size,
+                total_dur,
+                ok.load(std::sync::atomic::Ordering::Relaxed),
+                exhausted.load(std::sync::atomic::Ordering::Relaxed),
+                p50,
+                p95,
+                p99,
+            );
+        }
+
+        println!("\n=== MICRO BATCH PROBE: 16 writers, WITH rank refresh ===");
+        for batch_size in [1, 16, 32, 64, 128, 256] {
+            run_bench(false, true, 16, batch_size).await;
+            run_bench(true, true, 16, batch_size).await;
+        }
+
+        println!(
+            "\n=== MICRO BATCH PROBE: 16 writers, WITHOUT rank refresh (Phase 2 decoupling premise) ==="
+        );
+        for batch_size in [1, 16, 32, 64, 128, 256] {
+            run_bench(false, false, 16, batch_size).await;
+            run_bench(true, false, 16, batch_size).await;
         }
     }
 

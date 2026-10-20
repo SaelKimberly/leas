@@ -564,6 +564,7 @@ impl Database {
     /// One page of endpoint ids in display order, plus the filtered total.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn profiles_page(&self, req: &PageRequest) -> Result<PageMeta> {
+        let _ = self.drain_dirty_ranks().await;
         if let Some(direct) = &self.direct {
             let conn = direct.lock().await;
             return Self::page_ids_direct(&conn, req).await;

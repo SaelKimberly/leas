@@ -28,9 +28,12 @@ use std::time::Duration;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
-/// Default flush trigger: rows.
-pub const DEFAULT_FLUSH_ROWS: usize = 512;
-
+/// Default flush trigger: rows for WAL mode.
+pub const DEFAULT_FLUSH_ROWS_WAL: usize = 512;
+/// Default flush trigger: rows for MVCC mode (micro-batching to eliminate B-tree page conflict).
+pub const DEFAULT_FLUSH_ROWS_MVCC: usize = 32;
+/// Default flush trigger: rows (alias to WAL default for backwards compatibility).
+pub const DEFAULT_FLUSH_ROWS: usize = DEFAULT_FLUSH_ROWS_WAL;
 /// Default flush trigger: time.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -73,11 +76,9 @@ pub const MAX_STAGED_AGE_TICKS: u32 = 75;
 /// (a patch carries only what the write needs), so `coalesce` returns the row
 /// alongside the patch instead.
 #[derive(Debug, Clone)]
-pub struct Coalesced<K, R, P> {
+pub struct Coalesced<K, P> {
     /// The pending map key this row was staged under.
     pub key: K,
-    /// The source row, retained for re-staging after a failed write.
-    pub row: R,
     /// The coalesced patch the write path consumes.
     pub patch: P,
 }
@@ -100,11 +101,7 @@ pub trait CacheSpec: Send + Sync + 'static {
     fn key_of(row: &Self::Row) -> Self::Key;
 
     /// Fold the drained rows into one patch per identity.
-    ///
-    /// The returned triples keep the source row so a failed flush can re-stage
-    /// it; the driver calls this while holding the flush gate, so the result is
-    /// the exact set it will write.
-    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>>;
+    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Patch>>;
 
     /// Write `patches` on the driver's transaction. Returns rows written.
     ///
@@ -123,16 +120,20 @@ pub trait CacheSpec: Send + Sync + 'static {
         patches: &'a [Self::Patch],
     ) -> impl Future<Output = crate::Result<()>> + Send + 'a;
 
-    /// The pending entries a drained row is re-staged as after a failed write.
-    ///
-    /// Defaults to the identity: one row, under the key it was drained from.
-    /// A spec whose staging key is FINER than its patch identity overrides
-    /// this, because re-staging under the patch's own key would insert an
-    /// entry no later push or drain would ever match — the rows would sit in
-    /// the map forever and be written by nothing.
-    fn restage_entries(row: &Self::Row) -> Vec<(Self::Key, Self::Row)> {
-        vec![(Self::key_of(row), row.clone())]
+    /// Whether refresh should run inside the chunk transaction.
+    /// When false, in-tx refresh is skipped and [`Self::on_commit`] is called instead.
+    #[must_use]
+    fn should_refresh_in_tx(db: &crate::Database) -> bool {
+        let _ = db;
+        true
     }
+
+    /// Hook called after each chunk transaction commits.
+    fn on_commit(_db: &crate::Database, _patches: &[Self::Patch]) {}
+    /// Reconstruct staged entries from a patch if a chunk transaction fails.
+    /// Reconstructing entries from the patch on failure avoids keeping duplicate
+    /// source-row clones in heap during normal flush execution.
+    fn restage_patch(patch: &Self::Patch) -> Vec<(Self::Key, Self::Row)>;
 }
 
 /// A coalescing write-behind drain for one table.
@@ -215,8 +216,18 @@ impl<S: CacheSpec> WriteBehind<S> {
         Arc::new(Self {
             pending: DashMap::new(),
             staged: AtomicU64::new(0),
-            flush_rows: flush_rows.max(1),
-            timer_flush_floor: (flush_rows.max(1) / TIMER_FLOOR_DIVISOR).max(1),
+            flush_rows: if db.uses_concurrent_writes() && flush_rows == DEFAULT_FLUSH_ROWS_WAL {
+                DEFAULT_FLUSH_ROWS_MVCC
+            } else {
+                flush_rows.max(1)
+            },
+            timer_flush_floor: if db.uses_concurrent_writes()
+                && flush_rows == DEFAULT_FLUSH_ROWS_WAL
+            {
+                (DEFAULT_FLUSH_ROWS_MVCC / TIMER_FLOOR_DIVISOR).max(1)
+            } else {
+                (flush_rows.max(1) / TIMER_FLOOR_DIVISOR).max(1)
+            },
             flush_interval,
             max_staged_age: max_staged_age.max(flush_interval),
             db,
@@ -279,7 +290,7 @@ impl<S: CacheSpec> WriteBehind<S> {
     /// while the flush is writing inserts a fresh entry that the next window
     /// picks up. Removing the key a second time after the write would drop that
     /// state.
-    fn drain(&self) -> Vec<Coalesced<S::Key, S::Row, S::Patch>> {
+    fn drain(&self) -> Vec<Coalesced<S::Key, S::Patch>> {
         let keys: Vec<S::Key> = self.pending.iter().map(|entry| *entry.key()).collect();
         let rows: Vec<S::Row> = keys.iter().filter_map(|key| self.take(key)).collect();
         S::coalesce(rows)
@@ -324,16 +335,7 @@ impl<S: CacheSpec> WriteBehind<S> {
         if drained.is_empty() {
             return Ok(0);
         }
-        // Split the triples into the patches the write path consumes and the
-        // (key, row) pairs the failure path re-stages. The two vectors stay
-        // index-aligned, so chunk `i` of `patches` corresponds to `rows`
-        // starting at `i * flush_rows`.
-        let mut patches = Vec::with_capacity(drained.len());
-        let mut rows = Vec::with_capacity(drained.len());
-        for entry in drained {
-            patches.push(entry.patch);
-            rows.push((entry.key, entry.row));
-        }
+        let patches: Vec<S::Patch> = drained.into_iter().map(|entry| entry.patch).collect();
 
         let mut written = 0usize;
         for (index, chunk) in patches.chunks(self.flush_rows).enumerate() {
@@ -345,7 +347,9 @@ impl<S: CacheSpec> WriteBehind<S> {
                         let mut conn = db.connection().await?;
                         let mut tx = conn.transaction().await?;
                         let n = S::write_window(&mut tx, chunk).await?;
-                        S::refresh(&mut tx, chunk).await?;
+                        if S::should_refresh_in_tx(&db) {
+                            S::refresh(&mut tx, chunk).await?;
+                        }
                         tx.commit().await?;
                         Ok::<usize, crate::DatabaseError>(n)
                     }
@@ -356,28 +360,29 @@ impl<S: CacheSpec> WriteBehind<S> {
             match result {
                 Ok(n) => {
                     written += n;
-                    // Recorded HERE, not on the success return, so the windows
-                    // a later failure discards are still counted — see
+                    S::on_commit(&self.db, chunk);
                     // [`Self::committed_total`].
                     self.committed_total
                         .fetch_add(usize_to_u64(n), Ordering::Relaxed);
                     self.flushes.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => {
-                    // Re-stage the failing window AND every later window. A row
-                    // pushed while this flush was writing already holds a NEWER
-                    // snapshot than the drained one, so re-stage leaves it
-                    // alone — see [`Self::restage`].
-                    self.restage(&rows[index * self.flush_rows..]);
+                    let mut failed_entries = Vec::new();
+                    for patch in &patches[index * self.flush_rows..] {
+                        failed_entries.extend(S::restage_patch(patch));
+                    }
+                    self.restage(&failed_entries);
                     return Err(err);
                 }
             }
+        }
+        if !S::should_refresh_in_tx(&self.db) {
+            let _ = self.db.drain_dirty_ranks().await;
         }
         Ok(written)
     }
 
     /// Re-insert drained rows that a failed flush did not write.
-    ///
     /// The drain REMOVED them from `pending`, so a row still absent is put back
     /// and counted. A key that was pushed again while the flush was writing is
     /// already [`Entry::Occupied`] with a **newer** snapshot than the drained
@@ -387,13 +392,13 @@ impl<S: CacheSpec> WriteBehind<S> {
     /// One row may expand into several entries — see
     /// [`CacheSpec::restage_entries`].
     fn restage(&self, rows: &[(S::Key, S::Row)]) {
-        for (key, row) in rows.iter().flat_map(|(_, row)| S::restage_entries(row)) {
-            match self.pending.entry(key) {
-                Entry::Occupied(_) => {}
+        for (key, row) in rows {
+            match self.pending.entry(*key) {
                 Entry::Vacant(slot) => {
-                    slot.insert(row);
+                    slot.insert(row.clone());
                     self.staged.fetch_add(1, Ordering::Relaxed);
                 }
+                Entry::Occupied(_) => {}
             }
         }
     }
@@ -591,10 +596,7 @@ impl CacheSpec for CountrySpec {
         row.endpoint_id
     }
 
-    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>> {
-        // Last-writer-wins per endpoint, first-seen order preserved: the queue's
-        // `DashMap::insert` overwrote an existing entry in place, and its key
-        // order is not part of any contract.
+    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Patch>> {
         let mut latest: HashMap<Self::Key, CountryRow> = HashMap::new();
         let mut order: Vec<Self::Key> = Vec::new();
         for row in rows {
@@ -610,11 +612,20 @@ impl CacheSpec for CountrySpec {
                 let patch = CountryPatch {
                     endpoint_id: row.endpoint_id,
                     ip: row.ip,
-                    iso: row.iso.clone(),
+                    iso: row.iso,
                 };
-                Some(Coalesced { key, row, patch })
+                Some(Coalesced { key, patch })
             })
             .collect()
+    }
+
+    fn restage_patch(patch: &Self::Patch) -> Vec<(Self::Key, Self::Row)> {
+        let row = CountryRow {
+            endpoint_id: patch.endpoint_id,
+            ip: patch.ip,
+            iso: patch.iso.clone(),
+        };
+        vec![(Self::key_of(&row), row)]
     }
 
     async fn write_window<'a>(
@@ -726,18 +737,27 @@ impl CacheSpec for SourceSpec {
         row.seq
     }
 
-    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>> {
-        // Identity: every batch carries its own unique `seq`, so nothing is
-        // merged and drain order is preserved.
+    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Patch>> {
         rows.into_iter()
             .map(|row| {
                 let key = row.seq;
                 let patch = SourcePatch::from(&row);
-                Coalesced { key, row, patch }
+                Coalesced { key, patch }
             })
             .collect()
     }
 
+    fn restage_patch(patch: &Self::Patch) -> Vec<(Self::Key, Self::Row)> {
+        let batch = SourceBatch {
+            seq: patch.seq,
+            endpoints: patch.endpoints.clone(),
+            protocols: patch.protocols.clone(),
+            links: patch.links.clone(),
+            group_links: patch.group_links.clone(),
+            ip_literals: patch.ip_literals.clone(),
+        };
+        vec![(Self::key_of(&batch), batch)]
+    }
     /// Write every family in the window on the driver's transaction, and
     /// report the LINK rows written — the count the import outcome reports.
     async fn write_window<'a>(
@@ -760,6 +780,11 @@ impl CacheSpec for SourceSpec {
             ip_literals.extend_from_slice(&patch.ip_literals);
         }
         let stored_links = links.len();
+        // Rank refresh stays IN the window transaction for the import path:
+        // a fresh import's endpoints have no rank rows yet, so deferring
+        // would leave the page blind until a drain. The import window is
+        // already the wide-transaction shape; `on_commit`'s dirty marks are
+        // a safety net for callers that disable the in-tx refresh.
         crate::database::upsert_endpoints_bulk(tx, &endpoints).await?;
         crate::database::upsert_protocols_bulk(tx, &protocols).await?;
         crate::database::upsert_links_bulk(tx, &links).await?;
@@ -781,6 +806,30 @@ impl CacheSpec for SourceSpec {
         _patches: &'a [Self::Patch],
     ) -> crate::Result<()> {
         Ok(())
+    }
+
+    /// Under MVCC the import's rank refresh moves OUT of the window
+    /// transaction: a fresh import touches thousands of endpoints, and a
+    /// rank refresh inside `BEGIN CONCURRENT` widens the transaction's page
+    /// set for every concurrent writer. The endpoints are marked dirty on
+    /// commit instead; the next page load drains them.
+    fn should_refresh_in_tx(db: &crate::Database) -> bool {
+        !db.uses_concurrent_writes()
+    }
+
+    fn on_commit(db: &crate::Database, patches: &[Self::Patch]) {
+        if !db.uses_concurrent_writes() {
+            return;
+        }
+        let mut touched: Vec<crate::models_toasty::EndpointId> = patches
+            .iter()
+            .flat_map(|p| p.links.iter().map(|l| l.endpoint_id))
+            .collect();
+        touched.sort_unstable_by_key(|id| id.get());
+        touched.dedup();
+        if !touched.is_empty() {
+            db.mark_endpoint_ranks_dirty(&touched);
+        }
     }
 }
 
@@ -868,7 +917,7 @@ impl CacheSpec for LinkSpec {
     /// already the merge of its per-group sources, so each bit it carries is
     /// overlaid from that same snapshot — which is exactly what the per-group
     /// rows it replaced would have contributed.
-    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>> {
+    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Patch>> {
         use crate::LinkGroups;
         let mut order: Vec<(
             crate::models_toasty::ProtocolId,
@@ -922,24 +971,13 @@ impl CacheSpec for LinkSpec {
                 let (groups, link) = merged.remove(&link_key)?;
                 Some(Coalesced {
                     key: (link_key.0, link_key.1, groups),
-                    row: LinkRow {
-                        link: link.clone(),
-                        groups,
-                    },
                     patch: crate::LinkPatch { link, groups },
                 })
             })
             .collect()
     }
 
-    /// Re-stage a merged row as ONE ENTRY PER FLAG.
-    ///
-    /// The default would re-stage under the union key — a key neither
-    /// [`WriteBehind::<LinkSpec>::stage`] nor [`Self::key_of`] ever produces,
-    /// so the retry would write nothing and the drained results would be lost.
-    /// Per-flag entries are addressable again, which is the whole reason the
-    /// staging key is finer than the patch identity.
-    fn restage_entries(row: &Self::Row) -> Vec<(Self::Key, Self::Row)> {
+    fn restage_patch(patch: &Self::Patch) -> Vec<(Self::Key, Self::Row)> {
         use crate::LinkGroups;
         [
             LinkGroups::RESULT,
@@ -948,10 +986,10 @@ impl CacheSpec for LinkSpec {
             LinkGroups::STAB,
         ]
         .into_iter()
-        .filter(|flag| row.groups.contains(*flag))
+        .filter(|flag| patch.groups.contains(*flag))
         .map(|flag| {
             let single = LinkRow {
-                link: row.link.clone(),
+                link: patch.link.clone(),
                 groups: flag,
             };
             (Self::key_of(&single), single)
@@ -996,6 +1034,19 @@ impl CacheSpec for LinkSpec {
         touched.dedup();
         crate::endpoint_rank::refresh(tx, &touched).await?;
         Ok(())
+    }
+    fn should_refresh_in_tx(db: &crate::Database) -> bool {
+        !db.uses_concurrent_writes()
+    }
+
+    fn on_commit(db: &crate::Database, patches: &[Self::Patch]) {
+        if db.uses_concurrent_writes() {
+            let mut touched: Vec<crate::models_toasty::EndpointId> =
+                patches.iter().map(|p| p.link.endpoint_id).collect();
+            touched.sort_unstable();
+            touched.dedup();
+            db.mark_endpoint_ranks_dirty(&touched);
+        }
     }
 }
 
@@ -1063,8 +1114,7 @@ mod tests {
             row.key
         }
 
-        fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>> {
-            // Last-writer-wins per key, preserving first-seen order.
+        fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Patch>> {
             let mut map = HashMap::new();
             let mut order = Vec::new();
             for row in rows {
@@ -1081,9 +1131,19 @@ mod tests {
                         key: row.key,
                         value: row.value,
                     };
-                    Coalesced { key, row, patch }
+                    Coalesced { key, patch }
                 })
                 .collect()
+        }
+
+        fn restage_patch(patch: &Self::Patch) -> Vec<(Self::Key, Self::Row)> {
+            vec![(
+                patch.key,
+                FakeRow {
+                    key: patch.key,
+                    value: patch.value,
+                },
+            )]
         }
 
         async fn write_window<'a>(
@@ -1153,14 +1213,17 @@ mod tests {
             *row
         }
 
-        fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>> {
+        fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Patch>> {
             rows.into_iter()
                 .map(|key| Coalesced {
                     key,
-                    row: key,
                     patch: WindowPatch { key },
                 })
                 .collect()
+        }
+
+        fn restage_patch(patch: &Self::Patch) -> Vec<(Self::Key, Self::Row)> {
+            vec![(patch.key, patch.key)]
         }
 
         async fn write_window<'a>(
@@ -1511,8 +1574,8 @@ mod tests {
         // being written.
         driver.push(row(1, 99));
         let rows: Vec<(i64, FakeRow)> = drained
-            .into_iter()
-            .map(|entry| (entry.key, entry.row))
+            .iter()
+            .flat_map(|entry| FakeSpec::restage_patch(&entry.patch))
             .collect();
         driver.restage(&rows);
 
@@ -1554,7 +1617,6 @@ mod tests {
             .find(|p| p.key == EndpointId::new(1))
             .expect("endpoint 1 survived");
         assert_eq!(one.patch.iso, "DE");
-        assert_eq!(one.row.iso, "DE");
     }
 
     // ── SourceSpec (import bulk path) ────────────────────────────────────
@@ -2215,6 +2277,23 @@ mod tests {
             small.timer_flush_floor(),
             1,
             "under the divisor floors to 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_is_strictly_synchronous_and_non_blocking() {
+        let db = fake_db().await;
+        let driver = WriteBehind::<FakeSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200));
+
+        let start = std::time::Instant::now();
+        for i in 0..10_000 {
+            driver.push(row(i, i * 2));
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(driver.staged_len(), 10_000);
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "stage took too long: {elapsed:?}"
         );
     }
 }

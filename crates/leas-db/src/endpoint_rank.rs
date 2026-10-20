@@ -1894,4 +1894,19 @@ mod tests {
             "the failing sibling represents, not the purged link"
         );
     }
+
+    #[tokio::test]
+    async fn test_dirty_rank_set_tracks_and_drains() {
+        let db = crate::Database::in_memory().await.expect("db");
+        let eid1 = EndpointId::new(101);
+        let eid2 = EndpointId::new(102);
+
+        assert_eq!(db.dirty_rank_count(), 0);
+        db.mark_endpoint_ranks_dirty(&[eid1, eid2]);
+        assert_eq!(db.dirty_rank_count(), 2);
+
+        let drained = db.drain_dirty_ranks().await.expect("drain");
+        assert_eq!(drained, 0); // No links exist in empty in-memory DB
+        assert_eq!(db.dirty_rank_count(), 0);
+    }
 }
