@@ -165,6 +165,12 @@ pub struct DisplayRowData {
     /// or the red `[name]`/`[fast]`/`[real]` problem labels, or blank.
     test_str: String,
     test_style: Style,
+    /// The representative link's ring as `successes/attempts` (spec
+    /// `2026-10-20-stab-alive-design` D5) — the SAME link the Test cell
+    /// describes, so the two columns cannot disagree about whose numbers the
+    /// row shows. `—` when the ring has no samples.
+    stab_str: String,
+    stab_style: Style,
     outbound_addr: String,
     /// Exit flag cell (D14): `<flag>-<ISO>` or bare `<ISO>`, `—` unknown.
     outbound_flag: String,
@@ -220,6 +226,7 @@ impl DataTableRow for DisplayRowData {
                 7 => (self.test_str.as_str(), self.test_style),
                 8 => (self.outbound_flag.as_str(), self.row_style),
                 9 => (self.outbound_addr.as_str(), self.address_style),
+                10 => (self.stab_str.as_str(), self.stab_style),
                 _ => ("", self.row_style),
             };
             let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
@@ -664,16 +671,53 @@ fn test_cell_content(
 /// `stab_bin` and must be checkable against where the row sits. The neutral
 /// "no data" marker is deliberately not `0/0` — that reads as a measured zero.
 fn stability_ratio(link: &leas_db::models::ProfileStats) -> String {
+    let (successes, len) = stability_counts(link);
+    if len == 0 {
+        return "—".to_string();
+    }
+    format!("{successes}/{len}")
+}
+
+/// The ring's live `(successes, len)`, clamped the way `RankLink::new`
+/// clamps it: a negative or oversized stored len is a corrupt row, never a
+/// shift by >63.
+fn stability_counts(link: &leas_db::models::ProfileStats) -> (u32, u8) {
     let len = u8::try_from(
         link.stab_len
             .clamp(0, i64::from(leas_db::endpoint_rank::STAB_WINDOW)),
     )
     .unwrap_or(0);
-    if len == 0 {
-        return "—".to_string();
-    }
     let successes = leas_db::endpoint_rank::stab_successes(link.stab_mask.cast_unsigned(), len);
-    format!("{successes}/{len}")
+    (successes, len)
+}
+
+/// The endpoint row's Stab cell (spec `2026-10-20-stab-alive-design` D5): the
+/// REPRESENTATIVE link's ring — the same link `compute_test_cell` describes —
+/// as `successes/attempts`, `—` when the ring is empty.
+///
+/// Color thresholds: ≥80% success reads `ok`, ≥50% `warn`, below `bad` — the
+/// same roles the Test cell's delay colors use, so one theme sweep covers both
+/// columns. No samples is muted, not an error.
+fn compute_stab_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) -> (String, Style) {
+    let representative = row
+        .representative_link_index(!resolved)
+        .and_then(|i| row.links.get(i));
+    let Some(link) = representative else {
+        return (String::new(), Style::default());
+    };
+    let text = stability_ratio(link);
+    if text == "—" {
+        return (text, ThemeStyles::hint(theme));
+    }
+    let (successes, len) = stability_counts(link);
+    let style = if u32::from(len) * 4 <= successes * 5 {
+        ThemeStyles::test_delay_ok(theme)
+    } else if successes * 2 >= u32::from(len) {
+        ThemeStyles::test_delay_warn(theme)
+    } else {
+        ThemeStyles::test_delay_bad(theme)
+    };
+    (text, style)
 }
 
 /// Row-number cell: a 6-cell right-aligned slot plus a trailing gap cell
@@ -931,6 +975,7 @@ fn build_display_rows(
             info.and_then(|i| i.sni_whitelisted).unwrap_or(false),
         );
         let (test_str, test_style) = compute_test_cell(row, resolved, theme);
+        let (stab_str, stab_style) = compute_stab_cell(row, resolved, theme);
 
         let protocol_info_str = protocol_info_cell(row);
 
@@ -1101,6 +1146,8 @@ fn build_display_rows(
             protocol_info_str,
             test_str,
             test_style,
+            stab_str,
+            stab_style,
             outbound_addr,
             outbound_flag,
             // The same `▸`/`▾` chevrons the settings sections use, so the
@@ -1159,16 +1206,16 @@ fn render_data_grid(
     // Pane 1 supplies the frame (spec §6): the table renders frameless, inset
     // one cell per side to preserve the geometry the old Block's border gave.
 
-    // 10 columns (spec §7): status, ID, Flag, Address, Port, White, Protocol,
-    // Test, Out, Exit. No decorative bracket or glyph cells; every label
-    // carries the header role.
+    // 11 columns (spec §7 + `2026-10-20-stab-alive-design` D5): status, ID,
+    // Flag, Address, Port, White, Protocol, Test, Out, Exit, Stab. No
+    // decorative bracket or glyph cells; every label carries the header role.
     let header_style = ThemeStyles::table_header(theme);
     // Width-aware drop (tui-polish D7, re-derived for the §7 grid): the inner
     // width decides which columns survive. `Test` is protected — a row without
-    // its verdict is useless. Drop order: Exit, Out, White; then Address
+    // its verdict is useless. Drop order: Exit, Out, White, Stab; then Address
     // shrinks toward a 12-cell floor. Surviving columns carry their LOGICAL id
     // through `order`, so a drop never shifts another column's meaning.
-    let logical: [(usize, &str, u16); 10] = [
+    let logical: [(usize, &str, u16); 11] = [
         (0, "", 2),         // status glyph + expand chevron in the gap cell
         (1, "ID", 8),       // link id hex
         (2, "Flag", 5),     // inbound flag
@@ -1179,10 +1226,11 @@ fn render_data_grid(
         (7, "Test", 7),  // + fixed sort arrow
         (8, "Out", 5),   // exit flag
         (9, "Exit", 14), // exit IP
+        (10, "Stab", 7), // representative link's ring, successes/attempts
     ];
     let mut widths: Vec<u16> = logical.iter().map(|(_, _, w)| *w).collect();
     let inner_w = area.width.saturating_sub(2); // frameless inset
-    for &drop in &[9usize, 8, 5] {
+    for &drop in &[9usize, 8, 5, 10] {
         if widths.iter().sum::<u16>() > inner_w {
             widths[drop] = 0;
         }
@@ -1655,6 +1703,46 @@ mod tests {
         assert_eq!(stability_ratio(&link), "16/16");
     }
 
+    /// The row's Stab cell (spec `2026-10-20-stab-alive-design` D5) describes
+    /// the REPRESENTATIVE link's ring — the same link the Test cell shows —
+    /// and colors by success rate: ≥80% ok, ≥50% warn, below bad, no samples
+    /// muted.
+    #[test]
+    fn stab_cell_follows_the_representative_link_and_colors_the_ratio() {
+        use crate::ops::profiles::test_support::fake_row;
+        use leas_db::models::Latency;
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let mut row = fake_row(1, "1.2.3.4", 2);
+
+        // Representative: link 1 (the only measured one).
+        row.links[0].latency = None;
+        row.links[1].latency = Some(Latency::Real {
+            delay: 40,
+            ip: None,
+        });
+
+        // No samples → muted dash, not 0/0.
+        row.links[1].stab_mask = 0;
+        row.links[1].stab_len = 0;
+        let (text, style) = compute_stab_cell(&row, true, &theme);
+        assert_eq!(text, "—", "no samples is the neutral marker");
+        assert_eq!(style, ThemeStyles::hint(&theme), "no samples is muted");
+
+        // 14/16 = 87.5% → ok; 12/16 = 75% → warn; 6/16 = 37.5% → bad.
+        let mut cells = |mask: i64, len: i64| {
+            row.links[1].stab_mask = mask;
+            row.links[1].stab_len = len;
+            compute_stab_cell(&row, true, &theme)
+        };
+        let (text, style) = cells((1 << 14) - 1, 16);
+        assert_eq!(text, "14/16");
+        assert_eq!(style, ThemeStyles::test_delay_ok(&theme));
+        let (_, style) = cells((1 << 12) - 1, 16);
+        assert_eq!(style, ThemeStyles::test_delay_warn(&theme));
+        let (_, style) = cells((1 << 6) - 1, 16);
+        assert_eq!(style, ThemeStyles::test_delay_bad(&theme));
+    }
+
     fn sample_panel_row(marker: &str) -> PanelRow {
         PanelRow {
             marker: marker.to_string(),
@@ -1684,6 +1772,8 @@ mod tests {
             protocol_info_str: String::new(),
             test_str: String::new(),
             test_style: Style::default(),
+            stab_str: String::new(),
+            stab_style: Style::default(),
             outbound_addr: String::new(),
             outbound_flag: String::new(),
             expand_prefix: if panel_rows.is_empty() {

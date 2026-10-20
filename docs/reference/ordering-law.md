@@ -25,7 +25,9 @@ keys — this separation is the whole design:
 | **link key** | which of *this* endpoint's links represents it? | `(bin, stab_bin, ¬weight, -seen, protocol_id)` | within one endpoint |
 | **endpoint key** | where does the endpoint sit on the page? | `(band, bin, stab_bin, ¬weight, domain, sub_domain, addr, endpoint_id)` | across the feed |
 
-The endpoint key describes the **representative** link's order terms; whether the
+The endpoint key describes the **representative** link's order terms — chosen
+live-first since `2026-10-20` (§8.2): a link whose newest ring sample succeeded
+represents before a recently-failed sibling; whether the
 endpoint is in the `Successful` scope is a **separate stored fact**
 (`rank_proven`, §6) — a proven endpoint can carry `bin` 12 or 13 when an untested
 or failing sibling is its representative, so membership cannot ride the key.
@@ -83,8 +85,8 @@ and roughly how fast") while making the key a small dense integer.
 | --- | --- | --- | --- | --- |
 | 0 | real, < 50 ms | | 6–11 | fast success, same 6 delays |
 | 1 | real, < 100 ms | | 12 | untested (no latency) |
-| 2 | real, < 250 ms | | 13 | real/name error marker |
-| 3 | real, < 500 ms | | 14 | fast error marker |
+| 2 | real, < 250 ms | | 13 | real/name error, **no real success in the ring** |
+| 3 | real, < 500 ms | | 14 | fast error marker (unchanged) |
 | 4 | real, < 1000 ms | | 15 | DNS host, unresolved |
 | 5 | real, ≥ 1000 ms | | 16 | purged |
 
@@ -95,10 +97,12 @@ flowchart TD
     P -- no --> D{"DNS unresolved<br/>(endpoint-level)?"}
     D -- yes --> B15["bin 15"]
     D -- no --> E{"error marker?"}
-    E -- "real / name" --> B13["bin 13"]
     E -- "fast" --> B14["bin 14"]
-    E -- no --> M{"has latency?"}
-    M -- "no" --> B12["bin 12"]
+    E -- "real / name" --> PR{"ring holds a<br/>real success?"}
+    PR -- "no" --> B13["bin 13"]
+    PR -- "yes" --> M{"stored latency?"}
+    E -- no --> M
+    M -- "no" --> B12["bin 12 (no error)<br/>bin 13 (real err, proven)"]
     M -- "real" --> R["0 + delay_bin"]
     M -- "fast" --> F["6 + delay_bin"]
 ```
@@ -392,6 +396,42 @@ the plan shape, and the per-row key comparison gains one `u8`. Re-run the
 row. The `band IN (0,1) ORDER BY key` trap above is unchanged and still
 filesorts.
 
+### 8.2 The last-good-delay bin (2026-10-20)
+
+Spec `2026-10-20-stab-alive-design`, `STAB_VERSION` 2. Before this, a real/name
+error marker forced bin 13 and DOMINATED the stab bin — a 16/16-stable link
+whose latest real ping failed sank below every working server. The law now:
+
+* **Bin through an error.** A real/name error keeps the link's STORED latency
+  bin (`latency` survives a failure — `apply_test_result` never erases it)
+  while the link's ring holds at least one real success (`proven`). The recent
+  failure demotes through the stab bin only. Bin 13 = a real/name error with
+  NO real success anywhere in the link's ring (never succeeded, a short
+  all-failure ring, or a full 0/16 dead window) — the Failed filter
+  (`bin ∈ 13,14,15`) always catches such a link, so no row is orphaned between
+  views.
+* **Per-link, not endpoint-level.** The gate reads the LINK's ring, never the
+  stored endpoint `rank_proven`; an endpoint-level gate would let a 0/16
+  ghost keep its last-good bin whenever a sibling is proven.
+* **The fast-error arm is unchanged** (bin 14): a fast failure never samples
+  the ring (§2.1), so the stab demotion cannot express it.
+* **Representative is live-first** (`representative_index`, the ONE
+  statement): the min-key link among links whose NEWEST ring sample succeeded
+  (`stab_latest_ok`, the top live bit) and that carry no purge verdict; plain
+  min-key when no link is live. Without this a ghost link (an old 40 ms
+  success, now failing, key `(0, 7)`) out-keyed a live slower sibling —
+  and the row displayed the dead link. `EndpointRow::representative_link_index`
+  reads the same helper, so the Test/Stab cells and the stored keys cannot
+  drift apart.
+* **Retired:** `endpoint_rank::display_link_index` (and `display_rank`) — it
+  had no production caller; the connect/marker link stays
+  `select_best_measured_link` + `active_link` (manual override checked first).
+
+The `rank_weight_meta` stamp folded `STAB_VERSION` 2 into
+`KEY_INPUTS_VERSION`, so an existing database rebuilds `rank_weight` /
+`rank_stab` / `rank_proven` once on the first open. Plans/timings unchanged:
+the index columns and their meanings are identical, only the numbers changed.
+
 ## 9. What is retired
 
 | gone | replaced by |
@@ -403,6 +443,7 @@ filesorts.
 | `endpoint_rank_test`, `endpoint_rank_test_v2`, `endpoint_rank_window` | one `endpoint_rank_key_v2` |
 | `endpoint_rank_key` (v18: no `rank_stab`, no trailing `rank_proven`) | `endpoint_rank_key_v2` |
 | `PlanScope::bins()` (a `rank_bin` list) | `PlanScope::predicate()` (the proven-first partition, §6.1) |
+| `endpoint_rank::display_link_index` + `RankLink::display_rank` | the representative law (`representative_index`) for Test/Stab; `active_link` for the connect/marker link (§8.2) |
 
 `PageSort` keeps `Port` and `Ip` for the perf lab; `Ip` is additionally the
 search range index's rationale (`endpoint_ip_by_key`).

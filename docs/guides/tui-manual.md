@@ -61,6 +61,7 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | `Test`       | 7     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). The cell describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index`, the argmin of the ordering key) — the same link the `ID` column names, so the two cells cannot disagree. Labels survive restarts; the Speed Test `error_ttl_hours` setting clears them. The header's `↑` arrow is the fixed sort (`PageSort::Test`, ascending): sorting is deliberately not user-changeable, to avoid database contention |
 | `Out`        | 5     | Exit country flag, same `<flag>-<ISO>` idiom as `Flag`; `—` unknown |
 | `Exit`       | 14    | Exit IP of the active link's persisted real ping (`—` none); survives reruns |
+| `Stab`       | 7     | The REPRESENTATIVE link's stability ring as `successes/attempts` (e.g. `14/16`; `—` no samples yet) — the same link the `Test`/`ID` cells describe. Colored by success rate (green ≥80%, yellow ≥50%, red below; dashed = no samples). A stable server keeps its position and a healthy Stab cell even when its latest real ping failed (spec `2026-10-20-stab-alive-design`) |
 
 Every label carries the header role; there are no decorative separator cells.
 Delay/Speed/Traffic/Outbound details live in the expanded panel (below).
@@ -498,8 +499,8 @@ Rows:
   `Alt+↑`/`Alt+↓` adjustment (clamped so pane 1 keeps ≥6 rows); the compact bar
   is 1 row, and below 20 terminal rows it is always selected.
 - The table drops columns by width priority when the pane is narrow: `Exit`,
-  then `Out`, then `White` disappear, and `Address` shrinks toward a 12-cell
-  floor — `Test` (with the fixed sort arrow) is protected.
+  then `Out`, then `White`, then `Stab` disappear, and `Address` shrinks toward
+  a 12-cell floor — `Test` (with the fixed sort arrow) is protected.
 
 Tracing integration (backend logging):
 - TUI internals emit `tracing` events via `tracing-subscriber` with a
