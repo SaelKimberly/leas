@@ -747,10 +747,10 @@ impl EndpointRow {
     /// measured the current selection is kept. A pinned manual override is
     /// unaffected — `active_link()` checks it first.
     pub fn select_best_measured_link(&mut self) {
-        // The purge gate, mirroring `endpoint_rank::display_link_index`: a
-        // purged link never supplies the row's headline delay while a live link
-        // exists, and an all-purged endpoint falls back to its purged links
-        // (the Purgatory view's case).
+        // The purge gate (spec `2026-09-17-purge-reason-design` §5): a
+        // purged link never supplies the row's headline delay while a live
+        // link exists, and an all-purged endpoint falls back to its purged
+        // links (the Purgatory view's case).
         let live = self.links.iter().any(|l| l.purge_reason.is_none());
         let Some((best, _)) = self
             .links
@@ -808,15 +808,17 @@ impl EndpointRow {
     pub fn representative_link_index(&self, dns_unresolved: bool) -> Option<usize> {
         let weights = self.link_weights();
         let zero = crate::weight::ZERO_WEIGHT;
-        self.links
+        let links: Vec<crate::endpoint_rank::RankLink> = self
+            .links
             .iter()
-            .enumerate()
-            .map(|(i, l)| {
+            .map(|l| {
                 let weight = weights.get(&l.protocol_id).copied().unwrap_or(zero);
-                (i, Self::link_test_key(l, weight, dns_unresolved))
+                crate::endpoint_rank::RankLink::new(l, weight)
             })
-            .min_by_key(|&(_, key)| key)
-            .map(|(i, _)| i)
+            .collect();
+        // The live-first rule (spec `2026-10-20-stab-alive-design` D3), the
+        // same ONE statement the stored keys read.
+        crate::endpoint_rank::representative_index(&links, dns_unresolved).map(|(i, _)| i)
     }
 }
 

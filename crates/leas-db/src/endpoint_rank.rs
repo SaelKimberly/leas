@@ -93,6 +93,38 @@ pub const fn weight_u64(weight: ConfigWeight) -> u64 {
     u64::from_be_bytes(weight.to_be_bytes())
 }
 
+/// The representative-LINK key tuple: `(bin, stab, !weight, -seen, protocol_id)`.
+pub type LinkKey = (u8, u8, u64, i64, i64);
+
+/// The ONE statement of the live-first representative rule (spec
+/// `2026-10-20-stab-alive-design` D3): the min-key link among links whose
+/// NEWEST ring sample succeeded and that carry no purge verdict; when no link
+/// is live, the plain min-key link. Every representative choice — the stored
+/// rank keys and the typed in-memory panel — reads this, so the panel order,
+/// the stored keys, and the parity golden cannot drift apart.
+///
+/// Returns the chosen link's index and its key.
+#[must_use]
+pub fn representative_index(
+    links: &[RankLink],
+    dns_unresolved: bool,
+) -> Option<(usize, LinkKey)> {
+    let live = |(_, l): &(usize, &RankLink)| !l.purged && l.latest_ok == Some(true);
+    links
+        .iter()
+        .enumerate()
+        .filter(&live)
+        .map(|(i, l)| (i, l.key(dns_unresolved)))
+        .min_by_key(|&(_, key)| key)
+        .or_else(|| {
+            links
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (i, l.key(dns_unresolved)))
+                .min_by_key(|&(_, key)| key)
+        })
+}
+
 impl RankLink {
     /// Build a link view. The weight is REQUIRED, not defaulted: it comes from
     /// the link's protocol, which this row does not carry.
@@ -414,53 +446,6 @@ pub const fn dns_unresolved(row: &EndpointRow) -> bool {
     row.endpoint.is_dns() && row.resolved_ips.is_empty()
 }
 
-/// Index of the endpoint's display link.
-///
-/// The rule the retired SQL used: a manual override naming an existing link,
-/// else the best measured link (real before fast, lowest delay, then protocol
-/// id), else nothing. Deliberately not `active_link()`: that one falls back to
-/// the selected link (the first link when nothing was ever measured), while
-/// the ordering law treats "no measurement" as a sentinel that sorts first
-/// ascending.
-///
-/// The purge gate: a purged link never sources the endpoint's displayed values
-/// while a live link exists — the tier-6 sink applied to the display
-/// preference, and it covers the override branch too (checking `display_rank`
-/// would not: the override early-returns on the protocol id). A pin therefore
-/// cannot resurrect a purged link as the Active row's delay/exit-IP/speed/
-/// traffic/config source. An endpoint whose links are ALL purged falls back to
-/// them, so a Purgatory row still shows the values it has.
-#[must_use]
-pub fn display_link_index(links: &[RankLink], override_protocol: Option<i64>) -> Option<usize> {
-    let live = links.iter().any(|l| !l.purged);
-    let eligible = |l: &RankLink| !live || !l.purged;
-    if let Some(pid) = override_protocol
-        && let Some(index) = links
-            .iter()
-            .position(|l| l.protocol_id == pid && eligible(l))
-    {
-        return Some(index);
-    }
-    // Live-first (spec `2026-10-20-stab-alive-design` D4): when an eligible
-    // link's newest ring sample succeeded, the display prefers that subset —
-    // a ghost link (an old fast success, now failing) must not supply the
-    // row's Test/Stab while a working sibling exists. A manual override above
-    // beats this filter: the pin is the user's explicit choice.
-    let has_live = links
-        .iter()
-        .any(|l| eligible(l) && l.latest_ok == Some(true));
-    links
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| eligible(l) && (!has_live || l.latest_ok == Some(true)))
-        .filter_map(|(i, l)| {
-            l.display_rank()
-                .map(|rank| (i, rank, l.delay, l.protocol_id))
-        })
-        .min_by_key(|&(_, rank, delay, protocol)| (rank, delay, protocol))
-        .map(|(i, _, _, _)| i)
-}
-
 /// A rank row plus the one key that is NOT a model field.
 ///
 /// `rank_weight` is a RAW column (added with `ALTER TABLE ADD COLUMN` beside
@@ -531,21 +516,13 @@ pub fn compute_rank(
     dns_unresolved: bool,
     links: &[RankLink],
 ) -> Option<RankRow> {
-    // The representative link: the minimum key. Live-first (spec
-    // `2026-10-20-stab-alive-design` D3): a link whose NEWEST ring sample
-    // succeeded represents before any recently-failed sibling — without this,
-    // a ghost link (old 40 ms real success, now failing, bin 0) would out-key
-    // a live slower sibling (bin 3) and the row would display the dead link.
-    // Purged links never enter the live subset: their ring froze at purge
-    // time, so its newest bit can still be a success. Falls back to the plain
-    // min-key when no link is live, so an all-failed endpoint still gets a
-    // deterministic representative.
-    let (bin, stab, neg_weight, _, _) = links
-        .iter()
-        .filter(|l| !l.purged && l.latest_ok == Some(true))
-        .map(|l| l.key(dns_unresolved))
-        .min()
-        .or_else(|| links.iter().map(|l| l.key(dns_unresolved)).min())?;
+    // The representative link: the live-first rule (spec
+    // `2026-10-20-stab-alive-design` D3), the ONE statement in
+    // `representative_index`. Its OWN stab is what the stored column reports —
+    // the same link the bin/weight came from, so the stored stab and the
+    // stored key cannot describe different links.
+    let (bin, stab, neg_weight, _, _) =
+        representative_index(links, dns_unresolved)?.1;
     // `proven` is ENDPOINT-level and NOT the representative's: a link that has
     // worked in its window keeps the endpoint in `Successful` even when a
     // sibling is the representative (an untested sibling outranks a failed
@@ -1799,33 +1776,6 @@ mod tests {
         assert_eq!(rank.rank.bin, 16);
     }
 
-    #[test]
-    fn a_pin_cannot_resurrect_a_purged_link_as_the_display_link() {
-        let mut purged = link(10, Some(false), 10, 5);
-        purged.purged = true;
-        let links = [purged, link(11, Some(false), 90, 5)];
-        assert_eq!(
-            display_link_index(&links, Some(10)),
-            Some(1),
-            "the pinned purged link yields to the live one"
-        );
-        assert_eq!(
-            display_link_index(&links, Some(11)),
-            Some(1),
-            "a live pin is honoured"
-        );
-        let all_purged = [purged, {
-            let mut l = link(11, Some(false), 90, 5);
-            l.purged = true;
-            l
-        }];
-        assert_eq!(
-            display_link_index(&all_purged, None),
-            Some(0),
-            "all purged: the best measured purged link still displays"
-        );
-    }
-
     // ── last-good-delay bin law (spec `2026-10-20-stab-alive-design` D2) ──
 
     /// Every D2 row: (measured, delay, error kind, per-link proven) → bin.
@@ -1930,33 +1880,5 @@ mod tests {
         )
         .expect("rank");
         assert_eq!(row.rank.bin, 13, "the failing sibling represents, not the purged link");
-    }
-
-    #[test]
-    fn display_prefers_a_live_link_over_the_best_measured_ghost() {
-        let mut ghost = link(1, Some(true), 40, 10);
-        ghost.error_kind = Some(ProfileErr::Real);
-        ghost.latest_ok = Some(false);
-        let mut live = link(2, Some(true), 300, 10);
-        live.latest_ok = Some(true);
-        assert_eq!(
-            display_link_index(&[ghost, live], None),
-            Some(1),
-            "the working sibling displays; the ghost hides"
-        );
-    }
-
-    #[test]
-    fn a_pin_beats_liveness_in_the_display_rule() {
-        let mut ghost = link(1, Some(true), 40, 10);
-        ghost.error_kind = Some(ProfileErr::Real);
-        ghost.latest_ok = Some(false);
-        let mut live = link(2, Some(true), 300, 10);
-        live.latest_ok = Some(true);
-        assert_eq!(
-            display_link_index(&[ghost, live], Some(1)),
-            Some(0),
-            "the manual override is chosen ahead of the live-first filter"
-        );
     }
 }

@@ -94,27 +94,29 @@ out-keys a live slower sibling — key `(0, 7)` beats `(2, 0)` — and the
 endpoint row would display the dead link's Test/Stab while the working
 sibling is hidden.
 
-### D4 — Display link: override → live-first → best measured
-`display_link_index` precedence, explicitly:
+### D4 — Display link: production paths own it; the retired helper goes
+**Amendment (execution finding):** `endpoint_rank::display_link_index` had NO
+production caller — the UI's Test/Stab link is
+`EndpointRow::representative_link_index` (the D3 live-first law, shared via
+`representative_index`), and `active_link` (`select_best_measured_link` +
+manual override) owns the connect/marker/exit-IP link. Decision:
 
-1. **Manual override wins first** (unchanged): a user-pinned link is chosen
-   ahead of any live-first filtering, within the existing eligibility gate
-   (`ops/profiles.rs` persists the pin; a purged pin stays gated as today).
-2. Then live-first: among eligible (non-purged) links, prefer the subset with
-   `latest_ok == Some(true)`.
-3. Then the existing rule within the preferred subset: best measured
-   (real before fast, lowest delay, protocol id).
-
-The displayed Test/Stab values then never come from a ghost while a live
-sibling exists — and a pin still beats liveness. Single-link endpoints keep
-their last-good values (the failing link is all there is).
+- `display_link_index` is DELETED (dead duplicate of the law).
+- The main grid's Test and Stab cells both follow the REPRESENTATIVE link —
+  one link, one rule, no drift between the two columns or against the stored
+  page order.
+- `select_best_measured_link`/`active_link` are UNCHANGED (connection choice;
+  its purge gate already mirrors the law's eligibility). Wiring live-first
+  into the connect target is NOT in this spec's scope.
+- Pin precedence is unaffected: `active_link` checks the manual override
+  first (existing behavior, tested in `models_toasty`).
 
 ### D5 — Main-grid "Stab" column after "Test"
 The §7 grid gains an 11th logical column `(10, "Stab", 7)` after `Test`.
 
-- Value: the DISPLAY link's ring as `n/window` (`12/16`), `—` when the link
-  has no samples — same cell the expansion panel already renders per link
-  (`stability_ratio`); the collapsed row uses the display link.
+- Value: the REPRESENTATIVE link's ring (the same link the Test cell shows)
+  as `n/window` (`12/16`), `—` when the link has no samples — the collapsed
+  row reuses `stability_ratio`.
 - Color: ≥80% success → `--success`; ≥50% → `--warning`; <50% → `--error`;
   `—` → muted. Same span-styling pattern as the Test column's latency
   thresholds.
