@@ -82,7 +82,7 @@ smallvec = { version = "1.16.2", default-features = false, features = ["const_ne
 rapidhash = { version = "4.5.1", features = ["std", "unsafe"] }
 
 # ============ Test ============
-rstest = "0.27.0"
+rstest = "0.28.0"
 # Benchmark harness (`harness = false` targets in native/tls/route; run via
 # `cargo criterion`, results in ./.benchmarks — see criterion.toml).
 criterion = { version = "0.8.2" }
