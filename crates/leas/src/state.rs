@@ -23,7 +23,9 @@ use leas_proto::proto_spec::{
 use toasty::{Deferred, Json};
 
 use crate::BackendUpdateStatus;
-use crate::ops::{connect, events, ping, profiles, scheduler, settings, subscriptions, updates};
+use crate::ops::{
+    compact, connect, events, ping, profiles, scheduler, settings, subscriptions, updates,
+};
 use crate::types::{
     AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, FocusedPane, LogLine,
     NativeActivityLog, Pane1Tab, Pane2Tab, SectionList, SettingsSearch, SettingsSection,
@@ -168,6 +170,11 @@ pub struct AppState {
     /// status bar and the Actions Log panel: shared with the batch task, which
     /// writes them in place.
     pub batch_progress: Option<Arc<crate::types::BatchMeters>>,
+    /// Meters for a running maintenance command (`ops::compact`): the DNS
+    /// retry's `Name` bar and the Compact's `Comp` bar, rendered by the same
+    /// surfaces as `batch_progress`. Installed at spawn, cleared when the
+    /// command's terminal event arrives.
+    pub maint_progress: Option<Arc<crate::types::MaintMeters>>,
     /// The running batch's shared state (counters, class histograms, phase
     /// timings), published by `run_batch` once its plan resolves — the value
     /// comes from the batch task, hence `OnceLock` over `LazyLock`/`Mutex`.
@@ -649,6 +656,7 @@ impl AppState {
             shutdown_token: Arc::new(AtomicBool::new(false)),
             speed_test_stop: Arc::new(AtomicBool::new(false)),
             batch_progress: None,
+            maint_progress: None,
             batch: None,
             term_height: Cell::new(80),
             heed_storage: None,
@@ -1030,6 +1038,21 @@ impl AppState {
     /// in T17; batch machinery is removed until T19 rebuilds it).
     pub async fn remove_failed_servers(&mut self) {
         ping::remove_failed_servers(self).await;
+    }
+
+    /// Smart Endpoints Compact: merge provably-duplicate endpoints (same
+    /// port, shared protocol config, overlapping resolved addresses). The
+    /// scan + merges run OFF the event loop; the report arrives via
+    /// `CoreEvent::CompactFinished`.
+    pub fn compact_duplicate_endpoints(&mut self) {
+        compact::spawn_compact(self);
+    }
+
+    /// Mass DNS retry: re-resolve every DNS endpoint with an empty address
+    /// set, bypassing the TTL. The scan runs off the event loop; the lookups
+    /// dispatch on the loop when the target list arrives.
+    pub fn retry_failed_dns(&mut self) {
+        compact::spawn_dns_retry(self);
     }
 
     /// Poll core event channel and update state accordingly.

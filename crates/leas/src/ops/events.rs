@@ -598,6 +598,38 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
                 state.filter_cache_valid.set(false);
             }
+            CoreEvent::CompactFinished { merged, text } => {
+                state.log_trace("info", "tui::ops::compact", &text);
+                state.maint_progress = None;
+                if merged != 0 {
+                    // Merges delete endpoints: the loaded page must be re-read.
+                    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
+                    state.filter_cache_valid.set(false);
+                }
+            }
+            CoreEvent::DnsRetryTargets { targets } => {
+                let count = targets.len();
+                for (endpoint_id, host, sni) in targets {
+                    crate::ops::enrich::spawn_dns_resolve_host(
+                        state,
+                        endpoint_id,
+                        host,
+                        leas_db::models::HostType::Dns,
+                        sni,
+                        crate::ops::enrich::ResolveTrigger::Maintenance,
+                    );
+                }
+                state.log_trace(
+                    "info",
+                    "tui::ops::compact",
+                    &format!("DNS retry: {count} endpoint(s) dispatched"),
+                );
+            }
+            CoreEvent::MaintenanceDone => {
+                state.log_trace("info", "tui::ops::compact", "DNS retry: complete");
+                state.maint_progress = None;
+                crate::ops::enrich::set_resolve_progress(None);
+            }
             CoreEvent::TestTypeUpdate {
                 endpoint_id,
                 protocol_id,
@@ -1114,7 +1146,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     host,
                     host_type,
                     sni,
-                    false,
+                    crate::ops::enrich::ResolveTrigger::Routine,
                 );
             }
         }

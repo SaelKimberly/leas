@@ -768,7 +768,7 @@ async fn exec_link_upsert(
 /// The `CHECK`-constrained storage text of a [`ProfileErr`] variant. An
 /// exhaustive match, so a new variant cannot be forgotten; a wrong string is
 /// rejected by the column's CHECK constraint rather than stored.
-const fn error_kind_str(kind: crate::models_toasty::ProfileErr) -> &'static str {
+pub(crate) const fn error_kind_str(kind: crate::models_toasty::ProfileErr) -> &'static str {
     match kind {
         crate::models_toasty::ProfileErr::Real => "real",
         crate::models_toasty::ProfileErr::Fast => "fast",
@@ -1848,7 +1848,7 @@ impl Database {
     /// `links().all(FALSE)` is vacuously true exactly when the links
     /// collection is empty, lowering to `id NOT IN (SELECT protocol_id FROM
     /// profile_stats)`. Returns the number of protocols deleted.
-    async fn purge_orphan_protocols(tx: &mut dyn toasty::Executor) -> Result<usize> {
+    pub(crate) async fn purge_orphan_protocols(tx: &mut dyn toasty::Executor) -> Result<usize> {
         let never: toasty::stmt::Expr<bool> =
             toasty::stmt::Expr::from_untyped(toasty_core::stmt::Expr::FALSE);
         let orphans: Vec<Protocol> = Protocol::filter(Protocol::fields().links().all(never))

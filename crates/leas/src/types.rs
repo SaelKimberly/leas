@@ -560,6 +560,25 @@ pub enum CoreEvent {
     RetentionPurged {
         count: usize,
     },
+    /// Smart Endpoints Compact finished OFF the event loop (`ops::compact`):
+    /// a whole-table scan plus the merges would freeze input/render inline
+    /// (the same reason `ProfilesRowsReady` exists). The report text lands in
+    /// the actions panel, and the loaded page must be re-read — merges delete
+    /// endpoints.
+    CompactFinished {
+        merged: usize,
+        text: String,
+    },
+    /// The DNS-retry scan (also off the loop) found the unresolved hosts. The
+    /// UI task dispatches the actual lookups — `spawn_dns_resolve_host` needs
+    /// `&mut AppState` (session caches, scheduler gates).
+    DnsRetryTargets {
+        /// `(endpoint_id, host, active-protocol SNI)` per unresolved DNS host.
+        targets: Vec<(i64, String, Option<String>)>,
+    },
+    /// The DNS retry's last leader lookup finished: the maintenance meters can
+    /// come down.
+    MaintenanceDone,
     /// Result from a speed test operation. `endpoint_id` + `protocol_id`
     /// together address exactly one `ProfileStats` row: protocol rows are
     /// shared across endpoints (identity dedup excludes host/port), so a
@@ -703,4 +722,18 @@ pub struct BatchMeters {
     pub plan_pages_total: AtomicU32,
     pub fast: PhaseMeters,
     pub real: PhaseMeters,
+}
+
+/// Meters for the maintenance commands (`ops::compact`), read by the same
+/// progress surfaces the batch drives — the status bar's counters and the
+/// Actions-Log bars, relabelled `Name` / `Comp`.
+///
+/// `scan` covers the whole-table walk both commands start with (the merge
+/// phase's planning equivalent); `name` counts the DNS lookups of a retry run;
+/// `comp` counts the endpoint merges of a compact run.
+#[derive(Debug, Default)]
+pub struct MaintMeters {
+    pub scan: Arc<PhaseMeters>,
+    pub name: Arc<PhaseMeters>,
+    pub comp: Arc<PhaseMeters>,
 }

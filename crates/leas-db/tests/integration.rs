@@ -2360,3 +2360,342 @@ async fn apply_link_patches_survives_a_stale_snapshot_without_clobbering() {
         "the concurrent activity write survives"
     );
 }
+
+// ── Endpoint merge (Smart Endpoints Compact) ────────────────────────────
+
+use rstest::rstest;
+
+/// Seed one endpoint's resolved address set with a country stamp.
+async fn seed_addresses(conn: &mut toasty::Connection, endpoint_id: i64, ips: &[std::net::IpAddr]) {
+    let rows: Vec<(EndpointId, std::net::IpAddr)> = ips
+        .iter()
+        .map(|ip| (EndpointId::new(endpoint_id), *ip))
+        .collect();
+    leas_db::endpoint_ip::insert_literals_bulk(conn, &rows)
+        .await
+        .expect("seed addresses");
+}
+
+async fn load_link(
+    conn: &mut toasty::Connection,
+    endpoint_id: i64,
+    protocol_id: i64,
+) -> ProfileStats {
+    ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(protocol_id),
+        EndpointId::new(endpoint_id),
+    )
+    .first()
+    .exec(conn)
+    .await
+    .expect("reload")
+    .expect("link exists")
+}
+
+#[tokio::test]
+async fn merge_dns_survivor_absorbs_ip_literal_and_takes_better_evidence() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    // E1: DNS host, same protocol (1001), untested link, already resolved to
+    // 1.2.3.4. E2: the IP literal the DNS name resolves to — a measured link.
+    // Same uid + port + address overlap = the merge candidate shape.
+    seed_endpoint(
+        &mut conn,
+        1,
+        1001,
+        "srv.example",
+        HostType::Dns,
+        443,
+        ts(50),
+    )
+    .await;
+    seed_addresses(&mut conn, 1, &["1.2.3.4".parse().expect("ip")]).await;
+    // E2's endpoint row (IP literal: empty domain/sub_domain) and link.
+    toasty::create!(Endpoint {
+        created_at: 0,
+        id: EndpointId::new(2),
+        domain: String::new(),
+        sub_domain: String::new(),
+        port: 443,
+        ports: vec![8443],
+    })
+    .exec(&mut conn)
+    .await
+    .expect("create ip endpoint");
+    toasty::create!(ProfileStats {
+        created_at: 0,
+        updated_at: 0,
+        protocol_id: ProtocolId::new(1001),
+        endpoint_id: EndpointId::new(2),
+        last_seen_at: ts(90),
+        latency: Some(Latency::Fast { delay: 50 }),
+        stab_mask: 0b1,
+        stab_len: 1,
+        traffic: zero_traffic(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("create measured link");
+    seed_addresses(&mut conn, 2, &["1.2.3.4".parse().expect("ip")]).await;
+
+    let report = db
+        .merge_endpoints(EndpointId::new(1), EndpointId::new(2))
+        .await
+        .expect("merge");
+
+    // Absorbed row gone.
+    let gone = Endpoint::filter_by_id(EndpointId::new(2))
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read");
+    assert!(gone.is_none(), "absorbed endpoint must be deleted");
+
+    // Survivor link took the better evidence (measured beats untested).
+    let link = load_link(&mut conn, 1, 1001).await;
+    assert_eq!(link.latency, Some(Latency::Fast { delay: 50 }));
+    assert_eq!(
+        link.stab_len, 1,
+        "stability ring follows the winning evidence"
+    );
+    assert_eq!(
+        link.last_seen_at,
+        ts(90),
+        "last_seen_at is the max of the two sides"
+    );
+    assert_eq!(report.collisions_won_by_absorbed, 1);
+
+    // Address set unchanged in content: the overlap dedups.
+    let row = page_rows(
+        &db,
+        &page_req(leas_db::models::PurgatoryView::All, ts(0), None),
+    )
+    .await
+    .into_iter()
+    .find(|r| r.endpoint.id.get() == 1)
+    .expect("survivor row");
+    assert_eq!(
+        row.resolved_ips,
+        vec!["1.2.3.4".parse::<std::net::IpAddr>().expect("ip")]
+    );
+    assert_eq!(
+        row.endpoint.ports,
+        vec![443, 8443],
+        "ports union keeps the primary and adds the absorbed hop"
+    );
+
+    // Absorbed's rank row pruned, survivor's refreshed with its DNS domain.
+    let mut conn2 = db.connection().await.expect("connection");
+    let stale = leas_db::models::EndpointRank::filter_by_endpoint_id(EndpointId::new(2))
+        .first()
+        .exec(&mut conn2)
+        .await
+        .expect("read");
+    assert!(stale.is_none(), "absorbed rank row pruned");
+    let fresh = leas_db::models::EndpointRank::filter_by_endpoint_id(EndpointId::new(1))
+        .first()
+        .exec(&mut conn2)
+        .await
+        .expect("read")
+        .expect("survivor rank row");
+    assert_eq!(
+        fresh.domain, "srv.example",
+        "rank keys recomputed for the survivor"
+    );
+}
+
+#[tokio::test]
+async fn merge_keeps_survivor_purge_verdict_over_absorbed_measured_link() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    // Same pair shape, but the SURVIVOR's link carries a purge verdict and no
+    // measurement; the absorbed side is measured and clean.
+    toasty::create!(Endpoint {
+        created_at: 0,
+        id: EndpointId::new(1),
+        domain: Endpoint::derive_domain("srv.example", HostType::Dns).0,
+        sub_domain: Endpoint::derive_domain("srv.example", HostType::Dns).1,
+        port: 443,
+        ports: Vec::<u16>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("create dns endpoint");
+    seed_purged_link(&mut conn, 1, 1001, ts(50), PurgeReason::NotTls).await;
+    seed_addresses(&mut conn, 1, &["1.2.3.4".parse().expect("ip")]).await;
+    toasty::create!(Endpoint {
+        created_at: 0,
+        id: EndpointId::new(2),
+        domain: String::new(),
+        sub_domain: String::new(),
+        port: 443,
+        ports: Vec::<u16>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("create ip endpoint");
+    toasty::create!(ProfileStats {
+        created_at: 0,
+        updated_at: 0,
+        protocol_id: ProtocolId::new(1001),
+        endpoint_id: EndpointId::new(2),
+        last_seen_at: ts(90),
+        latency: Some(Latency::Fast { delay: 30 }),
+        stab_mask: 0b1,
+        stab_len: 1,
+        traffic: zero_traffic(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("create measured link");
+    seed_addresses(&mut conn, 2, &["1.2.3.4".parse().expect("ip")]).await;
+
+    db.merge_endpoints(EndpointId::new(1), EndpointId::new(2))
+        .await
+        .expect("merge");
+
+    let link = load_link(&mut conn, 1, 1001).await;
+    assert_eq!(
+        link.purge_reason,
+        Some(PurgeReason::NotTls),
+        "the survivor's own verdict survives any overwrite"
+    );
+    assert_eq!(
+        link.latency,
+        Some(Latency::Fast { delay: 30 }),
+        "measured fields still move in"
+    );
+}
+
+#[tokio::test]
+async fn merge_moves_group_membership_and_resolves_collision() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    seed_endpoint(
+        &mut conn,
+        1,
+        1001,
+        "srv.example",
+        HostType::Dns,
+        443,
+        ts(50),
+    )
+    .await;
+    seed_addresses(&mut conn, 1, &["1.2.3.4".parse().expect("ip")]).await;
+    toasty::create!(Endpoint {
+        created_at: 0,
+        id: EndpointId::new(2),
+        domain: String::new(),
+        sub_domain: String::new(),
+        port: 443,
+        ports: Vec::<u16>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("create ip endpoint");
+    toasty::create!(ProfileStats {
+        created_at: 0,
+        updated_at: 0,
+        protocol_id: ProtocolId::new(1001),
+        endpoint_id: EndpointId::new(2),
+        last_seen_at: ts(90),
+        stab_mask: 0,
+        stab_len: 0,
+        traffic: zero_traffic(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("create link");
+    seed_addresses(&mut conn, 2, &["1.2.3.4".parse().expect("ip")]).await;
+
+    // g1 both sides (collision: fresher last_seen wins, survivor's
+    // sort_order stays); g2 absorbed-only (moves).
+    toasty::create!(EndpointGroup {
+        endpoint_id: EndpointId::new(1),
+        group_id: "g1".to_owned(),
+        last_seen_at: ts(40),
+        sort_order: Some(7),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("seed g1 survivor");
+    toasty::create!(EndpointGroup {
+        endpoint_id: EndpointId::new(2),
+        group_id: "g1".to_owned(),
+        last_seen_at: ts(99),
+        sort_order: Some(2),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("seed g1 absorbed");
+    toasty::create!(EndpointGroup {
+        endpoint_id: EndpointId::new(2),
+        group_id: "g2".to_owned(),
+        last_seen_at: ts(10),
+        sort_order: Some(3),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("seed g2 absorbed");
+
+    db.merge_endpoints(EndpointId::new(1), EndpointId::new(2))
+        .await
+        .expect("merge");
+
+    let g1 = EndpointGroup::filter_by_endpoint_id_and_group_id(EndpointId::new(1), "g1".to_owned())
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read")
+        .expect("g1 exists");
+    assert_eq!(g1.last_seen_at, ts(99), "collision keeps the fresher stamp");
+    assert_eq!(
+        g1.sort_order,
+        Some(7),
+        "collision keeps the survivor's order"
+    );
+    let g2 = EndpointGroup::filter_by_endpoint_id_and_group_id(EndpointId::new(1), "g2".to_owned())
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read")
+        .expect("g2 moved");
+    assert_eq!(g2.sort_order, Some(3));
+}
+
+#[rstest]
+#[case::dns_over_ip(EndpointId::new(1), true, EndpointId::new(2), false, true)]
+#[case::ip_loses_to_dns(EndpointId::new(1), false, EndpointId::new(2), true, false)]
+#[case::older_dns_wins(EndpointId::new(1), true, EndpointId::new(2), true, true)]
+#[case::newer_dns_loses(EndpointId::new(2), true, EndpointId::new(1), true, false)]
+fn merge_survivor_rule_picks_dns_then_older(
+    #[case] id_a: EndpointId,
+    #[case] dns_a: bool,
+    #[case] id_b: EndpointId,
+    #[case] dns_b: bool,
+    #[case] left_wins: bool,
+) {
+    use leas_db::merge::{Survivor, pick_survivor};
+    let picked = pick_survivor(id_a, dns_a, id_b, dns_b);
+    assert_eq!(
+        picked,
+        if left_wins {
+            Survivor::Left
+        } else {
+            Survivor::Right
+        }
+    );
+}
+
+#[tokio::test]
+async fn merge_refuses_self_merge() {
+    let db = test_db().await;
+    assert!(
+        db.merge_endpoints(EndpointId::new(1), EndpointId::new(1))
+            .await
+            .is_err()
+    );
+}

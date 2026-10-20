@@ -372,6 +372,8 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 │  Fast + Real Ping (Failed)                              │
 │  Sort by Test                                         │
 │  Remove Bad Servers                                   │
+│  Retry Failed DNS Lookups                             │
+│  Compact Duplicate Endpoints                          │
 │  ─────                                                │
 │  Stop Testing                                         │
 │  ─────                                                │
@@ -719,6 +721,8 @@ appended when updates are available for installed backends.
    - **Fast + Real Ping (Successful / New / Successful + New / Failed)** — the same run narrowed to a scope of the feed: endpoints that achieved a real success; endpoints nothing has answered for yet (untested); those two together; or those whose links all failed (including a DNS name that never resolved). The scope reads the endpoint's stored test tier, so it is a filter on the plan, not a different pipeline. A scoped run freezes its endpoint list before the first probe, so an endpoint leaving the scope mid-run is still tested.
    - **Sort by Test** — re-sorts the table by test priority (real successes by delay, then the failure bands)
    - **Remove Bad Servers** — removes profiles with failed tests
+   - **Retry Failed DNS Lookups** — re-resolves every DNS-name endpoint whose address set is empty (never attempted or previously failed), bypassing the TTL. Purgatory rows are included. Results appear as usual resolutions; the actions panel logs how many lookups were dispatched.
+   - **Compact Duplicate Endpoints** — merges endpoints that are provably the same server: same port, a shared protocol config, AND an overlapping resolved-address set (config identity is host-independent, so the address overlap is the discriminator). The DNS host survives an IP-literal duplicate; two DNS hosts keep the older row. The survivor's links keep their own purge verdicts; the absorbed side's addresses, group memberships and measured evidence move over; rank keys are recomputed in the same transaction. Applies immediately with no undo — the actions-panel report lists every merge. An endpoint with a live connection is skipped.
 5. Results populate the expanded panel's per-protocol sub-table; real-ping
    exit IPs fill the single-line Outbound/Country columns — shown only once the
    endpoint's address is resolved, since an exit IP is evidence a tunnel worked.

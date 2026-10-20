@@ -23,6 +23,7 @@ pub mod driver;
 pub mod endpoint_ip;
 pub mod endpoint_rank;
 pub mod export;
+pub mod merge;
 pub mod profiles_query;
 mod retry;
 pub mod schema;

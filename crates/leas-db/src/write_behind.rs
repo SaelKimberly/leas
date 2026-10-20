@@ -253,6 +253,25 @@ impl<S: CacheSpec> WriteBehind<S> {
         removed
     }
 
+    /// Drop every staged entry whose key matches `pred`, keeping `staged` in
+    /// step with the map. Returns the number of entries dropped.
+    ///
+    /// The maintenance merge's guard: a patch staged for an endpoint that the
+    /// merge is about to DELETE must never reach the flush window — the write
+    /// would hit a live-FK error and the failure path would re-stage it,
+    /// retrying forever. The caller flushes first, then discards by absorbed
+    /// endpoint id, then merges.
+    pub fn discard_where<F: Fn(&S::Key) -> bool>(&self, pred: F) -> usize {
+        let keys: Vec<S::Key> = self.pending.iter().map(|entry| *entry.key()).collect();
+        let mut dropped = 0usize;
+        for key in keys {
+            if pred(&key) && self.take(&key).is_some() {
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
     /// Take every staged row out of the map, coalesced to one triple per
     /// identity.
     ///
@@ -1177,6 +1196,32 @@ mod tests {
         ) -> crate::Result<()> {
             Ok(())
         }
+    }
+
+    /// `discard_where` removes only matching staged entries and keeps the
+    /// `staged` counter in step — the maintenance merge's guard against a
+    /// staged patch outliving its (deleted) endpoint row.
+    #[tokio::test]
+    async fn discard_where_drops_only_matching_keys() {
+        let db = fake_db().await;
+        let driver: Arc<WriteBehind<FailingWindowSpec>> = WriteBehind::new_with_deadline(
+            Arc::clone(&db),
+            100,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
+        driver.push(1);
+        driver.push(2);
+        driver.push(3);
+        assert_eq!(driver.staged_len(), 3);
+
+        assert_eq!(driver.discard_where(|key| *key == 2), 1);
+        assert_eq!(driver.staged_len(), 2);
+        assert!(driver.get(&2).is_none(), "matching entry gone");
+        assert!(driver.get(&1).is_some(), "non-matching entry survives");
+        assert!(driver.get(&3).is_some(), "non-matching entry survives");
+        // An idempotent re-run drops nothing.
+        assert_eq!(driver.discard_where(|key| *key == 2), 0);
     }
 
     /// A flush that commits windows 1..k and fails on k+1 returns `Err`, and the

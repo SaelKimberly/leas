@@ -213,7 +213,8 @@ Methods previously in `lib.rs` extracted to `ops/` modules:
 - `ops/updates.rs` — spawn_update_check, spawn_update_download
 - `ops/settings.rs` — confirm_add_server, confirm_edit_server
 - `ops/profiles.rs` — delete_profile, clone_profile, import_url, nav_protocol_up/down, toggle_expand, set_active, set_protocol_default (DB override write + in-memory row patch — `endpoints_gen` is write-only, rows only reload on subscription events)
-- `ops/enrich.rs` — background enrichment: spawn_dns_resolve (TTL-gated, `x` force), spawn_enrich_ip_hosts (startup seed), spawn_whitelist_pass (on HostFeaturesLoaded), spawn_outbound_enrich (real-ping exit IP), extract_sni, protocol_row_to_profile
+- `ops/enrich.rs` — background enrichment: spawn_dns_resolve (TTL-gated, `x` force), spawn_enrich_ip_hosts (startup seed), spawn_whitelist_pass (on HostFeaturesLoaded), spawn_outbound_enrich (real-ping exit IP), extract_sni, protocol_row_to_profile; `ResolveTrigger` (Routine/Maintenance/Forced) picks the TTL gate, RESOLVE_SEM permit, and per-host waiter dedup
+- `ops/compact.rs` — maintenance commands (Speed Test menu): Mass DNS retry (`spawn_dns_retry` — re-resolves every DNS host with an empty address set, TTL bypassed, permit-bounded; lookups dispatch on the loop from `CoreEvent::DnsRetryTargets`) and Smart Endpoints Compact (`spawn_compact` — merges provably-same-server endpoints: same port + shared protocol_id + `endpoint_ip` overlap, connected components, survivor law in `leas-db/src/merge.rs`). Both run off the event loop; progress via `AppState::maint_progress` (`MaintMeters`: status bar + Actions-Log bars, labels `Name`/`Comp`); reports through `CoreEvent::CompactFinished`/`MaintenanceDone`. Before any endpoint delete it flushes and drains `LinkSpec` + `CountrySpec` staged patches for the absorbed ids (no FKs — a stale patch re-creates an orphan row)
 
 **TUI Screens (modules under `crates/leas/src/ui/`):**
 

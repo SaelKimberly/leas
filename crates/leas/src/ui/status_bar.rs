@@ -46,6 +46,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             },
         );
         (progress_text, ThemeStyles::warning(theme))
+    } else if let Some(m) = &state.maint_progress {
+        use Ordering::Relaxed;
+        let name = (m.name.done.load(Relaxed), m.name.total.load(Relaxed));
+        let comp = (m.comp.done.load(Relaxed), m.comp.total.load(Relaxed));
+        // Only a phase with a denominator renders: a Compact run shows no
+        // Name (no lookups), a retry run shows no Comp (no merges) — the
+        // same dead-second-label rule the bars follow. The table walk shows
+        // only in the Actions-Log panel ("scan n/rows"), like the batch's
+        // "planning n/m pages".
+        let text = match (name.1, comp.1) {
+            (0, 0) => " Maintenance...".to_owned(),
+            (0, c) => format!(" Comp: {}/{}", comp.0, c),
+            (n, 0) => format!(" Name: {}/{}", name.0, n),
+            (n, c) => format!(" Name: {}/{} · Comp: {}/{}", name.0, n, comp.0, c),
+        };
+        (text, ThemeStyles::warning(theme))
     } else if let Some(err) = &state.connection_error {
         (format!(" Error: {err}"), ThemeStyles::error(theme))
     } else {

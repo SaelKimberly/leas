@@ -7,6 +7,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::time::Duration;
 
@@ -177,7 +178,7 @@ const fn should_resolve(
 /// underscores (Telegram-channel names), spaces and non-ASCII — hickory
 /// errors on those ("Label contains invalid characters") and the failure is
 /// pure log noise.
-fn is_resolvable_hostname(host: &str) -> bool {
+pub(crate) fn is_resolvable_hostname(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
     if host.is_empty() || host.len() > 253 || host.starts_with('.') || host.contains("..") {
         return false;
@@ -290,7 +291,12 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     let sni = row
         .active_protocol()
         .and_then(|(_, p)| extract_sni(p, &row.endpoint.dns_name()));
-    spawn_dns_resolve_host(state, endpoint_id, host, host_type, sni, force);
+    let trigger = if force {
+        ResolveTrigger::Forced
+    } else {
+        ResolveTrigger::Routine
+    };
+    spawn_dns_resolve_host(state, endpoint_id, host, host_type, sni, trigger);
 }
 
 /// Bound on concurrent inbound resolutions.
@@ -303,6 +309,48 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
 /// stall the UI tick on DNS.
 static RESOLVE_SEM: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(64)));
+
+/// Who asked for a lookup — the three knobs (`TTL` gate, `RESOLVE_SEM`
+/// permit, per-host waiter dedup) never vary independently:
+///
+/// - [`Routine`]: TTL-gated, bounded, deduped — background enrichment.
+/// - [`Maintenance`]: TTL BYPASSED (the command re-asks failed names), but
+///   still bounded and deduped — a feed-wide retry is exactly the fan-out the
+///   semaphore exists to bound; unbounded it would open one socket per
+///   unresolved endpoint at once.
+/// - [`Forced`]: single-endpoint user action (the `x` key, the connect path)
+///   — bypasses TTL and the bound (a fair queue behind a feed's fan-out would
+///   look dead), and no per-host dedup: the user pressed the key on purpose.
+///
+/// [`Routine`]: ResolveTrigger::Routine
+/// [`Maintenance`]: ResolveTrigger::Maintenance
+/// [`Forced`]: ResolveTrigger::Forced
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveTrigger {
+    Routine,
+    Maintenance,
+    Forced,
+}
+
+/// Optional completion meter for in-flight lookups, installed by the DNS
+/// retry (its `Name` bar). Swap-able: the retry installs a fresh meter, and
+/// every completed lookup — whatever its trigger — bumps `done`, so the bar
+/// tracks the fleet while the meter exists.
+static RESOLVE_PROGRESS: std::sync::RwLock<Option<Arc<crate::types::PhaseMeters>>> =
+    std::sync::RwLock::new(None);
+
+/// Install (or clear, `None`) the DNS-retry completion meter.
+pub(crate) fn set_resolve_progress(meter: Option<Arc<crate::types::PhaseMeters>>) {
+    let mut guard = RESOLVE_PROGRESS.write().expect("resolve meter lock");
+    *guard = meter;
+}
+
+fn bump_resolve_progress() {
+    let meter = RESOLVE_PROGRESS.read().ok().and_then(|guard| guard.clone());
+    if let Some(meter) = meter {
+        meter.done.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Endpoint ids waiting on the lookup currently running for each host.
 ///
@@ -325,7 +373,7 @@ static LOOKUP_WAITERS: std::sync::LazyLock<dashmap::DashMap<String, Vec<i64>>> =
 
 /// The key a host is deduplicated under: case-insensitive, trailing dot
 /// dropped, so `Example.COM` and `example.com.` share one lookup.
-fn lookup_key(host: &str) -> String {
+pub(crate) fn lookup_key(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
@@ -343,12 +391,12 @@ pub fn spawn_dns_resolve_host(
     host: String,
     host_type: HostType,
     sni: Option<String>,
-    force: bool,
+    trigger: ResolveTrigger,
 ) {
     let scheduler = state.scheduler.clone();
     if !should_resolve(
         state.endpoint_info.get(&endpoint_id),
-        force,
+        trigger != ResolveTrigger::Routine,
         state.dns_cache_ttl_secs,
         unix_now(),
     ) {
@@ -378,7 +426,8 @@ pub fn spawn_dns_resolve_host(
 
     // An IP host is parsed, not queried, and a forced lookup is a user action
     // on one specific endpoint — neither shares a per-host query.
-    let key = (host_type == HostType::Dns && !force).then(|| lookup_key(&host));
+    let key = (host_type == HostType::Dns && trigger != ResolveTrigger::Forced)
+        .then(|| lookup_key(&host));
     if let Some(key) = &key
         && let Some(mut waiters) = LOOKUP_WAITERS.get_mut(key)
     {
@@ -439,7 +488,7 @@ pub fn spawn_dns_resolve_host(
                             // wait to `DNS_LOOKUP_TIMEOUT` makes report time a
                             // function of the timeout alone.
                             let bounded = async {
-                                let _permit = if force {
+                                let _permit = if trigger == ResolveTrigger::Forced {
                                     None
                                 } else {
                                     let permit =
@@ -523,6 +572,10 @@ pub fn spawn_dns_resolve_host(
                 }
             }
         };
+
+        // The lookup (or its failure) has an answer now: the maintenance
+        // retry's Name bar counts completions, not dispatches.
+        bump_resolve_progress();
 
         // Every endpoint waiting on this host shares the answer, so the whole
         // set is settled here: the per-host registry is released (a later
@@ -935,6 +988,17 @@ pub fn spawn_outbound_enrich(state: &mut AppState, endpoint_id: i64, ip_info: Op
             let _ = t.try_send(CoreEvent::EndpointInfoUpdated { endpoint_id, info });
         }
     });
+}
+
+/// Drain everything the country driver has staged for `ids` — the merge's
+/// anti-resurrection guard. A `CountrySpec` patch flushing after the endpoint
+/// delete would silently re-create an orphan `endpoint_ip` row (no FKs,
+/// ADR 0011), so the maintenance command discards by absorbed id first.
+/// Returns the number of discarded entries.
+pub(crate) fn discard_country_for(ids: &[i64]) -> usize {
+    GEO_DRIVER
+        .get()
+        .map_or(0, |driver| driver.discard_where(|k| ids.contains(&k.get())))
 }
 
 #[cfg(test)]

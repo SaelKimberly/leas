@@ -632,6 +632,8 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         state.start_batch_then_real_ping_scoped(PlanScope::Failed);
                     }
                     "Remove Bad Servers" => state.remove_failed_servers().await,
+                    "Retry Failed DNS Lookups" => state.retry_failed_dns(),
+                    "Compact Duplicate Endpoints" => state.compact_duplicate_endpoints(),
                     "Stop Testing" => state.stop_speed_test(),
                     "Clear All Stats" => {
                         state.confirmation = Some(crate::ConfirmAction::ClearStats);
@@ -1498,6 +1500,8 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Fast + Real Ping (Successful + New)"),
     SpeedTestMenuItem::Item("Fast + Real Ping (Failed)"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
+    SpeedTestMenuItem::Item("Retry Failed DNS Lookups"),
+    SpeedTestMenuItem::Item("Compact Duplicate Endpoints"),
     SpeedTestMenuItem::Separator,
     SpeedTestMenuItem::Item("Stop Testing"),
     SpeedTestMenuItem::Separator,

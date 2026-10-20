@@ -312,6 +312,57 @@ fn batch_bars(
 
     use crate::ui::widgets::progress;
 
+    // Maintenance commands take the same two bar rows with their own labels
+    // (`Name` for the DNS retry's lookups, `Comp` for the merges); the scan
+    // phase renders like the batch's "planning" row.
+    if let Some(meters) = &state.maint_progress {
+        let scan = (
+            meters.scan.done.load(Ordering::Relaxed),
+            meters.scan.total.load(Ordering::Relaxed),
+        );
+        let scan_line = if scan.1 > 0 && scan.0 < scan.1 {
+            Line::from(Span::styled(
+                format!("scan {}/{} rows", scan.0, scan.1),
+                ThemeStyles::footer_label(theme),
+            ))
+        } else {
+            Line::default()
+        };
+        let name_bar = |width: usize| {
+            progress::bar_line(
+                "Name",
+                meters.name.done.load(Ordering::Relaxed),
+                meters.name.total.load(Ordering::Relaxed),
+                meters.name.eta_secs(),
+                width,
+                theme,
+            )
+        };
+        let comp_bar = |width: usize| {
+            progress::bar_line(
+                "Comp",
+                meters.comp.done.load(Ordering::Relaxed),
+                meters.comp.total.load(Ordering::Relaxed),
+                meters.comp.eta_secs(),
+                width,
+                theme,
+            )
+        };
+        let comp_total = meters.comp.total.load(Ordering::Relaxed);
+        let name_total = meters.name.total.load(Ordering::Relaxed);
+        // Branch on the RUN, not on comp_total: a Compact run NEVER renders a
+        // Name bar (it has no lookups — the 0/0 bar was the reported bug), a
+        // retry run never renders a Comp bar, and a pure table walk shows the
+        // planning-style scan line alone.
+        if name_total > 0 {
+            return (Some(name_bar(width)), Some(scan_line));
+        }
+        if comp_total > 0 {
+            return (Some(comp_bar(width)), None);
+        }
+        return (Some(scan_line), None);
+    }
+
     let Some(meters) = &state.batch_progress else {
         return (None, None);
     };
@@ -459,6 +510,92 @@ mod tests {
             lines[3].contains("planning 1/92 pages"),
             "the first bar row reports the walk: {:?}",
             lines[3]
+        );
+    }
+}
+
+#[cfg(test)]
+mod maintenance_bar_tests {
+    use super::*;
+    use crate::ops::profiles::test_support::test_state;
+    use crate::types::MaintMeters;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::atomic::Ordering;
+
+    /// The maintenance run's bars: a RETRY run renders `Name` on the batch's
+    /// first bar row (plus the scan line) — and never a Comp bar, the mirror
+    /// of the compact-only rule.
+    #[tokio::test]
+    async fn maintenance_bars_render_on_the_batch_rows() {
+        let meters = MaintMeters {
+            scan: std::sync::Arc::default(),
+            name: std::sync::Arc::default(),
+            comp: std::sync::Arc::default(),
+        };
+        meters.name.total.store(5, Ordering::Relaxed);
+        meters.name.done.store(2, Ordering::Relaxed);
+
+        let mut state = test_state(vec![]).await;
+        state.maint_progress = Some(std::sync::Arc::new(meters));
+
+        let area = Rect::new(0, 0, 100, 20);
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_full(f, area, &state))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect();
+
+        assert!(
+            text.contains("Name [") && text.contains("2/5"),
+            "name bar: {text}"
+        );
+        assert!(
+            !text.contains("Comp ["),
+            "a retry run has no Comp bar: {text}"
+        );
+    }
+    /// A Compact run has no lookups: the `Name` row must stay EMPTY — no
+    /// dead 0/0 bar (the regression the first live run showed).
+    #[tokio::test]
+    async fn compact_run_renders_no_name_bar() {
+        let meters = MaintMeters {
+            scan: std::sync::Arc::default(),
+            name: std::sync::Arc::default(),
+            comp: std::sync::Arc::default(),
+        };
+        meters.comp.total.store(2, Ordering::Relaxed);
+        meters.comp.done.store(1, Ordering::Relaxed);
+        let mut state = test_state(vec![]).await;
+        state.maint_progress = Some(std::sync::Arc::new(meters));
+
+        let area = Rect::new(0, 0, 100, 20);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+        terminal
+            .draw(|f| render_full(f, area, &state))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect();
+
+        assert!(
+            text.contains("Comp [") && text.contains("1/2"),
+            "comp bar: {text}"
+        );
+        assert!(
+            !text.contains("Name ["),
+            "no Name bar without lookups: {text}"
         );
     }
 }
