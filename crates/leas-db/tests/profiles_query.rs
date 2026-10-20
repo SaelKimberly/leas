@@ -779,7 +779,10 @@ async fn anchor_and_page_agree_after_a_weight_change() {
         .expect("page");
     let moved = before.ids[0];
 
-    // Move the leading endpoint to the bottom band (real error).
+    // A real error does NOT move a PROVEN link (spec
+    // `2026-10-20-stab-alive-design` D2): the stored latency keeps its bin and
+    // the failure demotes through the stab ring, which this fixture's ring
+    // (1/1) does not do yet. The row stays where it was.
     toasty::sql::statement(
         "UPDATE profile_stats SET error = 1, error_kind = 'real', error_text = 'x' \
          WHERE endpoint_id = ?1",
@@ -789,6 +792,25 @@ async fn anchor_and_page_agree_after_a_weight_change() {
     .await
     .expect("mutate");
     // The raw statement bypassed the write paths, so refresh like they do.
+    db.refresh_endpoint_ranks(&[moved]).await.expect("ranks");
+    let after_error = db
+        .profiles_page(&request(PageSort::Test, true, 0, 100))
+        .await
+        .expect("page");
+    assert_eq!(
+        after_error.ids[0], moved,
+        "a proven link keeps its delay bin through a real error"
+    );
+
+    // A ring with no success left (16 real failures) sends the link to bin 13
+    // and the row to the bottom; the anchor tracks the new position.
+    toasty::sql::statement(
+        "UPDATE profile_stats SET stab_mask = 0, stab_len = 16 WHERE endpoint_id = ?1",
+    )
+    .bind(moved.get())
+    .exec(&mut db.connection().await.expect("conn"))
+    .await
+    .expect("mutate");
     db.refresh_endpoint_ranks(&[moved]).await.expect("ranks");
 
     let after = db

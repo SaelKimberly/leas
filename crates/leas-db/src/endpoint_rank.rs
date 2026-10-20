@@ -69,6 +69,11 @@ pub struct RankLink {
     /// `proven` OR. Not part of the key: reliability orders, it does not
     /// represent.
     pub proven: bool,
+    /// Whether the link's NEWEST ring sample succeeded (`None`: never
+    /// sampled). The live-first representative/display predicate (spec
+    /// `2026-10-20-stab-alive-design` D3/D4), derived once at construction so
+    /// the panel order, the stored keys, and the display link cannot drift.
+    pub latest_ok: Option<bool>,
     /// The static config weight — the compiled "which stack is likelier to
     /// work" prior (spec `2026-10-01-static-config-weight-design`).
     ///
@@ -98,6 +103,10 @@ impl RankLink {
             Some(Latency::Fast { delay }) => (Some(false), delay),
             None => (None, i32::MAX),
         };
+        let (mask, len) = (
+            link.stab_mask.cast_unsigned(),
+            u8::try_from(link.stab_len.clamp(0, i64::from(STAB_WINDOW))).unwrap_or(0),
+        );
         Self {
             protocol_id: link.protocol_id.get(),
             measured,
@@ -112,34 +121,28 @@ impl RankLink {
             purged: link.purge_reason.is_some(),
             // A negative or oversized stored len is a corrupt row: clamp rather
             // than shift by >63 (which is UB-ish in debug) or index a bogus bin.
-            stab: stab_bin(
-                link.stab_mask.cast_unsigned(),
-                u8::try_from(link.stab_len.clamp(0, i64::from(STAB_WINDOW))).unwrap_or(0),
-            ),
-            proven: stab_proven(
-                link.stab_mask.cast_unsigned(),
-                u8::try_from(link.stab_len.clamp(0, i64::from(STAB_WINDOW))).unwrap_or(0),
-            ),
+            stab: stab_bin(mask, len),
+            proven: stab_proven(mask, len),
+            latest_ok: stab_latest_ok(mask, len),
             weight,
         }
     }
 
-    /// Ascending key `(tier, !weight, latency, -seen, protocol_id)` — the
-    /// decision-16 law with the static weight inserted INSIDE the tier.
-    /// 0 real-ok, 1 fast-ok, 2 untested, 3 real/name-err, 4 fast-err,
-    /// 5 dns-unresolved, 6 purged. Only success tiers carry a delay.
+    /// Ascending key `(bin, stab, !weight, -seen, protocol_id)` — the
+    /// representative-LINK key (db-rewamp D11 + stab-bin spec +
+    /// `2026-10-20-stab-alive-design` D2/D3). The bin buckets delay AND error
+    /// class (see [`Self::bin`]); the weight is NEGATED (`u64::MAX -`) so this
+    /// stays ONE plain ascending tuple consumed by a single `.min()`, exactly
+    /// like the negated recency below: a `Reverse` or any non-tuple wrapper
+    /// would fork the single-implementation property the panel order and the
+    /// stored keys both depend on. Higher weight = better, and — deliberately,
+    /// at the accepted cost of the feature — it outranks the raw delay inside
+    /// a bin, so a 900 ms REALITY link sorts above a 40 ms TCP one.
     ///
-    /// The weight is NEGATED (`u64::MAX -`) so this stays ONE plain ascending
-    /// tuple consumed by a single `.min()`, exactly like `neg_seen` below: a
-    /// `Reverse` or any non-tuple wrapper would fork the single-implementation
-    /// property the panel order and the stored keys both depend on. Higher
-    /// weight = better, and — deliberately, at the accepted cost of the
-    /// feature — it outranks `latency` inside a tier, so a 900 ms REALITY link
-    /// sorts above a 40 ms TCP one.
-    ///
-    /// Tier 6 sits below every live band, so an endpoint's representative key is
-    /// a live link whenever one exists; an endpoint whose links are all purged
-    /// still gets a deterministic position for the Purgatory/All views.
+    /// The purged bin (16) sits below every live band, so an endpoint's
+    /// representative key is a live link whenever one exists; an endpoint
+    /// whose links are all purged still gets a deterministic position for the
+    /// Purgatory/All views.
     #[must_use]
     pub const fn key(&self, dns_unresolved: bool) -> (u8, u8, u64, i64, i64) {
         // The representative-LINK key (db-rewamp D11 + stab-bin spec): delay
@@ -162,10 +165,18 @@ impl RankLink {
         )
     }
 
-    /// The delay bin (db-rewamp D11): real<50..real≥1000 = 0-5,
-    /// fast<50..fast≥1000 = 6-11, untested = 12, real-err = 13, fast-err = 14,
-    /// dns-err = 15, purged = 16. A real measurement stays above a fast one of
-    /// any delay.
+    /// The delay bin (db-rewamp D11 + spec `2026-10-20-stab-alive-design`
+    /// D2): real<50..real≥1000 = 0-5, fast<50..fast≥1000 = 6-11, untested =
+    /// 12, dns-err = 15, purged = 16. A real measurement stays above a fast
+    /// one of any delay.
+    ///
+    /// An error no longer dominates a known-good delay: a real/name error
+    /// keeps the link's STORED latency bin while the link's ring holds a real
+    /// success (`proven`) — the recent failure demotes through the stab bin —
+    /// and falls to 13 only when the ring has no success at all (never
+    /// succeeded, or the window died). The fast-error arm is UNCHANGED: a
+    /// fast failure never samples the ring, so the stab demotion cannot
+    /// express it.
     #[must_use]
     pub const fn bin(&self, dns_unresolved: bool) -> u8 {
         if self.purged {
@@ -175,10 +186,17 @@ impl RankLink {
             return 15;
         }
         if let Some(kind) = &self.error_kind {
-            return match kind {
-                ProfileErr::Real | ProfileErr::Name => 13,
-                ProfileErr::Fast => 14,
-            };
+            if matches!(kind, ProfileErr::Real | ProfileErr::Name) {
+                if !self.proven {
+                    return 13;
+                }
+                return match self.measured {
+                    Some(true) => delay_bin(self.delay),
+                    Some(false) => 6 + delay_bin(self.delay),
+                    None => 13,
+                };
+            }
+            return 14;
         }
         match self.measured {
             Some(true) => delay_bin(self.delay),
@@ -233,7 +251,11 @@ const fn delay_bin(delay: i32) -> u8 {
 /// `STAB_WINDOW`/`STAB_WARMUP`/`STAB_NEUTRAL`) invalidates every STORED
 /// `rank_stab` exactly as a weight-cell edit invalidates every stored
 /// `rank_weight`. Bump on any such change.
-pub const STAB_VERSION: u32 = 1;
+///
+/// v2 (spec `2026-10-20-stab-alive-design`): the bin law reads the stored
+/// latency through a real error (last-good-delay bin) and the representative
+/// is live-first — every stored `rank_bin`/`rank_stab` pair must re-derive.
+pub const STAB_VERSION: u32 = 2;
 
 /// The version of every INPUT to the stored rank keys — the compiled weight
 /// tables *and* the stability thresholds. The stamp in `rank_weight_meta` holds
@@ -339,12 +361,26 @@ pub const fn stab_bin(mask: u64, len: u8) -> u8 {
     }
 }
 
-/// Whether the window holds at least one success — the link-level `proven`
+/// Whether the link's window holds at least one success — the link-level `proven`
 /// fact. Derived from the ring, never a separate durable bit, so a full window
 /// of failures retires a link from `Successful` on its own.
 #[must_use]
 pub const fn stab_proven(mask: u64, len: u8) -> bool {
     stab_successes(mask, len) > 0
+}
+
+/// Whether the NEWEST sample in the window succeeded — the link-level "live"
+/// fact (spec `2026-10-20-stab-alive-design` D3). The newest sample is always
+/// the top live bit (`bit len-1`): below the window the new sample enters as
+/// the newest with every existing bit keeping its index; at the window it
+/// enters at the top. `None` when the ring is empty.
+#[must_use]
+pub const fn stab_latest_ok(mask: u64, len: u8) -> Option<bool> {
+    if len == 0 {
+        None
+    } else {
+        Some(mask >> (len - 1) & 1 == 1)
+    }
 }
 
 /// The endpoint's own packed address key for the rank `addr` tiebreak (db-rewamp
@@ -405,10 +441,18 @@ pub fn display_link_index(links: &[RankLink], override_protocol: Option<i64>) ->
     {
         return Some(index);
     }
+    // Live-first (spec `2026-10-20-stab-alive-design` D4): when an eligible
+    // link's newest ring sample succeeded, the display prefers that subset —
+    // a ghost link (an old fast success, now failing) must not supply the
+    // row's Test/Stab while a working sibling exists. A manual override above
+    // beats this filter: the pin is the user's explicit choice.
+    let has_live = links
+        .iter()
+        .any(|l| eligible(l) && l.latest_ok == Some(true));
     links
         .iter()
         .enumerate()
-        .filter(|(_, l)| eligible(l))
+        .filter(|(_, l)| eligible(l) && (!has_live || l.latest_ok == Some(true)))
         .filter_map(|(i, l)| {
             l.display_rank()
                 .map(|rank| (i, rank, l.delay, l.protocol_id))
@@ -487,10 +531,21 @@ pub fn compute_rank(
     dns_unresolved: bool,
     links: &[RankLink],
 ) -> Option<RankRow> {
-    // The representative link: the minimum key. Its OWN stab is what the stored
-    // column reports — the same link the bin/weight came from, so the stored
-    // stab and the stored key cannot describe different links.
-    let (bin, stab, neg_weight, _, _) = links.iter().map(|l| l.key(dns_unresolved)).min()?;
+    // The representative link: the minimum key. Live-first (spec
+    // `2026-10-20-stab-alive-design` D3): a link whose NEWEST ring sample
+    // succeeded represents before any recently-failed sibling — without this,
+    // a ghost link (old 40 ms real success, now failing, bin 0) would out-key
+    // a live slower sibling (bin 3) and the row would display the dead link.
+    // Purged links never enter the live subset: their ring froze at purge
+    // time, so its newest bit can still be a success. Falls back to the plain
+    // min-key when no link is live, so an all-failed endpoint still gets a
+    // deterministic representative.
+    let (bin, stab, neg_weight, _, _) = links
+        .iter()
+        .filter(|l| !l.purged && l.latest_ok == Some(true))
+        .map(|l| l.key(dns_unresolved))
+        .min()
+        .or_else(|| links.iter().map(|l| l.key(dns_unresolved)).min())?;
     // `proven` is ENDPOINT-level and NOT the representative's: a link that has
     // worked in its window keeps the endpoint in `Successful` even when a
     // sibling is the representative (an untested sibling outranks a failed
@@ -1069,6 +1124,16 @@ pub(crate) async fn refresh(
             continue;
         };
         let protocol_id = field(1).and_then(as_i64).unwrap_or(0);
+        // A negative or oversized stored len is a corrupt row: clamp rather
+        // than shift by >63 (which is UB-ish in debug) or index a bogus bin.
+        let raw_mask = field(14).and_then(as_i64).unwrap_or(0).cast_unsigned();
+        let raw_len = u8::try_from(
+            field(15)
+                .and_then(as_i64)
+                .unwrap_or(0)
+                .clamp(0, i64::from(STAB_WINDOW)),
+        )
+        .unwrap_or(0);
         links.entry(endpoint_id).or_default().push(RankLink {
             protocol_id,
             error_kind: field(2)
@@ -1090,26 +1155,11 @@ pub(crate) async fn refresh(
             // A NULL column is a live link; any stored spelling is a verdict
             // (the value itself is the page's business, not the rank law's).
             purged: field(9).and_then(as_text).is_some(),
-            stab: stab_bin(
-                field(14).and_then(as_i64).unwrap_or(0).cast_unsigned(),
-                u8::try_from(
-                    field(15)
-                        .and_then(as_i64)
-                        .unwrap_or(0)
-                        .clamp(0, i64::from(STAB_WINDOW)),
-                )
-                .unwrap_or(0),
-            ),
-            proven: stab_proven(
-                field(14).and_then(as_i64).unwrap_or(0).cast_unsigned(),
-                u8::try_from(
-                    field(15)
-                        .and_then(as_i64)
-                        .unwrap_or(0)
-                        .clamp(0, i64::from(STAB_WINDOW)),
-                )
-                .unwrap_or(0),
-            ),
+            // A negative or oversized stored len is a corrupt row: clamp rather
+            // than shift by >63 (which is UB-ish in debug) or index a bogus bin.
+            stab: stab_bin(raw_mask, raw_len),
+            proven: stab_proven(raw_mask, raw_len),
+            latest_ok: stab_latest_ok(raw_mask, raw_len),
             // A link whose protocol row is absent (the join is LEFT) has no
             // known stack, so it sorts as "worst" — the same value an
             // un-refreshed endpoint carries, never a silent average.
@@ -1226,6 +1276,7 @@ fn parse_error_kind(text: &str) -> Option<ProfileErr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     // ── stability ring (spec §5.1) ──────────────────────────────────────
 
@@ -1374,6 +1425,7 @@ mod tests {
             purged: false,
             stab: STAB_NEUTRAL,
             proven: false,
+            latest_ok: None,
             weight: ZERO_WEIGHT,
         }
     }
@@ -1771,6 +1823,140 @@ mod tests {
             display_link_index(&all_purged, None),
             Some(0),
             "all purged: the best measured purged link still displays"
+        );
+    }
+
+    // ── last-good-delay bin law (spec `2026-10-20-stab-alive-design` D2) ──
+
+    /// Every D2 row: (measured, delay, error kind, per-link proven) → bin.
+    /// The failed real probe keeps the link's stored delay; the err band only
+    /// claims links with no real success in their ring.
+    #[rstest]
+    #[case::no_error_real_is_its_delay_bin(Some(true), 40, None, false, 0)]
+    #[case::no_error_fast_is_its_delay_bin(Some(false), 300, None, false, 6 + 3)]
+    #[case::no_error_untested_is_twelve(None, i32::MAX, None, false, 12)]
+    #[case::real_err_never_succeeded_is_thirteen(None, i32::MAX, Some(ProfileErr::Real), false, 13)]
+    #[case::real_err_short_failure_ring_is_thirteen(Some(false), 300, Some(ProfileErr::Real), false, 13)]
+    #[case::real_err_full_dead_window_is_thirteen(Some(true), 40, Some(ProfileErr::Real), false, 13)]
+    #[case::real_err_proven_no_latency_is_thirteen(None, i32::MAX, Some(ProfileErr::Real), true, 13)]
+    #[case::real_err_proven_keeps_its_real_delay(Some(true), 40, Some(ProfileErr::Real), true, 0)]
+    #[case::real_err_proven_fast_latency_uses_stored_latency(Some(false), 300, Some(ProfileErr::Real), true, 6 + 3)]
+    #[case::name_err_without_success_is_thirteen(None, i32::MAX, Some(ProfileErr::Name), false, 13)]
+    #[case::fast_err_with_latency_unchanged(Some(true), 40, Some(ProfileErr::Fast), false, 14)]
+    #[case::fast_err_without_latency_unchanged(None, i32::MAX, Some(ProfileErr::Fast), false, 14)]
+    #[case::purged_is_sixteen(Some(true), 40, None, true, 16)]
+    #[case::dns_unresolved_is_fifteen(Some(true), 40, None, true, 15)]
+    fn the_bin_law_keeps_a_known_good_delay_alive(
+        #[case] measured: Option<bool>,
+        #[case] delay: i32,
+        #[case] error_kind: Option<ProfileErr>,
+        #[case] proven: bool,
+        #[case] expected: u8,
+    ) {
+        let mut l = link(1, measured, delay, 10);
+        l.error_kind = error_kind;
+        l.proven = proven;
+        l.purged = expected == 16;
+        let dns_unresolved = expected == 15;
+        assert_eq!(l.bin(dns_unresolved), expected);
+    }
+
+    #[rstest]
+    #[case::empty_ring(0, 0, None)]
+    #[case::newest_success_below_window(0b011, 2, Some(true))]
+    #[case::newest_failure_below_window(0b001, 2, Some(false))]
+    #[case::newest_success_at_window(u64::MAX, STAB_WINDOW, Some(true))]
+    #[case::newest_failure_at_window(u64::MAX ^ (1 << 15), STAB_WINDOW, Some(false))]
+    fn stab_latest_ok_reads_the_top_live_bit(
+        #[case] mask: u64,
+        #[case] len: u8,
+        #[case] expected: Option<bool>,
+    ) {
+        assert_eq!(stab_latest_ok(mask, len), expected);
+    }
+
+    #[test]
+    fn a_live_sibling_represents_over_a_ghost() {
+        // The ghost: once the fastest link (40 ms), now failing — its key
+        // (bin 0, stab 7) would beat the live sibling's (bin 2, stab 0) under
+        // a pure min-key, and the endpoint row would show the dead link.
+        let mut ghost = link(1, Some(true), 40, 10);
+        ghost.error_kind = Some(ProfileErr::Real);
+        ghost.stab = 7;
+        ghost.proven = true;
+        ghost.latest_ok = Some(false);
+        let mut live = link(2, Some(true), 300, 10);
+        live.stab = 0;
+        live.proven = true;
+        live.latest_ok = Some(true);
+        let row = compute_rank(
+            EndpointId::new(7),
+            "h.example",
+            "",
+            Vec::new(),
+            false,
+            &[ghost, live],
+        )
+        .expect("rank");
+        assert_eq!(
+            row.rank.bin, 3,
+            "the live sibling's bin is the endpoint's bin"
+        );
+        assert_eq!(
+            row.rank.stab, 0,
+            "the stored stab describes the live sibling"
+        );
+    }
+
+    #[test]
+    fn a_purged_link_never_enters_the_live_representative_subset() {
+        // The purged link's ring froze at purge time; its newest bit is still
+        // a success. It must not represent over the failing live-band sibling.
+        let mut purged = link(1, Some(true), 40, 10);
+        purged.purged = true;
+        purged.proven = true;
+        purged.latest_ok = Some(true);
+        let mut failing = link(2, Some(true), 300, 10);
+        failing.error_kind = Some(ProfileErr::Real);
+        failing.proven = false;
+        failing.latest_ok = Some(false);
+        let row = compute_rank(
+            EndpointId::new(7),
+            "h.example",
+            "",
+            Vec::new(),
+            false,
+            &[purged, failing],
+        )
+        .expect("rank");
+        assert_eq!(row.rank.bin, 13, "the failing sibling represents, not the purged link");
+    }
+
+    #[test]
+    fn display_prefers_a_live_link_over_the_best_measured_ghost() {
+        let mut ghost = link(1, Some(true), 40, 10);
+        ghost.error_kind = Some(ProfileErr::Real);
+        ghost.latest_ok = Some(false);
+        let mut live = link(2, Some(true), 300, 10);
+        live.latest_ok = Some(true);
+        assert_eq!(
+            display_link_index(&[ghost, live], None),
+            Some(1),
+            "the working sibling displays; the ghost hides"
+        );
+    }
+
+    #[test]
+    fn a_pin_beats_liveness_in_the_display_rule() {
+        let mut ghost = link(1, Some(true), 40, 10);
+        ghost.error_kind = Some(ProfileErr::Real);
+        ghost.latest_ok = Some(false);
+        let mut live = link(2, Some(true), 300, 10);
+        live.latest_ok = Some(true);
+        assert_eq!(
+            display_link_index(&[ghost, live], Some(1)),
+            Some(0),
+            "the manual override is chosen ahead of the live-first filter"
         );
     }
 }
