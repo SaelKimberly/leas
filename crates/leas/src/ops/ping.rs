@@ -34,6 +34,8 @@ use crate::types::CoreEvent;
 /// and the `tempfile` dev-dependency, so it can only exist in the test unit.
 #[cfg(all(test, feature = "perf-lab"))]
 mod flow_cost;
+#[cfg(all(test, feature = "perf-lab"))]
+mod geo_batched_probe;
 
 /// Bound on concurrent single-test tasks (menu-triggered pings): the spawned
 /// future parks on this permit before doing work, so rapid keypresses queue

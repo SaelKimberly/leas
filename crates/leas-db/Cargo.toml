@@ -19,7 +19,7 @@ categories = ["database"]
 toasty = { workspace = true, features = ["serde", "jiff"] }
 toasty-core = "0.11"
 toasty-sql = "0.11"
-turso = "0.8"
+turso = "=0.9.0-pre.1"
 async-trait = "0.1"
 
 # ============ Time ============
