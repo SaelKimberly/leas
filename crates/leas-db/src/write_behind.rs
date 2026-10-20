@@ -808,29 +808,12 @@ impl CacheSpec for SourceSpec {
         Ok(())
     }
 
-    /// Under MVCC the import's rank refresh moves OUT of the window
-    /// transaction: a fresh import touches thousands of endpoints, and a
-    /// rank refresh inside `BEGIN CONCURRENT` widens the transaction's page
-    /// set for every concurrent writer. The endpoints are marked dirty on
-    /// commit instead; the next page load drains them.
-    fn should_refresh_in_tx(db: &crate::Database) -> bool {
-        !db.uses_concurrent_writes()
-    }
-
-    fn on_commit(db: &crate::Database, patches: &[Self::Patch]) {
-        if !db.uses_concurrent_writes() {
-            return;
-        }
-        let mut touched: Vec<crate::models_toasty::EndpointId> = patches
-            .iter()
-            .flat_map(|p| p.links.iter().map(|l| l.endpoint_id))
-            .collect();
-        touched.sort_unstable_by_key(|id| id.get());
-        touched.dedup();
-        if !touched.is_empty() {
-            db.mark_endpoint_ranks_dirty(&touched);
-        }
-    }
+    // NO should_refresh_in_tx / on_commit overrides: `upsert_links_bulk`
+    // keeps its in-transaction rank refresh in BOTH journal modes. A fresh
+    // import's endpoints have no rank row yet, so deferring would blind the
+    // page until a drain; and marking them dirty here anyway would make the
+    // flush-end `drain_dirty_ranks` re-run the whole (thousands-of-endpoints)
+    // refresh a second time per window.
 }
 
 /// The pending-map key of a staged link row: the link, plus the ONE column
@@ -2280,20 +2263,34 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stage_is_strictly_synchronous_and_non_blocking() {
-        let db = fake_db().await;
-        let driver = WriteBehind::<FakeSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200));
-
-        let start = std::time::Instant::now();
+    /// `push` must be callable from a PLAIN `#[test]` — no async runtime.
+    /// That is the structural proof of the ADR 0002 §3 contract: `stage`
+    /// never awaits and never needs an executor, so it cannot block the UI
+    /// task's drain or a sync disconnect path. (A wall-clock bound here would
+    /// flake on loaded CI; the property it would approximate is pinned by
+    /// construction.)
+    #[test]
+    fn stage_runs_without_an_async_runtime() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        // The driver's constructor needs the rt (in-memory Database::open),
+        // but `push` itself runs OUTSIDE `block_on` — a plain sync context.
+        let driver = rt.block_on(async {
+            let db = fake_db().await;
+            WriteBehind::<FakeSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200))
+        });
         for i in 0..10_000 {
             driver.push(row(i, i * 2));
         }
-        let elapsed = start.elapsed();
         assert_eq!(driver.staged_len(), 10_000);
-        assert!(
-            elapsed < Duration::from_millis(150),
-            "stage took too long: {elapsed:?}"
-        );
+        for i in 0..10_000 {
+            assert_eq!(
+                driver.get(&i).map(|r| r.value),
+                Some(i * 2),
+                "key {i} holds the last write"
+            );
+        }
     }
 }

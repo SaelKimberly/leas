@@ -1896,6 +1896,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::items_after_statements,
+        reason = "fixture items are scoped next to the discriminating case that needs them"
+    )]
     async fn test_dirty_rank_set_tracks_and_drains() {
         let db = crate::Database::in_memory().await.expect("db");
         let eid1 = EndpointId::new(101);
@@ -1908,5 +1912,112 @@ mod tests {
         let drained = db.drain_dirty_ranks().await.expect("drain");
         assert_eq!(drained, 0); // No links exist in empty in-memory DB
         assert_eq!(db.dirty_rank_count(), 0);
+
+        // Discriminating case: a REAL link whose stored key would be stale
+        // without the drain. Seed endpoint+link, then mark dirty WITHOUT a
+        // refresh and drain — the drain must create the endpoint_rank row.
+        use crate::models_toasty::{
+            Endpoint, HostType, ProfileStats, Protocol, Security, TrafficStats, Transport,
+        };
+        use leas_proto::proto_spec::{ProtocolKind, SecurityType, TransportType};
+        {
+            let mut conn = db.connection().await.expect("conn");
+            toasty::create!(Endpoint {
+                created_at: 0,
+                id: EndpointId::new(201),
+                domain: Endpoint::derive_domain("dirty.example", HostType::Dns).0,
+                sub_domain: Endpoint::derive_domain("dirty.example", HostType::Dns).1,
+                port: 443,
+                ports: Vec::<u16>::new(),
+            })
+            .exec(&mut conn)
+            .await
+            .expect("endpoint");
+            toasty::create!(Protocol {
+                created_at: 0,
+                id: ProtocolId::new(201),
+                sig: 201,
+                proto_kind: ProtocolKind::Vless,
+                transport: Transport {
+                    r#type: TransportType::Tcp,
+                },
+                security: Security {
+                    r#type: SecurityType::None,
+                    sni: None,
+                    fp: None,
+                    insecure: None,
+                },
+                config: toasty::Deferred::from(toasty::Json(
+                    leas_proto::proto_spec::ProtocolConfig::Vless(
+                        leas_proto::proto_spec::VlessConfig {
+                            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+                            uuid_origin: None,
+                            security: leas_proto::proto_spec::common::SecurityConfig::default(),
+                            transport: leas_proto::proto_spec::common::TransportConfig::Tcp,
+                            encryption: None,
+                            flow: None,
+                            path: None,
+                            splice: None,
+                            remarks: None,
+                            mux: None,
+                        },
+                    ),
+                )),
+            })
+            .exec(&mut conn)
+            .await
+            .expect("protocol");
+            toasty::create!(ProfileStats {
+                created_at: 0,
+                updated_at: 0,
+                protocol_id: ProtocolId::new(201),
+                endpoint_id: EndpointId::new(201),
+                last_seen_at: 1,
+                stab_mask: 0,
+                stab_len: 0,
+                traffic: TrafficStats {
+                    today_up: 0,
+                    today_down: 0,
+                    total_up: 0,
+                    total_down: 0,
+                },
+            })
+            .exec(&mut conn)
+            .await
+            .expect("link");
+        }
+        // No rank row exists yet — the write path that seeded the link did
+        // NOT refresh (this is the MVCC deferred-refresh shape).
+        let rows = toasty::sql::query("SELECT COUNT(*) FROM endpoint_rank WHERE endpoint_id = 201")
+            .exec(&mut db.connection().await.expect("conn"))
+            .await
+            .expect("count");
+        assert_eq!(
+            rows.first().and_then(|v| match v {
+                toasty::stmt::Value::Record(f) => f.first().cloned(),
+                other => Some(other.clone()),
+            }),
+            Some(toasty::stmt::Value::I64(0)),
+            "no rank row before the drain"
+        );
+
+        db.mark_endpoint_ranks_dirty(&[EndpointId::new(201)]);
+        let drained = db.drain_dirty_ranks().await.expect("drain");
+        assert_eq!(drained, 1, "the dirty endpoint was refreshed");
+        let rows = toasty::sql::query("SELECT COUNT(*) FROM endpoint_rank WHERE endpoint_id = 201")
+            .exec(&mut db.connection().await.expect("conn"))
+            .await
+            .expect("count");
+        assert_eq!(
+            rows.first().and_then(|v| match v {
+                toasty::stmt::Value::Record(f) => f.first().cloned(),
+                other => Some(other.clone()),
+            }),
+            Some(toasty::stmt::Value::I64(1)),
+            "the drain created the rank row"
+        );
+        // A second drain is a no-op — the set is empty.
+        let drained = db.drain_dirty_ranks().await.expect("second drain");
+        assert_eq!(drained, 0, "second drain has nothing to do");
     }
 }

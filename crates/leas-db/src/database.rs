@@ -445,6 +445,11 @@ impl Database {
     }
 
     /// Drain and recompute stored keys for all dirty endpoints.
+    ///
+    /// Ids are removed up front so a re-mark landing during the refresh
+    /// survives; on refresh FAILURE they are re-inserted, or those endpoints
+    /// would never be refreshed again (busy exhaustion is real — the refresh
+    /// retries 5×, then gives up).
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn drain_dirty_ranks(&self) -> Result<usize> {
         if self.dirty_ranks.is_empty() {
@@ -457,7 +462,15 @@ impl Database {
         for id in &ids {
             self.dirty_ranks.remove(id);
         }
-        self.refresh_endpoint_ranks(&ids).await
+        match self.refresh_endpoint_ranks(&ids).await {
+            Ok(n) => Ok(n),
+            Err(err) => {
+                for id in &ids {
+                    self.dirty_ranks.insert(*id);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Open a toasty DB by constructing builder. Separate for recovery logic.
@@ -2064,28 +2077,14 @@ pub async fn upsert_links_bulk(
     tx: &mut impl toasty::Executor,
     links: &[ProfileStats],
 ) -> Result<()> {
-    upsert_links_bulk_opt(tx, links, true).await
-}
-
-/// [`upsert_links_bulk`] with the in-tx rank refresh optional.
-///
-/// Under MVCC the refresh moves out of the window transaction (the write-behind
-/// driver marks the endpoints dirty on commit instead), so the driver passes
-/// `false`.
-pub async fn upsert_links_bulk_opt(
-    tx: &mut impl toasty::Executor,
-    links: &[ProfileStats],
-    refresh_ranks: bool,
-) -> Result<()> {
     // One multi-row upsert per chunk instead of one typed upsert per row
     // (measured 2026-09-16 over the reference feed: 2,000 links 360 ms → 48 ms).
     exec_link_upsert(tx, links, LINK_SOURCE_CONFLICT_SQL, now_epoch()).await?;
-    if !refresh_ranks {
-        return Ok(());
-    }
     // Derived state: the stored ordering keys follow the links, so every
     // link writer refreshes the endpoints it touched — here, inside the
     // caller's transaction, which makes the key update atomic with the write.
+    // Kept in BOTH journal modes: a fresh import's endpoints have no rank row
+    // yet, so deferring would blind the page until a drain.
     let mut touched: Vec<EndpointId> = links.iter().map(|l| l.endpoint_id).collect();
     touched.sort_unstable_by_key(|id| id.get());
     touched.dedup();
@@ -2869,6 +2868,15 @@ mod tests {
         for batch_size in [1, 16, 32, 64, 128, 256] {
             run_bench(false, true, 16, batch_size).await;
             run_bench(true, true, 16, batch_size).await;
+        }
+
+        // Production geometry: the geo drain is ONE owner (the WriteBehind
+        // driver), overlapped only by a page seed — the interesting rows are
+        // LOW writer counts, not the lab's 16x (database.rs probe precedent).
+        println!("\n=== MICRO BATCH PROBE: LOW writer counts (1/2/4), batch 32, rank in-tx ===");
+        for writers in [1, 2, 4] {
+            run_bench(false, true, writers, 32).await;
+            run_bench(true, true, writers, 32).await;
         }
 
         println!(
