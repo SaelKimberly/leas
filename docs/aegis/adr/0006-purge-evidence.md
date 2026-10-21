@@ -75,7 +75,7 @@ snapshot taken mid-re-run — the number moves with every probe run).
 | An `EXISTS (SELECT 1 FROM profile_stats WHERE purge_reason IS NOT NULL)` correlation in the page predicate | The correlated-subquery shape ADR 0001/0003 removed: the page would stop being a single index scan |
 | Purge from the fast phase's hard failures (timeout/refused/no-route) | A transient network condition, not a statement by the server; 31,020 links carried one on the reference run |
 | Purge `not testable by the native engine` | It is a statement about THIS engine, not about the config — the subprocess core can serve those rows |
-| A migration for the new column (additive `ALTER TABLE`) | The project has no migration machinery and the database is re-importable fixture data (decision 4); an additive alter would also weaken what the tag means |
+| A migration for the new column (additive `ALTER TABLE`) | **Superseded by ADR 0012 D-C (2026-10-08):** the project DOES have migration machinery now — `PRAGMA user_version` is a cursor, a supported older version applies the pending steps, and only an unknown cursor wipes. This row's original reason ("the project has no migration machinery… decision 4") no longer holds; the row is kept for the record because the alternative it rejected (an ad-hoc `ALTER` outside the cursor) is still wrong. The `purge_reason` column itself still ships as a schema-tag bump, because the *CHECK list* it needed is a table rebuild (decision 2) — that part of the row stands. |
 
 ## Consequences
 
@@ -121,3 +121,41 @@ Spec: `2026-09-22-native-testability-improvement-design.md` (T6).
 that ends under a later phase is now `NativeError::TunnelClosed` → `ProbeClass::Protocol`, not
 `Tls` (which is what the engine's `TlsError::Io` wrap produced). `evidence()` is `None` for it,
 exactly as for `Tls`, so this refines reporting without touching what a failure proves.
+
+## Amendment — 2026-10-21: an auth rejection earns NO purge verdict
+
+Spec: `2026-10-21-merged-test-pipeline-design.md` (D9). ADR: `0014`.
+
+The merged probe records a new fact: **the Auth flag** — a quad-state success flag (`ok` /
+`failed` / `n-a` / `unknown`) saying whether the server ACCEPTED this config. Its `failed` state is
+defined as *positive* rejection evidence, which is the shape decision 4's typed-evidence rule
+describes. So the question this ADR must answer is: does that observation earn a purge verdict?
+
+**It does not.** An auth rejection is recorded as the Auth flag plus a `[real]` marker, and the row
+**stays in Active**. No `FailureEvidence` arm and no `PurgeReason` variant are added.
+
+Three reasons, in the order they matter:
+
+1. **The signal is not unambiguously positive.** For hysteria2 it is (an explicit non-233 h3
+   status), and even there a non-233 may be the server's **masquerade** page answering a
+   non-hysteria request — a hijacked IP, not a wrong credential. For VLESS/VMess, "the connection
+   ended before the ack" is indistinguishable from a crash or a middlebox kill. sing-box writes the
+   VLESS response header **lazily** (only before the first application-data write), so an unobserved
+   ack is not a rejection at all — which is why the flag's `failed` state requires positive
+   evidence and an unobserved ack is `unknown`.
+2. **A false positive DELETES a working profile.** "Remove Bad Servers" deletes the row. A config
+   that worked yesterday and whose server restarted badly today would be gone, and no later run
+   would have proved it good.
+3. **The column is CHECK-frozen.** `PurgeReason` is "one nullable TEXT column and one CHECK list"
+   (decision 2), so a new variant forces a `profile_stats` table rebuild — the largest table in the
+   schema — for a signal that is not yet trustworthy.
+
+Decision 8 is unaffected and still governs: a verdict is cleared by a data-carrying success only.
+The merged pipeline does not change that — a transport handshake (the Fast Test, and stage 1 of
+the merged probe) still cannot clear a verdict, and the Fast Test still earns none.
+
+**Revisit condition.** Measure the Auth-flag distribution per server family once the merged probe
+lands. If `failed` is observed on rows that later succeed, the flag is unsound and must be
+dropped. If it is observed overwhelmingly on never-succeeding rows, a typed
+`FailureEvidence::AuthRejected` plus a `PurgeReason` variant becomes worth the rebuild. Until then
+the flag is a diagnostic, not a verdict.

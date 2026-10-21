@@ -245,7 +245,7 @@ pub fn default_export_path(scope: ExportScope) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leas_db::models::{EndpointId, ProfileStats, ProtocolId};
+    use leas_db::models::{EndpointId, Latency, ProfileStats, ProtocolId};
     use leas_proto::proto_spec::{
         EndpointEssentials, PlaceholderConfig, ProtocolConfig, ProtocolKind,
     };
@@ -276,7 +276,7 @@ mod tests {
                 endpoint_id: EndpointId::new(1),
                 last_used_at: None,
                 last_seen_at: 0,
-                latency: None,
+                latency: Latency::default(),
                 speed_bps: None,
                 error: None,
                 purge_reason: None,

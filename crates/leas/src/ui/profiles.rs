@@ -165,6 +165,12 @@ pub struct DisplayRowData {
     /// or the red `[name]`/`[fast]`/`[real]` problem labels, or blank.
     test_str: String,
     test_style: Style,
+    /// The Fast column: the TRANSPORT measurement (spec D2).
+    fast_str: String,
+    fast_style: Style,
+    /// The Auth column: the quad-state success flag's glyph (spec D3).
+    auth_str: String,
+    auth_style: Style,
     /// The representative link's ring as `successes/attempts` (spec
     /// `2026-10-20-stab-alive-design` D5) — the SAME link the Test cell
     /// describes, so the two columns cannot disagree about whose numbers the
@@ -223,10 +229,12 @@ impl DataTableRow for DisplayRowData {
                 4 => (self.port_str.as_str(), self.port_style),
                 5 => (self.white_str.as_str(), self.white_style),
                 6 => (self.protocol_info_str.as_str(), self.protocol_style),
-                7 => (self.test_str.as_str(), self.test_style),
-                8 => (self.stab_str.as_str(), self.stab_style),
-                9 => (self.outbound_flag.as_str(), self.row_style),
-                10 => (self.outbound_addr.as_str(), self.address_style),
+                7 => (self.fast_str.as_str(), self.fast_style),
+                8 => (self.auth_str.as_str(), self.auth_style),
+                9 => (self.test_str.as_str(), self.test_style),
+                10 => (self.stab_str.as_str(), self.stab_style),
+                11 => (self.outbound_flag.as_str(), self.row_style),
+                12 => (self.outbound_addr.as_str(), self.address_style),
                 _ => ("", self.row_style),
             };
             let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
@@ -536,12 +544,13 @@ fn compute_test_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) 
         Some(ProfileErr::Fast) => Some(TestFailure::Fast),
         None => None,
     };
-    let delay = representative.and_then(|l| match l.latency {
-        Some(
-            leas_db::models::Latency::Real { delay, .. } | leas_db::models::Latency::Fast { delay },
-        ) => Some(delay),
-        None => None,
-    });
+    // The Real cell shows the REAL measurement only (spec D17). The transport
+    // measurement has its own column: a row with a fast delay and a real
+    // failure renders `[12ms] ✓ [err]` — the number beside the verdict, which
+    // today's single column cannot show. Falling back to the fast delay here
+    // would put the transport span back in the Real cell and make the two
+    // columns say the same thing.
+    let delay = representative.and_then(|l| l.latency.real_delay);
     // The approximation marker: `~` says the verdict beside it was produced by a
     // SUBSTITUTED ClientHello — the link asked for a fingerprint with no roster
     // row, so the engine probed with its default. It is a provenance note about
@@ -601,6 +610,97 @@ const fn purge_label(reason: leas_db::models::PurgeReason) -> &'static str {
 enum TestFailure {
     Real,
     Fast,
+}
+
+/// The Auth cell's glyph: the quad-state success flag (spec D3).
+///
+/// | state | glyph | meaning |
+/// |---|---|---|
+/// | `ok` | `✓` | the server accepted this config |
+/// | `failed` | `✗` | positive rejection evidence |
+/// | `n-a` | `·` | the family has no server ack, or the engine cannot serve the row |
+/// | `unknown` | `?` | the ack is possible but was not observed in time |
+/// | never observed | (blank) | the row was never probed by a probe that reads the ack |
+///
+/// A blank is not `unknown`: "never observed" and "observed, but not in time"
+/// are different facts, and a `?` on an unprobed row would claim a probe ran.
+#[must_use]
+pub const fn auth_glyph(state: leas_db::models::AuthState) -> &'static str {
+    use leas_db::models::AuthState;
+    match state {
+        AuthState::Ok => "✓",
+        AuthState::Failed => "✗",
+        AuthState::NotApplicable => "·",
+        AuthState::Unknown => "?",
+    }
+}
+
+/// The Fast cell's content: the transport span, or a blank.
+///
+/// The Fast column is the TRANSPORT measurement (spec D2) — the time to
+/// establish the endpoint's transport. It is INDEPENDENT of the Real column:
+/// a row can carry a fast delay and a real failure ("the server is up, the
+/// config is not"), so the marker lives in the Real column and the number
+/// stays here (spec D17).
+///
+/// A row with no transport measurement renders blanks — a `—` would read as
+/// "measured, and the value is missing", which is not the same fact.
+fn fast_cell_content(delay: Option<i32>, theme: &opaline::Theme) -> (String, Style) {
+    let Some(d) = delay else {
+        return (" ".repeat(6), Style::default());
+    };
+    let style = if d >= TEST_BAD_MS {
+        ThemeStyles::test_delay_bad(theme)
+    } else if d >= TEST_WARN_MS {
+        ThemeStyles::test_delay_warn(theme)
+    } else {
+        ThemeStyles::test_delay_ok(theme)
+    };
+    (format!("[{}]", center_cell(&d.to_string(), 4)), style)
+}
+
+/// Compute the Fast cell for one endpoint row: the TRANSPORT measurement.
+///
+/// The representative link's own transport span — the SAME link the Real
+/// cell describes, so the two cells are about one link and cannot disagree.
+/// A link with no transport measurement (never probed, or the transport
+/// stage itself failed) renders blanks: there is no number to show, and a
+/// placeholder would read as a measurement.
+fn compute_fast_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) -> (String, Style) {
+    let representative = row
+        .representative_link_index(!resolved)
+        .and_then(|i| row.links.get(i));
+    fast_cell_content(representative.and_then(|l| l.latency.fast_delay), theme)
+}
+
+/// Compute the Auth cell for one endpoint row: the quad-state success flag's
+/// glyph.
+///
+/// The representative link's own flag — again the SAME link the Real cell
+/// describes. A row whose flag was never observed renders blanks: "never
+/// observed" is not "unknown" (the ack was possible but not seen in time),
+/// and a `?` on an unprobed row would claim a probe ran.
+fn compute_auth_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) -> (String, Style) {
+    let representative = row
+        .representative_link_index(!resolved)
+        .and_then(|i| row.links.get(i));
+    let Some(state) = representative
+        .and_then(|l| l.latency.auth)
+        .and_then(leas_db::models::AuthState::from_i64)
+    else {
+        return (" ".repeat(3), Style::default());
+    };
+    let style = match state {
+        leas_db::models::AuthState::Ok => ThemeStyles::test_delay_ok(theme),
+        leas_db::models::AuthState::Failed => ThemeStyles::test_delay_bad(theme),
+        // `n-a` and `unknown` are not verdicts about the config's quality, so
+        // they wear the neutral style: a dim `·`/`?`, never a success green
+        // and never a failure red.
+        leas_db::models::AuthState::NotApplicable | leas_db::models::AuthState::Unknown => {
+            ThemeStyles::hint(theme)
+        }
+    };
+    (auth_glyph(state).to_string(), style)
 }
 
 /// Pure Test-cell logic (no `AppState`) so the label precedence and color
@@ -975,6 +1075,8 @@ fn build_display_rows(
             info.and_then(|i| i.sni_whitelisted).unwrap_or(false),
         );
         let (test_str, test_style) = compute_test_cell(row, resolved, theme);
+        let (fast_str, fast_style) = compute_fast_cell(row, resolved, theme);
+        let (auth_str, auth_style) = compute_auth_cell(row, resolved, theme);
         let (stab_str, stab_style) = compute_stab_cell(row, resolved, theme);
 
         let protocol_info_str = protocol_info_cell(row);
@@ -989,10 +1091,7 @@ fn build_display_rows(
         // assert one. Without the gate a feed batch (which persists `latency_ip`
         // for every planned link) rendered `[name]` beside a live exit IP for
         // every endpoint outside the loaded page.
-        let active_outbound_ip = row.active_link().and_then(|l| match &l.latency {
-            Some(leas_db::models::Latency::Real { ip: Some(ip), .. }) => Some(ip.clone()),
-            _ => None,
-        });
+        let active_outbound_ip = row.active_link().and_then(|l| l.latency.ip.clone());
         let persisted_outbound = active_outbound_ip
             .clone()
             .or_else(|| info.and_then(|i| i.outbound_ip.map(|ip| ip.to_string())));
@@ -1036,17 +1135,14 @@ fn build_display_rows(
                 .iter()
                 .map(|link| {
                     let proto = row.protocols.get(&link.protocol_id);
-                    let delay = match (link.purge_reason, &link.latency) {
+                    let delay = match (
+                        link.purge_reason,
+                        link.latency.real_delay.or(link.latency.fast_delay),
+                    ) {
                         // The verdict replaces the numbers: the delay is
                         // phase 1's, on a link the classifier has retired.
                         (Some(reason), _) => format!("[{}]", purge_label(reason)),
-                        (
-                            None,
-                            Some(
-                                leas_db::models::Latency::Real { delay, .. }
-                                | leas_db::models::Latency::Fast { delay },
-                            ),
-                        ) => format!("{delay}ms"),
+                        (None, Some(delay)) => format!("{delay}ms"),
                         (None, None) => "-".to_string(),
                     };
                     let speed = link
@@ -1060,26 +1156,19 @@ fn build_display_rows(
                             format_traffic(total as u64)
                         }
                     };
-                    let (outbound, outbound_country) = link
-                        .latency
-                        .as_ref()
-                        .and_then(|l| match l {
-                            // Latency::Real.ip is the persisted exit IP
+                    let (outbound, outbound_country) = link.latency.ip.clone().map_or_else(
+                        || ("—".to_string(), "—".to_string()),
+                        |ip| {
+                            // `latency.ip` is the persisted exit IP
                             // (events.rs stores the bare IP; country comes
                             // from the mmdb cache seeded at load + on ping).
-                            leas_db::models::Latency::Real { ip, .. } => ip.clone(),
-                            leas_db::models::Latency::Fast { .. } => None,
-                        })
-                        .map_or_else(
-                            || ("—".to_string(), "—".to_string()),
-                            |ip| {
-                                let country = state.outbound_country_for(&ip).map_or_else(
-                                    || "—".to_string(),
-                                    |iso| format!("{} {iso}", iso_to_flag(&iso)),
-                                );
-                                (ip, country)
-                            },
-                        );
+                            let country = state.outbound_country_for(&ip).map_or_else(
+                                || "—".to_string(),
+                                |iso| format!("{} {iso}", iso_to_flag(&iso)),
+                            );
+                            (ip, country)
+                        },
+                    );
                     let (t, s) = proto.map_or((None, None), |p| {
                         (
                             Some(p.transport.r#type.as_str()),
@@ -1146,6 +1235,10 @@ fn build_display_rows(
             protocol_info_str,
             test_str,
             test_style,
+            fast_str,
+            fast_style,
+            auth_str,
+            auth_style,
             stab_str,
             stab_style,
             outbound_addr,
@@ -1198,9 +1291,14 @@ fn build_display_rows(
 /// The endpoint grid's columns (spec §7 + `2026-10-20-stab-alive-design` D5):
 /// logical id, header label, width. One owner for the header row, the width
 /// drops, and the row-cell match — a label or order change lands here once.
-/// `Stab` sits directly after `Test`: the two cells describe the SAME
+/// `Stab` sits directly after `Real`: the two cells describe the SAME
 /// representative link, and the spec requires them adjacent.
-const GRID_COLUMNS: [(usize, &str, u16); 11] = [
+///
+/// The Fast and Auth columns sit BEFORE `Real` (spec D17): the transport
+/// measurement and the auth flag are the two facts a row has BEFORE its
+/// verdict, so a reader sees "the server answered in 12 ms, the config was
+/// accepted, the real probe failed" left to right.
+const GRID_COLUMNS: [(usize, &str, u16); 13] = [
     (0, "", 2),         // status glyph + expand chevron in the gap cell
     (1, "ID", 8),       // link id hex
     (2, "Flag", 5),     // inbound flag
@@ -1208,10 +1306,12 @@ const GRID_COLUMNS: [(usize, &str, u16); 11] = [
     (4, "Port", 6),     // port
     (5, "White", 9),    // whitelist tokens
     (6, "Protocol", 24),
-    (7, "Test", 7),   // + fixed sort arrow
-    (8, "Stab", 7),   // representative link's ring, successes/attempts
-    (9, "Out", 5),    // exit flag
-    (10, "Exit", 14), // exit IP
+    (7, "Fast", 7),   // the transport span (spec D2)
+    (8, "Auth", 3),   // the quad-state success flag (spec D3)
+    (9, "Real", 7),   // the real span, or the failure marker
+    (10, "Stab", 7),  // representative link's ring, successes/attempts
+    (11, "Out", 5),   // exit flag
+    (12, "Exit", 14), // exit IP
 ];
 
 fn render_data_grid(
@@ -1227,14 +1327,20 @@ fn render_data_grid(
 
     let header_style = ThemeStyles::table_header(theme);
     // Width-aware drop (tui-polish D7, re-derived for the §7 grid): the inner
-    // width decides which columns survive. `Test` is protected — a row without
-    // its verdict is useless. Drop order: Exit, Out, White, Stab; then Address
-    // shrinks toward a 12-cell floor. Surviving columns carry their LOGICAL id
-    // through `order`, so a drop never shifts another column's meaning.
-    let logical: &[(usize, &str, u16); 11] = &GRID_COLUMNS;
+    // width decides which columns survive. `Real` is protected — a row without
+    // its verdict is useless. Drop order: Exit, Out, White, Stab, Auth, Fast;
+    // then Address shrinks toward a 12-cell floor. Surviving columns carry
+    // their LOGICAL id through `order`, so a drop never shifts another
+    // column's meaning.
+    //
+    // The two NEW columns (Fast, Auth) drop BEFORE Stab: they carry the
+    // merged row's two new facts, while `Stab` is a ring the row already
+    // showed. Fast drops before Auth because a number is the more useful of
+    // the two when the pane is narrow.
+    let logical: &[(usize, &str, u16); 13] = &GRID_COLUMNS;
     let mut widths: Vec<u16> = logical.iter().map(|(_, _, w)| *w).collect();
     let inner_w = area.width.saturating_sub(2); // frameless inset
-    for &drop in &[10usize, 9, 5, 8] {
+    for &drop in &[12usize, 11, 5, 10, 8, 7] {
         if widths.iter().sum::<u16>() > inner_w {
             widths[drop] = 0;
         }
@@ -1707,23 +1813,116 @@ mod tests {
         assert_eq!(stability_ratio(&link), "16/16");
     }
 
-    /// The grid's header order (spec `2026-10-20-stab-alive-design` D5):
-    /// `Stab` sits directly AFTER `Test` — the two cells describe the same
-    /// representative link, and the adjacency is the product requirement.
+    /// The merged row's three cells: the transport span, the auth glyph and
+    /// the real verdict, side by side (spec D17).
+    ///
+    /// The decisive case is a row whose transport answered but whose config
+    /// did not: the Fast cell keeps its number and the Real cell shows the
+    /// failure marker. Today's single Test column cannot show that pair — it
+    /// shows the marker alone, and the transport measurement is invisible.
     #[test]
-    fn the_grid_puts_stab_right_after_test() {
+    fn a_row_with_a_transport_span_and_a_real_failure_shows_both() {
+        use crate::ops::profiles::test_support::fake_row;
+        use leas_db::models::{ErrorInfo, Latency, ProfileErr};
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let mut row = fake_row(1, "1.2.3.4", 1);
+        row.links[0].latency = Latency {
+            real_delay: None,
+            fast_delay: Some(12),
+            ip: None,
+            auth: None,
+        };
+        row.links[0].error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "timeout".into(),
+        });
+
+        let (fast, _) = compute_fast_cell(&row, true, &theme);
+        let (auth, _) = compute_auth_cell(&row, true, &theme);
+        let (real, _) = compute_test_cell(&row, true, &theme);
+        assert!(fast.contains("12"), "the transport span shows: {fast:?}");
+        assert_eq!(real, "[real]", "the real verdict shows the marker");
+        assert_eq!(auth, "   ", "no auth observation renders blanks");
+    }
+
+    /// The Auth cell's four states (spec D3), and the fifth: never observed.
+    #[test]
+    fn the_auth_cell_renders_the_quad_state_glyphs() {
+        use crate::ops::profiles::test_support::fake_row;
+        use leas_db::models::{AuthState, Latency};
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let mut row = fake_row(1, "1.2.3.4", 1);
+
+        for (state, glyph) in [
+            (AuthState::Ok, "✓"),
+            (AuthState::Failed, "✗"),
+            (AuthState::NotApplicable, "·"),
+            (AuthState::Unknown, "?"),
+        ] {
+            row.links[0].latency = Latency {
+                real_delay: Some(30),
+                fast_delay: Some(12),
+                ip: None,
+                auth: state.as_i64(),
+            };
+            let (text, _) = compute_auth_cell(&row, true, &theme);
+            assert_eq!(text, glyph, "the {state:?} state renders {glyph}");
+        }
+
+        // Never observed: a blank, NOT the `unknown` glyph. "Never probed" and
+        // "probed, but the ack did not arrive in time" are different facts.
+        row.links[0].latency = Latency::real(30);
+        let (text, _) = compute_auth_cell(&row, true, &theme);
+        assert_eq!(text, "   ", "a row with no auth observation renders blanks");
+        assert_ne!(text.trim(), "?", "never observed is not unknown");
+    }
+
+    /// A row with no transport measurement renders blanks in the Fast cell.
+    #[test]
+    fn an_unprobed_row_renders_blanks_in_the_fast_cell() {
+        use crate::ops::profiles::test_support::fake_row;
+        use leas_db::models::Latency;
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let mut row = fake_row(1, "1.2.3.4", 1);
+        row.links[0].latency = Latency::default();
+        let (fast, _) = compute_fast_cell(&row, true, &theme);
+        assert_eq!(fast.trim(), "", "an unprobed row has no transport number");
+
+        // A real delay alone does NOT fill the Fast cell: the two measurements
+        // are independent facts (spec D2), and putting the real span in the
+        // Fast column would make the two columns say the same thing.
+        row.links[0].latency = Latency::real(42);
+        let (fast, _) = compute_fast_cell(&row, true, &theme);
+        assert_eq!(fast.trim(), "", "the real span is not a transport span");
+    }
+
+    /// The grid's header order (spec `2026-10-20-stab-alive-design` D5, plus
+    /// the merged pipeline's D17): `Stab` sits directly AFTER `Real` — the
+    /// two cells describe the same representative link, and the adjacency is
+    /// the product requirement. The merged pipeline's two new columns sit
+    /// BEFORE `Real`: the transport measurement and the auth flag are the
+    /// facts a row has before its verdict.
+    #[test]
+    fn the_grid_puts_stab_right_after_real() {
         let labels: Vec<&str> = GRID_COLUMNS.iter().map(|&(_, label, _)| label).collect();
         assert_eq!(
             labels,
             [
-                "", "ID", "Flag", "Address", "Port", "White", "Protocol", "Test", "Stab", "Out",
-                "Exit"
+                "", "ID", "Flag", "Address", "Port", "White", "Protocol", "Fast", "Auth", "Real",
+                "Stab", "Out", "Exit"
             ],
-            "Stab must sit immediately after Test"
+            "Fast and Auth sit before Real; Stab immediately after it"
         );
-        let test_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Test");
+        let real_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Real");
         let stab_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Stab");
-        assert_eq!(stab_pos, test_pos.map(|p| p + 1), "adjacency, numerically");
+        assert_eq!(stab_pos, real_pos.map(|p| p + 1), "adjacency, numerically");
+        // The Fast column precedes the Auth column, which precedes Real.
+        let fast_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Fast");
+        let auth_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Auth");
+        assert!(
+            fast_pos < auth_pos && auth_pos < real_pos,
+            "Fast │ Auth │ Real"
+        );
     }
 
     /// The row's Stab cell (spec `2026-10-20-stab-alive-design` D5) describes
@@ -1738,11 +1937,8 @@ mod tests {
         let mut row = fake_row(1, "1.2.3.4", 2);
 
         // Representative: link 1 (the only measured one).
-        row.links[0].latency = None;
-        row.links[1].latency = Some(Latency::Real {
-            delay: 40,
-            ip: None,
-        });
+        row.links[0].latency = Latency::default();
+        row.links[1].latency = Latency::real_with_ip(40, None);
 
         // No samples → muted dash, not 0/0.
         row.links[1].stab_mask = 0;
@@ -1795,6 +1991,10 @@ mod tests {
             protocol_info_str: String::new(),
             test_str: String::new(),
             test_style: Style::default(),
+            fast_str: String::new(),
+            fast_style: Style::default(),
+            auth_str: String::new(),
+            auth_style: Style::default(),
             stab_str: String::new(),
             stab_style: Style::default(),
             outbound_addr: String::new(),
@@ -1872,7 +2072,7 @@ mod tests {
         let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = fake_row(1, "1.2.3.4", 1);
         let rep_id = row.links[0].protocol_id;
-        row.links[0].latency = Some(Latency::Fast { delay: 42 });
+        row.links[0].latency = Latency::real(42);
         row.protocols.get_mut(&rep_id).expect("rep").security.fp = Some(String::from("qq"));
         let (text, _) = compute_test_cell(&row, true, &theme);
         assert!(text.contains("42"), "the measurement survives: {text:?}");
@@ -1894,10 +2094,7 @@ mod tests {
             kind: ProfileErr::Real,
             text: "timeout".into(),
         });
-        row.links[1].latency = Some(Latency::Real {
-            delay: 40,
-            ip: None,
-        });
+        row.links[1].latency = Latency::real_with_ip(40, None);
         // p102 stays untested.
 
         // The representative is p101 (tier 0), so its delay is what the row
@@ -1911,7 +2108,7 @@ mod tests {
 
         // Every link failed → no clean measurement remains → the marker, from
         // the representative's kind (real ranks above fast).
-        row.links[1].latency = None;
+        row.links[1].latency = Latency::default();
         row.links[1].error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "timeout".into(),
@@ -1938,12 +2135,12 @@ mod tests {
         use leas_db::models::{ErrorInfo, Latency, ProfileErr};
         let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = fake_row(1, "1.2.3.4", 2);
-        row.links[0].latency = Some(Latency::Fast { delay: 12 });
+        row.links[0].latency = Latency::real(12);
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Real,
             text: "timeout".into(),
         });
-        row.links[1].latency = Some(Latency::Fast { delay: 20 });
+        row.links[1].latency = Latency::real(20);
 
         // `select_best_measured_link` would pick links[0] (12 < 20) — the cell
         // must not follow it.
@@ -1971,7 +2168,7 @@ mod tests {
         use leas_db::models::{ErrorInfo, Latency, ProfileErr};
         let theme = crate::ui::theme::load("tokyo-night").unwrap();
         let mut row = fake_row(1, "1.2.3.4", 1);
-        row.links[0].latency = Some(Latency::Fast { delay: 44 });
+        row.links[0].latency = Latency::real(44);
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "timeout".into(),

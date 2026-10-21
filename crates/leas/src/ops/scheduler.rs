@@ -434,7 +434,7 @@ impl TaskScheduler {
 mod tests {
     use std::sync::Arc;
 
-    use leas_db::models::{EndpointId, ProfileStats, ProtocolId, TaskKind, TrafficStats};
+    use leas_db::models::{EndpointId, Latency, ProfileStats, ProtocolId, TaskKind, TrafficStats};
     use toasty::Deferred;
 
     use super::MIN_DNS_DEFER_SECS;
@@ -452,7 +452,7 @@ mod tests {
             endpoint_id: EndpointId::new(eid),
             last_used_at: None,
             last_seen_at: ts(0),
-            latency: None,
+            latency: Latency::default(),
             speed_bps: None,
             error: None,
             purge_reason: None,

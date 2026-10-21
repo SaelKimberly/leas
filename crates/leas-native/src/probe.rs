@@ -52,8 +52,18 @@ pub struct ProbeRequest<'a> {
     pub method: ProbeMethod,
     /// Origin-form path, query string included (`/generate_204`, `/json/?x=1`).
     pub path: &'a str,
-    /// Budget for the request (the body read is capped by the same value).
+    /// Budget for the PROTOCOL + PROBE stages (the body read is capped by the
+    /// same value).
     pub timeout: Duration,
+    /// Budget for the TRANSPORT stage alone — the time to establish the
+    /// endpoint's transport (the dial to the proxy server's socket).
+    ///
+    /// **Independent** of `timeout`, not a split of it (spec
+    /// `2026-10-21-merged-test-pipeline-design` D12): the transport span is
+    /// the measurement that says "the server is alive", so it must never be
+    /// truncated by the protocol stage's budget. The two budgets bound
+    /// different stages, so a row's worst case is their SUM.
+    pub transport_timeout: Duration,
 }
 
 /// A completed probe: the response head plus the body (capped).
@@ -64,6 +74,49 @@ pub struct ProbeResponse {
     /// Time from the start of the request to the response HEAD — the probe's
     /// latency (the body read is not part of it).
     pub elapsed: Duration,
+    /// The TRANSPORT span: the time to establish the endpoint's transport.
+    ///
+    /// `None` when the transport stage did not complete — the attempt never
+    /// got past the dial, so there is no transport measurement to report.
+    /// This is the Fast metric (spec D2): the same unit in the Fast Test
+    /// (endpoint scope) and as stage 1 of the Real Test (link scope).
+    pub transport_span: Option<Duration>,
+}
+
+/// A failed probe: the engine's error PLUS the transport span the attempt
+/// measured before it failed.
+///
+/// The span is the whole reason this type exists (spec D12). A plain
+/// `NativeError` loses it: the failure path returns early, so the span the
+/// dial produced never reaches the caller — and the row loses the fact that
+/// separates "the server is dead" from "the server is up and the config is
+/// not" (531 of 535 real-timeout rows on the 2026-09-21 run had a sub-second
+/// transport span).
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct ProbeError {
+    /// The engine's typed error — the class and the evidence come from it.
+    pub error: NativeError,
+    /// The TRANSPORT span, when the transport stage completed before the
+    /// failure. `None` when the transport stage itself failed.
+    pub transport_span: Option<Duration>,
+}
+
+impl ProbeError {
+    /// A failure with no transport measurement (the transport stage failed).
+    #[must_use]
+    pub const fn new(error: NativeError) -> Self {
+        Self {
+            error,
+            transport_span: None,
+        }
+    }
+
+    /// The engine's error, for the callers that classify it.
+    #[must_use]
+    pub const fn error(&self) -> &NativeError {
+        &self.error
+    }
 }
 
 /// Upper bound on a probe body. A probe reads a `generate_204` (empty) or a
@@ -72,46 +125,104 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// Dial `req.host:req.port` through `params` and issue `req` over the tunnel.
 ///
-/// The whole attempt runs under ONE deadline of `req.timeout` (the caller's
-/// `real_ping_timeout_secs`): dial, security handshake, transport upgrade,
-/// protocol handshake, target TLS and the request head. The engine's per-step
-/// limits (`timeouts::DIAL`/`SECURITY`/… , 10 s each) are defence in depth, not
-/// the contract — without this wrapper a 5 s setting let a probe spend 10 s in
-/// the dial alone and report `timeout on tcp dial (limit 10s)`.
+/// The attempt runs in TWO stages with INDEPENDENT deadlines (spec
+/// `2026-10-21-merged-test-pipeline-design` D12):
+///
+/// 1. **TRANSPORT** — the dial to the endpoint's IP+port, bounded by
+///    `req.transport_timeout`. The span it produces is the Fast metric: the
+///    time to establish the endpoint's transport.
+/// 2. **PROTOCOL + PROBE** — the security handshake, the transport upgrade,
+///    the protocol handshake, the target TLS and the request head, bounded by
+///    `req.timeout`.
+///
+/// The budgets are NOT a split of one total: the transport span is the
+/// measurement that separates "the server is alive" from "the server is dead",
+/// so it must never be truncated by the protocol stage's budget. A row's worst
+/// case is therefore their SUM (5 s + 5 s by default).
+///
+/// The engine's per-step limits (`timeouts::DIAL`/`SECURITY`/… , 10 s each)
+/// are defence in depth, not the contract — without this wrapper a 5 s
+/// setting let a probe spend 10 s in the dial alone and report `timeout on
+/// tcp dial (limit 10s)`.
 pub async fn fetch(
     mut params: NativeConnectParams,
     req: &ProbeRequest<'_>,
-) -> Result<ProbeResponse, NativeError> {
+) -> Result<ProbeResponse, ProbeError> {
     params.target = TargetAddr::new(req.host, req.port);
     let started = Instant::now();
-    // Boxed: the wrapped attempt's state machine carries the dial, the engine
-    // TLS handshake and the hyper request together, and every caller awaits it
-    // inside its own function — one box per attempt keeps those futures small.
+    // ── STAGE 1: TRANSPORT ──────────────────────────────────────────────
+    // The DIAL alone: the TCP connection to the proxy server's IP+port (or
+    // the QUIC handshake for a QUIC-family protocol). Nothing else — the
+    // security handshake, the transport upgrade and the protocol phase all run
+    // under the SECOND budget, so a slow handshake cannot eat the transport
+    // measurement and a slow transport cannot eat the handshake's budget.
+    let target = params.target.clone();
+    let dial_params = params.clone();
+    let dial_started = Instant::now();
+    let dialed = Box::pin(tokio::time::timeout(
+        req.transport_timeout,
+        crate::chain::dial_transport(&dial_params, target),
+    ))
+    .await
+    .map_err(|_| {
+        ProbeError::new(NativeError::Timeout {
+            step: "probe transport",
+            limit: req.transport_timeout,
+        })
+    })?
+    .map_err(ProbeError::new)?;
+    // The transport span: the time to establish the endpoint's transport. It
+    // is `Some` whenever the dial completed — including when the protocol
+    // stage later failed, which is exactly the case the merged row reports as
+    // "the transport was alive, the config was not".
+    let transport_span = dial_started.elapsed();
+
+    // ── STAGE 2: PROTOCOL + PROBE ───────────────────────────────────────
+    // The security handshake, the transport upgrade, the protocol handshake,
+    // the target TLS and the request head — all under `req.timeout`.
+    //
+    // The mux arm is here, not in stage 1: a mux row's protocol phase opens
+    // the multiplexer over the dialed stream, so the mux handshake is the
+    // PROTOCOL stage's work. The SAME predicate the inbound dial uses, so the
+    // probe cannot report a plugin row as "server unreachable" when the real
+    // cause is a missing mux frame (v2ray-plugin's server mandates mux).
     let attempt = async move {
-        // The SAME predicate the inbound dial uses: a link that resolved mux goes
-        // through the mux protocol phase and one session, so the probe cannot
-        // report a plugin row as "server unreachable" when the real cause is a
-        // missing mux frame (v2ray-plugin's server mandates mux).
+        let ctx = crate::context::LinkContext::new(params.clone(), params.target.clone());
         let tunnel = if params.mux {
+            // The mux multiplexer rides the DIAL the transport stage made —
+            // one connection for the whole attempt, so the transport span
+            // measures the connection the probe actually used (spec D2).
+            let mux = crate::chain::finish_chain_mux(&ctx, dialed).await?;
             // The session owns its tunnel here too, for the same keepalive
             // reason as the inbound dial.
-            let mux = crate::connect_mux(&params).await?;
             crate::mux_session::open_session(mux, &params.target).await?
         } else {
-            Box::new(crate::connect(params).await?)
+            crate::chain::finish_chain(&ctx, dialed).await?
         };
         fetch_over(tunnel, req).await
     };
     let response = Box::pin(tokio::time::timeout(req.timeout, attempt))
         .await
-        .map_err(|_| NativeError::Timeout {
-            step: "probe attempt",
-            limit: req.timeout,
-        })??;
+        .map_err(|_| {
+            // The transport span rides along with the failure: the transport
+            // was alive, the protocol stage was not (spec D12).
+            ProbeError {
+                error: NativeError::Timeout {
+                    step: "probe attempt",
+                    limit: req.timeout,
+                },
+                transport_span: Some(transport_span),
+            }
+        })?
+        .map_err(|error| ProbeError {
+            error,
+            transport_span: Some(transport_span),
+        })?;
     // The probe's latency is the whole span, the dial included — the same span
     // the subprocess probe measured through its local SOCKS hop.
     Ok(ProbeResponse {
         elapsed: started.elapsed(),
+        transport_span: Some(transport_span),
         ..response
     })
 }
@@ -166,6 +277,10 @@ pub async fn fetch_over<S: crate::Stream + 'static>(
         status,
         body,
         elapsed,
+        // The stream-level half has no transport stage of its own: the caller
+        // passes an ALREADY-connected stream. The dial's span belongs to
+        // `fetch`, which is the only path that measures it.
+        transport_span: None,
     })
 }
 
@@ -316,6 +431,9 @@ mod tests {
             method: ProbeMethod::Get,
             path: "/",
             timeout: Duration::from_millis(300),
+            // The transport budget is generous: the dial SUCCEEDS here, and
+            // the protocol stage is what must fail.
+            transport_timeout: Duration::from_secs(5),
         };
         let started = Instant::now();
         let err = fetch(params, &req)
@@ -323,7 +441,7 @@ mod tests {
             .expect_err("a silent peer must fail the probe");
         assert!(
             matches!(
-                err,
+                err.error,
                 NativeError::Timeout {
                     step: "probe attempt",
                     ..
@@ -335,6 +453,217 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "the attempt budget must bound the handshake: {:?}",
             started.elapsed()
+        );
+        server.abort();
+    }
+
+    /// The TRANSPORT stage is bounded by its OWN budget, and the protocol
+    /// stage by its own — they are INDEPENDENT, not a split of one total
+    /// (spec `2026-10-21-merged-test-pipeline-design` D12).
+    ///
+    /// A peer that accepts the TCP connection and then never answers the TLS
+    /// handshake: the transport stage SUCCEEDED (the socket is established), so
+    /// the attempt fails in the PROTOCOL stage — and the transport span is
+    /// still reported, because the transport was alive and the config was not
+    /// (531 of 535 real-timeout rows on the 2026-09-21 run had a sub-second
+    /// fast latency: the transport was alive, the timeout was spent later).
+    #[tokio::test]
+    async fn the_transport_stage_has_its_own_budget() {
+        use std::time::Instant;
+
+        use leas_proto::proto_spec::endpoint::EndpointEssentials;
+
+        use crate::addr::TargetAddr;
+        use crate::context::NativeConnectParams;
+        use crate::error::NativeError;
+        use crate::probe::fetch;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+
+        let params = NativeConnectParams::new(
+            vless_tls(),
+            EndpointEssentials::new(addr.ip().to_string(), addr.port()),
+            TargetAddr::new("dest.test", 443),
+        );
+        let req = ProbeRequest {
+            host: "dest.test",
+            port: 443,
+            https: false,
+            method: ProbeMethod::Get,
+            path: "/",
+            // The PROTOCOL budget is the short one: the dial succeeds, and
+            // the protocol stage is what must run out.
+            timeout: Duration::from_millis(300),
+            // The transport budget is generous: the dial must SUCCEED.
+            transport_timeout: Duration::from_secs(5),
+        };
+        let started = Instant::now();
+        let err = fetch(params, &req)
+            .await
+            .expect_err("a silent peer must fail the probe");
+        assert!(
+            matches!(
+                err.error,
+                NativeError::Timeout {
+                    step: "probe attempt",
+                    ..
+                }
+            ),
+            "expected the PROTOCOL stage's deadline, got {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the protocol stage is bounded by ITS budget, not the transport's: {:?}",
+            started.elapsed()
+        );
+        // The transport span SURVIVES the protocol-stage failure: the dial
+        // completed, so the transport was alive and the config was not (spec
+        // D12). The merged row's whole value is this pair of facts.
+        assert!(
+            err.transport_span.is_some(),
+            "a failure after the dial must still report the transport span"
+        );
+        server.abort();
+    }
+
+    /// A peer that never accepts the connection fails in the TRANSPORT stage,
+    /// under the transport budget.
+    #[tokio::test]
+    async fn a_refused_transport_fails_under_the_transport_budget() {
+        use std::time::Instant;
+
+        use leas_proto::proto_spec::endpoint::EndpointEssentials;
+
+        use crate::addr::TargetAddr;
+        use crate::context::NativeConnectParams;
+        use crate::error::NativeError;
+        use crate::probe::fetch;
+
+        // A listener that is dropped: the port is closed, so the dial is
+        // refused immediately.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let params = NativeConnectParams::new(
+            vless_tls(),
+            EndpointEssentials::new(addr.ip().to_string(), addr.port()),
+            TargetAddr::new("dest.test", 443),
+        );
+        let req = ProbeRequest {
+            host: "dest.test",
+            port: 443,
+            https: false,
+            method: ProbeMethod::Get,
+            path: "/",
+            timeout: Duration::from_secs(5),
+            transport_timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        let err = fetch(params, &req)
+            .await
+            .expect_err("a refused transport must fail the probe");
+        assert!(
+            !matches!(err.error, NativeError::Timeout { .. }),
+            "a refused dial is a transport failure, not a timeout: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the transport stage is bounded by its own budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A MUX row's probe costs ONE connection, not two.
+    ///
+    /// The mux multiplexer rides the transport stage's dial — the probe does
+    /// not re-dial to open the mux session. The connection counter is the
+    /// evidence: the claim "one connection" is not observable otherwise, and a
+    /// re-dial would double the row's cost (and make the transport span
+    /// measure a connection the probe then threw away — spec D2).
+    #[tokio::test]
+    async fn a_mux_row_probes_over_one_connection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use leas_proto::proto_spec::ProtocolConfig;
+        use leas_proto::proto_spec::endpoint::EndpointEssentials;
+
+        use crate::addr::TargetAddr;
+        use crate::context::NativeConnectParams;
+        use crate::probe::fetch;
+
+        // A VLESS+mux row. The peer accepts and then goes silent: the probe
+        // fails in the PROTOCOL stage, which is all this test needs — the
+        // connection COUNT is the evidence.
+        let config: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "mux": { "limited": 8 },
+            "transport": { "type": "tcp" },
+            "security": { "type": "tls", "sni": "dest.test", "insecure": true }
+        }))
+        .expect("config parses");
+        assert!(
+            NativeConnectParams::resolved_mux(&config),
+            "the row must resolve to mux, or the test proves nothing"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Each accepted socket is held by its OWN task: a sleep in the
+                // accept loop would block the next accept, and the counter
+                // would never see a second connection — the test would pass a
+                // re-dial.
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(sock);
+                });
+            }
+        });
+
+        let params = NativeConnectParams::new(
+            config,
+            EndpointEssentials::new(addr.ip().to_string(), addr.port()),
+            TargetAddr::new("dest.test", 443),
+        );
+        let req = ProbeRequest {
+            host: "dest.test",
+            port: 443,
+            https: false,
+            method: ProbeMethod::Get,
+            path: "/",
+            timeout: Duration::from_millis(300),
+            transport_timeout: Duration::from_secs(5),
+        };
+        let _ = fetch(params, &req)
+            .await
+            .expect_err("a silent peer must fail");
+
+        // The accept counter is filled by the SERVER task, so it lags the
+        // client by a scheduling quantum — a re-dial that the timeout cut
+        // short would still be in flight when the probe returned. Give the
+        // server task the chance to record it before asserting, or the test
+        // would pass a re-dial.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The dial happened once. A re-dial for the mux session would make
+        // this 2.
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a mux row's probe must use ONE connection: the mux session rides the transport stage's dial"
         );
         server.abort();
     }
@@ -360,6 +689,7 @@ mod tests {
             method,
             path,
             timeout: Duration::from_secs(5),
+            transport_timeout: Duration::from_secs(5),
         }
     }
 

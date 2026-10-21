@@ -176,6 +176,7 @@ async fn seed_link(
         stab_mask: 0,
         stab_len: 0,
         traffic: zero_traffic(),
+        latency: Latency::default(),
     })
     .exec(conn)
     .await
@@ -213,6 +214,7 @@ async fn seed_purged_link(
         stab_mask: 0,
         stab_len: 0,
         traffic: zero_traffic(),
+        latency: Latency::default(),
     })
     .exec(conn)
     .await
@@ -305,19 +307,9 @@ async fn rows_are_sorted_by_test_priority() {
 
     seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
     // fast-ok with the best latency.
-    seed_link_latency(&mut conn, 1, 1002, 20, Some(Latency::Fast { delay: 5 })).await;
+    seed_link_latency(&mut conn, 1, 1002, 20, Latency::fast(5)).await;
     // real-ok (tier 0 beats tier 1 regardless of latency).
-    seed_link_latency(
-        &mut conn,
-        1,
-        1003,
-        30,
-        Some(Latency::Real {
-            delay: 200,
-            ip: None,
-        }),
-    )
-    .await;
+    seed_link_latency(&mut conn, 1, 1003, 30, Latency::real_with_ip(200, None)).await;
 
     // The fixture seeded with raw writes: make the stored keys follow.
 
@@ -344,14 +336,7 @@ async fn dns_unresolved_endpoint_sinks_links_to_bottom() {
         10,
     )
     .await;
-    seed_link_latency(
-        &mut conn,
-        1,
-        1002,
-        20,
-        Some(Latency::Real { delay: 5, ip: None }),
-    )
-    .await;
+    seed_link_latency(&mut conn, 1, 1002, 20, Latency::real_with_ip(5, None)).await;
 
     // The fixture seeded with raw writes: make the stored keys follow.
 
@@ -978,7 +963,7 @@ async fn seed_link_latency(
     endpoint_id: i64,
     protocol_id: i64,
     last_seen: i64,
-    latency: Option<Latency>,
+    latency: Latency,
 ) {
     toasty::create!(Protocol {
         created_at: 0,
@@ -1052,6 +1037,7 @@ async fn purge_expired_deletes_expired_and_linkless_keeps_fresh() {
         stab_mask: 0,
         stab_len: 0,
         traffic: zero_traffic(),
+        latency: Latency::default(),
     })
     .exec(&mut conn)
     .await
@@ -1161,6 +1147,7 @@ async fn delete_endpoint_cascades_and_purges_orphan_protocols() {
         stab_mask: 0,
         stab_len: 0,
         traffic: zero_traffic(),
+        latency: Latency::default(),
     })
     .exec(&mut conn)
     .await
@@ -1240,17 +1227,7 @@ async fn clear_all_stats_zeroes_traffic_and_clears_results() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("connection");
     seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, 10).await;
-    seed_link_latency(
-        &mut conn,
-        1,
-        1002,
-        20,
-        Some(Latency::Real {
-            delay: 12,
-            ip: None,
-        }),
-    )
-    .await;
+    seed_link_latency(&mut conn, 1, 1002, 20, Latency::real_with_ip(12, None)).await;
     seed_endpoint(&mut conn, 2, 2001, "2.2.2.2", HostType::Ipv4, 443, 30).await;
 
     for pid in [1001, 1002, 2001] {
@@ -1281,7 +1258,7 @@ async fn clear_all_stats_zeroes_traffic_and_clears_results() {
     assert_eq!(links.len(), 3);
     for link in links {
         assert_eq!(link.traffic, zero_traffic(), "traffic zeroed on every row");
-        assert_eq!(link.latency, None, "latency cleared");
+        assert_eq!(link.latency, Latency::default(), "latency cleared");
         assert_eq!(link.speed_bps, None, "speed cleared");
         assert_eq!(link.error, None, "error cleared");
     }
@@ -1375,7 +1352,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         created_at: ts(0),
         links: Deferred::default(),
     };
-    let link = |last_seen: i64, latency: Option<Latency>| ProfileStats {
+    let link = |last_seen: i64, latency: Latency| ProfileStats {
         protocol_id: ProtocolId::new(1001),
         endpoint_id: EndpointId::new(1),
         last_used_at: Some(ts(10)),
@@ -1413,7 +1390,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         leas_db::upsert_protocols_bulk(&mut tx, std::slice::from_ref(&protocol))
             .await
             .expect("bulk protocols");
-        leas_db::upsert_links_bulk(&mut tx, &[link(50, Some(Latency::Fast { delay: 7 }))])
+        leas_db::upsert_links_bulk(&mut tx, &[link(50, Latency::fast(7))])
             .await
             .expect("bulk links");
         leas_db::upsert_endpoint_group_links_bulk(&mut tx, std::slice::from_ref(&group_link))
@@ -1446,7 +1423,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
     // (latency) and TRAFFIC keep their stored values, and last_used_at survives
     // (owned by its own writer). A subscription refresh re-persists the link
     // from a fresh parse, so its snapshot measurement is not an update.
-    let mut refreshed = link(60, Some(Latency::Fast { delay: 123 }));
+    let mut refreshed = link(60, Latency::fast(123));
     refreshed.traffic = TrafficStats {
         today_up: 5,
         today_down: 6,
@@ -1478,7 +1455,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
     assert_eq!(row[0].links[0].last_seen_at, ts(60), "last_seen_at updated");
     assert_eq!(
         row[0].links[0].latency,
-        Some(Latency::Fast { delay: 7 }),
+        Latency::fast(7),
         "a refresh snapshot does not overwrite the stored measurement"
     );
     assert_eq!(
@@ -1537,7 +1514,7 @@ async fn subscription_upsert_flow_assembles_group_rows() {
         endpoint_id: EndpointId::new(1),
         last_used_at: None,
         last_seen_at: now,
-        latency: None,
+        latency: Latency::default(),
         speed_bps: None,
         error: None,
         purge_reason: None,
@@ -1825,10 +1802,7 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
     .await
     .expect("load")
     .expect("row");
-    result_row.latency = Some(Latency::Real {
-        delay: 42,
-        ip: Some("203.0.113.5".to_string()),
-    });
+    result_row.latency = Latency::real_with_ip(42, Some("203.0.113.5".to_string()));
     result_row.speed_bps = Some(9_000_000);
     result_row.error = Some(ErrorInfo {
         kind: ProfileErr::Fast,
@@ -1877,10 +1851,7 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
     .expect("row");
     assert_eq!(
         result_row.latency,
-        Some(Latency::Real {
-            delay: 42,
-            ip: Some("203.0.113.5".to_string())
-        })
+        Latency::real_with_ip(42, Some("203.0.113.5".to_string()))
     );
     assert_eq!(result_row.speed_bps, Some(9_000_000));
     assert_eq!(
@@ -1948,7 +1919,7 @@ async fn apply_link_patches_applies_a_window_wider_than_one_statement_chunk() {
         .await
         .expect("load")
         .expect("row");
-        link.latency = Some(Latency::Fast { delay: 7 });
+        link.latency = Latency::fast(7);
         patches.push(LinkPatch {
             link,
             groups: LinkGroups::RESULT,
@@ -1963,9 +1934,7 @@ async fn apply_link_patches_applies_a_window_wider_than_one_statement_chunk() {
     let persisted: Vec<ProfileStats> = ProfileStats::all().exec(&mut conn).await.expect("links");
     assert_eq!(persisted.len(), patches.len());
     assert!(
-        persisted
-            .iter()
-            .all(|l| l.latency == Some(Latency::Fast { delay: 7 })),
+        persisted.iter().all(|l| l.latency == Latency::fast(7)),
         "every row in the window carries the patched result"
     );
 }
@@ -2015,7 +1984,7 @@ async fn apply_link_patches_upserts_absent_and_near_miss_pairs_exactly() {
         let mut link = base.clone();
         link.protocol_id = ProtocolId::new(protocol_id);
         link.endpoint_id = EndpointId::new(endpoint_id);
-        link.latency = Some(Latency::Fast { delay });
+        link.latency = Latency::fast(delay);
         LinkPatch {
             link,
             groups: LinkGroups::RESULT,
@@ -2035,7 +2004,7 @@ async fn apply_link_patches_upserts_absent_and_near_miss_pairs_exactly() {
         patches.len(),
         "the absent pairs were inserted, not skipped as already-present"
     );
-    let by_key: std::collections::HashMap<(i64, i64), (Option<Latency>, i64)> = persisted
+    let by_key: std::collections::HashMap<(i64, i64), (Latency, i64)> = persisted
         .iter()
         .map(|l| {
             (
@@ -2048,7 +2017,7 @@ async fn apply_link_patches_upserts_absent_and_near_miss_pairs_exactly() {
         let key = ((k + 1) * 10, k + 2);
         assert_eq!(
             by_key.get(&key).map(|(latency, _)| latency.clone()),
-            Some(Some(Latency::Fast { delay: 9 })),
+            Some(Latency::fast(9)),
             "the absent pair {key:?} was inserted with its patched result"
         );
     }
@@ -2057,7 +2026,7 @@ async fn apply_link_patches_upserts_absent_and_near_miss_pairs_exactly() {
         let (latency, last_seen_at) = by_key.get(&key).expect("row");
         assert_eq!(
             latency,
-            &Some(Latency::Fast { delay: 7 }),
+            &Latency::fast(7),
             "the existing pair {key:?} took the patched result"
         );
         // The probe reported this pair as EXISTING, so the write was the
@@ -2092,7 +2061,7 @@ async fn apply_link_patches_isolates_column_groups() {
     .expect("load")
     .expect("row");
     // Known values in every group.
-    row.latency = Some(Latency::Real { delay: 7, ip: None });
+    row.latency = Latency::real_with_ip(7, None);
     row.speed_bps = Some(1_000);
     row.error = Some(ErrorInfo {
         kind: ProfileErr::Real,
@@ -2114,7 +2083,7 @@ async fn apply_link_patches_isolates_column_groups() {
 
     // A stale snapshot: every group differs from what is persisted.
     let mut stale = row.clone();
-    stale.latency = Some(Latency::Fast { delay: 99 });
+    stale.latency = Latency::fast(99);
     stale.error = None;
     stale.purge_reason = None;
     stale.traffic = TrafficStats {
@@ -2159,7 +2128,7 @@ async fn apply_link_patches_isolates_column_groups() {
     );
     assert_eq!(
         after.latency,
-        Some(Latency::Real { delay: 7, ip: None }),
+        Latency::real_with_ip(7, None),
         "stale result snapshot ignored"
     );
     assert_eq!(after.error.as_ref().map(|e| e.kind), Some(ProfileErr::Real));
@@ -2180,7 +2149,7 @@ async fn apply_link_patches_isolates_column_groups() {
     .await
     .expect("reload")
     .expect("row");
-    assert_eq!(after.latency, Some(Latency::Fast { delay: 99 }));
+    assert_eq!(after.latency, Latency::fast(99));
     assert_eq!(after.error, None);
     assert_eq!(
         after.traffic,
@@ -2224,7 +2193,7 @@ async fn apply_link_patches_isolates_column_groups() {
     );
     assert_eq!(
         after.latency,
-        Some(Latency::Fast { delay: 99 }),
+        Latency::fast(99),
         "and leaves the result group alone"
     );
     assert_eq!(
@@ -2274,11 +2243,7 @@ async fn apply_link_patches_isolates_column_groups() {
         },
         "a STAB patch must NOT write traffic (the catch-all `else` this test exists for)"
     );
-    assert_eq!(
-        after.latency,
-        Some(Latency::Fast { delay: 99 }),
-        "nor the result group"
-    );
+    assert_eq!(after.latency, Latency::fast(99), "nor the result group");
     assert_eq!(
         after.purge_reason,
         Some(PurgeReason::TransportRejected),
@@ -2332,7 +2297,7 @@ async fn apply_link_patches_survives_a_stale_snapshot_without_clobbering() {
         .await
         .expect("activity write");
 
-    stale.latency = Some(Latency::Fast { delay: 55 });
+    stale.latency = Latency::fast(55);
     stale.last_used_at = None; // the stale snapshot's view of the clock
     assert_eq!(
         db.apply_link_patches(&[LinkPatch {
@@ -2353,7 +2318,7 @@ async fn apply_link_patches_survives_a_stale_snapshot_without_clobbering() {
     .await
     .expect("reload")
     .expect("row");
-    assert_eq!(row.latency, Some(Latency::Fast { delay: 55 }));
+    assert_eq!(row.latency, Latency::fast(55));
     assert_eq!(
         row.last_used_at,
         Some(ts(777)),
@@ -2429,7 +2394,7 @@ async fn merge_dns_survivor_absorbs_ip_literal_and_takes_better_evidence() {
         protocol_id: ProtocolId::new(1001),
         endpoint_id: EndpointId::new(2),
         last_seen_at: ts(90),
-        latency: Some(Latency::Fast { delay: 50 }),
+        latency: Latency::fast(50),
         stab_mask: 0b1,
         stab_len: 1,
         traffic: zero_traffic(),
@@ -2454,7 +2419,7 @@ async fn merge_dns_survivor_absorbs_ip_literal_and_takes_better_evidence() {
 
     // Survivor link took the better evidence (measured beats untested).
     let link = load_link(&mut conn, 1, 1001).await;
-    assert_eq!(link.latency, Some(Latency::Fast { delay: 50 }));
+    assert_eq!(link.latency, Latency::fast(50));
     assert_eq!(
         link.stab_len, 1,
         "stability ring follows the winning evidence"
@@ -2542,7 +2507,7 @@ async fn merge_keeps_survivor_purge_verdict_over_absorbed_measured_link() {
         protocol_id: ProtocolId::new(1001),
         endpoint_id: EndpointId::new(2),
         last_seen_at: ts(90),
-        latency: Some(Latency::Fast { delay: 30 }),
+        latency: Latency::fast(30),
         stab_mask: 0b1,
         stab_len: 1,
         traffic: zero_traffic(),
@@ -2564,7 +2529,7 @@ async fn merge_keeps_survivor_purge_verdict_over_absorbed_measured_link() {
     );
     assert_eq!(
         link.latency,
-        Some(Latency::Fast { delay: 30 }),
+        Latency::fast(30),
         "measured fields still move in"
     );
 }
@@ -2605,6 +2570,7 @@ async fn merge_moves_group_membership_and_resolves_collision() {
         stab_mask: 0,
         stab_len: 0,
         traffic: zero_traffic(),
+        latency: Latency::default(),
     })
     .exec(&mut conn)
     .await

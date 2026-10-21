@@ -796,14 +796,15 @@ const PAGE_PROJECTION: &[&str] = &[
     "(SELECT group_concat(hex(ip_key), ',') FROM endpoint_ip ip WHERE ip.endpoint_id = e.id)",
     "e.resolved_at",
     "e.created_at",
-    // profile_stats (25)
+    // profile_stats (26)
     "ps.protocol_id",
     "ps.endpoint_id",
     "ps.last_used_at",
     "ps.last_seen_at",
-    "ps.latency",
-    "ps.latency_delay",
+    "ps.latency_real_delay",
+    "ps.latency_fast_delay",
     "ps.latency_ip",
+    "ps.latency_auth",
     "ps.speed_bps",
     "ps.error",
     "ps.error_kind",
@@ -1011,9 +1012,10 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
     let endpoint_id = p.next_endpoint_id()?;
     let last_used_at = p.next_opt_ts()?;
     let last_seen_at = p.next_ts()?;
-    let latency_kind: Option<String> = p.next()?;
-    let latency_delay: Option<i64> = p.next()?;
+    let latency_real_delay: Option<i64> = p.next()?;
+    let latency_fast_delay: Option<i64> = p.next()?;
     let latency_ip: Option<String> = p.next()?;
+    let latency_auth: Option<i64> = p.next()?;
     let speed_bps: Option<i64> = p.next()?;
     let error_flag = p.next_opt_bool()?;
     let error_kind: Option<ProfileErr> = p.next()?;
@@ -1031,17 +1033,14 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
     let updated_at = p.next_ts()?;
     let version: u64 = p.next()?;
 
-    let latency = latency_delay.and_then(|delay| {
-        let delay = i32::try_from(delay).unwrap_or(i32::MAX);
-        match latency_kind.as_deref() {
-            Some("real") => Some(Latency::Real {
-                delay,
-                ip: latency_ip,
-            }),
-            Some("fast") => Some(Latency::Fast { delay }),
-            _ => None,
-        }
-    });
+    // The two delay columns carry the provenance now (schema 19): a row can
+    // hold BOTH, and the real one outranks the fast one.
+    let latency = Latency {
+        real_delay: latency_real_delay.map(|d| i32::try_from(d).unwrap_or(i32::MAX)),
+        fast_delay: latency_fast_delay.map(|d| i32::try_from(d).unwrap_or(i32::MAX)),
+        ip: latency_ip,
+        auth: latency_auth,
+    };
     let error = match (error_flag, error_kind) {
         // `ErrorInfo.text` is not optional: the flag only ever accompanies a
         // text on the write paths, so a missing one is a corrupt row.

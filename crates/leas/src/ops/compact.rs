@@ -527,7 +527,7 @@ mod tests {
             endpoint_id: EndpointId::new(endpoint_id),
             last_used_at: None,
             last_seen_at: 0,
-            latency: None,
+            latency: Latency::default(),
             speed_bps: None,
             error: None,
             purge_reason: None,
@@ -583,7 +583,7 @@ mod tests {
         db.upsert_protocol(&vless_row(1001)).await.unwrap();
         db.upsert_link(&link(1, 1001)).await.unwrap();
         let mut l2 = link(2, 1001);
-        l2.latency = Some(Latency::Fast { delay: 42 });
+        l2.latency = Latency::fast(42);
         db.upsert_link(&l2).await.unwrap();
         let mut conn = db.connection().await.unwrap();
         leas_db::endpoint_ip::insert_literals_bulk(

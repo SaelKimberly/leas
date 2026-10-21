@@ -34,6 +34,7 @@ use crate::error::DatabaseError;
 use crate::models_toasty::AppMeta;
 
 pub mod ddl;
+pub mod steps;
 
 /// The version this crate's schema is at. Distinct from
 /// [`crate::database::SCHEMA_VERSION`] only in that this one is the cursor's
@@ -58,7 +59,14 @@ async fn cursor(conn: &mut impl toasty::Executor) -> Result<i64> {
 /// The stability seed's own one-way stamp: its presence means the day-one seed
 /// has run on this database. `app_meta` is the typed key/value table the PSL
 /// version already uses.
-const STABILITY_SEEDED_KEY: &str = "stability_seeded";
+///
+/// **v2** (schema 19): the seed's predicate used to name the `latency`
+/// discriminator column, which migration 19 DROPS. A v1-stamped database has
+/// already been seeded, so its rings are populated and it must not re-seed —
+/// but it must also not be read as "never seeded" and re-seeded with the new
+/// predicate. The distinct key says "the seed ran" without naming a column
+/// that no longer exists.
+const STABILITY_SEEDED_KEY: &str = "stability_seeded_v2";
 
 async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<()> {
     for alter in ddl::STAB_ADD_COLUMNS {
@@ -97,10 +105,11 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             // added to `ddl.rs` takes, and every statement is idempotent.
             ensure_raw_ddl(conn).await?;
             // Day-one stability seed (spec `2026-10-09-stab-bin-design` §6.2).
-            // `latency = 'real'` is evidence a real success happened —
-            // `apply_test_result` writes `Latency::Real` only on success and
-            // KEEPS it when it later writes an error — but an existing
-            // database's rings are empty, so every previously-successful link
+            // `latency_real_delay IS NOT NULL` is evidence a real success
+            // happened — `apply_test_result` writes the real delay only on
+            // success and KEEPS it when it later writes an error — but an
+            // existing database's rings are empty, so every
+            // previously-successful link
             // would read `rank_proven = 0` and drop out of ALL four scoped
             // menus. Seeding the ring with that one known success keeps
             // `proven` true and the window neutral (one sample < `STAB_WARMUP`).
@@ -151,22 +160,82 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             Ok(())
         }
         other => {
-            // 0 < other < LATEST would be "apply the steps after `other`" once
-            // real migrations exist. There are none yet, so any such value names
-            // a schema from BEFORE this module existed — the pre-alpha tag
-            // world, where 1..17 were unrelated schemas. Neither readable nor
-            // migratable: report it, and `open` applies its documented wipe.
+            // 0 < other < LATEST: apply the steps after `other`, in order.
+            // ADR 0012 D-C's policy, implemented for the first time (the
+            // step list is `schema::steps`).
+            //
+            // A cursor below the FIRST step's version names the pre-alpha tag
+            // world, where 1..17 were unrelated schemas: neither readable nor
+            // migratable. That is reported as incompatible, and `open` applies
+            // its documented wipe.
+            if other >= 1 {
+                let steps = steps::steps_after(other);
+                if let Some(steps) = steps {
+                    apply_steps(conn, steps).await?;
+                    return Ok(());
+                }
+            }
             Err(DatabaseError::IncompatibleSchema(other))
         }
+    }
+}
+
+/// Apply the migration steps, in order, and advance the cursor to the
+/// version they produce.
+///
+/// The steps and the cursor advance in **ONE transaction**: a kill between
+/// them cannot leave a half-migrated file (the steps applied, the cursor not
+/// advanced — which would re-run the non-idempotent RENAME/DROP and fail).
+/// The cursor stamp is what makes the steps safe to apply at all.
+async fn apply_steps(conn: &mut toasty::Connection, steps: &[steps::Step]) -> Result<()> {
+    let mut tx = conn
+        .transaction_builder()
+        .mode(TransactionMode::Immediate)
+        .begin()
+        .await?;
+    let result = async {
+        // The cursor advances to the LAST step's version — the steps are
+        // applied in order, so the last one is the newest schema.
+        let mut version = 0;
+        for step in steps {
+            match step.kind {
+                steps::StepKind::Sql(statements) => {
+                    for statement in statements {
+                        toasty::sql::query(*statement).exec(&mut tx).await?;
+                    }
+                }
+                steps::StepKind::Rebuild => {
+                    return Err(DatabaseError::Generic(
+                        "migration step `Rebuild` is not implemented yet".into(),
+                    ));
+                }
+            }
+            version = step.version;
+        }
+        toasty::sql::query(format!("PRAGMA user_version = {version}"))
+            .exec(&mut tx)
+            .await?;
+        Ok::<(), DatabaseError>(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            tx.commit().await?;
+            tracing::info!(target: "leas_db",
+                "profile_stats: applied the latency reshape (schema 19)");
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }
 
 /// The day-one stability seed: give every link that has a real measurement a
 /// one-sample success ring, so `rank_proven` is true for it immediately.
 ///
-/// `latency` is the embed's discriminator column (`'real'`/`'fast'`/`''`), the
-/// same one the rank refresh matches on. Only `'real'` seeds: a fast latency is
-/// a TCP handshake, which proves nothing about the config.
+/// `latency_real_delay IS NOT NULL` is the "a real measurement happened"
+/// predicate — the same one the rank refresh reads now that the `latency`
+/// discriminator is gone (schema 19). Only a REAL measurement seeds: a fast
+/// latency is a transport handshake, which proves nothing about the config.
 ///
 /// Runs at most ONCE per database, and the seed and its stamp land in ONE
 /// transaction — so the crash window the ALTER-gated form had (ALTER applied,
@@ -191,11 +260,12 @@ async fn seed_stability_once(conn: &mut toasty::Connection) -> Result<()> {
     let result = async {
         let count = scalar_count(
             &mut tx,
-            "SELECT COUNT(*) FROM profile_stats WHERE latency = 'real'",
+            "SELECT COUNT(*) FROM profile_stats WHERE latency_real_delay IS NOT NULL",
         )
         .await?;
         toasty::sql::query(
-            "UPDATE profile_stats SET stab_mask = 1, stab_len = 1 WHERE latency = 'real'",
+            "UPDATE profile_stats SET stab_mask = 1, stab_len = 1 \
+             WHERE latency_real_delay IS NOT NULL",
         )
         .exec(&mut tx)
         .await?;

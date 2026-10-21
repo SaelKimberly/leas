@@ -1267,7 +1267,8 @@ pub(crate) mod test_support {
     use crate::AppState;
     use leas_config::AppConfig;
     use leas_db::models::{
-        Endpoint, EndpointId, EndpointRow, HostType, ProfileStats, ProtocolId, TrafficStats,
+        Endpoint, EndpointId, EndpointRow, HostType, Latency, ProfileStats, ProtocolId,
+        TrafficStats,
     };
     use std::sync::Arc;
     use toasty::Deferred;
@@ -1313,7 +1314,7 @@ pub(crate) mod test_support {
                 endpoint_id: EndpointId::new(id),
                 last_used_at: None,
                 last_seen_at: ts(0),
-                latency: None,
+                latency: Latency::default(),
                 speed_bps: None,
                 error: None,
                 purge_reason: None,
@@ -1724,13 +1725,13 @@ mod edit_tests {
         let endpoint = super::test_support::fake_row(42, "never-seen.example", 1).endpoint;
         let protocol = super::leas_db_helper::vless_protocol(4200);
         let link = {
-            use leas_db::models::{ProfileStats, TrafficStats};
+            use leas_db::models::{Latency, ProfileStats, TrafficStats};
             ProfileStats {
                 protocol_id: protocol.id,
                 endpoint_id: endpoint.id,
                 last_used_at: None,
                 last_seen_at: super::test_support::ts(0),
-                latency: None,
+                latency: Latency::default(),
                 speed_bps: None,
                 error: None,
                 purge_reason: None,
@@ -2053,7 +2054,7 @@ mod ttl_tests {
     use super::test_support::fake_row;
     use super::*;
     use leas_config::AppConfig;
-    use leas_db::models::{EndpointId, ErrorInfo, ProfileErr, ProfileStats, ProtocolId};
+    use leas_db::models::{EndpointId, ErrorInfo, Latency, ProfileErr, ProfileStats, ProtocolId};
     use std::sync::Arc;
 
     /// Stamp `error` on the row's link so it persists as a failure marker.
@@ -2099,7 +2100,7 @@ mod ttl_tests {
     /// The persisted error kind of a link, if any.
     async fn link_latency_delay(db: &Database, proto_id: i64, endpoint_id: i64) -> Option<i32> {
         let mut conn = db.connection().await.unwrap();
-        ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        let link = ProfileStats::filter_by_protocol_id_and_endpoint_id(
             ProtocolId::new(proto_id),
             EndpointId::new(endpoint_id),
         )
@@ -2107,12 +2108,8 @@ mod ttl_tests {
         .exec(&mut conn)
         .await
         .unwrap()
-        .expect("link persisted")
-        .latency
-        .map(|l| match l {
-            leas_db::models::Latency::Real { delay, .. }
-            | leas_db::models::Latency::Fast { delay } => delay,
-        })
+        .expect("link persisted");
+        link.latency.real_delay.or(link.latency.fast_delay)
     }
 
     async fn link_error_kind(db: &Database, proto_id: i64, endpoint_id: i64) -> Option<ProfileErr> {
@@ -2155,7 +2152,7 @@ mod ttl_tests {
         // its expired marker with nothing pending.
         let mut retested = row.links[0].clone();
         retested.error = None;
-        retested.latency = Some(leas_db::models::Latency::Fast { delay: 7 });
+        retested.latency = Latency::fast(7);
         state.link_stage.stage(&retested, LinkGroups::RESULT);
 
         reload_profiles(&mut state).await;

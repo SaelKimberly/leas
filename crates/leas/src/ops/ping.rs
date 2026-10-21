@@ -12,7 +12,7 @@ use leas_db::Database;
 use leas_db::LinkGroups;
 use leas_db::models::Protocol as DbProtocol;
 use leas_db::models::{
-    Endpoint, EndpointId, EndpointRow, Latency, ProfileStats, ProtocolId, PurgatoryView, TaskKind,
+    Endpoint, EndpointId, EndpointRow, ProfileStats, ProtocolId, PurgatoryView, TaskKind,
 };
 use leas_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use leas_native::capability;
@@ -222,6 +222,7 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 protocol_id,
                 test_type: TestType::TcpPing,
                 latency_ms,
+                transport_ms: None,
                 speed_bps: None,
                 ip_info: None,
                 error,
@@ -301,6 +302,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         protocol_id,
                         test_type: TestType::RealPing,
                         latency_ms: None,
+                        transport_ms: None,
                         speed_bps: None,
                         ip_info: None,
                         error: Some("Protocol row not found for real ping".to_string()),
@@ -318,6 +320,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         protocol_id,
                         test_type: TestType::RealPing,
                         latency_ms: None,
+                        transport_ms: None,
                         speed_bps: None,
                         ip_info: None,
                         error: Some(format!("Failed to load protocol: {e}")),
@@ -340,6 +343,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                     protocol_id,
                     test_type: TestType::RealPing,
                     latency_ms: None,
+                    transport_ms: None,
                     speed_bps: None,
                     ip_info: None,
                     error: Some(untestable_marker_text(&reason)),
@@ -358,6 +362,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 ping_url: &ping_url,
                 ip_provider,
                 timeout,
+                transport_timeout: timeout,
                 retries,
             },
         )
@@ -365,11 +370,16 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
         // The typed evidence the engine reported becomes the purge verdict —
         // the only place a single ping can earn one (the taxonomy lives in
         // `ops::purge`, never here).
-        let (latency_ms, ip_info, error, purge) = match result {
-            Ok(r) => (Some(r.latency_ms), r.ip_info, None, None),
+        //
+        // The TRANSPORT span rides along on BOTH arms: it is the Fast metric,
+        // and it survives a failure — a row whose transport answered but whose
+        // config did not says "the server is up, the config is not" (spec
+        // D12).
+        let (latency_ms, transport_ms, error, purge) = match result {
+            Ok(r) => (Some(r.latency_ms), r.transport_ms, None, None),
             Err(e) => (
                 None,
-                None,
+                e.transport_ms,
                 Some(e.text),
                 // The `security_fp` COLUMN from this site's own `Protocol` row
                 // — the same input every other path reads.
@@ -377,6 +387,21 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                     crate::ops::purge::reason_for(ev, protocol.security.fp.as_deref())
                 }),
             ),
+        };
+        // The exit IP is a SEPARATE phase (spec D10/D11): the probe's verdict
+        // never depends on it, and it ages on its own. A failed probe does
+        // NOT fetch one — there is no proof the config works, so a tunnel
+        // built from it would report the WRONG exit.
+        let ip_info = if latency_ms.is_some() {
+            match ping_native::parse_probe_url(&ping_url) {
+                Ok(target) => {
+                    let params = ping_native::probe_params(&endpoint, &addresses, &config, &target);
+                    ping_native::fetch_exit_ip(&params, ip_provider).await
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
         };
 
         try_send_or_warn(
@@ -386,6 +411,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 protocol_id,
                 test_type: TestType::RealPing,
                 latency_ms,
+                transport_ms,
                 speed_bps: None,
                 ip_info,
                 error,
@@ -442,6 +468,7 @@ pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64
                 protocol_id,
                 test_type: TestType::SpeedTest,
                 latency_ms: None,
+                transport_ms: None,
                 speed_bps,
                 ip_info: None,
                 error,
@@ -498,6 +525,7 @@ pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 protocol_id,
                 test_type: TestType::UdpTest,
                 latency_ms,
+                transport_ms: None,
                 speed_bps: None,
                 ip_info: None,
                 error,
@@ -638,6 +666,9 @@ const FEED_SORT: PageSort = PageSort::Test;
 enum ProbeOutcome {
     Ok {
         latency_ms: Option<u64>,
+        /// The TRANSPORT span in ms — the time to establish the endpoint's
+        /// transport (spec D2). The Fast metric.
+        transport_ms: Option<u64>,
         ip_info: Option<String>,
     },
     Failed {
@@ -653,6 +684,12 @@ enum ProbeOutcome {
         /// the real runner: a fast probe's TCP handshake proves nothing about
         /// the config, which is why no fast path can earn a purge verdict.
         evidence: Option<leas_native::error::FailureEvidence>,
+        /// The TRANSPORT span in ms, when the transport stage completed before
+        /// the failure. `None` when the transport stage itself failed.
+        ///
+        /// A failure that carries it says "the transport was alive, the config
+        /// was not" (spec D12) — the merged row's whole point.
+        transport_ms: Option<u64>,
     },
 }
 
@@ -668,6 +705,7 @@ impl ProbeOutcome {
             // native engine" and the batch's own bookkeeping failures arrive,
             // and neither is a statement about the config's quality.
             evidence: None,
+            transport_ms: None,
         }
     }
 }
@@ -819,6 +857,9 @@ impl BatchProbeRunner for EngineProbeRunner {
             {
                 Ok(dur) => ProbeOutcome::Ok {
                     latency_ms: Some(dur.as_millis() as u64),
+                    // The fast probe IS a transport measurement: its span is
+                    // the transport span (spec D2).
+                    transport_ms: Some(dur.as_millis() as u64),
                     ip_info: None,
                 },
                 Err(e) => {
@@ -836,6 +877,7 @@ impl BatchProbeRunner for EngineProbeRunner {
                         // would have removed the sentence from the log.
                         text: e.to_string(),
                         evidence: None,
+                        transport_ms: None,
                     }
                 }
             }
@@ -851,15 +893,30 @@ impl BatchProbeRunner for EngineProbeRunner {
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
         Box::pin(async move {
             match ping_native::real_ping(endpoint, addresses, config, &req).await {
-                Ok(result) => ProbeOutcome::Ok {
-                    latency_ms: Some(result.latency_ms),
-                    ip_info: result.ip_info,
-                },
+                Ok(result) => {
+                    // The exit IP is a SEPARATE phase (spec D10/D11): it rides
+                    // its own tunnel, it never affects the probe's verdict, and
+                    // a failed probe does not fetch one.
+                    let ip_info = match ping_native::parse_probe_url(req.ping_url) {
+                        Ok(target) => {
+                            let params =
+                                ping_native::probe_params(endpoint, addresses, config, &target);
+                            ping_native::fetch_exit_ip(&params, req.ip_provider).await
+                        }
+                        Err(_) => None,
+                    };
+                    ProbeOutcome::Ok {
+                        latency_ms: Some(result.latency_ms),
+                        transport_ms: result.transport_ms,
+                        ip_info,
+                    }
+                }
                 Err(e) => ProbeOutcome::Failed {
                     text: e.text,
                     class: e.class,
                     hard: false,
                     evidence: e.evidence,
+                    transport_ms: e.transport_ms,
                 },
             }
         })
@@ -905,6 +962,9 @@ pub(crate) struct BatchShared {
     dedup_endpoints: bool,
     fast_timeout: Duration,
     real_timeout: Duration,
+    /// The TRANSPORT stage's own budget — independent of `real_timeout`
+    /// (spec `2026-10-21-merged-test-pipeline-design` D12).
+    transport_timeout: Duration,
     real_retries: u32,
     ping_url: String,
     ip_provider: IpProvider,
@@ -1050,6 +1110,9 @@ pub(crate) struct BatchParams {
     dedup_endpoints: bool,
     fast_timeout: Duration,
     real_timeout: Duration,
+    /// The TRANSPORT stage's own budget — independent of `real_timeout`
+    /// (spec `2026-10-21-merged-test-pipeline-design` D12).
+    transport_timeout: Duration,
     real_retries: u32,
     ping_url: String,
     ip_provider: IpProvider,
@@ -1089,6 +1152,7 @@ impl BatchShared {
             dedup_endpoints: p.dedup_endpoints,
             fast_timeout: p.fast_timeout,
             real_timeout: p.real_timeout,
+            transport_timeout: p.transport_timeout,
             real_retries: p.real_retries,
             ping_url: p.ping_url,
             ip_provider: p.ip_provider,
@@ -2232,6 +2296,7 @@ impl BatchShared {
                     ping_url: &self.ping_url,
                     ip_provider: self.ip_provider,
                     timeout: self.real_timeout,
+                    transport_timeout: self.transport_timeout,
                     retries: self.real_retries,
                 },
             )
@@ -2373,25 +2438,35 @@ impl BatchShared {
     /// import moves every endpoint's ordering keys) used to drop those results
     /// silently. Staging here is what makes "emitted == persisted" hold.
     fn stage_result(&self, link: &ProfileStats, test_type: TestType, outcome: &ProbeOutcome) {
-        let (latency_ms, ip_info, error, purge) = match outcome {
+        let (latency_ms, transport_ms, ip_info, error, purge) = match outcome {
             ProbeOutcome::Ok {
                 latency_ms,
+                transport_ms,
                 ip_info,
-            } => (*latency_ms, ip_info.as_deref(), None, None),
-            ProbeOutcome::Failed { text, evidence, .. } => (
+            } => (*latency_ms, *transport_ms, ip_info.as_deref(), None, None),
+            ProbeOutcome::Failed {
+                text,
+                evidence,
+                transport_ms,
+                ..
+            } => (
                 None,
+                *transport_ms,
                 None,
                 Some(text.as_str()),
                 evidence.and_then(|ev| self.purge_for(link, ev)),
             ),
         };
         let mut row = link.clone();
+        // The fast phase's own measurement, when one ran for this link. It is
+        // the SAME class of fact as the probe's transport span (spec D2), so
+        // the probe's span — fresher, from the same pass — wins below.
         if let Some(delay) = self
             .fast_latency
             .lock()
             .get(&(link.protocol_id, link.endpoint_id))
         {
-            row.latency = Some(Latency::Fast { delay: *delay });
+            row.latency.fast_delay = Some(*delay);
         }
         // A REAL probe is the one stability sample that ran (spec §7.1). Fast
         // pings prove nothing about the config and never sample; the untestable
@@ -2410,7 +2485,14 @@ impl BatchShared {
         // The mapping returns the groups to write: RESULT always, plus PURGE
         // when the verdict moved.
         if let Some(groups) = crate::ops::events::apply_test_result(
-            &mut row, test_type, latency_ms, None, ip_info, error, purge,
+            &mut row,
+            test_type,
+            latency_ms,
+            transport_ms,
+            None,
+            ip_info,
+            error,
+            purge,
         ) {
             self.writer.stage(&row, groups);
         }
@@ -2483,13 +2565,20 @@ impl BatchShared {
                 }
             }
         }
-        let (latency_ms, ip_info, error, purge) = match outcome {
+        let (latency_ms, transport_ms, ip_info, error, purge) = match outcome {
             ProbeOutcome::Ok {
                 latency_ms,
+                transport_ms,
                 ip_info,
-            } => (*latency_ms, ip_info.clone(), None, None),
-            ProbeOutcome::Failed { text, evidence, .. } => (
+            } => (*latency_ms, *transport_ms, ip_info.clone(), None, None),
+            ProbeOutcome::Failed {
+                text,
+                evidence,
+                transport_ms,
+                ..
+            } => (
                 None,
+                *transport_ms,
                 None,
                 Some(text.clone()),
                 evidence.and_then(|ev| self.purge_for(link, ev)),
@@ -2508,6 +2597,7 @@ impl BatchShared {
                 protocol_id: link.protocol_id.get(),
                 test_type,
                 latency_ms,
+                transport_ms,
                 speed_bps: None,
                 ip_info,
                 error,
@@ -2572,6 +2662,7 @@ impl BatchShared {
                 protocol_id,
                 test_type: TestType::RealPing,
                 latency_ms: None,
+                transport_ms: None,
                 speed_bps: None,
                 ip_info: None,
                 error: Some(text.to_string()),
@@ -2698,6 +2789,11 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     state.batch = Some(batch_slot.clone());
     let fast_timeout = *state.config.speed_test.tcp_timeout_secs;
     let real_timeout = *state.config.speed_test.real_ping_timeout_secs;
+    // The TRANSPORT stage's budget is the FAST level's timeout: the transport
+    // stage measures the same thing the fast probe measures (the time to
+    // establish the endpoint's transport), and the two budgets are INDEPENDENT
+    // (spec D12) — a slow transport does not eat the protocol stage's budget.
+    let transport_timeout = *state.config.speed_test.tcp_timeout_secs;
     let real_retries = state.config.speed_test.real_ping_retries;
     let ping_url = state.config.speed_test.ping_url.clone();
     let ip_provider = state.config.speed_test.ip_provider;
@@ -2723,6 +2819,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
         dedup_endpoints,
         fast_timeout,
         real_timeout,
+        transport_timeout,
         real_retries,
         ping_url,
         ip_provider,
@@ -2951,10 +3048,12 @@ mod tests {
             Self {
                 fast_outcome: ProbeOutcome::Ok {
                     latency_ms: Some(10),
+                    transport_ms: Some(10),
                     ip_info: None,
                 },
                 real_outcome: Mutex::new(ProbeOutcome::Ok {
                     latency_ms: Some(50),
+                    transport_ms: Some(10),
                     ip_info: Some("1.2.3.4".to_string()),
                 }),
                 fast_calls: Arc::new(AtomicUsize::new(0)),
@@ -3061,10 +3160,7 @@ mod tests {
         // by a real success — a `latency = Real` with an empty ring is a state
         // the law's invariant forbids.
         let mut successful = fake_row(1, "10.0.0.1", 2);
-        successful.links[0].latency = Some(Latency::Real {
-            delay: 30,
-            ip: None,
-        });
+        successful.links[0].latency = Latency::real(30);
         successful.links[0].stab_mask = 1;
         successful.links[0].stab_len = 1;
         // e2: untested (tier 2).
@@ -3154,7 +3250,7 @@ mod tests {
         // `Failed` scope now.
         for i in 2..=4 {
             let mut fixed = fake_row(i, &format!("10.0.0.{i}"), 1);
-            fixed.links[0].latency = Some(Latency::Fast { delay: 10 });
+            fixed.links[0].latency = Latency::fast(10);
             h.state
                 .db
                 .upsert_link(&fixed.links[0])
@@ -3219,7 +3315,7 @@ mod tests {
         // already dispatched, so a live-order walk would page past them.
         for i in 2..=4 {
             let mut fixed = fake_row(i, &format!("10.0.1.{i}"), 1);
-            fixed.links[0].latency = Some(Latency::Fast { delay: 1 });
+            fixed.links[0].latency = Latency::fast(1);
             h.state
                 .db
                 .upsert_link(&fixed.links[0])
@@ -3428,6 +3524,7 @@ mod tests {
             dedup_endpoints: dedup,
             fast_timeout: Duration::from_secs(2),
             real_timeout: Duration::from_secs(2),
+            transport_timeout: Duration::from_secs(2),
             real_retries: 1,
             ping_url: "http://127.0.0.1/".to_string(),
             ip_provider: IpProvider::IpApi,
@@ -3578,11 +3675,14 @@ mod tests {
         for row in &h.state.endpoints {
             for link in &row.links {
                 // Real ping superseded the fast latency; no error markers.
-                assert!(
-                    matches!(
-                        link.latency,
-                        Some(Latency::Real { delay: 50, ip: Some(ref s) }) if s == "1.2.3.4"
-                    ),
+                assert_eq!(
+                    link.latency,
+                    Latency {
+                        real_delay: Some(50),
+                        fast_delay: Some(10),
+                        ip: Some("1.2.3.4".to_string()),
+                        auth: None,
+                    },
                     "unexpected latency {link:?}"
                 );
                 assert!(link.error.is_none(), "no marker expected: {link:?}");
@@ -3666,7 +3766,7 @@ mod tests {
             .expect("row");
             assert_eq!(
                 link.latency,
-                Some(Latency::Fast { delay: 10 }),
+                Latency::fast(10),
                 "a feed link's result is persisted: {link:?}"
             );
         }
@@ -3701,11 +3801,14 @@ mod tests {
             .await
             .expect("read")
             .expect("row");
-            assert!(
-                matches!(
-                    &link.latency,
-                    Some(Latency::Real { delay: 50, ip: Some(ip) }) if ip == "1.2.3.4"
-                ),
+            assert_eq!(
+                link.latency,
+                Latency {
+                    real_delay: Some(50),
+                    fast_delay: Some(10),
+                    ip: Some("1.2.3.4".to_string()),
+                    auth: None,
+                },
                 "the batch's own staging must persist the result: {link:?}"
             );
             assert!(link.error.is_none(), "no marker expected: {link:?}");
@@ -3734,6 +3837,7 @@ mod tests {
                     text: "IO: Connection refused (os error 111)".to_string(),
                     class: ProbeClass::Refused,
                     hard: true,
+                    transport_ms: None,
                     evidence: None,
                 },
             );
@@ -3785,11 +3889,14 @@ mod tests {
 
         for row in &rows[1..] {
             let link = persisted(row).await;
-            assert!(
-                matches!(
-                    &link.latency,
-                    Some(Latency::Real { delay: 50, ip: Some(ip) }) if ip == "1.2.3.4"
-                ),
+            assert_eq!(
+                link.latency,
+                Latency {
+                    real_delay: Some(50),
+                    fast_delay: Some(10),
+                    ip: Some("1.2.3.4".to_string()),
+                    auth: None,
+                },
                 "a probed link carries the real result: {link:?}"
             );
         }
@@ -3824,7 +3931,7 @@ mod tests {
         .expect("row");
         assert_eq!(
             link.latency,
-            Some(Latency::Fast { delay: 10 }),
+            Latency::fast(10),
             "the fast delay survives a real-ping failure: {link:?}"
         );
         assert_eq!(
@@ -3858,6 +3965,7 @@ mod tests {
                 text: "connection timed out".into(),
                 class: ProbeClass::Timeout,
                 hard: true,
+                transport_ms: None,
                 evidence: None,
             },
         )]);
@@ -3987,6 +4095,7 @@ mod tests {
                 text: "connection timed out".into(),
                 class: ProbeClass::Timeout,
                 hard: true,
+                transport_ms: None,
                 evidence: None,
             },
         )]);
@@ -4043,6 +4152,7 @@ mod tests {
                 text: "connection timed out".into(),
                 class: ProbeClass::Timeout,
                 hard: true,
+                transport_ms: None,
                 evidence: None,
             },
         )]);
@@ -4114,6 +4224,7 @@ mod tests {
             TestType::TcpPing,
             &ProbeOutcome::Ok {
                 latency_ms: Some(12),
+                transport_ms: Some(12),
                 ip_info: None,
             },
         );
@@ -4131,6 +4242,7 @@ mod tests {
             TestType::RealPing,
             &ProbeOutcome::Ok {
                 latency_ms: Some(40),
+                transport_ms: Some(12),
                 ip_info: None,
             },
         );
@@ -4148,6 +4260,7 @@ mod tests {
                 text: "timeout".to_string(),
                 class: ProbeClass::Timeout,
                 hard: false,
+                transport_ms: None,
                 evidence: None,
             },
         );
@@ -4452,7 +4565,13 @@ mod tests {
             "one TCP ping per unique address"
         );
         for link in &h.state.endpoints[0].links {
-            assert!(matches!(link.latency, Some(Latency::Fast { delay: 10 })));
+            assert!(matches!(
+                link.latency,
+                Latency {
+                    fast_delay: Some(10),
+                    ..
+                }
+            ));
             assert!(link.error.is_none());
             assert_gate_clear(h.state.scheduler.as_ref(), link);
         }
@@ -4483,9 +4602,7 @@ mod tests {
             "the sibling waiting for the real slot is retired by the success"
         );
         let links = &h.state.endpoints[0].links;
-        let with_real = links
-            .iter()
-            .filter(|l| matches!(l.latency, Some(Latency::Real { .. })));
+        let with_real = links.iter().filter(|l| l.latency.real_delay.is_some());
         assert_eq!(with_real.count(), 1, "exactly one link got a real result");
         for link in links {
             // The retired sibling never wrote a marker or a latency.
@@ -4506,10 +4623,15 @@ mod tests {
 
         assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 2);
         for link in &h.state.endpoints[0].links {
-            assert!(matches!(
+            assert_eq!(
                 link.latency,
-                Some(Latency::Real { delay: 50, .. })
-            ));
+                Latency {
+                    real_delay: Some(50),
+                    fast_delay: Some(10),
+                    ip: Some("1.2.3.4".to_string()),
+                    auth: None,
+                }
+            );
             assert!(link.error.is_none());
         }
     }
@@ -4661,7 +4783,10 @@ mod tests {
         );
         assert!(matches!(
             h.state.endpoints[0].links[0].latency,
-            Some(Latency::Fast { .. })
+            Latency {
+                fast_delay: Some(_),
+                ..
+            }
         ));
     }
 
@@ -4774,7 +4899,7 @@ mod tests {
             "the deferred real half was probed after the window"
         );
         let link = &h.state.endpoints[0].links[0];
-        assert!(matches!(link.latency, Some(Latency::Real { .. })));
+        assert!(link.latency.real_delay.is_some());
         assert!(link.error.is_none());
         assert_gate_clear(h.state.scheduler.as_ref(), link);
         assert!(
@@ -4852,6 +4977,7 @@ mod tests {
                 text: "IO: Connection refused (os error 111)".to_string(),
                 class: ProbeClass::Refused,
                 hard: true,
+                transport_ms: None,
                 evidence: None,
             },
         );

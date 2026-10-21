@@ -190,6 +190,7 @@ async fn probe_through_real_xray_vless_server() {
         method: ProbeMethod::Get,
         path: "/",
         timeout: Duration::from_secs(5),
+        transport_timeout: Duration::from_secs(5),
     };
 
     let response = probe::fetch(params, &request)

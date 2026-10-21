@@ -589,6 +589,14 @@ pub enum CoreEvent {
         protocol_id: i64,
         test_type: TestType,
         latency_ms: Option<u64>,
+        /// The TRANSPORT span in ms — the time to establish the endpoint's
+        /// transport (spec `2026-10-21-merged-test-pipeline-design` D2).
+        ///
+        /// It is INDEPENDENT of `latency_ms`: a merged probe produces both in
+        /// one pass, and the transport span survives a failure (the transport
+        /// was alive, the config was not). `None` when the transport stage did
+        /// not complete.
+        transport_ms: Option<u64>,
         speed_bps: Option<u64>,
         ip_info: Option<String>,
         error: Option<String>,

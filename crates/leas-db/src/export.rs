@@ -35,7 +35,8 @@ impl ExportScope {
     const fn predicate(self) -> &'static str {
         match self {
             Self::Alive => {
-                "ps.purge_reason IS NULL AND ps.error_kind IS NULL AND ps.latency IS NOT NULL \
+                "ps.purge_reason IS NULL AND ps.error_kind IS NULL \
+                 AND (ps.latency_real_delay IS NOT NULL OR ps.latency_fast_delay IS NOT NULL) \
                  AND (e.domain = '' OR EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id))"
             }
             Self::Resolved => {
@@ -210,7 +211,8 @@ fn projection_sql(scope: ExportScope) -> String {
         "SELECT e.domain, e.sub_domain, e.port, e.ports, \
          pr.proto_kind, pr.transport_type, pr.security_type, pr.config, \
          ps.protocol_id, ps.endpoint_id, \
-         ps.last_used_at, ps.last_seen_at, ps.latency, ps.latency_delay, ps.latency_ip, \
+         ps.last_used_at, ps.last_seen_at, ps.latency_real_delay, ps.latency_fast_delay, \
+         ps.latency_ip, ps.latency_auth, \
          ps.speed_bps, ps.error, ps.error_kind, ps.error_text, ps.purge_reason, \
          ps.traffic_today_up, ps.traffic_today_down, ps.traffic_total_up, ps.traffic_total_down, \
          ps.created_at, ps.updated_at, ps.version, {address_key} AS ip_key, \
@@ -245,21 +247,18 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
         .map_err(|e| DatabaseError::Generic(format!("export protocol config: {e}")))?;
     let protocol_id = ProtocolId::new(integer(row, 8)?);
     let endpoint_id = EndpointId::new(integer(row, 9)?);
-    let latency = match (
-        optional_text(row, 12)?.as_deref(),
-        optional_integer(row, 13)?.and_then(|value| i32::try_from(value).ok()),
-    ) {
-        (Some("real"), Some(delay)) => Some(Latency::Real {
-            delay,
-            ip: optional_text(row, 14)?,
-        }),
-        (Some("fast"), Some(delay)) => Some(Latency::Fast { delay }),
-        _ => None,
+    // The two delay columns carry the provenance now (schema 19): a row can
+    // hold BOTH, and the real one outranks the fast one.
+    let latency = Latency {
+        real_delay: optional_integer(row, 12)?.and_then(|v| i32::try_from(v).ok()),
+        fast_delay: optional_integer(row, 13)?.and_then(|v| i32::try_from(v).ok()),
+        ip: optional_text(row, 14)?,
+        auth: optional_integer(row, 15)?,
     };
-    let error = match (optional_bool(row, 16)?, optional_text(row, 17)?) {
+    let error = match (optional_bool(row, 17)?, optional_text(row, 18)?) {
         (Some(true), Some(kind)) => Some(ErrorInfo {
             kind: profile_err(&kind)?,
-            text: optional_text(row, 18)?.unwrap_or_default(),
+            text: optional_text(row, 19)?.unwrap_or_default(),
         }),
         (Some(true), None) => {
             return Err(DatabaseError::Generic(
@@ -268,7 +267,7 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
         }
         _ => None,
     };
-    let purge_reason = optional_text(row, 19)?
+    let purge_reason = optional_text(row, 20)?
         .map(|value| purge_reason(&value))
         .transpose()?;
     let link = ProfileStats {
@@ -277,24 +276,24 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
         last_used_at: optional_integer(row, 10)?,
         last_seen_at: integer(row, 11)?,
         latency,
-        speed_bps: optional_integer(row, 15)?,
+        speed_bps: optional_integer(row, 16)?,
         error,
         purge_reason,
-        stab_mask: optional_integer(row, 29)?.unwrap_or(0),
-        stab_len: optional_integer(row, 30)?.unwrap_or(0),
+        stab_mask: optional_integer(row, 30)?.unwrap_or(0),
+        stab_len: optional_integer(row, 31)?.unwrap_or(0),
         traffic: TrafficStats {
-            today_up: integer(row, 20)?,
-            today_down: integer(row, 21)?,
-            total_up: integer(row, 22)?,
-            total_down: integer(row, 23)?,
+            today_up: integer(row, 21)?,
+            today_down: integer(row, 22)?,
+            total_up: integer(row, 23)?,
+            total_down: integer(row, 24)?,
         },
-        created_at: integer(row, 24)?,
-        updated_at: integer(row, 25)?,
-        version: u64::try_from(integer(row, 26)?).unwrap_or_default(),
+        created_at: integer(row, 25)?,
+        updated_at: integer(row, 26)?,
+        version: u64::try_from(integer(row, 27)?).unwrap_or_default(),
         protocol: toasty::Deferred::default(),
         endpoint: toasty::Deferred::default(),
     };
-    let ip_key = optional_blob(row, 27)?.unwrap_or_default();
+    let ip_key = optional_blob(row, 28)?.unwrap_or_default();
     let resolved_ip = endpoint_ip::ip_of(&ip_key);
     // db-rewamp D2/D10: `domain` empty ⇒ an IP/exotic host whose literal lives
     // in `endpoint_ip`; otherwise the DNS name is `sub_domain.domain`.
@@ -476,7 +475,7 @@ mod tests {
     fn link(
         protocol_id: i64,
         endpoint_id: i64,
-        latency: Option<Latency>,
+        latency: Latency,
         error: Option<ErrorInfo>,
     ) -> ProfileStats {
         ProfileStats {
@@ -510,7 +509,7 @@ mod tests {
         host: &str,
         host_type: HostType,
         ips: &[std::net::IpAddr],
-        latency: Option<Latency>,
+        latency: Latency,
         error: Option<ErrorInfo>,
     ) {
         db.upsert_endpoint(&endpoint(id, host, host_type))
@@ -549,7 +548,7 @@ mod tests {
             "one.example",
             HostType::Dns,
             &["1.1.1.1".parse().unwrap()],
-            Some(Latency::Fast { delay: 10 }),
+            Latency::fast(10),
             None,
         )
         .await;
@@ -559,10 +558,7 @@ mod tests {
             "two.example",
             HostType::Dns,
             &[],
-            Some(Latency::Real {
-                delay: 10,
-                ip: None,
-            }),
+            Latency::real_with_ip(10, None),
             None,
         )
         .await;
@@ -572,10 +568,7 @@ mod tests {
             "three.example",
             HostType::Dns,
             &["3.3.3.3".parse().unwrap()],
-            Some(Latency::Real {
-                delay: 10,
-                ip: None,
-            }),
+            Latency::real_with_ip(10, None),
             Some(ErrorInfo {
                 kind: crate::models_toasty::ProfileErr::Fast,
                 text: "later failure".into(),
@@ -605,11 +598,20 @@ mod tests {
             "many.example",
             HostType::Dns,
             &["1.1.1.1".parse().unwrap(), "2.2.2.2".parse().unwrap()],
-            None,
+            Latency::default(),
             None,
         )
         .await;
-        seed(&db, 2, "8.8.8.8", HostType::Ipv4, &[], None, None).await;
+        seed(
+            &db,
+            2,
+            "8.8.8.8",
+            HostType::Ipv4,
+            &[],
+            Latency::default(),
+            None,
+        )
+        .await;
 
         let mut reader = db
             .open_export_reader(ExportScope::Resolved)
@@ -660,7 +662,7 @@ mod tests {
             .await
             .expect("endpoint");
         db.upsert_protocol(&protocol).await.expect("protocol");
-        db.upsert_link(&link(2022, 22, None, None))
+        db.upsert_link(&link(2022, 22, Latency::default(), None))
             .await
             .expect("link");
 

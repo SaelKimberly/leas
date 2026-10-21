@@ -157,6 +157,7 @@ impl BatchProbeRunner for NullRunner {
         Box::pin(async move {
             ProbeOutcome::Ok {
                 latency_ms: Some(10),
+                transport_ms: Some(10),
                 ip_info: None,
             }
         })
@@ -172,6 +173,7 @@ impl BatchProbeRunner for NullRunner {
         Box::pin(async move {
             ProbeOutcome::Ok {
                 latency_ms: Some(50),
+                transport_ms: Some(10),
                 ip_info: Some("1.2.3.4".to_owned()),
             }
         })
@@ -198,6 +200,7 @@ fn batch_params(
         real_phase,
         dedup_endpoints: false,
         fast_timeout: Duration::from_secs(2),
+        transport_timeout: Duration::from_secs(2),
         real_timeout: Duration::from_secs(2),
         real_retries: 1,
         ping_url: "http://127.0.0.1/".to_owned(),
@@ -258,7 +261,7 @@ async fn flow_cost_report() {
     seed_db(&state, &page).await;
     let make_staged = |i: usize| {
         let mut link = links_all[i % links_all.len()].clone();
-        link.latency = Some(Latency::Fast { delay: 12 });
+        link.latency = Latency::fast(12);
         link.error = Some(leas_db::models::ErrorInfo {
             kind: ProfileErr::Fast,
             text: "Connection refused by the remote proxy host".to_owned(),
@@ -334,6 +337,7 @@ async fn flow_cost_report() {
     let shared = Arc::new(BatchShared::new(params));
     let outcome_ok = ProbeOutcome::Ok {
         latency_ms: Some(37),
+        transport_ms: Some(10),
         ip_info: Some("1.2.3.4".to_owned()),
     };
     let outcome_err = ProbeOutcome::Failed {
@@ -341,6 +345,7 @@ async fn flow_cost_report() {
         class: ProbeClass::Timeout,
         hard: true,
         evidence: None,
+        transport_ms: None,
     };
     let stage_result_acc = bench_sync(4096, || {
         let link = &links_all[black_box(0)];
@@ -384,6 +389,7 @@ async fn flow_cost_report() {
             class: ProbeClass::Timeout,
             hard: true,
             evidence: None,
+            transport_ms: None,
         },
     ))
     .fold(HashMap::new(), |mut m, (h, p, o)| {
@@ -557,6 +563,7 @@ async fn flow_cost_report() {
             key.clone(),
             ProbeOutcome::Ok {
                 latency_ms: Some(9),
+                transport_ms: Some(9),
                 ip_info: None,
             },
         );
@@ -1444,6 +1451,7 @@ async fn flow_cost_network() {
         ping_url: PING_URL,
         ip_provider: IpProvider::IpApi,
         timeout: budget,
+        transport_timeout: budget,
         retries: 1,
     };
     'sample: for row in &rows {
@@ -1642,6 +1650,7 @@ async fn flow_cost_transport_control() {
         ping_url: PING_URL,
         ip_provider: IpProvider::IpApi,
         timeout: budget,
+        transport_timeout: budget,
         retries: 1,
     };
     let mut histogram: std::collections::BTreeMap<String, usize> =
@@ -1711,6 +1720,7 @@ async fn hit_miss_rows(hit: bool) -> Vec<TableRow> {
             endpoint_id,
             protocol_id,
             test_type: TestType::TcpPing,
+            transport_ms: None,
             latency_ms: Some(12),
             speed_bps: None,
             ip_info: None,

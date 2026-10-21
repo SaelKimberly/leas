@@ -798,7 +798,7 @@ mod tests {
         // Pre-existing latency + error markers must survive a connect
         // failure (a failed connect is NOT a ping — no markers written).
         let link = &mut row.links[0];
-        link.latency = Some(Latency::Fast { delay: 42 });
+        link.latency = Latency::fast(42);
         link.error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "previous failure".to_string(),
@@ -856,7 +856,7 @@ mod tests {
         // traffic counters are untouched.
         let link = &state.endpoints[0].links[0];
         assert!(
-            link.latency.is_some(),
+            link.latency.is_measured(),
             "pre-existing latency marker preserved"
         );
         assert!(link.error.is_some(), "pre-existing error marker preserved");

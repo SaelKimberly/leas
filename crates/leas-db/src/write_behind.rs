@@ -1669,7 +1669,7 @@ mod tests {
             endpoint_id: EndpointId::new(endpoint_id),
             last_used_at: None,
             last_seen_at: 0,
-            latency: None,
+            latency: Latency::default(),
             speed_bps: None,
             error: None,
             purge_reason: None,
@@ -1842,7 +1842,7 @@ mod tests {
 
     fn with_latency(base: &ProfileStats, delay: i32) -> ProfileStats {
         let mut row = base.clone();
-        row.latency = Some(Latency::Fast { delay });
+        row.latency = Latency::fast(delay);
         row
     }
 
@@ -1872,7 +1872,7 @@ mod tests {
 
         let seeded = link_row(1);
         let mut row = link_row(1);
-        row.latency = Some(Latency::Fast { delay: 42 });
+        row.latency = Latency::fast(42);
         row.error = Some(crate::models_toasty::ErrorInfo {
             kind: ProfileErr::Fast,
             text: "boom".to_owned(),
@@ -1886,7 +1886,7 @@ mod tests {
         assert_eq!(driver.flush().await.expect("flush"), 1, "one link written");
 
         let stored = stored_link(&file_db, 1).await;
-        assert_eq!(stored.latency, Some(Latency::Fast { delay: 42 }));
+        assert_eq!(stored.latency, Latency::fast(42));
         assert_eq!(stored.error.as_ref().map(|e| e.text.as_str()), Some("boom"));
         assert_eq!(stored.purge_reason, Some(PurgeReason::NotTls));
         assert_eq!(
@@ -1946,7 +1946,7 @@ mod tests {
         );
         assert_eq!(
             out[0].patch.link.latency,
-            Some(Latency::Fast { delay: 100 }),
+            Latency::fast(100),
             "the RESULT columns are carried"
         );
         assert_eq!(
@@ -2003,7 +2003,7 @@ mod tests {
         assert_eq!(stored.purge_reason, Some(PurgeReason::NotTls));
         assert_eq!(
             stored.latency,
-            Some(Latency::Fast { delay: 44 }),
+            Latency::fast(44),
             "and the result half landed too"
         );
     }
@@ -2036,7 +2036,7 @@ mod tests {
         );
         assert_eq!(driver.staged_len(), 0);
         let stored = stored_link(&db, 1).await;
-        assert_eq!(stored.latency, Some(Latency::Fast { delay: 33 }));
+        assert_eq!(stored.latency, Latency::fast(33));
         assert_eq!(
             stored.purge_reason,
             Some(PurgeReason::RealityFallback),
@@ -2090,7 +2090,7 @@ mod tests {
         assert_eq!(driver.flush_count(), 1, "one transaction per window");
 
         let row = stored_link(&db, 1).await;
-        assert_eq!(row.latency, Some(Latency::Fast { delay: 44 }));
+        assert_eq!(row.latency, Latency::fast(44));
         assert_eq!(row.speed_bps, Some(1_000_000));
         assert_eq!(row.traffic.total_up, 5);
     }
@@ -2128,7 +2128,7 @@ mod tests {
         let staged = driver
             .get(&(row.protocol_id, row.endpoint_id, LinkGroups::RESULT))
             .expect("the staged RESULT row");
-        assert_eq!(staged.link.latency, Some(Latency::Fast { delay: 12 }));
+        assert_eq!(staged.link.latency, Latency::fast(12));
         assert!(
             driver
                 .get(&(row.protocol_id, row.endpoint_id, LinkGroups::PURGE,))

@@ -90,6 +90,7 @@ async fn run(row: Row, timeout: Duration) -> String {
         method: ProbeMethod::Head,
         path: PING_PATH,
         timeout,
+        transport_timeout: timeout,
     };
     let started = Instant::now();
     match probe::fetch(params, &request).await {

@@ -5,8 +5,7 @@ use leas_core::CoreType;
 use leas_core::speed_test::TestType;
 use leas_db::LinkGroups;
 use leas_db::models::{
-    EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr, ProfileStats, PurgeReason,
-    TrafficStats,
+    EndpointId, EndpointRow, ErrorInfo, ProfileErr, ProfileStats, PurgeReason, TrafficStats,
 };
 
 use crate::AppState;
@@ -151,6 +150,7 @@ pub(crate) fn apply_test_result(
     row: &mut ProfileStats,
     test_type: TestType,
     latency_ms: Option<u64>,
+    transport_ms: Option<u64>,
     speed_bps: Option<u64>,
     ip_info: Option<&str>,
     error: Option<&str>,
@@ -159,6 +159,12 @@ pub(crate) fn apply_test_result(
     if let Some(err) = error {
         if err == "Cancelled" {
             return None;
+        }
+        // The TRANSPORT span survives the failure: the transport was alive, the
+        // config was not (spec D12). The Fast column then shows a number
+        // beside the failure marker instead of a blank.
+        if let Some(transport_ms) = transport_ms {
+            row.latency.fast_delay = Some(transport_ms as i32);
         }
         // Persisted failure marker — the profiles Test column renders
         // `[fast]`/`[real]` from `link.error.kind`; the measurement (if any)
@@ -179,13 +185,29 @@ pub(crate) fn apply_test_result(
     }
     match test_type {
         TestType::RealPing => {
-            row.latency = latency_ms.map(|ms| Latency::Real {
-                delay: ms as i32,
-                ip: exit_ip(ip_info),
-            });
+            // The merged probe produces BOTH facts in one pass: the transport
+            // span (the Fast metric) and the real span (the probe's own). They
+            // do not overlap — the real span is measured from the probe's
+            // start, the transport span from the dial's start (spec D2).
+            //
+            // FIELD-wise, not a struct replacement: the two delays and the
+            // exit IP are INDEPENDENT facts that age on their own (spec
+            // D11), so a fast probe must not erase a measured real delay and
+            // a real probe must not erase the exit IP.
+            if let Some(ms) = latency_ms {
+                row.latency.real_delay = Some(ms as i32);
+            }
+            if let Some(ip) = exit_ip(ip_info) {
+                row.latency.ip = Some(ip);
+            }
+            if let Some(transport_ms) = transport_ms {
+                row.latency.fast_delay = Some(transport_ms as i32);
+            }
         }
         TestType::TcpPing | TestType::UdpTest => {
-            row.latency = latency_ms.map(|ms| Latency::Fast { delay: ms as i32 });
+            if let Some(ms) = latency_ms {
+                row.latency.fast_delay = Some(ms as i32);
+            }
         }
         TestType::SpeedTest => row.speed_bps = speed_bps.map(|v| v as i64),
     }
@@ -646,6 +668,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 protocol_id,
                 test_type,
                 latency_ms,
+                transport_ms,
                 speed_bps,
                 ip_info,
                 error,
@@ -703,6 +726,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                 link,
                                 test_type,
                                 latency_ms,
+                                transport_ms,
                                 speed_bps,
                                 ip_info.as_deref(),
                                 error.as_deref(),
@@ -1413,6 +1437,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("timeout after 5s"),
             Some(PurgeReason::TransportRejected),
         )
@@ -1431,6 +1456,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("REALITY error: received real certificate"),
             Some(PurgeReason::RealityFallback),
         )
@@ -1442,6 +1468,7 @@ mod tests {
         let groups = apply_test_result(
             &mut link,
             TestType::RealPing,
+            None,
             None,
             None,
             None,
@@ -1461,6 +1488,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(link.purge_reason, Some(PurgeReason::RealityFallback));
 
@@ -1469,6 +1497,7 @@ mod tests {
             &mut link,
             TestType::RealPing,
             Some(120),
+            None,
             None,
             Some("198.51.100.9 | DE"),
             None,
@@ -1484,6 +1513,7 @@ mod tests {
             apply_test_result(
                 &mut link,
                 TestType::RealPing,
+                None,
                 None,
                 None,
                 None,
@@ -1508,6 +1538,7 @@ mod tests {
             &mut link,
             TestType::SpeedTest,
             None,
+            None,
             Some(9_000_000),
             None,
             None,
@@ -1520,6 +1551,7 @@ mod tests {
         let groups = apply_test_result(
             &mut link,
             TestType::SpeedTest,
+            None,
             None,
             None,
             None,
@@ -1558,9 +1590,9 @@ mod tests {
             .find(|l| l.protocol_id.get() == pid)
             .expect("link exists");
         link.latency = if real {
-            Some(Latency::Real { delay, ip: None })
+            Latency::real(delay)
         } else {
-            Some(Latency::Fast { delay })
+            Latency::fast(delay)
         };
     }
 
@@ -1739,6 +1771,7 @@ mod tests {
                 endpoint_id: pair.0,
                 protocol_id: pair.1,
                 test_type: TestType::TcpPing,
+                transport_ms: None,
                 latency_ms: Some(7),
                 speed_bps: None,
                 ip_info: None,
@@ -1895,7 +1928,7 @@ mod tests {
         state.endpoints = vec![row];
         state.connected_protocol_id = Some(100);
         let _ = state.db.upsert_link(&link).await;
-        state.endpoints[0].links[0].latency = None;
+        state.endpoints[0].links[0].latency = Latency::default();
 
         // Send and drain in lockstep: the channel holds 16, and the point is
         // that each drained result stages instead of committing.
@@ -1905,6 +1938,7 @@ mod tests {
                 endpoint_id: 100,
                 protocol_id: 7,
                 test_type: TestType::TcpPing,
+                transport_ms: None,
                 latency_ms: Some(10 + i),
                 speed_bps: None,
                 ip_info: None,
@@ -2305,6 +2339,7 @@ mod tests {
             endpoint_id: 2,
             protocol_id: 101,
             test_type: TestType::TcpPing,
+            transport_ms: None,
             latency_ms: Some(45),
             speed_bps: None,
             ip_info: None,
@@ -2325,7 +2360,7 @@ mod tests {
             .expect("ep2 p101 link");
         assert_eq!(
             ep2_p101.latency,
-            Some(Latency::Fast { delay: 45 }),
+            Latency::fast(45),
             "probing endpoint's own row must carry the result"
         );
         assert_eq!(
@@ -2335,7 +2370,7 @@ mod tests {
                 .find(|l| l.protocol_id.get() == 101)
                 .unwrap()
                 .latency,
-            None,
+            Latency::default(),
             "sibling endpoint must stay untouched"
         );
 
@@ -2347,6 +2382,7 @@ mod tests {
             endpoint_id: 1,
             protocol_id: 101,
             test_type: TestType::TcpPing,
+            transport_ms: None,
             latency_ms: Some(60),
             speed_bps: None,
             ip_info: None,
@@ -2363,7 +2399,7 @@ mod tests {
                 .find(|l| l.protocol_id.get() == 101)
                 .unwrap()
                 .latency,
-            Some(Latency::Fast { delay: 60 }),
+            Latency::fast(60),
             "second endpoint's result processed, not dropped"
         );
         // ep2's earlier result survives the second event (no cross-write).
@@ -2374,7 +2410,7 @@ mod tests {
                 .find(|l| l.protocol_id.get() == 101)
                 .unwrap()
                 .latency,
-            Some(Latency::Fast { delay: 45 })
+            Latency::fast(45)
         );
     }
 
@@ -2392,10 +2428,7 @@ mod tests {
             text: "timeout".into(),
         });
         row.links[0].last_seen_at = crate::ops::profiles::test_support::ts(200);
-        row.links[1].latency = Some(Latency::Real {
-            delay: 90,
-            ip: None,
-        });
+        row.links[1].latency = Latency::real(90);
         row.links[1].last_seen_at = crate::ops::profiles::test_support::ts(100);
         state.endpoints = vec![row];
         state.selected_index = 0;
@@ -2405,6 +2438,7 @@ mod tests {
             endpoint_id: 1,
             protocol_id: 101,
             test_type: TestType::RealPing,
+            transport_ms: None,
             latency_ms: Some(40),
             speed_bps: None,
             ip_info: Some("5.6.7.8|US".to_string()),
@@ -2424,10 +2458,11 @@ mod tests {
             leas_db::models::ProtocolId::new(101),
             "best real-ok link must become the preferred protocol"
         );
-        assert!(matches!(
+        assert_eq!(
             active.latency,
-            Some(Latency::Real { delay: 40, .. })
-        ));
+            Latency::real_with_ip(40, Some("5.6.7.8".to_string())),
+            "the real result carries its exit IP alongside the delay"
+        );
     }
 
     #[tokio::test]
@@ -2449,6 +2484,7 @@ mod tests {
             endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::RealPing,
+            transport_ms: None,
             latency_ms: Some(120),
             speed_bps: None,
             ip_info: Some("1.2.3.4|US".to_string()),
@@ -2469,10 +2505,11 @@ mod tests {
         // selected_sub followed p9 to its new index 1.
         assert_eq!(state.selected_sub, Some(1));
         // p8's latency persisted as a Real measurement (with the ip part).
-        assert!(matches!(
+        assert_eq!(
             state.endpoints[0].links[0].latency,
-            Some(Latency::Real { delay: 120, ip: Some(ref s) }) if s == "1.2.3.4"
-        ));
+            Latency::real_with_ip(120, Some("1.2.3.4".to_string())),
+            "p8's latency persisted as a Real measurement (with the ip part)"
+        );
     }
 
     #[tokio::test]
@@ -2490,6 +2527,7 @@ mod tests {
             endpoint_id: 100,
             protocol_id: 7,
             test_type: TestType::RealPing,
+            transport_ms: None,
             latency_ms: None,
             speed_bps: None,
             ip_info: None,
@@ -2528,6 +2566,7 @@ mod tests {
             endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::TcpPing,
+            transport_ms: None,
             latency_ms: Some(15),
             speed_bps: None,
             ip_info: None,
@@ -2544,10 +2583,7 @@ mod tests {
             .map(|l| l.protocol_id.get())
             .collect();
         assert_eq!(ids, vec![7, 8]); // real-ok 200 still above fast-ok 15
-        assert!(matches!(
-            state.endpoints[0].links[1].latency,
-            Some(Latency::Fast { delay: 15 })
-        ));
+        assert_eq!(state.endpoints[0].links[1].latency, Latency::fast(15));
     }
 
     #[tokio::test]
@@ -2565,6 +2601,7 @@ mod tests {
             endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::UdpTest,
+            transport_ms: None,
             latency_ms: Some(50),
             speed_bps: None,
             ip_info: None,
@@ -2584,10 +2621,7 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![7, 8]);
         // Latency persisted (fast-class semantics).
-        assert!(matches!(
-            state.endpoints[0].links[1].latency,
-            Some(Latency::Fast { delay: 50 })
-        ));
+        assert_eq!(state.endpoints[0].links[1].latency, Latency::fast(50));
     }
 
     #[tokio::test]
@@ -2607,6 +2641,7 @@ mod tests {
             endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::RealPing,
+            transport_ms: None,
             latency_ms: Some(10),
             speed_bps: None,
             ip_info: Some("1.2.3.4|US".to_string()),
@@ -2642,6 +2677,7 @@ mod tests {
             endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::RealPing,
+            transport_ms: None,
             latency_ms: None,
             speed_bps: None,
             ip_info: None,
@@ -2659,7 +2695,7 @@ mod tests {
             .iter()
             .find(|l| l.protocol_id.get() == 8)
             .unwrap();
-        assert!(link.latency.is_none());
+        assert!(!link.latency.is_measured());
         assert!(link.error.is_none());
         let ids: Vec<i64> = state.endpoints[0]
             .links
@@ -2733,6 +2769,7 @@ mod tests {
             endpoint_id: 0,
             protocol_id: 8,
             test_type: TestType::TcpPing,
+            transport_ms: None,
             latency_ms: Some(1),
             speed_bps: None,
             ip_info: None,
@@ -2754,6 +2791,7 @@ mod tests {
             endpoint_id: 0,
             protocol_id: 9,
             test_type: TestType::RealPing,
+            transport_ms: None,
             latency_ms: Some(20),
             speed_bps: None,
             ip_info: None,

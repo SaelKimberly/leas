@@ -119,3 +119,46 @@ pub const V18_AFTER_ALTERS: &[&str] = &[
     ENDPOINT_RANK_BAND_WINDOW,
     RANK_WEIGHT_META,
 ];
+
+/// **Migration 19** — the latency reshape (spec
+/// `2026-10-21-merged-test-pipeline-design` D5, ADR 0016).
+///
+/// The `Latency` embed was an ENUM: one shared `latency_delay` column plus an
+/// exclusive `latency` discriminator, so a row could hold a real delay OR a
+/// fast delay, never both. The merged probe produces both in one pass, so
+/// the row now carries `latency_real_delay` and `latency_fast_delay`
+/// independently, plus the auth flag — and the discriminator is gone.
+///
+/// The ORDER matters:
+///
+/// 1. the fast column is added FIRST, and the data step copies a `'fast'`
+///    row's delay into it — the v18 shape stored the delay ONCE, in
+///    `latency_delay`, and the discriminator said which kind it was;
+/// 2. a `'fast'` row's `latency_delay` is CLEARED: it is a TRANSPORT span,
+///    not a real measurement, and the new shape keeps the two apart;
+/// 3. the RENAME then turns the remaining `latency_delay` (the real rows'
+///    delays) into `latency_real_delay`;
+/// 4. the DROP goes last — after it, the discriminator's rows are gone and
+///    the two delay columns are the whole provenance.
+///
+/// **These statements are NOT idempotent.** `RENAME COLUMN` and
+/// `DROP COLUMN` fail with "no such column" on a second application, and this
+/// engine has no `IF NOT EXISTS` form for either. They are safe **only
+/// because the migration cursor gates them** — the step runs when
+/// `cursor < 19` and the cursor advances in the same transaction. This is why
+/// the statements live in the step list (`schema::steps`) and NOT in
+/// `ensure_raw_ddl`, which re-runs on every open and has no version to gate
+/// on.
+pub const V19_LATENCY_RESHAPE: &[&str] = &[
+    "ALTER TABLE profile_stats ADD COLUMN latency_fast_delay INTEGER",
+    "ALTER TABLE profile_stats ADD COLUMN latency_auth INTEGER",
+    // The data step: a 'fast' row's delay is a TRANSPORT span, so it belongs
+    // in the fast column. It must run before the discriminator is dropped.
+    "UPDATE profile_stats SET latency_fast_delay = latency_delay \
+     WHERE latency = 'fast'",
+    // ...and the SAME delay leaves the real column: a fast-only row has no
+    // real measurement, and the new shape keeps the two apart.
+    "UPDATE profile_stats SET latency_delay = NULL WHERE latency = 'fast'",
+    "ALTER TABLE profile_stats RENAME COLUMN latency_delay TO latency_real_delay",
+    "ALTER TABLE profile_stats DROP COLUMN latency",
+];

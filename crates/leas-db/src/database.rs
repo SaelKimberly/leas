@@ -11,8 +11,8 @@ use toasty_core::stmt::Value;
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
     AppMeta, DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointIp, EndpointRank,
-    EndpointRow, Group, ProfileStats, Protocol, ProtocolId, RouteProbes, RoutingRule, TrafficStats,
-    now_epoch,
+    EndpointRow, Group, Latency, ProfileStats, Protocol, ProtocolId, RouteProbes, RoutingRule,
+    TrafficStats, now_epoch,
 };
 use crate::retry_on_busy;
 
@@ -90,7 +90,16 @@ use crate::retry_on_busy;
 // 18 = `endpoints.host`/`host_type` dropped (db-rewamp D2/D10): the identity
 // input is the derived `(domain, sub_domain)` split, and every address lives in
 // `endpoint_ip` (an IP-literal endpoint's dial target has no other home).
-pub const SCHEMA_VERSION: i64 = 18;
+//
+// 19 = the latency row carries TWO delays and an auth flag (spec
+// `2026-10-21-merged-test-pipeline-design` D4/D5, ADR 0016): the `Latency`
+// embed became a struct, so `latency_delay` is split into
+// `latency_real_delay` (the full probe's span) and `latency_fast_delay` (the
+// transport span), `latency_auth` was added, and the `latency` discriminator
+// was DROPPED — a row's provenance is now carried by which delay column is
+// populated. This is the crate's FIRST real migration step: a version-18
+// database migrates in place, and only an unknown cursor still wipes.
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
 /// geo step wrote (`None` until it does).
@@ -658,7 +667,8 @@ const LINK_COMPARE_KEYS: &str = "protocol_id, endpoint_id";
 /// appends its tuples and then the `ON CONFLICT` action. The column order IS
 /// the order [`link_values_sql`] emits.
 const LINK_UPSERT_PREFIX: &str = "INSERT INTO profile_stats (protocol_id, endpoint_id, \
-     last_used_at, last_seen_at, latency, latency_delay, latency_ip, speed_bps, \
+     last_used_at, last_seen_at, latency_real_delay, latency_fast_delay, latency_ip, \
+     latency_auth, speed_bps, \
      error, error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
      traffic_total_up, traffic_total_down, created_at, updated_at, version, \
      stab_mask, stab_len) VALUES ";
@@ -679,15 +689,17 @@ fn link_values_sql(link: &ProfileStats, now: i64) -> String {
         link.endpoint_id.get(),
         link.last_seen_at
     );
-    match &link.latency {
-        Some(crate::models_toasty::Latency::Real { delay, ip }) => {
-            let _ = write!(sql, "'real', {delay}, {}", sql_opt_lit(ip.as_deref()));
-        }
-        Some(crate::models_toasty::Latency::Fast { delay }) => {
-            let _ = write!(sql, "'fast', {delay}, NULL");
-        }
-        None => sql.push_str("NULL, NULL, NULL"),
-    }
+    // The four measurement columns. There is no discriminator any more: a
+    // row's provenance is carried by WHICH delay column is populated
+    // (schema 19, spec D4).
+    let _ = write!(
+        sql,
+        "{}, {}, {}, {}",
+        sql_opt_num(link.latency.real_delay.map(i64::from)),
+        sql_opt_num(link.latency.fast_delay.map(i64::from)),
+        sql_opt_lit(link.latency.ip.as_deref()),
+        sql_opt_num(link.latency.auth),
+    );
     let _ = write!(sql, ", {}, ", sql_opt_num(link.speed_bps));
     match &link.error {
         Some(error) => {
@@ -737,9 +749,10 @@ fn link_patch_conflict_sql(groups: LinkGroups) -> String {
     let mut sets: Vec<&str> = Vec::with_capacity(16);
     if has_result {
         sets.extend_from_slice(&[
-            "latency = excluded.latency",
-            "latency_delay = excluded.latency_delay",
+            "latency_real_delay = excluded.latency_real_delay",
+            "latency_fast_delay = excluded.latency_fast_delay",
             "latency_ip = excluded.latency_ip",
+            "latency_auth = excluded.latency_auth",
             "speed_bps = excluded.speed_bps",
             "error = excluded.error",
             "error_kind = excluded.error_kind",
@@ -1845,7 +1858,7 @@ impl Database {
                         total_up: 0,
                         total_down: 0,
                     })
-                    .latency(None)
+                    .latency(Latency::default())
                     .error(None)
                     .speed_bps(None)
                     // The stability ring goes with the measurements: "clear all
@@ -2643,9 +2656,7 @@ mod tests {
                             endpoint_id: EndpointId::new(id),
                             last_used_at: None,
                             last_seen_at: 1,
-                            latency: Some(Latency::Fast {
-                                delay: (i % 900) as i32,
-                            }),
+                            latency: Latency::fast((i % 900) as i32),
                             speed_bps: None,
                             error: None,
                             purge_reason: None,
@@ -2663,9 +2674,7 @@ mod tests {
                             protocol: toasty::Deferred::default(),
                             endpoint: toasty::Deferred::default(),
                         };
-                        row.latency = Some(Latency::Fast {
-                            delay: (i % 900) as i32,
-                        });
+                        row.latency = Latency::fast((i % 900) as i32);
                         let row_patch = LinkPatch {
                             link: row,
                             groups: LinkGroups::RESULT,
@@ -2775,9 +2784,7 @@ mod tests {
                                 endpoint_id: eid,
                                 last_used_at: None,
                                 last_seen_at: 1,
-                                latency: Some(Latency::Fast {
-                                    delay: ((r + b) % 900) as i32,
-                                }),
+                                latency: Latency::fast(((r + b) % 900) as i32),
                                 speed_bps: None,
                                 error: None,
                                 purge_reason: None,
@@ -2795,9 +2802,7 @@ mod tests {
                                 protocol: toasty::Deferred::default(),
                                 endpoint: toasty::Deferred::default(),
                             };
-                            row.latency = Some(Latency::Fast {
-                                delay: ((r + b) % 900) as i32,
-                            });
+                            row.latency = Latency::fast(((r + b) % 900) as i32);
                             patches.push(LinkPatch {
                                 link: row,
                                 groups: LinkGroups::RESULT,
@@ -3084,6 +3089,7 @@ mod tests {
             stab_mask: 0,
             stab_len: 0,
             traffic: zero_traffic(),
+            latency: Latency::default(),
         })
         .exec(conn)
         .await
@@ -3268,10 +3274,7 @@ mod tests {
                 protocol_id: ProtocolId::new(pid),
                 endpoint_id: EndpointId::new(1),
                 last_seen_at: ts(last_seen),
-                latency: Some(Latency::Real {
-                    delay: 10,
-                    ip: None
-                }),
+                latency: Latency::real_with_ip(10, None),
                 stab_mask: 0,
                 stab_len: 0,
                 traffic: zero_traffic(),
@@ -3690,7 +3693,7 @@ mod tests {
             endpoint_id: EndpointId::new(endpoint_id),
             last_used_at: None,
             last_seen_at: ts(last_seen),
-            latency: None,
+            latency: Latency::default(),
             speed_bps: None,
             error: None,
             purge_reason: None,
@@ -3791,7 +3794,7 @@ mod tests {
             .expect("protocol");
 
         let mut probed = link_struct(1001, 1, 100);
-        probed.latency = Some(Latency::Fast { delay: 42 });
+        probed.latency = Latency::fast(42);
         probed.error = Some(crate::models_toasty::ErrorInfo {
             kind: crate::models_toasty::ProfileErr::Real,
             text: "timeout on tcp dial".to_string(),
@@ -3825,7 +3828,7 @@ mod tests {
         .expect("row");
         assert_eq!(
             stored.latency,
-            Some(Latency::Fast { delay: 42 }),
+            Latency::fast(42),
             "a measurement survives an import refresh"
         );
         assert!(
@@ -3913,7 +3916,7 @@ mod tests {
         assert_eq!(count, 1, "composite-key upsert must not duplicate");
 
         // Second upsert replaces the result-state fields (e.g. latency).
-        link.latency = Some(Latency::Fast { delay: 42 });
+        link.latency = Latency::fast(42);
         link.last_seen_at = ts(200);
         db.upsert_link(&link)
             .await
@@ -3928,7 +3931,7 @@ mod tests {
         .await
         .expect("read")
         .expect("row");
-        assert_eq!(stored.latency, Some(Latency::Fast { delay: 42 }));
+        assert_eq!(stored.latency, Latency::fast(42));
         assert_eq!(stored.last_seen_at, ts(200));
         assert_eq!(stored.traffic, link.traffic);
     }

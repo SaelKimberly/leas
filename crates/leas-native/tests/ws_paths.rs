@@ -237,6 +237,7 @@ async fn run_row(
         method: ProbeMethod::Get,
         path: "/",
         timeout: Duration::from_secs(5),
+        transport_timeout: Duration::from_secs(5),
     };
 
     let outcome = probe::fetch(params, &request).await;

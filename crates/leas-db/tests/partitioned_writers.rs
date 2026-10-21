@@ -108,6 +108,7 @@ async fn seed_feed(db: &Database, n: usize) {
             stab_mask: 0,
             stab_len: 0,
             traffic: zero_traffic(),
+            latency: Latency::default(),
         })
         .exec(&mut conn)
         .await
@@ -121,7 +122,7 @@ fn fast_patch(id: i64, delay: i32) -> LinkPatch {
         endpoint_id: EndpointId::new(id),
         last_used_at: None,
         last_seen_at: 1,
-        latency: Some(Latency::Fast { delay }),
+        latency: Latency::fast(delay),
         speed_bps: None,
         error: None,
         purge_reason: None,
@@ -140,11 +141,14 @@ fn fast_patch(id: i64, delay: i32) -> LinkPatch {
     }
 }
 
-/// The stored `latency_delay` of one link, or `None` when the row is absent.
+/// The stored TRANSPORT delay of one link, or `None` when the row is absent.
+///
+/// The fixture patches a FAST result, and schema 19 gives the transport span
+/// its own column (`latency_fast_delay`) — it does not touch the real one.
 async fn stored_delay(db: &Database, id: i64) -> Option<i32> {
     let mut conn = db.connection().await.expect("conn");
     let rows = toasty::sql::query(format!(
-        "SELECT latency_delay FROM profile_stats WHERE endpoint_id = {id}"
+        "SELECT latency_fast_delay FROM profile_stats WHERE endpoint_id = {id}"
     ))
     .exec(&mut conn)
     .await

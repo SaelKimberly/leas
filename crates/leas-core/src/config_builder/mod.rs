@@ -183,7 +183,7 @@ impl ConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leas_db::models::{HostType, ProfileStats, TrafficStats, Transport};
+    use leas_db::models::{HostType, Latency, ProfileStats, TrafficStats, Transport};
     use leas_proto::proto_spec::common::TransportConfig;
     use leas_proto::proto_spec::{
         CoreType as ProtoCoreType, ProtocolKind, SecurityConfig, SecurityType, TransportType,
@@ -260,7 +260,7 @@ mod tests {
             endpoint_id: leas_db::models::EndpointId::new(1),
             last_used_at: None,
             last_seen_at: ts(0),
-            latency: None,
+            latency: Latency::default(),
             speed_bps: None,
             error: None,
             purge_reason: None,

@@ -83,6 +83,61 @@ async fn secured_upgraded(ctx: &LinkContext, dialed: BoxStream) -> Result<BoxStr
     transport::upgrade(ctx, secured).await
 }
 
+/// The TRANSPORT stage of a probe: establish the endpoint's transport, and
+/// nothing else.
+///
+/// This is the DIAL — the TCP connection to the proxy server's IP+port (or
+/// the QUIC handshake for a QUIC-family protocol, spec D2's caveat). The
+/// security handshake, the transport upgrade and the protocol phase all run
+/// AFTER it, under the probe's second budget.
+///
+/// Splitting the dial out of [`connect_chain`] is what makes the transport
+/// span a measurement rather than a guess: the span covers exactly the work
+/// that says "the server is alive" and nothing else.
+///
+/// The returned stream is the RAW socket — the caller continues the chain
+/// from it (security → upgrade → protocol).
+pub async fn dial_transport(
+    link: &NativeConnectParams,
+    target: TargetAddr,
+) -> Result<BoxStream, NativeError> {
+    let ctx = LinkContext::new(link.clone(), target);
+    if protocol::is_quic_link(&ctx) {
+        // A QUIC-family protocol replaces dial + security + upgrade with one
+        // QUIC handshake (spec §5.2), so the "transport" IS that handshake.
+        // The span then includes the QUIC + TLS handshakes — the caveat
+        // recorded in spec D2.
+        return protocol::connect_quic(&ctx).await;
+    }
+    transport::connect(&ctx, None).await
+}
+
+/// Continue a chain from an already-dialed stream: the security handshake,
+/// the transport upgrade and the protocol phase.
+///
+/// The counterpart of [`dial_transport`]: together they are
+/// [`connect_chain`]'s body, split at the boundary the probe's two budgets
+/// need.
+pub async fn finish_chain(ctx: &LinkContext, dialed: BoxStream) -> Result<BoxStream, NativeError> {
+    let upgraded = secured_upgraded(ctx, dialed).await?;
+    protocol::connect(ctx, upgraded).await
+}
+
+/// Continue a MUX chain from an already-dialed stream: the security
+/// handshake, the transport upgrade and the mux protocol phase.
+///
+/// The mux counterpart of [`finish_chain`]. It exists so the probe's mux arm
+/// does not dial TWICE: the transport stage's dial is the one the mux
+/// multiplexer rides, so the transport span measures the connection the probe
+/// actually used (spec D2) and the row costs one handshake, not two.
+pub async fn finish_chain_mux(
+    ctx: &LinkContext,
+    dialed: BoxStream,
+) -> Result<protocol::MuxTunnel, NativeError> {
+    let upgraded = secured_upgraded(ctx, dialed).await?;
+    protocol::connect_mux(ctx, upgraded).await
+}
+
 /// Connect through a chain of proxies to the final `target`.
 pub async fn connect_chain(
     links: &[NativeConnectParams],

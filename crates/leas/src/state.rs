@@ -13,8 +13,8 @@ use leas_core::speed_test::TestType;
 use leas_db::Database;
 use leas_db::hash::stable_hash;
 use leas_db::models::{
-    Endpoint, EndpointGroup, EndpointId, Group, HostType, ProfileStats, Protocol, ProtocolId,
-    PurgatoryView, RoutingRule, Security, TrafficStats, Transport,
+    Endpoint, EndpointGroup, EndpointId, Group, HostType, Latency, ProfileStats, Protocol,
+    ProtocolId, PurgatoryView, RoutingRule, Security, TrafficStats, Transport,
 };
 use leas_proto::proto_spec::common::TransportConfig;
 use leas_proto::proto_spec::{
@@ -232,7 +232,7 @@ pub struct AppState {
     pub endpoint_info: HashMap<i64, EndpointInfo>,
     /// mmdb country per outbound (exit) IP, keyed by the IP string. Filled at
     /// profile load and on real-ping success; survives reruns because the
-    /// source (`Latency::Real.ip`) is persisted and lookups rerun at load.
+    /// source (`latency.ip`) is persisted and lookups rerun at load.
     /// A 512-entry LRU (not the old unbounded `HashMap`): a long-lived
     /// session touching many exit IPs stays bounded; `lru::LruCache::get`
     /// needs `&mut`, hence the `Mutex` (the old plain `HashMap` had no
@@ -415,7 +415,7 @@ pub fn link_from_parsed_with_id(protocol_id: ProtocolId, endpoint_id: EndpointId
         endpoint_id,
         last_used_at: None,
         last_seen_at: now,
-        latency: None,
+        latency: Latency::default(),
         speed_bps: None,
         error: None,
         purge_reason: None,

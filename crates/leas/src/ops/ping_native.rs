@@ -99,6 +99,14 @@ pub struct ProbeFailure {
     /// for a failure this module raised itself — the probe-URL shape, the
     /// target request's own status — and for anything transient.
     pub evidence: Option<FailureEvidence>,
+    /// The TRANSPORT span in ms, when the transport stage completed before the
+    /// failure.
+    ///
+    /// This is the Fast metric carried through a FAILURE (spec D12): a row
+    /// whose transport answered but whose config did not still reports the
+    /// transport span, so the panel can say "the server is up, the config is
+    /// not". `None` when the transport stage itself failed.
+    pub transport_ms: Option<u64>,
 }
 
 impl ProbeFailure {
@@ -130,6 +138,7 @@ impl ProbeFailure {
             class,
             text: err.to_string(),
             evidence: err.evidence(),
+            transport_ms: None,
         }
     }
 
@@ -143,6 +152,7 @@ impl ProbeFailure {
             class,
             text: text.into(),
             evidence: None,
+            transport_ms: None,
         }
     }
 }
@@ -153,8 +163,16 @@ pub struct NativeProbeReq<'a> {
     /// Which exit-IP provider to ask first (the rest of the family-agnostic set
     /// is the fallback chain).
     pub ip_provider: IpProvider,
-    /// Per-attempt budget (the whole dial + request for one attempt).
+    /// Per-attempt budget for the PROTOCOL + PROBE stages.
     pub timeout: Duration,
+    /// Per-attempt budget for the TRANSPORT stage alone — the time to
+    /// establish the endpoint's transport.
+    ///
+    /// **Independent** of `timeout` (spec
+    /// `2026-10-21-merged-test-pipeline-design` D12): the transport span is
+    /// the measurement that says "the server is alive", so it must never be
+    /// truncated by the protocol stage's budget.
+    pub transport_timeout: Duration,
     /// Concurrent attempts; the fastest 2xx wins.
     pub retries: u32,
 }
@@ -163,7 +181,17 @@ pub struct NativeProbeReq<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeProbeResult {
     pub latency_ms: u64,
+    /// The TRANSPORT span in ms: the time to establish the endpoint's
+    /// transport. `None` when the transport stage did not complete.
+    ///
+    /// This is the Fast metric (spec D2) — the same unit in the Fast Test
+    /// (endpoint scope) and as stage 1 of the Real Test (link scope).
+    pub transport_ms: Option<u64>,
     /// `"<ip> | <country>"` when the IP API answered, else `None`.
+    ///
+    /// Always `None` from [`real_ping`]: the exit IP is a SEPARATE phase
+    /// (spec D10/D11), fetched by [`fetch_exit_ip`]. The field stays so the
+    /// result shape can carry an IP when a caller has one in hand.
     pub ip_info: Option<String>,
 }
 
@@ -220,30 +248,67 @@ pub async fn real_ping(
 ) -> Result<NativeProbeResult, ProbeFailure> {
     let target =
         parse_probe_url(req.ping_url).map_err(|e| ProbeFailure::local(ProbeClass::Config, e))?;
-    let params = NativeConnectParams::new(
-        config.clone(),
-        endpoint_essentials(endpoint, addresses),
-        TargetAddr::new(target.host.as_str(), target.port),
-    );
+    let params = probe_params(endpoint, addresses, config, &target);
 
-    let latency_ms = probe_attempts(&params, &target, req).await?;
-    let ip_info = fetch_ip_info(&params, req.ip_provider).await;
+    let (latency_ms, transport_ms) = probe_attempts(&params, &target, req).await?;
     Ok(NativeProbeResult {
         latency_ms,
-        ip_info,
+        transport_ms,
+        ip_info: None,
     })
 }
 
-/// Fan out `retries` attempts and return the fastest 2xx latency in ms.
+/// The connect parameters for a row's probe and for its exit-IP fetch.
+///
+/// Public because the exit-IP fetch is a SEPARATE phase (spec D10/D11) and
+/// needs the same parameters: the caller builds them once and hands them to
+/// both [`real_ping`] and [`fetch_exit_ip`].
+#[must_use]
+pub fn probe_params(
+    endpoint: &Endpoint,
+    addresses: &[std::net::IpAddr],
+    config: &ProtocolConfig,
+    target: &ProbeUrl,
+) -> NativeConnectParams {
+    NativeConnectParams::new(
+        config.clone(),
+        endpoint_essentials(endpoint, addresses),
+        TargetAddr::new(target.host.as_str(), target.port),
+    )
+}
+
+/// The exit IP for a row, fetched through its own tunnel.
+///
+/// A SEPARATE phase, not part of the probe (spec D10/D11): the exit IP is
+/// its own fact, it ages on its own, and a missing IP is a missing fact — not
+/// a config failure. The probe's verdict never depends on it, and the
+/// `Fill Exit IPs` command calls this directly.
+///
+/// The fetch rides a SECOND tunnel through the same proxy: a tunnel is bound
+/// to one target, so the exit-IP host needs its own connection. A mux row can
+/// open a second SESSION on its live tunnel instead — that handover is the
+/// caller's business (the worker owns the live connection), not this
+/// function's.
+pub async fn fetch_exit_ip(params: &NativeConnectParams, provider: IpProvider) -> Option<String> {
+    fetch_ip_info(params, provider).await
+}
+
+/// Fan out `retries` attempts and return the fastest 2xx latency in ms, plus
+/// the TRANSPORT span the winning attempt measured.
 ///
 /// Spawned tasks (not one polling loop): each attempt runs the engine's TLS /
 /// REALITY handshake, which is CPU-bound, and the attempts must not serialize
 /// on one worker thread.
+///
+/// The transport span is reported even when the attempt FAILED after the
+/// dial — that is the whole point of measuring it separately (spec D12): a
+/// row that reached the server but failed the config says "the transport was
+/// alive, the config was not".
 async fn probe_attempts(
     params: &NativeConnectParams,
     target: &ProbeUrl,
     req: &NativeProbeReq<'_>,
-) -> Result<u64, ProbeFailure> {
+) -> Result<(u64, Option<u64>), ProbeFailure> {
     let attempts = req.retries.max(1);
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..attempts {
@@ -251,6 +316,7 @@ async fn probe_attempts(
         let host = target.host.clone();
         let path = target.path.clone();
         let (port, https, timeout) = (target.port, target.https, req.timeout);
+        let transport_timeout = req.transport_timeout;
         set.spawn(async move {
             let request = ProbeRequest {
                 host: &host,
@@ -259,28 +325,56 @@ async fn probe_attempts(
                 method: ProbeMethod::Head,
                 path: &path,
                 timeout,
+                transport_timeout,
             };
             probe::fetch(params, &request)
                 .await
-                .map(|r| (r.status, r.elapsed.as_millis() as u64))
-                .map_err(|e| ProbeFailure::from_engine(&e))
+                .map(|r| {
+                    (
+                        r.status,
+                        r.elapsed.as_millis() as u64,
+                        r.transport_span.map(|s| s.as_millis() as u64),
+                    )
+                })
+                .map_err(|e| {
+                    // The transport span rides along with the failure: the
+                    // transport was alive, the config was not (spec D12).
+                    let mut failure = ProbeFailure::from_engine(e.error());
+                    failure.transport_ms = e.transport_span.map(|s| s.as_millis() as u64);
+                    failure
+                })
         });
     }
 
     let mut best: Option<u64> = None;
+    // The transport span of the FASTEST successful attempt, and — when every
+    // attempt failed — the transport span of the last failure (the transport
+    // was alive even though the config was not).
+    let mut best_transport: Option<u64> = None;
     let mut last_error: Option<ProbeFailure> = None;
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok(Ok((status, ms))) if (200..300).contains(&status) => {
+            Ok(Ok((status, ms, transport))) if (200..300).contains(&status) => {
                 best = Some(best.map_or(ms, |b| b.min(ms)));
+                if best == Some(ms) {
+                    best_transport = transport;
+                }
             }
-            Ok(Ok((status, _))) => {
-                last_error = Some(ProbeFailure::local(
-                    ProbeClass::Http,
-                    format!("unexpected status {status}"),
-                ));
+            Ok(Ok((status, _, transport))) => {
+                // A non-2xx answer: the transport was alive (the probe reached
+                // the target), so the span is kept on the failure.
+                let mut failure =
+                    ProbeFailure::local(ProbeClass::Http, format!("unexpected status {status}"));
+                failure.transport_ms = transport;
+                last_error = Some(failure);
             }
-            Ok(Err(e)) => last_error = Some(e),
+            Ok(Err(e)) => {
+                // The engine's failure already carries its transport span —
+                // `probe::fetch` reports the span it measured before the
+                // failure (spec D12). Keeping it here is what makes the
+                // "the server is up, the config is not" row possible.
+                last_error = Some(e);
+            }
             Err(e) => {
                 last_error = Some(ProbeFailure::local(
                     ProbeClass::Io,
@@ -290,11 +384,22 @@ async fn probe_attempts(
         }
     }
 
-    best.ok_or_else(|| {
-        last_error.unwrap_or_else(|| {
-            ProbeFailure::local(ProbeClass::Other, "all attempts failed".to_string())
-        })
-    })
+    if let Some(ms) = best {
+        return Ok((ms, best_transport));
+    }
+    // The failure carries the transport span when the transport stage
+    // completed: the row then says "the server is up, the config is
+    // not" (spec D12) instead of only "timeout".
+    //
+    // The span is read FROM the failure, not from a separate accumulator: the
+    // engine-failure arm (the only arm a real timeout, a TLS error or a
+    // refusal reaches) stores it on the failure itself, and a separate
+    // accumulator would be set only by the non-2xx arm — silently dropping
+    // the span on every real failure.
+    let failure = last_error.unwrap_or_else(|| {
+        ProbeFailure::local(ProbeClass::Other, "all attempts failed".to_string())
+    });
+    Err(failure)
 }
 
 /// Attempts at the exit-IP fetch. The fetch rides a SECOND tunnel through the
@@ -435,6 +540,7 @@ async fn fetch_ip_info_once(
         method: ProbeMethod::Get,
         path: &target.path,
         timeout: IP_INFO_TIMEOUT,
+        transport_timeout: IP_INFO_TIMEOUT,
     };
     let outcome = match probe::fetch(params.clone(), &request).await {
         Ok(response) => {
@@ -501,6 +607,75 @@ mod tests {
         // "send everything to Protocol".
         let tls = leas_native::error::NativeError::Tls("alert 2 40".into());
         assert_eq!(ProbeFailure::from_engine(&tls).class, ProbeClass::Tls);
+    }
+
+    /// A failure that happened AFTER the dial keeps the transport span
+    /// (spec D12).
+    ///
+    /// The span is the fact that separates "the server is dead" from "the
+    /// server is up and the config is not" (531 of 535 real-timeout rows on
+    /// the 2026-09-21 run had a sub-second transport span). It reaches the
+    /// caller on the FAILURE, so the batch path can produce the merged row's
+    /// "the transport was alive" line.
+    ///
+    /// The regression this pins: the span used to live in a separate
+    /// accumulator that only the non-2xx arm set, so every REAL engine
+    /// failure (a timeout, a TLS error, a refusal) dropped it — and the
+    /// merged row could never be produced by the batch.
+    ///
+    /// The peer here accepts the TCP connection and then goes silent: the
+    /// dial succeeds (so a transport span exists) and the PROTOCOL stage
+    /// times out (so the probe fails).
+    #[tokio::test]
+    async fn a_failed_probe_still_reports_the_transport_span() {
+        use std::time::Duration;
+
+        use leas_native::probe::{ProbeMethod, ProbeRequest, fetch};
+
+        // A peer that accepts and never answers: the transport stage
+        // completes, the protocol stage does not.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+
+        let config = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "tcp" },
+            "security": { "type": "tls", "sni": "dest.test", "insecure": true }
+        }))
+        .expect("config parses");
+        let params = leas_native::context::NativeConnectParams::new(
+            config,
+            leas_proto::proto_spec::endpoint::EndpointEssentials::new(
+                addr.ip().to_string(),
+                addr.port(),
+            ),
+            leas_native::addr::TargetAddr::new("dest.test", 443),
+        );
+        let req = ProbeRequest {
+            host: "dest.test",
+            port: 443,
+            https: false,
+            method: ProbeMethod::Head,
+            path: "/",
+            timeout: Duration::from_millis(300),
+            transport_timeout: Duration::from_secs(5),
+        };
+        let err = fetch(params, &req)
+            .await
+            .expect_err("a silent peer must fail the probe");
+        assert!(
+            err.transport_span.is_some(),
+            "the transport span survives the protocol-stage failure: {err}"
+        );
+        server.abort();
     }
 
     /// The provider's refusal shapes are what tell a rate limit (or a broken

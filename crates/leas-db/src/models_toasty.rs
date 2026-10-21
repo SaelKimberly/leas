@@ -11,13 +11,6 @@
     clippy::used_underscore_binding,
     reason = "toasty-macros synthesizes `_0`-named parameters in the Update builder setters for unnamed tuple fields (`EndpointId`, `ProtocolId`) and uses them; the generated impls carry the field's span so no narrower scope reaches them, and no handwritten code here uses underscore-prefixed bindings"
 )]
-// Same root cause, different lint: `#[shared(..)]` emits one accessor per
-// variant that reads the shared column, and the expansion takes `&self` without
-// using it. The lint's span is the VARIANT, so an allow on the variant or the
-// enum does not reach it — only this module scope does, and no handwritten code
-// in this file defines a method that ignores `self`.
-#![allow(clippy::unused_self)]
-
 use std::collections::HashMap;
 
 use jiff::Timestamp;
@@ -245,19 +238,147 @@ pub struct Security {
     pub insecure: Option<bool>,
 }
 
-/// Latency of one probe, real or fast. Both variants share the `delay`
-/// column (`latency_delay`); `ip` exists only on `Real` (`latency_ip`).
-#[derive(Debug, Clone, PartialEq, Eq, toasty::Embed)]
-pub enum Latency {
-    Real {
-        #[shared(delay)]
-        delay: i32,
-        ip: Option<String>,
-    },
-    Fast {
-        #[shared(delay)]
-        delay: i32,
-    },
+/// The per-link measurements (spec `2026-10-21-merged-test-pipeline-design`
+/// D4, ADR 0016).
+///
+/// This was an ENUM with a shared `delay` column and an exclusive
+/// discriminator (`latency` = `'real'`/`'fast'`), so a row could hold a real
+/// delay OR a fast delay, never both. The merged probe produces BOTH in one
+/// pass — the transport span (stage 1) and the real span (stage 3) — so the
+/// enum's exclusivity was the defect.
+///
+/// It is a **struct** embed now, and a **non-Option** one on purpose: a
+/// nullable struct embed adds a dedicated presence column named `latency`
+/// (toasty's `map_field_struct`), which would keep the very discriminator the
+/// change drops. A non-Option struct flattens to its leaf columns and
+/// nothing else:
+///
+/// ```text
+/// latency_real_delay   the real span (the tunnel + request)
+/// latency_fast_delay   the transport span (the dial to the endpoint)
+/// latency_ip           the exit IP of the real measurement
+/// latency_auth         the auth flag (see `AuthState`)
+/// ```
+///
+/// A row with no measurement is the all-`NULL` struct — which is why the
+/// field is not an `Option`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, toasty::Embed)]
+pub struct Latency {
+    /// The real measurement: the full probe's span (ms). `None` = no real
+    /// measurement.
+    pub real_delay: Option<i32>,
+    /// The transport measurement: the time to establish the endpoint's
+    /// transport (ms). `None` = no transport measurement.
+    pub fast_delay: Option<i32>,
+    /// The exit IP of the real measurement.
+    pub ip: Option<String>,
+    /// The auth flag — see [`AuthState`].
+    pub auth: Option<i64>,
+}
+
+impl Latency {
+    /// A real measurement (the full probe's span), with no exit IP and no
+    /// auth flag.
+    #[must_use]
+    pub const fn real(delay: i32) -> Self {
+        Self {
+            real_delay: Some(delay),
+            fast_delay: None,
+            ip: None,
+            auth: None,
+        }
+    }
+
+    /// A real measurement with an exit IP.
+    #[must_use]
+    pub const fn real_with_ip(delay: i32, ip: Option<String>) -> Self {
+        Self {
+            real_delay: Some(delay),
+            fast_delay: None,
+            ip,
+            auth: None,
+        }
+    }
+
+    /// A transport measurement (the time to establish the endpoint's
+    /// transport), with no real measurement and no auth flag.
+    #[must_use]
+    pub const fn fast(delay: i32) -> Self {
+        Self {
+            real_delay: None,
+            fast_delay: Some(delay),
+            ip: None,
+            auth: None,
+        }
+    }
+
+    /// The row's headline delay: the real measurement when there is one, else
+    /// the transport measurement. A real delay outranks a fast one of any
+    /// delay — the same rule the rank law applies.
+    #[must_use]
+    pub const fn headline_delay(&self) -> Option<i32> {
+        match self.real_delay {
+            Some(delay) => Some(delay),
+            None => self.fast_delay,
+        }
+    }
+
+    /// Whether the row carries any measurement at all.
+    #[must_use]
+    pub const fn is_measured(&self) -> bool {
+        self.real_delay.is_some() || self.fast_delay.is_some()
+    }
+}
+
+/// The auth flag: did the server ACCEPT this config?
+///
+/// A **quad-state** success flag, not a measurement (spec D3). The states are
+/// a Rust-side enum behind a plain integer column on purpose: a toasty ENUM
+/// embed emits `TEXT` with a `CHECK (col IN (...))`, and a column's CHECK
+/// cannot be altered afterwards (a new state would force a `profile_stats`
+/// table rebuild). The `stab_mask`/`stab_len` columns are the same shape.
+///
+/// `NULL` = never observed (the row was never probed by a probe that reads
+/// the ack).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthState {
+    /// The ack arrived — the server accepted this config.
+    Ok,
+    /// POSITIVE rejection evidence (an EOF during the peel, an auth error, a
+    /// framing error). An unobserved ack is never `Failed`: sing-box writes
+    /// the VLESS response header lazily, so a slow target yields no ack at
+    /// all.
+    Failed,
+    /// The family has no server ack (Trojan, SS-AEAD), or the native engine
+    /// cannot serve the row at all.
+    NotApplicable,
+    /// The ack is possible but was not observed in time.
+    Unknown,
+}
+
+impl AuthState {
+    /// The stored integer value. `None` = never observed.
+    #[must_use]
+    pub const fn as_i64(self) -> Option<i64> {
+        match self {
+            Self::Ok => Some(1),
+            Self::Failed => Some(2),
+            Self::NotApplicable => Some(3),
+            Self::Unknown => Some(4),
+        }
+    }
+
+    /// The state a stored integer names. `None` = never observed.
+    #[must_use]
+    pub const fn from_i64(value: i64) -> Option<Self> {
+        match value {
+            1 => Some(Self::Ok),
+            2 => Some(Self::Failed),
+            3 => Some(Self::NotApplicable),
+            4 => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 // ── Primary models (toasty ORM, mapped to DB tables) ────────────────────
@@ -450,7 +571,10 @@ pub struct ProfileStats {
     /// purge's cutoff and the staleness windows scan on it.
     #[index]
     pub last_seen_at: i64,
-    pub latency: Option<Latency>, // embed enum, shared delay column
+    /// The per-link measurements. A non-Option struct embed, so the columns
+    /// are `latency_real_delay` / `latency_fast_delay` / `latency_ip` /
+    /// `latency_auth` and there is NO discriminator column (spec D4).
+    pub latency: Latency,
     pub speed_bps: Option<i64>,
     /// Persisted failure marker (`error` + `error_kind` + `error_text`).
     ///
@@ -758,10 +882,13 @@ impl EndpointRow {
             .enumerate()
             .filter(|(_, l)| !live || l.purge_reason.is_none())
             .filter_map(|(i, l)| {
-                let (rank, delay) = match l.latency {
-                    Some(Latency::Real { delay, .. }) => (0u8, delay),
-                    Some(Latency::Fast { delay }) => (1u8, delay),
-                    None => return None,
+                // A real measurement outranks a fast one of any delay
+                // (schema 19): the real delay is read first, the fast one
+                // only when there is no real measurement.
+                let (rank, delay) = match (l.latency.real_delay, l.latency.fast_delay) {
+                    (Some(delay), _) => (0u8, delay),
+                    (None, Some(delay)) => (1u8, delay),
+                    (None, None) => return None,
                 };
                 Some((i, (rank, delay)))
             })
@@ -845,7 +972,7 @@ mod tests {
     use toasty::Deferred;
 
     /// Endpoint with links `(protocol_id, last_seen_at_secs, latency, error)`.
-    fn row(links: &[(i64, i64, Option<Latency>, Option<ErrorInfo>)]) -> EndpointRow {
+    fn row(links: &[(i64, i64, Latency, Option<ErrorInfo>)]) -> EndpointRow {
         let mut row = EndpointRow {
             endpoint: Endpoint {
                 id: EndpointId::new(1),
@@ -899,11 +1026,11 @@ mod tests {
     }
 
     fn real(delay: i32) -> Latency {
-        Latency::Real { delay, ip: None }
+        Latency::real(delay)
     }
 
     fn fast(delay: i32) -> Latency {
-        Latency::Fast { delay }
+        Latency::fast(delay)
     }
 
     fn err(kind: ProfileErr) -> ErrorInfo {
@@ -930,9 +1057,9 @@ mod tests {
         // tiers still rank the error low; the display preference follows
         // measurements).
         let mut r = row(&[
-            (10, 1, Some(fast(44)), Some(err(ProfileErr::Fast))),
-            (11, 2, Some(real(50)), None),
-            (12, 3, None, None),
+            (10, 1, fast(44), Some(err(ProfileErr::Fast))),
+            (11, 2, real(50), None),
+            (12, 3, Latency::default(), None),
         ]);
         r.select_best_measured_link();
         assert_eq!(r.selected_protocol, 1, "real-ok lowest delay wins");
@@ -941,7 +1068,7 @@ mod tests {
 
     #[test]
     fn select_best_measured_link_fast_ok_when_no_real() {
-        let mut r = row(&[(10, 1, Some(fast(90)), None), (11, 2, Some(fast(44)), None)]);
+        let mut r = row(&[(10, 1, fast(90), None), (11, 2, fast(44), None)]);
         r.select_best_measured_link();
         assert_eq!(r.selected_protocol, 1, "fast-ok lowest delay wins");
     }
@@ -949,8 +1076,8 @@ mod tests {
     #[test]
     fn select_best_measured_link_keeps_selection_when_unmeasured() {
         let mut r = row(&[
-            (10, 1, None, None),
-            (11, 2, None, Some(err(ProfileErr::Real))),
+            (10, 1, Latency::default(), None),
+            (11, 2, Latency::default(), Some(err(ProfileErr::Real))),
         ]);
         r.select_best_measured_link();
         assert_eq!(r.selected_protocol, 0, "no measurement -> keep selection");
@@ -961,8 +1088,8 @@ mod tests {
         // A link that carries both a success and a later failure marker is
         // still the best measured link (user-facing: the row shows 44ms).
         let mut r = row(&[
-            (10, 1, Some(fast(44)), Some(err(ProfileErr::Fast))),
-            (11, 2, None, None),
+            (10, 1, fast(44), Some(err(ProfileErr::Fast))),
+            (11, 2, Latency::default(), None),
         ]);
         r.select_best_measured_link();
         assert_eq!(r.selected_protocol, 0);
@@ -972,7 +1099,7 @@ mod tests {
     fn select_best_measured_link_skips_a_purged_link() {
         // The purged link has the better delay, and must not supply the row's
         // headline numbers while a live link exists.
-        let mut r = row(&[(10, 1, Some(fast(10)), None), (11, 2, Some(fast(90)), None)]);
+        let mut r = row(&[(10, 1, fast(10), None), (11, 2, fast(90), None)]);
         purge(&mut r, 10, PurgeReason::NotTls);
         r.select_best_measured_link();
         assert_eq!(
@@ -986,7 +1113,7 @@ mod tests {
     fn select_best_measured_link_falls_back_when_every_link_is_purged() {
         // The Purgatory view's case: nothing live, so the row still shows the
         // values its links have.
-        let mut r = row(&[(10, 1, Some(fast(10)), None), (11, 2, Some(fast(90)), None)]);
+        let mut r = row(&[(10, 1, fast(10), None), (11, 2, fast(90), None)]);
         purge(&mut r, 10, PurgeReason::NotTls);
         purge(&mut r, 11, PurgeReason::OriginUnreachable);
         r.select_best_measured_link();
@@ -1002,9 +1129,9 @@ mod tests {
         // The purged link carries the best measurement of the three (real-ok
         // 12ms) and must still sort last: tier 6 is below every live band.
         let mut r = row(&[
-            (10, 1, Some(real(12)), None),
-            (11, 2, Some(fast(90)), None),
-            (12, 3, None, None),
+            (10, 1, real(12), None),
+            (11, 2, fast(90), None),
+            (12, 3, Latency::default(), None),
         ]);
         purge(&mut r, 10, PurgeReason::RealityFallback);
         r.sort_links_by_test_priority(false);
@@ -1024,9 +1151,9 @@ mod tests {
     fn real_ok_above_fast_ok_above_untested() {
         // real-ok 200ms outranks fast-ok 10ms — tier beats latency.
         let mut r = row(&[
-            (10, 1, Some(real(200)), None), // real-ok
-            (20, 2, Some(fast(10)), None),  // fast-ok
-            (30, 3, None, None),            // untested
+            (10, 1, real(200), None),          // real-ok
+            (20, 2, fast(10), None),           // fast-ok
+            (30, 3, Latency::default(), None), // untested
         ]);
         r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![10, 20, 30]);
@@ -1035,10 +1162,10 @@ mod tests {
     #[test]
     fn latency_orders_within_success_tiers() {
         let mut r = row(&[
-            (10, 1, Some(fast(50)), None),
-            (20, 2, Some(fast(10)), None),
-            (30, 3, Some(real(120)), None),
-            (40, 4, Some(real(90)), None),
+            (10, 1, fast(50), None),
+            (20, 2, fast(10), None),
+            (30, 3, real(120), None),
+            (40, 4, real(90), None),
         ]);
         r.sort_links_by_test_priority(false);
         // real tier first (30:120, 40:90 by latency), then fast tier (20:10, 10:50)
@@ -1051,9 +1178,9 @@ mod tests {
         // below the untested 30; 20 has a fast error -> below 10 (fast worse
         // than real).
         let mut r = row(&[
-            (10, 1, Some(real(50)), Some(err(ProfileErr::Real))),
-            (20, 2, Some(fast(80)), Some(err(ProfileErr::Fast))),
-            (30, 3, None, None),
+            (10, 1, real(50), Some(err(ProfileErr::Real))),
+            (20, 2, fast(80), Some(err(ProfileErr::Fast))),
+            (30, 3, Latency::default(), None),
         ]);
         r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![30, 10, 20]);
@@ -1063,8 +1190,8 @@ mod tests {
     fn both_failed_uses_fast_tier() {
         // Both links carry a fast error: tie on tier, order by recency.
         let mut r = row(&[
-            (10, 1, None, Some(err(ProfileErr::Fast))),
-            (20, 2, None, Some(err(ProfileErr::Fast))),
+            (10, 1, Latency::default(), Some(err(ProfileErr::Fast))),
+            (20, 2, Latency::default(), Some(err(ProfileErr::Fast))),
         ]);
         r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![20, 10]);
@@ -1072,7 +1199,7 @@ mod tests {
 
     #[test]
     fn dns_unresolved_sinks_all_protocols() {
-        let mut r = row(&[(10, 1, Some(real(50)), None), (20, 2, None, None)]);
+        let mut r = row(&[(10, 1, real(50), None), (20, 2, Latency::default(), None)]);
         r.sort_links_by_test_priority(true);
         assert_eq!(ids(&r), vec![20, 10]); // untested first; dns tier wins for both
     }
@@ -1080,9 +1207,9 @@ mod tests {
     #[test]
     fn untested_keeps_last_seen_recency_order() {
         let mut r = row(&[
-            (10, 5, None, None),
-            (20, 9, None, None),
-            (30, 1, None, None),
+            (10, 5, Latency::default(), None),
+            (20, 9, Latency::default(), None),
+            (30, 1, Latency::default(), None),
         ]);
         r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![20, 10, 30]); // newest first
@@ -1091,9 +1218,9 @@ mod tests {
     #[test]
     fn best_key_returns_min_over_links() {
         let r = row(&[
-            (10, 1, Some(real(200)), None),
-            (20, 2, Some(fast(10)), None),
-            (30, 3, None, None),
+            (10, 1, real(200), None),
+            (20, 2, fast(10), None),
+            (30, 3, Latency::default(), None),
         ]);
         // Best = real-ok (tier 0), latency 200. Recency is epoch SECONDS —
         // the stored unit, so the key compares exactly what
@@ -1114,7 +1241,7 @@ mod tests {
 
     #[test]
     fn active_link_respects_override() {
-        let mut r = row(&[(10, 1, Some(real(50)), None), (20, 2, Some(fast(10)), None)]);
+        let mut r = row(&[(10, 1, real(50), None), (20, 2, fast(10), None)]);
         r.endpoint.manual_protocol_override = Some(ProtocolId::new(20));
         assert_eq!(r.active_link().unwrap().protocol_id, ProtocolId::new(20));
         // Override to a protocol with no link -> fall back to selection.
@@ -1127,7 +1254,7 @@ mod tests {
 
     #[test]
     fn active_protocol_pairs_link_with_protocol() {
-        let mut r = row(&[(10, 1, Some(real(50)), None)]);
+        let mut r = row(&[(10, 1, real(50), None)]);
         let protocol = Protocol {
             id: ProtocolId::new(10),
             sig: 10,
@@ -1176,7 +1303,7 @@ mod tests {
         #[key]
         #[auto]
         id: i64,
-        latency: Option<Latency>,
+        latency: Latency,
         transport: Transport,
         security: Security,
         traffic: TrafficStats,
@@ -1227,10 +1354,7 @@ mod tests {
         let mut db = probe_db().await;
 
         let mut created = toasty::create!(ScratchEmbedProbe {
-            latency: Some(Latency::Real {
-                delay: 42,
-                ip: Some("1.2.3.4".to_string()),
-            }),
+            latency: Latency::real_with_ip(42, Some("1.2.3.4".to_string())),
             transport: tcp_transport(),
             security: no_security(),
             traffic: zero_traffic(),
@@ -1242,10 +1366,7 @@ mod tests {
 
         assert_eq!(
             created.latency,
-            Some(Latency::Real {
-                delay: 42,
-                ip: Some("1.2.3.4".to_string()),
-            })
+            Latency::real_with_ip(42, Some("1.2.3.4".to_string()))
         );
 
         // Round-trips as Real (shared delay column + variant ip column).
@@ -1255,16 +1376,13 @@ mod tests {
             .expect("read back");
         assert_eq!(
             read.latency,
-            Some(Latency::Real {
-                delay: 42,
-                ip: Some("1.2.3.4".to_string()),
-            })
+            Latency::real_with_ip(42, Some("1.2.3.4".to_string()))
         );
 
         // Variant switch Real -> Fast: the shared `latency_delay` column
         // carries 99 into the new variant; `latency_ip` clears to NULL.
         toasty::update!(created {
-            latency: Some(Latency::Fast { delay: 99 }),
+            latency: Latency::fast(99),
         })
         .exec(&mut db)
         .await
@@ -1274,7 +1392,7 @@ mod tests {
             .get(&mut db)
             .await
             .expect("read back");
-        assert_eq!(read.latency, Some(Latency::Fast { delay: 99 }));
+        assert_eq!(read.latency, Latency::fast(99));
     }
 
     #[tokio::test]
@@ -1293,6 +1411,7 @@ mod tests {
             },
             traffic: zero_traffic(),
             kind: TaskKind::SpeedTest,
+            latency: Latency::default(),
         })
         .exec(&mut db)
         .await
@@ -1327,6 +1446,7 @@ mod tests {
                 kind: ProfileErr::Real,
                 text: "timeout".to_string(),
             }),
+            latency: Latency::default(),
         })
         .exec(&mut db)
         .await

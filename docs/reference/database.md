@@ -63,9 +63,10 @@ erDiagram
         BIGINT endpoint_id PK "FK endpoints.id"
         BIGINT last_used_at
         BIGINT last_seen_at "staleness + retention"
-        TEXT latency "real|fast, NULL = untested"
-        INTEGER latency_delay "ms"
+        INTEGER latency_real_delay "ms, the real probe's span (schema 19)"
+        INTEGER latency_fast_delay "ms, the transport span (schema 19)"
         TEXT latency_ip "exit IP of a real ping"
+        INTEGER latency_auth "auth flag: 1=ok 2=failed 3=n-a 4=unknown, NULL = never observed (schema 19)"
         BIGINT speed_bps
         BOOLEAN error "failure marker flag"
         TEXT error_kind "real|fast|name"
@@ -204,8 +205,19 @@ test measures and everything traffic counts, plus the one durable VERDICT
 swept by `error_ttl_hours`, `purge_reason` only moves when a real probe earns one
 or a data-carrying success clears one, and it is written by its own column group
 so no other writer can rewrite it from a stale snapshot. The three embeds are flattened
-into columns, so one "row" in mermaid is `latency`+`latency_delay`+`latency_ip`,
+into columns, so one "row" in mermaid is
+`latency_real_delay`+`latency_fast_delay`+`latency_ip`+`latency_auth`,
 `error`+`error_kind`+`error_text`, and the four `traffic_*` counters.
+
+**The latency embed has TWO delays and no discriminator** (schema 19). It was an
+enum with a shared `latency_delay` column and an exclusive `latency`
+discriminator, so a row could hold a real delay OR a fast delay, never both;
+the merged probe produces both in one pass (the transport span and the real
+span), so the embed is a struct now and the discriminator is gone. A row's
+provenance is carried by **which delay column is populated** — the real one
+outranks the fast one of any delay. `latency_auth` is the auth flag, a
+quad-state success flag stored as a plain integer (a toasty enum embed would
+emit a CHECK list, and a column's CHECK cannot be altered afterwards).
 `#[version]` makes typed single-row updates optimistic-concurrency safe; the
 bulk patch path bumps it manually. Writers are disjoint by column group
 (`LinkGroups::RESULT` vs `TRAFFIC`) so a ping result and the stats poller can

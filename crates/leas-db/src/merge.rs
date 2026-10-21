@@ -41,7 +41,7 @@
 use crate::database::sql_lit;
 use crate::endpoint_rank::RankLink;
 use crate::models_toasty::{
-    Endpoint, EndpointGroup, EndpointId, EndpointIp, Latency, ProfileStats, ProtocolId,
+    Endpoint, EndpointGroup, EndpointId, EndpointIp, ProfileStats, ProtocolId,
 };
 use crate::weight::ConfigWeight;
 use crate::{Database, DatabaseError, Result, retry_on_busy};
@@ -272,17 +272,25 @@ async fn overwrite_link_fields(
     now: i64,
 ) -> Result<()> {
     use std::fmt::Write as _;
-    let (latency, latency_delay, latency_ip) = match &absorbed.latency {
-        Some(Latency::Real { delay, ip }) => (
-            "'real'".to_owned(),
-            delay.to_string(),
-            ip.as_deref().map_or_else(|| "NULL".to_owned(), sql_lit),
-        ),
-        Some(Latency::Fast { delay }) => {
-            ("'fast'".to_owned(), delay.to_string(), "NULL".to_owned())
-        }
-        None => ("NULL".to_owned(), "NULL".to_owned(), "NULL".to_owned()),
-    };
+    // The four measurement columns (schema 19): the two delays are independent
+    // and the auth flag rides with them. There is no discriminator any more.
+    let latency_real_delay = absorbed
+        .latency
+        .real_delay
+        .map_or_else(|| "NULL".to_owned(), |d| d.to_string());
+    let latency_fast_delay = absorbed
+        .latency
+        .fast_delay
+        .map_or_else(|| "NULL".to_owned(), |d| d.to_string());
+    let latency_ip = absorbed
+        .latency
+        .ip
+        .as_deref()
+        .map_or_else(|| "NULL".to_owned(), sql_lit);
+    let latency_auth = absorbed
+        .latency
+        .auth
+        .map_or_else(|| "NULL".to_owned(), |a| a.to_string());
     // `speed_bps` is independent of the error embed (the upsert writer emits
     // it unconditionally), so it always copies; the error embed only when the
     // absorbed side carries one.
@@ -302,8 +310,10 @@ async fn overwrite_link_fields(
     let mut sql = String::with_capacity(512);
     let _ = write!(
         sql,
-        "UPDATE profile_stats SET latency = {latency}, latency_delay = {latency_delay}, \
-         latency_ip = {latency_ip}, speed_bps = {speed}, error = {error}, \
+        "UPDATE profile_stats SET latency_real_delay = {latency_real_delay}, \
+         latency_fast_delay = {latency_fast_delay}, \
+         latency_ip = {latency_ip}, latency_auth = {latency_auth}, \
+         speed_bps = {speed}, error = {error}, \
          error_kind = {error_kind}, error_text = {error_text}, \
          stab_mask = {}, stab_len = {}, \
          last_seen_at = MAX(last_seen_at, {}), \

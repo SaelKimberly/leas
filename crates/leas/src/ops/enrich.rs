@@ -895,15 +895,15 @@ pub fn spawn_whitelist_pass(state: &mut AppState) {
 
 /// Seed the outbound-IP country cache at profile load.
 ///
-/// Collects the distinct exit IPs persisted on links (`Latency::Real.ip`),
-/// looks each up in mmdb and fills `state.outbound_country_cache` — async, so
-/// IPs render immediately and flags a moment later. Survives reruns: the
-/// source IPs are persisted and this re-runs at every load.
+/// Collects the distinct exit IPs persisted on links (`latency.ip`), looks
+/// each up in mmdb and fills `state.outbound_country_cache` — async, so IPs
+/// render immediately and flags a moment later. Survives reruns: the source
+/// IPs are persisted and this re-runs at every load.
 pub fn spawn_outbound_countries(state: &mut AppState) {
     let mut ips = std::collections::HashSet::new();
     for row in &state.endpoints {
         for link in &row.links {
-            if let Some(leas_db::models::Latency::Real { ip: Some(ip), .. }) = &link.latency {
+            if let Some(ip) = link.latency.ip.as_ref() {
                 ips.insert(ip.clone());
             }
         }

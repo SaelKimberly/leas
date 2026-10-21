@@ -129,6 +129,7 @@ async fn seed_link_with(
             total_up: 0,
             total_down: 0,
         },
+        latency: Latency::default(),
     })
     .exec(&mut *conn)
     .await
@@ -138,10 +139,13 @@ async fn seed_link_with(
         // A real measurement IS a success (spec `2026-10-09-stab-bin-design`
         // §6.2): seed the one-sample ring so `rank_proven` follows, exactly as
         // the day-one seed does for a real database. Without this the fixture
-        // would carry `latency='real'` with an empty ring — a state the law's
+        // would carry a real delay with an empty ring — a state the law's
         // invariant (`rank_bin ∈ 0..=5 ⇒ proven`) forbids.
+        //
+        // Schema 19: the real delay lives in `latency_real_delay`; there is no
+        // `latency` discriminator column any more.
         toasty::sql::statement(
-            "UPDATE profile_stats SET latency = 'real', latency_delay = ?1, \
+            "UPDATE profile_stats SET latency_real_delay = ?1, \
              stab_mask = 1, stab_len = 1 \
              WHERE endpoint_id = ?2 AND protocol_id = ?3",
         )
@@ -204,7 +208,7 @@ fn link_value(
         endpoint_id: EndpointId::new(endpoint_id),
         last_used_at: None,
         last_seen_at: ts(last_seen),
-        latency: delay.map(|delay| Latency::Real { delay, ip: None }),
+        latency: delay.map(Latency::real).unwrap_or_default(),
         speed_bps: None,
         error: error_kind.map(|kind| ErrorInfo {
             kind: match kind {
@@ -1179,63 +1183,70 @@ async fn seed_projection_into(db: &Database) {
          'steal.example', NULL, NULL, 'null', 1788220812)",
         // e1/link A: real ping with an exit IP, speed, traffic, a task slot.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
-         last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
+         last_seen_at, latency_real_delay, latency_fast_delay, latency_ip, latency_auth, \
+         speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (11, 1, 1789034400, \
-          1789038000, 'real', 42, '198.51.100.9', 1234567, \
+          1789038000, 42, NULL, '198.51.100.9', NULL, 1234567, \
           NULL, NULL, NULL, 11, 22, 33, 44, 1788220805, \
           1789038000, 3, 65535, 16)",
         // e1/link B: fast ping, a fast failure, form config.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
-         last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
+         last_seen_at, latency_real_delay, latency_fast_delay, latency_ip, latency_auth, \
+         speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (13, 1, NULL, 1789041600, \
-          'fast', 8, NULL, NULL, 1, 'fast', 'fast probe', 0, 0, 0, 0, \
+          NULL, 8, NULL, NULL, NULL, 1, 'fast', 'fast probe', 0, 0, 0, 0, \
           1788220806, 1789041600, 1, 0, 0)",
         // e1/link C: the x_http protocol row above, measured — so the raw-column
         // read that computes its weight is on the page path the parity golden
         // checks, not only on a synthetic parser test.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
-         last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
+         last_seen_at, latency_real_delay, latency_fast_delay, latency_ip, latency_auth, \
+         speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (14, 1, NULL, 1789043400, \
-          'real', 77, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, \
+          77, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, \
           1788220812, 1789043400, 1, 65535, 16)",
         // e2: name-resolution failure, no measurement.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
-         last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
+         last_seen_at, latency_real_delay, latency_fast_delay, latency_ip, latency_auth, \
+         speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (11, 2, NULL, 1789045200, NULL, \
-          NULL, NULL, NULL, 1, 'name', 'name probe', 0, 0, 0, 0, \
+          NULL, NULL, NULL, NULL, 1, 'name', 'name probe', 0, 0, 0, 0, \
           1788220807, 1789045200, 2, 0, 0)",
         // e2's second link: the only PURGED one, so the purge filter's two
         // policies produce different pages from this fixture.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
-         last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
+         last_seen_at, latency_real_delay, latency_fast_delay, latency_ip, latency_auth, \
+         speed_bps, error, \
          error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
          traffic_total_up, traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (13, 2, NULL, 1789047000, NULL, \
-          NULL, NULL, NULL, 1, 'real', 'reality error', 'reality_fallback', 0, 0, 0, 0, \
+          NULL, NULL, NULL, NULL, 1, 'real', 'reality error', 'reality_fallback', 0, 0, 0, 0, \
           1788220810, 1789047000, 1, 0, 0)",
         // e3: a measured success AND a real failure on one endpoint, plus a
         // link whose protocol row does not exist (LEFT JOIN -> no entry).
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
-         last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
+         last_seen_at, latency_real_delay, latency_fast_delay, latency_ip, latency_auth, \
+         speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (13, 3, NULL, 1789048800, \
-          'real', 5, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, \
+          5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, \
           1788220808, 1789048800, 1, 65535, 16)",
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
-         last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
+         last_seen_at, latency_real_delay, latency_fast_delay, latency_ip, latency_auth, \
+         speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (99, 3, NULL, 1789052400, NULL, \
-          NULL, NULL, NULL, 1, 'real', 'real probe', 0, 0, 0, 0, \
+          NULL, NULL, NULL, NULL, 1, 'real', 'real probe', 0, 0, 0, 0, \
           1788220809, 1789052400, 1, 0, 0)",
     ] {
         toasty::sql::statement(stmt)
@@ -1524,7 +1535,7 @@ async fn page_projection_matches_the_orm_rows() {
         "inside tier 5 the static weight leads, ahead of recency"
     );
     assert!(
-        dns_row.links[0].latency.is_some(),
+        dns_row.links[0].latency.is_measured(),
         "the leading link is the measured one, chosen by weight rather than by recency"
     );
 }
@@ -1575,7 +1586,7 @@ async fn link_patches_leave_columns_outside_their_groups_alone() {
     stale.created_at = ts(0);
     stale.last_used_at = None;
     stale.speed_bps = None;
-    stale.latency = None;
+    stale.latency = Latency::default();
     assert_eq!(
         db.apply_link_patches(&[leas_db::LinkPatch {
             link: stale,
@@ -1591,7 +1602,7 @@ async fn link_patches_leave_columns_outside_their_groups_alone() {
         .await
         .expect("read")
         .expect("link");
-    assert_eq!(after.latency, None, "the RESULT group landed");
+    assert_eq!(after.latency, Latency::default(), "the RESULT group landed");
     assert_eq!(after.error, None, "the RESULT group landed");
     assert_eq!(
         after.last_seen_at, untouched_seen,
@@ -1618,7 +1629,7 @@ async fn link_patch_inserts_a_missing_row_and_refreshes_its_key() {
         .expect("read")
         .expect("link");
     fresh.protocol_id = ProtocolId::new(4242);
-    fresh.latency = Some(leas_db::models::Latency::Real { delay: 5, ip: None });
+    fresh.latency = Latency::real_with_ip(5, None);
     fresh.error = None;
 
     assert_eq!(
@@ -1636,10 +1647,7 @@ async fn link_patch_inserts_a_missing_row_and_refreshes_its_key() {
         .await
         .expect("read")
         .expect("inserted");
-    assert_eq!(
-        inserted.latency,
-        Some(leas_db::models::Latency::Real { delay: 5, ip: None })
-    );
+    assert_eq!(inserted.latency, Latency::real_with_ip(5, None));
 }
 
 /// The weight column is materialized, NOT NULL, and read back as the packed

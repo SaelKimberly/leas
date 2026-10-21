@@ -20,8 +20,7 @@ use toasty_core::driver::operation::TransactionMode;
 use toasty_core::stmt::Value;
 
 use crate::models_toasty::{
-    Endpoint, EndpointId, EndpointRank, EndpointRow, Latency, ProfileErr, ProfileStats, Protocol,
-    ProtocolId,
+    Endpoint, EndpointId, EndpointRank, EndpointRow, ProfileErr, ProfileStats, Protocol, ProtocolId,
 };
 use leas_proto::proto_spec::{
     SecurityType, TransportType,
@@ -129,10 +128,14 @@ impl RankLink {
     /// the link's protocol, which this row does not carry.
     #[must_use]
     pub fn new(link: &ProfileStats, weight: ConfigWeight) -> Self {
-        let (measured, delay) = match link.latency {
-            Some(Latency::Real { delay, .. }) => (Some(true), delay),
-            Some(Latency::Fast { delay }) => (Some(false), delay),
-            None => (None, i32::MAX),
+        // A row's provenance is carried by WHICH delay column is populated
+        // (schema 19): a real delay outranks a fast one of any delay, so the
+        // real one is read first and the fast one only when there is no real
+        // measurement.
+        let (measured, delay) = match (link.latency.real_delay, link.latency.fast_delay) {
+            (Some(delay), _) => (Some(true), delay),
+            (None, Some(delay)) => (Some(false), delay),
+            (None, None) => (None, i32::MAX),
         };
         let (mask, len) = (
             link.stab_mask.cast_unsigned(),
@@ -1076,7 +1079,8 @@ pub(crate) async fn refresh(
     // deferred `config` JSON is NOT touched — nothing in the formula reads it.
     let mut links: HashMap<i64, Vec<RankLink>> = HashMap::new();
     let rows = toasty::sql::query(format!(
-        "SELECT ps.endpoint_id, ps.protocol_id, ps.error_kind, ps.latency, ps.latency_delay, \
+        "SELECT ps.endpoint_id, ps.protocol_id, ps.error_kind, \
+         ps.latency_real_delay, ps.latency_fast_delay, \
          ps.last_seen_at, ps.speed_bps, ps.traffic_total_up, ps.traffic_total_down, \
          ps.purge_reason, \
          pr.transport_type, pr.security_type, pr.security_sni, pr.security_fp, \
@@ -1095,6 +1099,10 @@ pub(crate) async fn refresh(
         let protocol_id = field(1).and_then(as_i64).unwrap_or(0);
         // A negative or oversized stored len is a corrupt row: clamp rather
         // than shift by >63 (which is UB-ish in debug) or index a bogus bin.
+        // The projection's column order: 0 endpoint, 1 protocol, 2 error_kind,
+        // 3 real delay, 4 fast delay, 5 last_seen, 6 speed, 7 traffic up,
+        // 8 traffic down, 9 purge_reason, 10..13 the protocol discriminators,
+        // 14 the ring mask, 15 the ring length.
         let raw_mask = field(14).and_then(as_i64).unwrap_or(0).cast_unsigned();
         let raw_len = u8::try_from(
             field(15)
@@ -1103,20 +1111,26 @@ pub(crate) async fn refresh(
                 .clamp(0, i64::from(STAB_WINDOW)),
         )
         .unwrap_or(0);
+        // The two delay columns carry the provenance now: a real delay
+        // outranks a fast one of any delay (schema 19).
+        let real_delay = field(3)
+            .and_then(as_i64)
+            .and_then(|d| i32::try_from(d).ok());
+        let fast_delay = field(4)
+            .and_then(as_i64)
+            .and_then(|d| i32::try_from(d).ok());
+        let (measured, delay) = match (real_delay, fast_delay) {
+            (Some(delay), _) => (Some(true), delay),
+            (None, Some(delay)) => (Some(false), delay),
+            (None, None) => (None, i32::MAX),
+        };
         links.entry(endpoint_id).or_default().push(RankLink {
             protocol_id,
             error_kind: field(2)
                 .and_then(as_text)
                 .and_then(|k| parse_error_kind(&k)),
-            measured: field(3).and_then(as_text).and_then(|k| match k.as_str() {
-                "real" => Some(true),
-                "fast" => Some(false),
-                _ => None,
-            }),
-            delay: field(4)
-                .and_then(as_i64)
-                .and_then(|d| i32::try_from(d).ok())
-                .unwrap_or(0),
+            measured,
+            delay,
             seen_secs: field(5).and_then(as_i64).unwrap_or(0),
             speed: field(6).and_then(as_i64),
             traffic: field(7).and_then(as_i64).unwrap_or(0)
@@ -1601,10 +1615,7 @@ mod tests {
                 endpoint_id: crate::models_toasty::EndpointId::new(1),
                 last_used_at: None,
                 last_seen_at: 0,
-                latency: Some(Latency::Real {
-                    delay: 10,
-                    ip: None,
-                }),
+                latency: Latency::real_with_ip(10, None),
                 speed_bps: None,
                 error: None,
                 purge_reason: None,
@@ -1917,7 +1928,7 @@ mod tests {
         // without the drain. Seed endpoint+link, then mark dirty WITHOUT a
         // refresh and drain — the drain must create the endpoint_rank row.
         use crate::models_toasty::{
-            Endpoint, HostType, ProfileStats, Protocol, Security, TrafficStats, Transport,
+            Endpoint, HostType, Latency, ProfileStats, Protocol, Security, TrafficStats, Transport,
         };
         use leas_proto::proto_spec::{ProtocolKind, SecurityType, TransportType};
         {
@@ -1981,6 +1992,7 @@ mod tests {
                     total_up: 0,
                     total_down: 0,
                 },
+                latency: Latency::default(),
             })
             .exec(&mut conn)
             .await
