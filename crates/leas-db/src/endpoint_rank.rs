@@ -211,12 +211,26 @@ impl RankLink {
     /// succeeded, or the window died). The fast-error arm is UNCHANGED: a
     /// fast failure never samples the ring, so the stab demotion cannot
     /// express it.
+    ///
+    /// **A MEASURED link is never in the DNS band (15).** The band says "this
+    /// name does not resolve", but a measurement is the transport coming up —
+    /// and the probe dials the NAME and lets the OS resolve it, WITHOUT
+    /// persisting the resolution. So a DNS endpoint the probe reached has an
+    /// empty address set AND a measurement: the two facts are both true, and
+    /// the band must not file it as unresolved. Before this, such a row sat in
+    /// band 15 — BELOW every real-error band (13) — so a working server
+    /// sorted below the failures, which is the ordering law inverted.
+    ///
+    /// The band still applies to a link with NO measurement: that is the
+    /// genuinely unresolved case (the probe never reached it, or never ran).
     #[must_use]
     pub const fn bin(&self, dns_unresolved: bool) -> u8 {
         if self.purged {
             return 16;
         }
-        if dns_unresolved {
+        // The DNS band needs POSITIVE evidence of "unresolved": an empty
+        // address set on a link that was MEASURED is not that evidence.
+        if dns_unresolved && self.measured.is_none() {
             return 15;
         }
         if let Some(kind) = &self.error_kind {
@@ -280,7 +294,14 @@ const fn delay_bin(delay: i32) -> u8 {
 /// v2 (spec `2026-10-20-stab-alive-design`): the bin law reads the stored
 /// latency through a real error (last-good-delay bin) and the representative
 /// is live-first — every stored `rank_bin`/`rank_stab` pair must re-derive.
-pub const STAB_VERSION: u32 = 2;
+///
+/// v3 (2026-10-22): a MEASURED link is never in the DNS band (15). The
+/// probe dials the DNS name and the OS resolves it, WITHOUT persisting the
+/// resolution — so a DNS endpoint the probe reached has an empty address set
+/// AND a measurement, and the old law filed it below every real-error band.
+/// A working server sorted below the failures: the ordering law inverted.
+/// Every stored `rank_bin` must re-derive.
+pub const STAB_VERSION: u32 = 3;
 
 /// The version of every INPUT to the stored rank keys — the compiled weight
 /// tables *and* the stability thresholds. The stamp in `rank_weight_meta` holds
@@ -527,7 +548,15 @@ pub fn compute_rank(
     // success: the host cannot be dialled, so it is not in the working pool.
     // The old law excluded it structurally (its links collapse to bin 15, never
     // 0..=5); under the proven-first partition that exclusion has to be stated.
-    let proven = !dns_unresolved && links.iter().any(|l| !l.purged && l.proven);
+    //
+    // The same correction as the bin law: an endpoint whose link was
+    // MEASURED is not "unresolved" (the probe dialled the name and the OS
+    // resolved it, without persisting the resolution), so a measured link
+    // proves the endpoint exactly as it would for an IP-literal host. Without
+    // this, a DNS endpoint the probe reached was excluded from `Successful`
+    // for the same reason it was filed in the DNS band.
+    let measured_any = links.iter().any(|l| l.measured.is_some());
+    let proven = (!dns_unresolved || measured_any) && links.iter().any(|l| !l.purged && l.proven);
     // The view windows ask whether any LIVE link falls in the band. A
     // purged-only endpoint therefore reports `NO_SEEN`, which is below every
     // window bound — that is exactly "it belongs to Purgatory" (spec §5), and it
@@ -1785,14 +1814,22 @@ mod tests {
     /// The failed real probe keeps the link's stored delay; the err band only
     /// claims links with no real success in their ring.
     #[rstest]
-    #[case::no_error_real_is_its_delay_bin(Some(true), 40, None, false, 0)]
-    #[case::no_error_fast_is_its_delay_bin(Some(false), 300, None, false, 6 + 3)]
-    #[case::no_error_untested_is_twelve(None, i32::MAX, None, false, 12)]
-    #[case::real_err_never_succeeded_is_thirteen(None, i32::MAX, Some(ProfileErr::Real), false, 13)]
+    #[case::no_error_real_is_its_delay_bin(Some(true), 40, None, false, false, 0)]
+    #[case::no_error_fast_is_its_delay_bin(Some(false), 300, None, false, false, 6 + 3)]
+    #[case::no_error_untested_is_twelve(None, i32::MAX, None, false, false, 12)]
+    #[case::real_err_never_succeeded_is_thirteen(
+        None,
+        i32::MAX,
+        Some(ProfileErr::Real),
+        false,
+        false,
+        13
+    )]
     #[case::real_err_short_failure_ring_is_thirteen(
         Some(false),
         300,
         Some(ProfileErr::Real),
+        false,
         false,
         13
     )]
@@ -1801,6 +1838,7 @@ mod tests {
         40,
         Some(ProfileErr::Real),
         false,
+        false,
         13
     )]
     #[case::real_err_proven_no_latency_is_thirteen(
@@ -1808,28 +1846,95 @@ mod tests {
         i32::MAX,
         Some(ProfileErr::Real),
         true,
+        false,
         13
     )]
-    #[case::real_err_proven_keeps_its_real_delay(Some(true), 40, Some(ProfileErr::Real), true, 0)]
-    #[case::real_err_proven_fast_latency_uses_stored_latency(Some(false), 300, Some(ProfileErr::Real), true, 6 + 3)]
-    #[case::name_err_without_success_is_thirteen(None, i32::MAX, Some(ProfileErr::Name), false, 13)]
-    #[case::fast_err_with_latency_unchanged(Some(true), 40, Some(ProfileErr::Fast), false, 14)]
-    #[case::fast_err_without_latency_unchanged(None, i32::MAX, Some(ProfileErr::Fast), false, 14)]
-    #[case::purged_is_sixteen(Some(true), 40, None, true, 16)]
-    #[case::dns_unresolved_is_fifteen(Some(true), 40, None, true, 15)]
+    #[case::real_err_proven_keeps_its_real_delay(
+        Some(true),
+        40,
+        Some(ProfileErr::Real),
+        true,
+        false,
+        0
+    )]
+    #[case::real_err_proven_fast_latency_uses_stored_latency(Some(false), 300, Some(ProfileErr::Real), true, false, 6 + 3)]
+    #[case::name_err_without_success_is_thirteen(
+        None,
+        i32::MAX,
+        Some(ProfileErr::Name),
+        false,
+        false,
+        13
+    )]
+    #[case::fast_err_with_latency_unchanged(
+        Some(true),
+        40,
+        Some(ProfileErr::Fast),
+        false,
+        false,
+        14
+    )]
+    #[case::fast_err_without_latency_unchanged(
+        None,
+        i32::MAX,
+        Some(ProfileErr::Fast),
+        false,
+        false,
+        14
+    )]
+    #[case::purged_is_sixteen(Some(true), 40, None, true, true, 16)]
+    #[case::dns_unresolved_and_unmeasured_is_fifteen(None, i32::MAX, None, true, true, 15)]
+    #[case::dns_unresolved_but_measured_keeps_its_real_bin(Some(true), 40, None, true, false, 0)]
+    #[case::dns_unresolved_but_measured_fast_keeps_its_fast_bin(
+        Some(false),
+        40,
+        None,
+        true,
+        false,
+        6
+    )]
     fn the_bin_law_keeps_a_known_good_delay_alive(
         #[case] measured: Option<bool>,
         #[case] delay: i32,
         #[case] error_kind: Option<ProfileErr>,
         #[case] proven: bool,
+        #[case] dns_unresolved: bool,
         #[case] expected: u8,
     ) {
         let mut l = link(1, measured, delay, 10);
         l.error_kind = error_kind;
         l.proven = proven;
         l.purged = expected == 16;
-        let dns_unresolved = expected == 15;
         assert_eq!(l.bin(dns_unresolved), expected);
+    }
+
+    /// A MEASURED link is never in the DNS band (15) — the band is below
+    /// every real-error band (13), so filing a working server there sorts it
+    /// BELOW the failures. That is the ordering law inverted, and it is what
+    /// the 2026-10-22 report saw.
+    ///
+    /// The fact that makes it possible: the probe dials the DNS NAME and lets
+    /// the OS resolve it, WITHOUT persisting the resolution — so a DNS endpoint
+    /// the probe reached has an empty address set AND a measurement.
+    #[test]
+    fn a_measured_dns_link_ranks_above_a_real_error() {
+        let mut working = link(1, Some(true), 40, 10);
+        working.proven = true;
+        // The endpoint's address set is empty (the probe never persisted the
+        // resolution) — but the link WAS measured.
+        let working_bin = working.bin(true);
+        let mut failed = link(2, Some(true), 40, 10);
+        failed.error_kind = Some(ProfileErr::Real);
+        failed.proven = false;
+        let failed_bin = failed.bin(false);
+        assert!(
+            working_bin < failed_bin,
+            "a working server must rank above a real error: {working_bin} vs {failed_bin}"
+        );
+        assert!(
+            working_bin <= 5,
+            "a measured real delay is in the real bands 0..=5: {working_bin}"
+        );
     }
 
     #[rstest]

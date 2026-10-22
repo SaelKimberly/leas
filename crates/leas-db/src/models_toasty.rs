@@ -1197,11 +1197,33 @@ mod tests {
         assert_eq!(ids(&r), vec![20, 10]);
     }
 
+    /// A DNS host's LINKS sort by their own bands; the DNS band only
+    /// applies to a link with NO measurement.
+    ///
+    /// The measured link (`real(50)`) keeps the real bands, so it sorts above
+    /// the untested one — the same order a resolved host's links get. The
+    /// untested link still sinks to the DNS band.
     #[test]
-    fn dns_unresolved_sinks_all_protocols() {
+    fn dns_unresolved_sinks_only_the_unmeasured_links() {
         let mut r = row(&[(10, 1, real(50), None), (20, 2, Latency::default(), None)]);
         r.sort_links_by_test_priority(true);
-        assert_eq!(ids(&r), vec![20, 10]); // untested first; dns tier wins for both
+        assert_eq!(
+            ids(&r),
+            vec![10, 20],
+            "the measured link keeps its real band; the untested one sinks"
+        );
+    }
+
+    /// A DNS host whose links were NEVER measured sinks them all to the DNS
+    /// band — the genuinely unresolved case.
+    #[test]
+    fn dns_unresolved_sinks_all_unmeasured_protocols() {
+        let mut r = row(&[
+            (10, 1, Latency::default(), None),
+            (20, 2, Latency::default(), None),
+        ]);
+        r.sort_links_by_test_priority(true);
+        assert_eq!(ids(&r), vec![20, 10]); // recency decides inside the DNS band
     }
 
     #[test]

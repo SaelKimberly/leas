@@ -2770,11 +2770,23 @@ mod tests {
         assert_eq!(state.endpoints[0].links[1].latency, Latency::fast(50));
     }
 
+    /// A DNS host with an EMPTY address set whose links were MEASURED does
+    /// NOT sink to the DNS band.
+    ///
+    /// The probe dials the NAME and the OS resolves it, without persisting the
+    /// resolution — so a measured DNS link has an empty address set AND a
+    /// measurement. The old law filed both links in the DNS band (15) and
+    /// ordered them by id; the corrected law keeps their MEASUREMENT's band, so
+    /// the faster real delay leads.
+    ///
+    /// (The genuinely unresolved case — a link with no measurement at all — is
+    /// the one the DNS band is for; `dns_unresolved_sinks_all_unmeasured_protocols`
+    /// in the db crate covers it.)
     #[tokio::test]
-    async fn dns_unresolved_endpoint_sinks_after_result() {
+    async fn a_measured_dns_link_keeps_its_measurement_band() {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
-        set_delay(&mut row, 7, 50, true); // real-ok
+        set_delay(&mut row, 7, 50, true); // real-ok, 50 ms
         // (already a DNS host)
         row.resolved_ips.clear(); // a DNS host with no resolved address
         state.endpoints = vec![row]; // no endpoint_info entry -> unresolved
@@ -2800,15 +2812,15 @@ mod tests {
         .unwrap();
         assert!(state.poll_core_events().await);
 
-        // dns tier sinks both protocols to the bottom. Within the dns tier the
-        // tiebreak is `last_seen_at desc, then id asc`; both links share
-        // last_seen ts(0), so id asc wins -> [7, 8].
+        // Both links are MEASURED, so both keep their real band: p8's 10 ms is
+        // bin 0 and p7's 50 ms is bin 1, so p8 leads. The empty address set
+        // does not sink them — the probe reached them.
         let ids: Vec<i64> = state.endpoints[0]
             .links
             .iter()
             .map(|l| l.protocol_id.get())
             .collect();
-        assert_eq!(ids, vec![7, 8]);
+        assert_eq!(ids, vec![8, 7]);
     }
 
     #[tokio::test]

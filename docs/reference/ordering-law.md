@@ -87,14 +87,28 @@ and roughly how fast") while making the key a small dense integer.
 | 1 | real, < 100 ms | | 12 | untested (no latency) |
 | 2 | real, < 250 ms | | 13 | real/name error, **no real success in the ring** |
 | 3 | real, < 500 ms | | 14 | fast error marker (unchanged) |
-| 4 | real, < 1000 ms | | 15 | DNS host, unresolved |
+| 4 | real, < 1000 ms | | 15 | DNS host, unresolved **and never measured** |
 | 5 | real, ≥ 1000 ms | | 16 | purged |
+
+**Bin 15 needs POSITIVE evidence of "unresolved" (2026-10-22).** The probe
+dials the DNS *name* and the OS resolves it, WITHOUT persisting the
+resolution — so a DNS endpoint the probe reached has an **empty address set
+AND a measurement**. Filing such a link in bin 15 put it below every
+real-error bin (13): a working server sorted below the failures, which is the
+ordering law inverted. A **measured** link therefore keeps its measurement's
+bin; bin 15 is for the links that were never measured.
+
+The same correction applies to the `proven` flag (the `Successful` scope): a
+measured DNS endpoint is proven exactly as an IP-literal one is.
+
+`STAB_VERSION` 2 → 3: the band law is an input to the stored rank keys, so
+every stored `rank_bin` re-derives on the first open after this ships.
 
 ```mermaid
 flowchart TD
     A["a link"] --> P{"purged?"}
     P -- yes --> B16["bin 16"]
-    P -- no --> D{"DNS unresolved<br/>(endpoint-level)?"}
+    P -- no --> D{"DNS unresolved<br/>AND never measured?"}
     D -- yes --> B15["bin 15"]
     D -- no --> E{"error marker?"}
     E -- "fast" --> B14["bin 14"]

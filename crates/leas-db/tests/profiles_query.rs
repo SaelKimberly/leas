@@ -275,14 +275,22 @@ async fn seed_into(db: &Database) {
     seed_endpoint(&mut conn, 5, HostType::Dns, &["10.0.0.5"]).await;
     seed_link(&mut conn, 5, 107, Some(40), Some("fast"), 140).await;
     seed_link(&mut conn, 5, 108, None, None, 160).await;
-    // e6: dns host, unresolved (persisted) despite a stored measurement.
+    // e6: dns host, unresolved (persisted) and NEVER MEASURED.
+    //
+    // The link has NO measurement, so the DNS band applies to it — that is
+    // the genuinely unresolved case. (A MEASURED link on an unresolved host
+    // is a different case: the probe dialled the name and the OS resolved it
+    // without persisting the resolution, so the link is NOT unresolved and
+    // keeps its measurement's band. `a_measured_dns_link_keeps_its_real_band`
+    // covers that one.)
+    //
     // Deliberately TCP while e7's representative is `x_http`: the two rows must
     // DISAGREE on weight (5 vs 7), because that disagreement is what makes the
     // parity golden red if a reader stops understanding toasty's `x_http` label.
     // Give e6 the same transport and both laws would agree again — which is how
     // a revert-proof test silently stops proving anything.
     seed_endpoint(&mut conn, 6, HostType::Dns, &[]).await;
-    seed_link(&mut conn, 6, 109, Some(5), None, 170).await;
+    seed_link(&mut conn, 6, 109, None, None, 170).await;
     // e8: the endpoint-level stability discriminator. It and e2 below are both
     // a single tcp link in bin 0 with the SAME static weight, and they differ
     // ONLY on the ring: e2 perfect, e8 poor. That makes their relative position
@@ -459,8 +467,8 @@ async fn plan_scopes_select_by_materialized_tier() {
     // and e5 — whose representative is its UNTESTED sibling (bin 12) but which
     // still holds the proven real link 107. That last row is the whole point of
     // the feature: a proven endpoint is not "New" because a sibling is
-    // untested. e6 is a DNS-unresolved host and is excluded despite its stored
-    // real measurement.
+    // untested. e6 is a DNS-unresolved host with NO measurement, so it is
+    // neither proven nor measured — it is in neither scope.
     let successful = db
         .profiles_page(&scoped(PlanScope::Successful))
         .await
@@ -485,8 +493,8 @@ async fn plan_scopes_select_by_materialized_tier() {
     assert_eq!(untested.total, 1);
 
     // Failed: NOT proven and carrying a failure marker. e6 is the DNS host
-    // whose stored measurement sits in the name band — the row that shows
-    // `[name]` and cannot otherwise be re-tested deliberately.
+    // that was never measured — the row that shows `[name]` and cannot
+    // otherwise be re-tested deliberately.
     let failed = db
         .profiles_page(&scoped(PlanScope::Failed))
         .await
@@ -708,6 +716,10 @@ async fn resolving_a_dns_host_moves_its_stored_key() {
     // (mimicry band 7 against e6's tcp row's 5), and inside a bin the stability
     // ties and the static weight decides, so e7's 9 ms leads e6's 5 ms. Under
     // the `x_http` label bug that order inverts and this assertion goes red.
+    //
+    // e6 is UNMEASURED, so resolving it moves it out of the DNS band (15) and
+    // into the untested band (12) — above the failure bands, below the real
+    // ones.
     let e7 = after.iter().position(|id| *id == EndpointId::new(7));
     let e6 = after.iter().position(|id| *id == unresolved);
     assert!(

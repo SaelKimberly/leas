@@ -3237,8 +3237,17 @@ mod tests {
         );
     }
 
+    /// A DNS endpoint the PROBE REACHED is not "unresolved" — the probe
+    /// dials the name and the OS resolves it, without persisting the
+    /// resolution. So a measured link on a DNS host with no address rows keeps
+    /// its MEASUREMENT's band.
+    ///
+    /// Before the correction the band said 15 ("DNS unresolved") for such a
+    /// link — and band 15 sits BELOW every real-error band (13), so a working
+    /// server sorted below the failures. That is the ordering law inverted,
+    /// and it is what the 2026-10-22 report saw.
     #[tokio::test]
-    async fn dns_unresolved_sinks_links_to_bottom() {
+    async fn a_measured_dns_link_is_not_sunk_to_the_dns_band() {
         let db = Database::in_memory().await.expect("in-memory db");
         let mut conn = db.connection().await.expect("connection");
 
@@ -3249,7 +3258,7 @@ mod tests {
             sub_domain: Endpoint::derive_domain("unresolved.example", HostType::Dns).1,
             port: 443,
             ports: Vec::<u16>::new(),
-            // no address rows -> unresolved (the child table owns that fact)
+            // no address rows -> the address set is empty
         })
         .exec(&mut conn)
         .await
@@ -3289,13 +3298,14 @@ mod tests {
 
         let rows = rows_of(&db, &req(PurgatoryView::All, ts(0))).await;
         let row = &rows[0];
-        // Both links sink to tier 5; recency decides.
+        // The MEASURED links keep the real bands (0..=5): a 10 ms real delay
+        // is bin 0. Recency decides between the two.
         assert_eq!(row.links[0].protocol_id, ProtocolId::new(1002));
         assert_eq!(row.links[1].protocol_id, ProtocolId::new(1001));
         assert_eq!(
             row.best_test_priority_key(true).unwrap().0,
-            15,
-            "dns-err bin"
+            0,
+            "a measured DNS link keeps its real band — it is not 'unresolved'"
         );
     }
 

@@ -321,8 +321,13 @@ async fn rows_are_sorted_by_test_priority() {
     assert_eq!(order, vec![1003, 1002, 1001], "real-ok, fast-ok, untested");
 }
 
+/// A DNS endpoint the PROBE REACHED is not "unresolved": the probe dials the
+/// name and the OS resolves it, without persisting the resolution. So a
+/// MEASURED link keeps its measurement's band — the DNS band (15) is for links
+/// with no measurement, and it sits below every real-error band, so filing a
+/// working server there sorted it below the failures.
 #[tokio::test]
-async fn dns_unresolved_endpoint_sinks_links_to_bottom() {
+async fn a_measured_dns_link_is_not_sunk_to_the_dns_band() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("connection");
 
@@ -346,9 +351,48 @@ async fn dns_unresolved_endpoint_sinks_links_to_bottom() {
     let row = &rows[0];
     assert_eq!(
         row.best_test_priority_key(true).expect("key").0,
-        15,
-        "dns-unresolved dominates every link bin"
+        0,
+        "a measured DNS link keeps its real band — it is not 'unresolved'"
     );
+}
+
+/// A DNS endpoint the PROBE REACHED keeps its measurement's band.
+///
+/// The probe dials the NAME and the OS resolves it, without persisting the
+/// resolution — so a DNS endpoint the probe reached has an EMPTY address set
+/// AND a measurement. The old law filed such a link in the DNS band (15),
+/// which sits BELOW every real-error band (13): a working server sorted below
+/// the failures. That is the ordering law inverted, and it is what the
+/// 2026-10-22 report saw.
+#[tokio::test]
+async fn a_measured_dns_link_keeps_its_real_band() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    // A DNS host with NO address rows — the address set is empty.
+    seed_endpoint(
+        &mut conn,
+        1,
+        1001,
+        "measured-but-unpersisted.example",
+        HostType::Dns,
+        443,
+        10,
+    )
+    .await;
+    // ...and a link the probe MEASURED: a 5 ms real delay.
+    seed_link_latency(&mut conn, 1, 1002, 20, Latency::real_with_ip(5, None)).await;
+
+    seed_ranks(&db).await;
+
+    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), None)).await;
+    let row = &rows[0];
+    let bin = row.best_test_priority_key(true).expect("key").0;
+    assert!(
+        bin <= 5,
+        "a measured real delay is in the real bands 0..=5, not the DNS band: {bin}"
+    );
+    assert_ne!(bin, 15, "a measured link is not 'unresolved'");
 }
 
 #[tokio::test]
