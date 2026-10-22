@@ -51,7 +51,7 @@ rustls = { workspace = true, optional = true, features = ["tls12", "logging", "r
 tonic-prost = "0.14.6"
 
 # ============ Build & Archiving ============
-zip = "8.6.0"
+zip = "9.0.5"
 flate2.workspace = true
 tar = "0.4.46"
 
@@ -61,7 +61,7 @@ leas-proto = { path = "../leas-proto", version = "0.1.0" }
 
 # ============ Logging ============
 tracing.workspace = true
-libc = "0.2.189"
+libc = "0.2.191"
 tempfile.workspace = true
 
 # ============ Persistent Log Storage ============
@@ -73,7 +73,7 @@ tempfile.workspace = true
 # (RUSTSEC-2025-0141, unmaintained) from the graph, which is what turns the
 # one `cargo deny check advisories` failure green. `serde_json` stays — it is
 # a direct workspace dep in five crates and arrives via tonic/prost anyway.
-heed = { version = "0.22.1", default-features = false }
+heed = { version = "0.23.0", default-features = false }
 # Serialization for the LMDB log store. `default-features = false` drops
 # postcard's default `heapless-cas` feature: we only use `to_slice` (core),
 # `to_allocvec` and `from_bytes` — never `postcard::heapless` — so this removes
@@ -87,7 +87,7 @@ leas-hakari = { version = "0.1", path = "../leas-hakari" }
 	# protox parses the source in-process and hands `prost-build::compile_fds` a
 	# `FileDescriptorSet`, so the emitted code is unchanged (pinned by a byte
 	# comparison against the protoc-generated baseline).
-	protox = "0.9"
+	protox = "0.10"
 
 	[lints]
 	workspace = true

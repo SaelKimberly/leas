@@ -1,6 +1,6 @@
 use heed::byteorder::BE;
 use heed::types::{Bytes, Str, Unit};
-use heed::{Database, Env, EnvOpenOptions, WithoutTls};
+use heed::{CommitOrAbort, Database, Env, EnvOpenOptions, WithoutTls};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -54,9 +54,9 @@ pub struct LogMessage {
 pub struct HeedLogStorage {
     env: Env<WithoutTls>,
     /// Key = u64 `timestamp_ns` (big-endian), Value = postcard(LogMessage)
-    logs: Database<U64BE, Bytes>,
+    logs: Database<'static, U64BE, Bytes>,
     /// Key = target string, Value = () — a set of seen targets
-    targets: Database<Str, Unit>,
+    targets: Database<'static, Str, Unit>,
     /// Counter of `MapFull` events encountered (incremented instead of emitting tracing events).
     pub mapsize_full_count: AtomicU64,
 }
@@ -83,17 +83,23 @@ impl HeedLogStorage {
         // SAFETY: We use default flags (no unsafe flags like NO_SYNC).
         let env = unsafe { options.open(path) }.map_err(|e| HeedError::Env(e.to_string()))?;
 
-        let mut wtxn = env.write_txn().map_err(|e| HeedError::Txn(e.to_string()))?;
+        let wtxn = env.write_txn().map_err(|e| HeedError::Txn(e.to_string()))?;
 
-        let logs: Database<U64BE, Bytes> = env
-            .create_database(&mut wtxn, Some(LOG_DB_NAME))
-            .map_err(|e| HeedError::Db(e.to_string()))?;
-
-        let targets: Database<Str, Unit> = env
-            .create_database(&mut wtxn, Some(TARGETS_DB_NAME))
-            .map_err(|e| HeedError::Db(e.to_string()))?;
-
-        wtxn.commit().map_err(|e| HeedError::Txn(e.to_string()))?;
+        // heed 0.23 opens databases inside the transaction that creates them and
+        // only hands out usable handles once that transaction commits, so
+        // creation and the commit are one operation: `create_databases_and_commit`
+        // owns the write txn and returns the committed (`'static`) handles.
+        let (logs, targets) = env
+            .create_databases_and_commit(wtxn, |dbo, wtxn| {
+                let logs = dbo.create_database::<U64BE, Bytes>(wtxn, Some(LOG_DB_NAME));
+                let targets = dbo.create_database::<Str, Unit>(wtxn, Some(TARGETS_DB_NAME));
+                match (logs, targets) {
+                    (Ok(logs), Ok(targets)) => Ok(CommitOrAbort::<_, ()>::Commit((logs, targets))),
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                }
+            })
+            .map_err(|e| HeedError::Db(e.to_string()))?
+            .unwrap_commit();
 
         Ok(Self {
             env,

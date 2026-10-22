@@ -84,16 +84,19 @@ machete mode='report':
     @cargo machete --with-metadata --skip-target-dir
 
 # Outdated direct dependencies. Informational by design (`--exit-code 0`):
-# direct deps are kept at latest (semver-major tracks toasty 0.11, maxminddb
-# 0.32, compact_str 0.10, brotli 9, zstd 0.14, yaml-rust2 0.13, rstest 0.27,
-# ratatui-themes 0.3, dirs 7, base64 0.23, sha2 0.11 are applied with breakage
-# fixes — all landed as manifest-only edits). The residual entries are
-# transitive-only, graph-inherent dual-major pins in the generated
-# leas-hakari, e.g. base64 0.22 via dns-stamp-parser/tantivy/tonic,
-# compact_str 0.9 via ratatui-core 0.1.2, hashbrown 0.16 via lru 0.16 (NOT
-# yaml-rust2, which moved to hashlink 0.12.2), nom 7 via tantivy-query-grammar,
-# unicode-truncate 2 via ratatui-core, constant_time_eq 0.4 via blake3 + zip,
-# quinn-udp 0.5 via quinn, tower-http 0.6 via reqwest, syn 2 vs 3, and the
+# direct deps are kept at latest (the 2026-10-22 pass moved every direct dep to
+# its latest stable release, semver-major included — zip 9, heed 0.23,
+# parking_lot 0.13, lru 0.19, protox 0.10, uuid 1.28, hyper 1.12 and the rest
+# — with the breakage fixed in `leas-core/src/log_heed.rs` for heed's new
+# commit-scoped database API). The residual entries are transitive-only,
+# graph-inherent dual-major pins in the generated leas-hakari, e.g. base64
+# 0.22 via dns-stamp-parser/tantivy/tonic, compact_str 0.9 via ratatui-core
+# 0.1.2, hashbrown 0.16 via lru 0.16 (NOT yaml-rust2, which moved to hashlink
+# 0.12.2), nom 7 via cexpr/bindgen (turso_sdk_kit), itertools 0.14 via prost
+# 0.14, lock_api 0.4 via dashmap 6, parking_lot 0.12 via arboard/crossterm/
+# opaline, lru 0.18 via ratatui-core 0.1.2, constant_time_eq 0.4 via blake3,
+# quinn-udp 0.5 via quinn 0.11, rand_core 0.6 via crypto-common 0.1 (turso's
+# aes-gcm 0.10), tower-http 0.6 via reqwest 0.13, syn 2 vs 3, and the
 # getrandom/windows-sys platform pins — only upstream bumps remove them, so a
 # hard fail would keep the gate red indefinitely.
 outdated mode='report':

@@ -51,7 +51,7 @@ unicode-width = "0.2.2"
 ratatui-cheese = "0.7.0"
 tui-popup = "0.7.7"
 tui-scrollbar = "0.2.8"
-arboard = "3.6.1"
+arboard = "3.7.0"
 
 # ============ Error Handling ============
 	anyhow.workspace = true
@@ -66,9 +66,11 @@ chrono = { version = "0.4.45" }
 humantime.workspace = true
 url.workspace = true
 parking_lot.workspace = true
-# Memory-diet Task 6 (B-slice gate): the ONLY new-dep allowance. `lru 0.18`
-# is already in Cargo.lock (toasty's transitive dep), so no new crates enter
-# the tree — direct edges only for the TUI's bounded caches.
+# Memory-diet Task 6 (B-slice gate): the ONLY new-dep allowance. `lru` is
+# already in Cargo.lock (toasty's transitive dep), so no new CRATE enters the
+# tree — direct edges only for the TUI's bounded caches. The VERSION is ours:
+# lru 0.19 coexists with the 0.18.x copy `ratatui-core` pins and the 0.16.x
+# copy `tantivy` pins; both are upstream-forced, not a choice made here.
 lru.workspace = true
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 opaline = { version = "0.4.2", default-features = false, features = ["builtin-themes", "ratatui", "gradients", "discovery", "widgets"] }

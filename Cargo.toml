@@ -25,12 +25,12 @@ too_many_lines = "allow"
 
 [workspace.dependencies]
 # ============ Async Runtime & I/O ============
-tokio = { version = "1.53.1" }
+tokio = { version = "1.54.1" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
 # ============ Serialization ============
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151" }
+serde_json = { version = "1.0.154" }
 
 # ============ Error Handling ============
 thiserror = { version = "2.0.21" }
@@ -66,17 +66,17 @@ reqwest = { version = "^0.13.5", default-features = false, features = ["rustls-n
 dirs = { version = "^7.0.0" }
 
 # ============ Text / Search / Hash ============
-uuid = { version = "1.26.1", features = ["v4"] }
+uuid = { version = "1.28.0", features = ["v4"] }
 
 # ============ Encoding ============
-escape8259 = "0.5.3"
+escape8259 = "0.5.4"
 urlencoding = "2.1.3"
 # daachorse (Double-Array Aho-Corasick) has no `ascii_case_insensitive` build
 # option; call sites that need it lowercase the haystack with
 # `to_ascii_lowercase` (byte-length-preserving, so match ranges map 1:1).
 daachorse = "5.1.0"
 memchr = "2.8.3"
-smallvec = { version = "1.16.2", default-features = false, features = ["const_new"] }
+smallvec = { version = "1.16.3", default-features = false, features = ["const_new"] }
 
 # ============ Hashing ============
 rapidhash = { version = "4.5.1", features = ["std", "unsafe"] }
@@ -94,7 +94,7 @@ criterion = { version = "0.8.2" }
 # aws_lc_rs (leas-core pins it default-features = false + ring/tls12 —
 # that pin is the reason aws-lc-rs stays out of the lockfile; check with
 # `cargo tree -i aws-lc-rs` after any dependency change).
-rustls = { version = "0.23.45", default-features = false }
+rustls = { version = "0.23.46", default-features = false }
 
 # ============ Crypto ============
 # Shared by leas-tls / leas-native / leas-route (ring) and
@@ -108,7 +108,7 @@ aes = "0.9.3"
 # direct dep adds no tree entry. `derive` brings the `ZeroizeOnDrop` macro.
 # Shared by leas-tls (key schedule, ML-KEM, REALITY auth) and
 # leas-native (protocol key material).
-zeroize = { version = "1.9.0", features = ["derive"] }
+zeroize = { version = "1.9.1", features = ["derive"] }
 
 # ============ TUI ============
 
@@ -123,7 +123,7 @@ tracing = { version = "0.1.44" }
 # ============ Time / Duration Parsing ============
 humantime = "2.4.0"
 url = "2.5.8"
-jiff = "0.2.37"
+jiff = "0.2.38"
 
 # ============ ORM (Turso backend only — no other drivers enabled) ============
 toasty = { version = "0.11", default-features = false }
@@ -138,12 +138,14 @@ bytes = "1.12.1"
 # flate2: RFC 8879 cert decompression (leas-tls) + core binary archives.
 flate2 = "1.1.10"
 # lru: bounded caches in the TUI, geoip and the routing engine.
-lru = "0.18.5"
+lru = "0.19.0"
 # md-5 / sha2: JA3/JA4 fingerprints (tls) + VMess/VLESS wire crypto (native).
 md-5 = "0.11.0"
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 # parking_lot: infallible sync locks across the TUI, route, native and tls.
-parking_lot = "0.12.5"
+# 0.13 here; the TUI's own crates (arboard/crossterm/opaline) still pin 0.12,
+# so the graph carries both — upstream-forced, not a choice made here.
+parking_lot = "0.13.0"
 # rcgen: rustls server doubles in the tls test suites + the native e2e harness.
 rcgen = "0.14.10"
 # tempfile: every crate's test scratch dirs.
@@ -152,9 +154,9 @@ tempfile = "3.27.0"
 # The entry carries ONLY the two features every consumer wants; leas-core
 # adds `logging` on its own edge, so the hoisted entry does not widen the
 # native e2e build.
-tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 # webpki-roots: QUIC root store (native) + the tls engine's WebPkiVerifier.
-webpki-roots = "1.0.9"
+webpki-roots = "1.0.10"
 # x25519-dalek: REALITY's dual-agreement keypair (tls) + native e2e configs.
 x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
 [workspace.metadata.cargo-machete]

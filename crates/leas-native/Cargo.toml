@@ -44,7 +44,7 @@ chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 ctr = { version = "0.10.1", features = ["zeroize"] }
 hmac = { version = "0.13.0", features = ["zeroize"] }
 sha2 = { workspace = true, features = ["zeroize"] }
-crc32fast = "1.5.2"
+crc32fast = "1.5.3"
 md-5 = { workspace = true, features = ["zeroize"] }
 blake2 = { version = "0.11.0", features = ["zeroize"] }
 # Classic-AEAD subkey KDF: HKDF-SHA1(psk, salt, b"ss-subkey").
@@ -54,7 +54,7 @@ hkdf = "0.13.0"
 # psk || salt). Promoted from dev-dependency (b3.rs cross-validation uses it too).
 blake3 = { version = "1.8.7", features = ["zeroize"] }
 wide = "1.7.1"
-inout = "0.2.2"
+inout = "0.2.5"
 
 # Secret wiping for the key material we own ourselves: VMess cmd/session
 # keys, VLESS UUIDs, Shadowsocks subkeys, the mlkem768x25519plus state.
@@ -70,12 +70,12 @@ futures-sink = "0.3.34"
 bytes.workspace = true
 
 # gRPC transport framing (HTTP/2, RFC 7540) over the engine stream
-h2 = "0.4.19"
+h2 = "0.4.20"
 http = "1.5.0"
 
 # HTTP/1.1 + HTTP/2 client framing (hyper) — minimal features, latest minor.
 # We own the stream + timeouts; hyper owns request/response/chunked/101 framing.
-hyper = { version = "1.11.1", default-features = false, features = ["client", "http1", "http2"] }
+hyper = { version = "1.12.0", default-features = false, features = ["client", "http1", "http2"] }
 # tokio↔hyper IO bridge: hyper's own rt::Read/Write traits take a different
 # buffer type than tokio's, so BoxStream goes through TokioIo (hyper-util's
 # standard adapter). TokioExecutor spawns hyper's h2 driver tasks.

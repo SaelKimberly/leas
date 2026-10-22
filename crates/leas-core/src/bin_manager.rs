@@ -347,6 +347,7 @@ pub enum BinError {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use std::io::Write;
 
     /// A fixture binary's name as THIS platform spells an executable. The
     /// fixture and the product have to agree, and on Windows that means `.exe`
@@ -664,6 +665,45 @@ mod tests {
         for name in expected_remaining {
             assert!(tmp.join(name).exists(), "{name} should remain");
         }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The zip path is the one a user hits when a downloaded core archive is
+    /// unpacked, and the ARCHIVE decides where the bytes land: a nested entry
+    /// must arrive byte-for-byte, and a traversal entry must never escape the
+    /// target directory. zip 9 rewrote its name handling (the entry name is
+    /// stored only as the archive key), so the path decision is worth pinning.
+    #[test]
+    fn zip_extraction_writes_entries_and_refuses_traversal() {
+        let tmp = std::env::temp_dir().join("leas-test-zip-extract");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let archive = tmp.join("core.zip");
+        let target = tmp.join("out");
+
+        {
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("core-1.0/bin/core", options).unwrap();
+            writer.write_all(b"payload").unwrap();
+            writer.start_file("../escape.txt", options).unwrap();
+            writer.write_all(b"escaped").unwrap();
+            writer.finish().unwrap();
+        }
+
+        extract_archive(&archive, CoreType::SingBox, &target).unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("core-1.0/bin/core")).unwrap(),
+            b"payload",
+            "the nested entry must land with its bytes intact"
+        );
+        assert!(
+            !tmp.join("escape.txt").exists(),
+            "a traversal entry must not escape the target directory"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -33,7 +33,7 @@ x25519-dalek.workspace = true
 # async I/O seam
 tokio = { workspace = true, features = ["io-util", "time", "rt", "sync"] }
 # cert verification
-rustls-webpki = { version = "0.103.15", default-features = false, features = ["ring", "std"] }
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.15.1"
 webpki-roots.workspace = true
 # JA3 hash
@@ -53,7 +53,7 @@ thiserror.workspace = true
 # `zeroize` wipes the decapsulation key on drop; `default-features = false`
 # keeps ciphertexts and shared secrets inline (no heap), which the
 # allocation-free `encapsulate_into` path depends on.
-ml-kem = { version = "0.3.2", default-features = false, features = ["zeroize"] }
+ml-kem = { version = "0.3.3", default-features = false, features = ["zeroize"] }
 # RNG trait for the adapter in `crypto::mlkem`: `RingRng` bridges ring's CSPRNG
 # into `encapsulate_with_rng`, so ML-KEM key material keeps the workspace's one
 # RNG provider instead of a second OS-RNG path.
@@ -65,7 +65,7 @@ rand_core = { version = "0.10.1", default-features = false }
 # are already in the workspace lockfile; brotli is new.
 flate2.workspace = true
 brotli = "9.0.0"
-zstd = "0.14.0"
+zstd = "0.14.3"
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 [lints]
 workspace = true
