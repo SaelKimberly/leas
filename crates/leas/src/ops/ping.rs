@@ -2984,6 +2984,14 @@ impl BatchShared {
     /// Called from [`Self::after_fast_settle`], i.e. right after that link's fast
     /// result: the reverse order would let the fast success (which writes
     /// `error = None`) clear the marker.
+    ///
+    /// The row carries NO transport measurement: the capability gate refused
+    /// the config BEFORE any dial, so the transport was never measured. The
+    /// marker therefore says exactly that — the `Auth` flag is `n-a` (the
+    /// engine could not ask the server) and the Fast column stays empty, which
+    /// is the honest "not measurable" state (spec D1's transport-only row).
+    /// A reader must not read the empty Fast column as "the transport failed":
+    /// nothing was measured, and the marker's own text says why.
     fn emit_untestable_marker(&self, link: &ProfileStats, text: &str) {
         // Persist from the link's own snapshot: the events handler only stages
         // what the loaded page still holds.
@@ -3101,8 +3109,10 @@ pub fn start_endpoint_batch_real_ping(state: &mut AppState) {
 /// thousands. The limiter is the difference between a fill that works and a
 /// fill that is refused by every provider.
 pub fn start_fill_exit_ips(state: &mut AppState, scope: PlanScope) {
-    // A feed-wide plan is loaded by the fill task (off the UI thread).
-    if state.batch_progress.is_some() {
+    // The fill is its own command with its own progress surface, so it does
+    // NOT share the batch's slot: a batch running at the same time would fight
+    // the fill for the one bar.
+    if state.batch_progress.is_some() || state.fill_progress.is_some() {
         state.log_trace("warn", "tui::ops::ping", "A batch is already running");
         return;
     }
@@ -3115,8 +3125,8 @@ pub fn start_fill_exit_ips(state: &mut AppState, scope: PlanScope) {
     let writer = state.link_stage.clone();
     let stop = state.speed_test_stop.clone();
     let ip_provider = state.config.speed_test.ip_provider;
-    let meters = Arc::new(crate::types::BatchMeters::default());
-    state.batch_progress = Some(Arc::clone(&meters));
+    let meters = Arc::new(crate::types::FillMeters::default());
+    state.fill_progress = Some(Arc::clone(&meters));
     tokio::spawn(run_fill_exit_ips(FillExitIpsParams {
         db,
         writer,
@@ -3134,7 +3144,7 @@ struct FillExitIpsParams {
     writer: Arc<leas_db::WriteBehind<leas_db::LinkSpec>>,
     tx: mpsc::Sender<CoreEvent>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    meters: Arc<crate::types::BatchMeters>,
+    meters: Arc<crate::types::FillMeters>,
     scope: PlanScope,
     ip_provider: IpProvider,
 }
@@ -3185,8 +3195,6 @@ async fn run_fill_exit_ips(params: FillExitIpsParams) {
         }
     };
     let ids = page.ids;
-    meters.plan_pages_total.store(1, Ordering::Relaxed);
-    meters.plan_pages_done.store(0, Ordering::Relaxed);
     let rows = match db.load_page_projection(&ids, false).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -3195,7 +3203,6 @@ async fn run_fill_exit_ips(params: FillExitIpsParams) {
             return;
         }
     };
-    meters.plan_pages_done.store(1, Ordering::Relaxed);
     // The links to fill: the scope's links, in the walk's order. The endpoint
     // rows come from the same projection the batch's walk uses, so the fill
     // dials the same addresses the probe would.
@@ -3210,8 +3217,9 @@ async fn run_fill_exit_ips(params: FillExitIpsParams) {
                 .map(move |link| (link, endpoint.clone(), addresses.clone()))
         })
         .collect();
+    // The bar's denominator: the links the fill walks.
     meters
-        .main
+        .look
         .total
         .store(plans.len() as u32, Ordering::Relaxed);
     let total = plans.len() as u32;
@@ -3227,22 +3235,28 @@ async fn run_fill_exit_ips(params: FillExitIpsParams) {
             .ok()
             .flatten()
         else {
+            // The protocol row could not be loaded: the fill cannot ask about
+            // this link, and asking again would not change it.
             done += 1;
-            meters.main.done.store(done, Ordering::Relaxed);
+            meters.look.done.store(done, Ordering::Relaxed);
+            meters.fail.total.fetch_add(1, Ordering::Relaxed);
+            meters.fail.done.fetch_add(1, Ordering::Relaxed);
             continue;
         };
         // The probe target is a placeholder: the exit-IP fetch dials the
         // PROXY server and asks the provider through it.
         let Some(target) = ping_native::parse_probe_url("http://127.0.0.1/").ok() else {
             done += 1;
-            meters.main.done.store(done, Ordering::Relaxed);
+            meters.look.done.store(done, Ordering::Relaxed);
+            meters.fail.total.fetch_add(1, Ordering::Relaxed);
+            meters.fail.done.fetch_add(1, Ordering::Relaxed);
             continue;
         };
         let params =
             ping_native::probe_params(&endpoint, &addresses, &protocol.config.get().0, &target);
         let ip_info = ping_native::fetch_exit_ip(&params, ip_provider).await;
         done += 1;
-        meters.main.done.store(done, Ordering::Relaxed);
+        meters.look.done.store(done, Ordering::Relaxed);
         if let Some(ip_info) = ip_info {
             // The exit IP and the country flag — NEVER the real delay (spec
             // D11). The row keeps the real measurement it already had.
@@ -3269,6 +3283,21 @@ async fn run_fill_exit_ips(params: FillExitIpsParams) {
                 marker_kind: None,
                 auth_ack: None,
             });
+            // The link's exit IP was fetched.
+            meters.ok.total.fetch_add(1, Ordering::Relaxed);
+            meters.ok.done.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // No provider answered for this link. Whether another attempt is
+            // worth it depends on WHY: a refusal (a rate limit, a quota) is
+            // deterministic for the provider and only time fixes it, while a
+            // transport failure is worth another try.
+            //
+            // The fetch reports a refusal and a transport failure the same way
+            // (`None`), so the fill counts them together as "failed" — and the
+            // RETRY count is the ones the fetch itself could not complete,
+            // which the fetch's own error text distinguishes.
+            meters.fail.total.fetch_add(1, Ordering::Relaxed);
+            meters.fail.done.fetch_add(1, Ordering::Relaxed);
         }
     }
     // The writer flushes the staged rows; the terminal event closes the bar.
@@ -3276,7 +3305,9 @@ async fn run_fill_exit_ips(params: FillExitIpsParams) {
     let _ = tx.try_send(CoreEvent::BatchEnded);
     tracing::info!(
         target: "tui::ops::ping",
-        "exit-IP fill: {done}/{total} link(s) processed"
+        "exit-IP fill: {done}/{total} link(s) processed, {} fetched, {} failed",
+        meters.ok.done.load(Ordering::Relaxed),
+        meters.fail.done.load(Ordering::Relaxed),
     );
 }
 

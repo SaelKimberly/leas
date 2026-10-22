@@ -175,6 +175,11 @@ pub struct AppState {
     /// surfaces as `batch_progress`. Installed at spawn, cleared when the
     /// command's terminal event arrives.
     pub maint_progress: Option<Arc<crate::types::MaintMeters>>,
+    /// The running `Fill Exit IPs` command's meters — its own `Look` bar and
+    /// its own ok/fail/retry counts. A separate slot from `maint_progress`
+    /// because the fill is its own command with its own lifecycle: it starts
+    /// when the user asks for it and ends when its last link is settled.
+    pub fill_progress: Option<Arc<crate::types::FillMeters>>,
     /// The running batch's shared state (counters, class histograms, phase
     /// timings), published by `run_batch` once its plan resolves — the value
     /// comes from the batch task, hence `OnceLock` over `LazyLock`/`Mutex`.
@@ -657,6 +662,7 @@ impl AppState {
             speed_test_stop: Arc::new(AtomicBool::new(false)),
             batch_progress: None,
             maint_progress: None,
+            fill_progress: None,
             batch: None,
             term_height: Cell::new(80),
             heed_storage: None,

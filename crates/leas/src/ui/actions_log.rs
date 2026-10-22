@@ -363,6 +363,35 @@ fn batch_bars(
         return (Some(scan_line), None);
     }
 
+    // The `Fill Exit IPs` command has its OWN bar: it is not a batch, and it
+    // runs at the same time as nothing else, so it takes the first bar row
+    // with its own label (`Look` — the fill LOOKS UP an exit IP) and its own
+    // ok/fail/retry counts.
+    //
+    // The counts are the point: "the fill finished" is not one number — a
+    // link's exit IP was fetched, every provider refused it, or the fetch
+    // failed in a way another attempt could fix.
+    if let Some(meters) = &state.fill_progress {
+        let look = || {
+            progress::bar_line(
+                "Look",
+                meters.look.done.load(Ordering::Relaxed),
+                meters.look.total.load(Ordering::Relaxed),
+                meters.look.eta_secs(),
+                width,
+                theme,
+            )
+        };
+        let ok = meters.ok.done.load(Ordering::Relaxed);
+        let fail = meters.fail.done.load(Ordering::Relaxed);
+        let retry = meters.retry.done.load(Ordering::Relaxed);
+        let counts = Line::from(Span::styled(
+            format!("exit IPs: {ok} ok, {fail} failed, {retry} retryable"),
+            ThemeStyles::footer_label(theme),
+        ));
+        return (Some(look()), Some(counts));
+    }
+
     let Some(meters) = &state.batch_progress else {
         return (None, None);
     };
@@ -435,6 +464,39 @@ mod tests {
                 "no bar without a batch: {line:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_fill_command_renders_its_own_bar_and_counts() {
+        let meters = crate::types::FillMeters::default();
+        meters.look.total.store(120, Ordering::Relaxed);
+        meters.look.done.store(30, Ordering::Relaxed);
+        meters.ok.done.store(24, Ordering::Relaxed);
+        meters.fail.done.store(5, Ordering::Relaxed);
+        meters.retry.done.store(1, Ordering::Relaxed);
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        state.fill_progress = Some(Arc::new(meters));
+        let lines = render_panel(&state);
+        // The fill's own bar, on the first bar row.
+        assert!(lines[3].contains("Look"), "the Look bar: {:?}", lines[3]);
+        assert!(lines[3].contains("30/120"), "the counters: {:?}", lines[3]);
+        assert!(
+            lines[3].contains('█') || lines[3].contains('░'),
+            "the row carries a bar: {:?}",
+            lines[3]
+        );
+        // The second row carries the outcome counts — the fill's three
+        // outcomes are not one number.
+        assert!(
+            lines[4].contains("24 ok") && lines[4].contains("5 failed"),
+            "the ok/fail/retry counts: {:?}",
+            lines[4]
+        );
+        assert!(
+            lines[4].contains("1 retryable"),
+            "the retry count: {:?}",
+            lines[4]
+        );
     }
 
     #[tokio::test]

@@ -761,3 +761,23 @@ pub struct MaintMeters {
     pub name: Arc<PhaseMeters>,
     pub comp: Arc<PhaseMeters>,
 }
+
+/// Meters for the `Fill Exit IPs` command — its own progress surface.
+///
+/// The fill is not a batch: it never probes and never writes a real delay, so
+/// it does not share the batch's counters. It has its own bar (labelled
+/// `Look`) and its own three counts, because "the fill finished" is not one
+/// number: a link's exit IP was fetched, refused by every provider, or the
+/// fetch itself failed and the link is worth another try.
+#[derive(Debug, Default)]
+pub struct FillMeters {
+    /// The links the fill is walking.
+    pub look: Arc<PhaseMeters>,
+    /// The links whose exit IP was fetched.
+    pub ok: Arc<PhaseMeters>,
+    /// The links every provider refused (a rate limit, a quota).
+    pub fail: Arc<PhaseMeters>,
+    /// The links whose fetch failed in a way another attempt could fix (a
+    /// transport error, a timeout).
+    pub retry: Arc<PhaseMeters>,
+}

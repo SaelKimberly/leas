@@ -1094,6 +1094,10 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // and sweeps before sending this.
                 state.batch_progress = None;
                 state.batch = None;
+                // The `Fill Exit IPs` command ends on the same terminal event
+                // (it is a separate command, not a batch, but it has no
+                // end signal of its own) — its bar goes with it.
+                state.fill_progress = None;
                 state.speed_test_stop.store(false, Ordering::Relaxed);
                 // The run's last results may have been throttled (the page
                 // refetch during a batch is at most one per

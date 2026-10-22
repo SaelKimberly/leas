@@ -570,12 +570,19 @@ fn compute_test_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) 
             leas_native::security::fingerprint::resolve_fingerprint(p.security.fp.as_deref()).1
         });
     let (mut text, style) = test_cell_content(
-        row.endpoint.is_dns(),
-        resolved,
-        untestable,
-        purged,
-        failure,
-        delay,
+        &RealCellFacts {
+            dns: DnsFacts {
+                is_dns: row.endpoint.is_dns(),
+                resolved,
+            },
+            untestable,
+            purged,
+            failure,
+            active_delay: delay,
+            // The TRANSPORT measurement: a DNS endpoint the probe REACHED is
+            // reachable, so the `[name]` marker cannot stand beside it.
+            transport_measured: representative.and_then(|l| l.latency.fast_delay).is_some(),
+        },
         theme,
     );
     if approximated {
@@ -703,30 +710,92 @@ fn compute_auth_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) 
     (auth_glyph(state).to_string(), style)
 }
 
+/// The facts the Real cell's label precedence reads.
+///
+/// Grouped because there are more than three of them, and a row of bare
+/// booleans is unreadable at the call site: `true, true, false` says nothing
+/// about which fact is which.
+struct RealCellFacts<'a> {
+    /// The endpoint's DNS facts.
+    ///
+    /// Grouped because the two are one question — "is this name resolved?" —
+    /// and the cell's precedence needs both halves of the answer: the name
+    /// marker needs `is_dns` AND `!resolved` AND no transport measurement.
+    dns: DnsFacts,
+    /// The native engine cannot serve this row (`[n/a]`).
+    untestable: bool,
+    /// The purge verdict's label, when the row is a Purgatory row.
+    purged: Option<&'a str>,
+    /// The persisted failure marker's class, when the row carries one.
+    failure: Option<TestFailure>,
+    /// The real measurement, when the row has one.
+    active_delay: Option<i32>,
+    /// The TRANSPORT measurement — the probe's stage-1 span. A DNS endpoint
+    /// whose transport SUCCEEDED was reachable: the probe dialed the name and
+    /// the OS resolved it. So the `[name]` marker (which says "this name does
+    /// not resolve") cannot stand beside a transport measurement — the two
+    /// contradict each other, and the measurement is the fresher fact (the
+    /// resolution is not persisted by the probe, so the endpoint's address set
+    /// can be empty while the probe reached it).
+    transport_measured: bool,
+}
+
+/// The endpoint's DNS facts: is the host a NAME, and did it resolve?
+#[derive(Clone, Copy)]
+struct DnsFacts {
+    /// The host is a DNS name (so `[name]` is a possible label).
+    is_dns: bool,
+    /// The name RESOLVED (the address set is not empty).
+    resolved: bool,
+}
+
+impl Default for RealCellFacts<'_> {
+    /// The default is a RESOLVED, testable, unmeasured row.
+    ///
+    /// `resolved` defaults to `true` (not the bool default): a row that says
+    /// nothing about its resolution is NOT an unresolved one — the `[name]`
+    /// marker needs positive evidence (an empty address set), and the caller
+    /// passes that explicitly.
+    fn default() -> Self {
+        Self {
+            dns: DnsFacts {
+                is_dns: false,
+                resolved: true,
+            },
+            untestable: false,
+            purged: None,
+            failure: None,
+            active_delay: None,
+            transport_measured: false,
+        }
+    }
+}
+
 /// Pure Test-cell logic (no `AppState`) so the label precedence and color
 /// thresholds are unit-testable.
-fn test_cell_content(
-    host_is_dns: bool,
-    resolved: bool,
-    untestable: bool,
-    purged: Option<&str>,
-    failure: Option<TestFailure>,
-    active_delay: Option<i32>,
-    theme: &opaline::Theme,
-) -> (String, Style) {
+fn test_cell_content(facts: &RealCellFacts<'_>, theme: &opaline::Theme) -> (String, Style) {
     let bad = ThemeStyles::test_delay_bad(theme);
-    if host_is_dns && !resolved {
+    if facts.dns.is_dns && !facts.dns.resolved && !facts.transport_measured {
         return (format!("[{}]", center_cell("name", 4)), bad);
     }
-    if untestable {
+    if facts.untestable {
         // The native engine cannot test this row: the marker is a status about
         // the row, not a failed attempt, so it outranks a stored delay the same
-        // way `[name]` does. It renders as `[real]` (the persisted kind is
-        // `ProfileErr::Real` — the frozen `error_kind` CHECK leaves no other
-        // kind to store).
-        return (format!("[{}]", center_cell("real", 4)), bad);
+        // way `[name]` does.
+        //
+        // It renders as `[n-a]`, NOT `[real]`: no real probe RAN, so `[real]`
+        // is a false statement — it says "the probe ran and the config
+        // failed", when the truth is "the engine was never asked". The
+        // persisted kind is still `ProfileErr::Real` (the frozen `error_kind`
+        // CHECK leaves no other kind to store), but the LABEL is the display's
+        // own: the marker text names the reason, and the label says which
+        // question was never asked.
+        //
+        // `n/a` is the same word D3 uses for the Auth flag's "not
+        // applicable" state — the two say the same thing about the same row.
+        return (format!("[{}]", center_cell("n/a", 4)), bad);
     }
-    if let Some(label) = purged {
+    if let Some(label) = facts.purged {
         // Only reachable when every link of the endpoint is purged (the Active
         // view does not load a purged link beside a live one), so this is the
         // Purgatory/All row: the verdict is what the row IS.
@@ -741,7 +810,7 @@ fn test_cell_content(
     // made the cell and the sort key two different laws. Tier ordering
     // (decision 16): real-err ranks above fast-err — the real check is the
     // deeper probe, so when both classes failed `[real]` wins.
-    let failure_label = match failure {
+    let failure_label = match facts.failure {
         Some(TestFailure::Real) => Some("real"),
         Some(TestFailure::Fast) => Some("fast"),
         None => None,
@@ -749,7 +818,7 @@ fn test_cell_content(
     if let Some(label) = failure_label {
         return (format!("[{}]", center_cell(label, 4)), bad);
     }
-    match active_delay {
+    match facts.active_delay {
         Some(d) if d >= 0 => {
             let style = if d >= TEST_BAD_MS {
                 bad
@@ -2645,29 +2714,116 @@ mod tests {
         crate::ui::theme::load("tokyo-night").unwrap()
     }
 
+    /// A DNS endpoint the probe REACHED cannot carry the `[name]` marker.
+    ///
+    /// The marker says "this name does not resolve", but the transport
+    /// measurement says the opposite: the probe dialed the NAME and the OS
+    /// resolved it. The two cannot both be true, and the measurement is the
+    /// fresher fact — the resolution is not persisted by the probe, so the
+    /// endpoint's address set can be empty while the probe reached it.
+    #[test]
+    fn a_reached_dns_endpoint_does_not_carry_the_name_marker() {
+        let theme = test_theme();
+        // Unresolved AND measured: the marker would contradict the
+        // measurement.
+        let (t, _) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: true,
+                    resolved: false,
+                },
+                transport_measured: true,
+                ..Default::default()
+            },
+            &theme,
+        );
+        assert_ne!(
+            t, "[name]",
+            "the transport succeeded, so the name DID resolve: {t}"
+        );
+        // Unresolved and UNMEASURED: the marker stands — nothing says the
+        // name resolved.
+        let (t, _) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: true,
+                    resolved: false,
+                },
+                transport_measured: false,
+                ..Default::default()
+            },
+            &theme,
+        );
+        assert_eq!(t, "[name]", "nothing was measured, so the marker stands");
+    }
+
     /// The purge verdict outranks the delay the link still carries from phase 1
     /// — the row is retired, and its only reachable position is Purgatory/All.
     #[test]
     fn test_cell_shows_the_purge_label_over_a_delay() {
         let theme = crate::ui::theme::load("tokyo-night").unwrap();
-        let (text, _) = test_cell_content(false, true, false, Some("mitm"), None, Some(12), &theme);
-        assert_eq!(text, "[mitm]", "the verdict replaces the delay");
+        let (t, _s) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: false,
+                    resolved: true,
+                },
+                untestable: false,
+                purged: Some("mitm"),
+                failure: None,
+                active_delay: Some(12),
+                transport_measured: false,
+            },
+            &theme,
+        );
+        assert_eq!(t, "[mitm]", "the verdict replaces the delay");
 
         // A row with no verdict is unchanged by the new slot.
-        let (text, _) = test_cell_content(false, true, false, None, None, Some(12), &theme);
-        assert_eq!(text, "[ 12 ]");
+        let (t, _) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: false,
+                    resolved: true,
+                },
+                untestable: false,
+                purged: None,
+                failure: None,
+                active_delay: Some(12),
+                transport_measured: false,
+            },
+            &theme,
+        );
+        assert_eq!(t, "[ 12 ]");
     }
 
     #[test]
     fn test_cell_colors_delay_by_threshold() {
         let theme = test_theme();
-        let (t, s) = test_cell_content(false, true, false, None, None, Some(12), &theme);
+        let (t, s) = test_cell_content(
+            &RealCellFacts {
+                active_delay: Some(12),
+                ..Default::default()
+            },
+            &theme,
+        );
         assert_eq!(t, "[ 12 ]");
         assert_eq!(s.fg, Some(theme.color("success").into()));
-        let (t, s) = test_cell_content(false, true, false, None, None, Some(612), &theme);
+        let (t, s) = test_cell_content(
+            &RealCellFacts {
+                active_delay: Some(612),
+                ..Default::default()
+            },
+            &theme,
+        );
         assert_eq!(t, "[ 612]");
         assert_eq!(s.fg, Some(theme.color("warning").into()));
-        let (t, s) = test_cell_content(false, true, false, None, None, Some(1234), &theme);
+        let (t, s) = test_cell_content(
+            &RealCellFacts {
+                active_delay: Some(1234),
+                ..Default::default()
+            },
+            &theme,
+        );
         assert_eq!(t, "[1234]");
         assert_eq!(s.fg, Some(theme.color("error").into()));
     }
@@ -2675,18 +2831,38 @@ mod tests {
     #[test]
     fn test_cell_blank_without_measurement() {
         let theme = test_theme();
-        let (t, _) = test_cell_content(false, true, false, None, None, None, &theme);
+        let (t, _) = test_cell_content(&RealCellFacts::default(), &theme);
         assert_eq!(t, "      ");
     }
 
     #[test]
     fn test_cell_shows_name_when_dns_unresolved() {
         let theme = test_theme();
-        let (t, s) = test_cell_content(true, false, false, None, None, Some(12), &theme);
+        let (t, s) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: true,
+                    resolved: false,
+                },
+                active_delay: Some(12),
+                ..Default::default()
+            },
+            &theme,
+        );
         assert_eq!(t, "[name]");
         assert_eq!(s.fg, Some(theme.color("error").into()));
         // Resolved DNS name behaves like a normal host.
-        let (t, _) = test_cell_content(true, true, false, None, None, Some(12), &theme);
+        let (t, _) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: true,
+                    resolved: true,
+                },
+                active_delay: Some(12),
+                ..Default::default()
+            },
+            &theme,
+        );
         assert_eq!(t, "[ 12 ]");
     }
 
@@ -2696,23 +2872,33 @@ mod tests {
         // A failure marker outranks the link's OWN measurement: a failed probe
         // keeps its latency stored, and rendering it would hide a failure the
         // ordering law already ranks in an error tier.
-        let (t, _) = test_cell_content(
-            false,
-            true,
-            false,
-            None,
-            Some(TestFailure::Real),
-            Some(12),
+        let (t, _s) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: false,
+                    resolved: true,
+                },
+                untestable: false,
+                purged: None,
+                failure: Some(TestFailure::Real),
+                active_delay: Some(12),
+                transport_measured: false,
+            },
             &theme,
         );
         assert_eq!(t, "[real]");
-        let (t, _) = test_cell_content(
-            false,
-            true,
-            false,
-            None,
-            Some(TestFailure::Fast),
-            Some(12),
+        let (t, _s) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: false,
+                    resolved: true,
+                },
+                untestable: false,
+                purged: None,
+                failure: Some(TestFailure::Fast),
+                active_delay: Some(12),
+                transport_measured: false,
+            },
             &theme,
         );
         assert_eq!(t, "[fast]");
@@ -2720,29 +2906,45 @@ mod tests {
         // (tier 3) ranks above fast-err (tier 4), the real check being the
         // deeper probe (T20 flip).
         let (t, s) = test_cell_content(
-            false,
-            true,
-            false,
-            None,
-            Some(TestFailure::Real),
-            None,
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: false,
+                    resolved: true,
+                },
+                untestable: false,
+                purged: None,
+                failure: Some(TestFailure::Real),
+                active_delay: None,
+                transport_measured: false,
+            },
             &theme,
         );
         assert_eq!(t, "[real]");
         assert_eq!(s.fg, Some(theme.color("error").into()));
         // Only a fast-class failure marker with no delay → [fast].
-        let (t, _) = test_cell_content(
-            false,
-            true,
-            false,
-            None,
-            Some(TestFailure::Fast),
-            None,
+        let (t, _s) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: false,
+                    resolved: true,
+                },
+                untestable: false,
+                purged: None,
+                failure: Some(TestFailure::Fast),
+                active_delay: None,
+                transport_measured: false,
+            },
             &theme,
         );
         assert_eq!(t, "[fast]");
         // No failure markers → the delay shows even when untested links exist.
-        let (t, _) = test_cell_content(false, true, false, None, None, Some(30), &theme);
+        let (t, _) = test_cell_content(
+            &RealCellFacts {
+                active_delay: Some(30),
+                ..Default::default()
+            },
+            &theme,
+        );
         assert_eq!(t, "[ 30 ]");
     }
 
@@ -2751,23 +2953,48 @@ mod tests {
         let theme = test_theme();
         // A stored (fast) delay must not hide the "cannot be tested" status —
         // that is the whole point of the marker.
-        let (t, s) = test_cell_content(false, true, true, None, None, Some(12), &theme);
-        assert_eq!(t, "[real]");
+        let (t, s) = test_cell_content(
+            &RealCellFacts {
+                untestable: true,
+                active_delay: Some(12),
+                ..Default::default()
+            },
+            &theme,
+        );
+        assert_eq!(
+            t, "[ n/a]",
+            "the engine was never asked, so the label must not claim the probe failed"
+        );
         assert_eq!(s.fg, Some(theme.color("error").into()));
         // A genuine failure marker outranks a measured delay too — the marker
         // is the later, deeper statement about the link.
-        let (t, _) = test_cell_content(
-            false,
-            true,
-            false,
-            None,
-            Some(TestFailure::Real),
-            Some(12),
+        let (t, _s) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: false,
+                    resolved: true,
+                },
+                untestable: false,
+                purged: None,
+                failure: Some(TestFailure::Real),
+                active_delay: Some(12),
+                transport_measured: false,
+            },
             &theme,
         );
         assert_eq!(t, "[real]");
         // DNS-unresolved stays the deepest state.
-        let (t, _) = test_cell_content(true, false, true, None, None, None, &theme);
+        let (t, _) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: true,
+                    resolved: false,
+                },
+                untestable: true,
+                ..Default::default()
+            },
+            &theme,
+        );
         assert_eq!(t, "[name]");
     }
 
