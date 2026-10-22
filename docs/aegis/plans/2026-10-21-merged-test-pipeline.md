@@ -355,6 +355,34 @@ RED tests: the grid renders `Fast │ Auth │ Real`; a row with a fast delay an
 
 **The throughput claim must be measured, not asserted:** run the old pipeline and the new one over the same corpus and report both. If the new pipeline is not faster on healthy rows, the merge's premise is wrong and the plan stops for review (spec §7's "slower on hanging servers" is an accepted cost; "not faster on healthy rows" is not).
 
+### Smoke evidence (2026-10-22)
+
+The TUI surface was verified against a REAL runtime (the `tui-test` harness, an
+isolated `HOME` + `XDG_CONFIG_HOME`, a copy of the seeded fixture):
+
+| step | result |
+|---|---|
+| the Speed Test menu | `Fast Test (Selected)` / `Real Test (Selected)` / `Speed Test (Selected)` / `UDP Test (Selected)` — separator — `Fast Test (All Profiles)` / `Real Test (All Profiles)` / `Real Test (Successful)` / `Real Test (New)` / `Real Test (Successful + New)` / `Real Test (Failed)` / `Fill Exit IPs (Successful)` — … The `Fast + Real Ping` entries are GONE. |
+| the grid header | `Fast ↑  Auth Real` — the Fast column carries the sort arrow, Auth sits between it and Real. |
+| a measured row | `[ 12 ]  ✓   [ 120]` — the transport span, the auth flag (ok) and the real span, side by side. |
+| the decisive row (the transport answered, the config did not) | `[ 12 ]  ✗    [real]` — the transport span BESIDE the auth failure BESIDE the real-probe failure. The old single Test column could not show that pair. |
+| a transport-only row | `[ 45 ]  ·` — the transport span and the n-a auth, no real span. |
+| an unprobed row | blanks in Fast and Auth. |
+
+**Not verified on screen (the fixture has no reachable server):** the live
+`Real Test` filling the three cells from a real probe, the mux handover
+counting one handshake, and `Fill Exit IPs` filling the Exit column. Those
+need a real endpoint; the probe-level equivalents are pinned by the tests
+(`the_transport_stage_has_its_own_budget`,
+`a_mux_row_probes_over_one_connection`,
+`a_failed_probe_still_reports_the_transport_span`).
+
+**The throughput claim is still OPEN.** It needs the old and the new pipeline
+over the same live corpus, and the corpus here has no reachable server. The
+structural argument is one connection per link instead of two (the TCP ping is
+gone) and one probe instead of a ping plus a probe — but a measurement is not
+a claim, and this item stays open until one exists.
+
 ---
 
 ## Risks
