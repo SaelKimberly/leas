@@ -612,25 +612,30 @@ pub async fn remove_failed_servers(state: &mut AppState) {
 // Batch pipeline (T19) — rebuilt on the TaskScheduler
 // ══════════════════════════════════════════════════════════════════════════
 //
-// Phase 1 schedules one `FastPing` task per link; the fast probes are
-// deduplicated by (address, port) — one TCP ping per unique address, the
-// result fanned out to every link sharing it (the old `FastCache` semantics).
-// It is bounded by `fast_ping_concurrency` (one probe future per unique
-// address at a time). `DnsDeferred` links are re-scheduled after the deferral
-// window in a spawned task; `QueueFull` links are skipped (the scheduler logs
-// the warning).
-// Phase 2 (after every phase-1 task settles) schedules one `RealPing` task per
-// link on the native engine (`ops/ping_native.rs` with the protocol row
-// reloaded WITH config). Links the native engine cannot serve are retired at
-// plan time (kind gate) or by their own probe (config gate) and receive the
-// persisted `[real]` marker instead of a probe — `emit_untestable_markers`
-// runs after phase 1 so the marker is never cleared by a fast success. With
-// `dedup_endpoints` (the `real_ping_test_all_protocols` negation), the first
-// successful real ping on an endpoint retires the remaining links' real tasks
-// via `scheduler.cancel_queued` + `complete` — cancelled tasks never write
-// error markers. The scheduler is the single gate authority: probes run only
-// for ids `schedule`/`complete` hand out, and every completion re-reads the
-// link (stale snapshots are rejected by the scheduler).
+// ONE probe per link (spec `2026-10-21-merged-test-pipeline-design`): the
+// merged Real Test dispatches the native probe directly — its TRANSPORT stage
+// IS the fast measurement, so a real-phase batch runs no separate TCP ping.
+// The fast-only batch (the Fast Test command) keeps the TCP probe.
+//
+// The GROUP-ENTRY barrier: the plan's links are contiguous per endpoint, so
+// the endpoint's first protocol is dispatched and its siblings wait for that
+// verdict — dropped when the endpoint succeeded, released when it did not.
+// There is no second barrier check and no cancel-on-winner: a sibling in
+// flight completes and records its full result.
+//
+// A transport failure (the probe's own `transport_failed` flag, never the
+// class — the stage-1 and stage-2+ deadlines share `Timeout`) retires the row
+// and writes the `[fast]` marker. Links the native engine cannot serve are
+// retired at plan time (kind gate) or by their own probe (config gate) and
+// receive the persisted untestable marker instead of a probe.
+//
+// The one concurrency limit is `real_ping_concurrency` — it bounds native
+// handshakes, the expensive stage; the fast half takes no permit of its own.
+// `DnsDeferred` links are re-scheduled after the deferral window in a spawned
+// task; `QueueFull` links are skipped (the scheduler logs the warning). The
+// scheduler is the single gate authority: probes run only for ids
+// `schedule`/`complete` hand out, and every completion re-reads the link
+// (stale snapshots are rejected by the scheduler).
 //
 // Batches are serialized (one at a time): the fire-handshake does not support
 // two batches racing to fire promoted tasks on the same link, and the shared
