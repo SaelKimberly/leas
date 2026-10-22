@@ -241,12 +241,6 @@ pub struct NativeProbeResult {
     /// This is the Fast metric (spec D2) — the same unit in the Fast Test
     /// (endpoint scope) and as stage 1 of the Real Test (link scope).
     pub transport_ms: Option<u64>,
-    /// `"<ip> | <country>"` when the IP API answered, else `None`.
-    ///
-    /// Always `None` from [`real_ping`]: the exit IP is a SEPARATE phase
-    /// (spec D10/D11), fetched by [`fetch_exit_ip`]. The field stays so the
-    /// result shape can carry an IP when a caller has one in hand.
-    pub ip_info: Option<String>,
 }
 
 /// One parsed probe URL: the pieces `probe::fetch` needs.
@@ -308,7 +302,6 @@ pub async fn real_ping(
     Ok(NativeProbeResult {
         latency_ms,
         transport_ms,
-        ip_info: None,
     })
 }
 

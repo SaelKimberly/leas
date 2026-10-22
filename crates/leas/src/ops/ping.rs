@@ -211,9 +211,20 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
         };
         let fmgr = leas_core::FastPingManager::new(timeout_dur);
         let result = fmgr.ping(config_type, &addr, port).await;
-        let (latency_ms, error) = match result {
-            Ok(dur) => (Some(dur.as_millis() as u64), None),
-            Err(e) => (None, Some(e.to_string())),
+        let (latency_ms, transport_ms, error) = match result {
+            // The fast probe IS a transport measurement (spec D2), so its span
+            // IS the transport span. The batch's fast runner says the same
+            // thing (it writes `transport_ms`), and two writers of one column
+            // must not disagree: this path and that one measure the same
+            // fact.
+            //
+            // The error arm stays `None`: a failed dial measured no transport.
+            Ok(dur) => (
+                Some(dur.as_millis() as u64),
+                Some(dur.as_millis() as u64),
+                None,
+            ),
+            Err(e) => (None, None, Some(e.to_string())),
         };
         try_send_or_warn(
             &tx,
@@ -222,7 +233,7 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 protocol_id,
                 test_type: TestType::TcpPing,
                 latency_ms,
-                transport_ms: None,
+                transport_ms,
                 speed_bps: None,
                 ip_info: None,
                 error,
@@ -1068,10 +1079,11 @@ pub(crate) struct BatchShared {
     /// Wall-clock marks of the two levels, in ms since `started`. The spans
     /// overlap by construction (that is the pipeline), which the summary says.
     plan_ms: AtomicU32,
-    fast_started_ms: AtomicU32,
-    fast_ended_ms: AtomicU32,
-    real_started_ms: AtomicU32,
-    real_ended_ms: AtomicU32,
+    /// The one level's wall-clock marks, in ms since `started` (spec D14:
+    /// one level, one pair). The Fast Test and the Real Test are different
+    /// runs, so they do not overlap.
+    started_ms: AtomicU32,
+    ended_ms: AtomicU32,
     // ── real-level endpoint dedup: endpoints whose real ping succeeded ─
     completed_endpoints: Mutex<HashSet<i64>>,
     /// The group's SIBLINGS, held until the group's first protocol's verdict
@@ -1096,24 +1108,34 @@ pub(crate) struct BatchShared {
 
 /// Per-batch counters, folded into ONE summary line at the end (per-result
 /// lines moved to `debug` for the same reason: a batch's volume is not a log).
+///
+/// The `fast_*` counters belong to the FAST-ONLY batch (the Fast Test's own
+/// command); the `probe_*` counters belong to the MERGED one (the Real Test).
+/// A run populates ONE set, never both — the counters are not two views of
+/// one run, they are two different runs.
 #[derive(Default)]
 struct BatchCounters {
+    // ── the Fast Test's own run ──
     fast_ok: AtomicU32,
     fast_hard_failed: AtomicU32,
     fast_soft_failed: AtomicU32,
     /// Fast-level failures by class (the reason `fast_hard_failed` /
     /// `fast_soft_failed` only count, never explain).
     fast_fail: Mutex<BTreeMap<ProbeClass, u32>>,
+    // ── the merged Real Test's run ──
+    /// Probes that succeeded.
+    probe_ok: AtomicU32,
+    /// Probes that failed.
+    probe_failed: AtomicU32,
+    /// Probe failures by class.
+    probe_fail: Mutex<BTreeMap<ProbeClass, u32>>,
     /// Groups whose siblings were DROPPED (the endpoint's first protocol
     /// succeeded) and groups whose siblings were RELEASED (it did not).
     group_dropped: AtomicU32,
     group_released: AtomicU32,
-    real_ok: AtomicU32,
-    real_failed: AtomicU32,
-    /// Real-level failures by class.
-    real_fail: Mutex<BTreeMap<ProbeClass, u32>>,
     untestable: AtomicU32,
-    /// Real halves retired because the fast level proved them unreachable.
+    /// Links retired because their TRANSPORT stage failed — the merged
+    /// pipeline's "not measurable" outcome (spec D1).
     unreachable: AtomicU32,
     deferred: AtomicU32,
     queue_full: AtomicU32,
@@ -1227,10 +1249,8 @@ impl BatchShared {
             fast_latency: Mutex::new(HashMap::new()),
             counters: BatchCounters::default(),
             plan_ms: AtomicU32::new(0),
-            fast_started_ms: AtomicU32::new(0),
-            fast_ended_ms: AtomicU32::new(0),
-            real_started_ms: AtomicU32::new(0),
-            real_ended_ms: AtomicU32::new(0),
+            started_ms: AtomicU32::new(0),
+            ended_ms: AtomicU32::new(0),
             completed_endpoints: Mutex::new(HashSet::new()),
             deferred_siblings: Mutex::new(HashMap::new()),
             resolve_requested: Mutex::new(HashSet::new()),
@@ -1646,30 +1666,47 @@ fn plan_line(links: u32, pages: u32, plan_ms: u32) -> String {
 pub(crate) fn summary_line(shared: &BatchShared) -> String {
     let counters = &shared.counters;
     let load = |counter: &AtomicU32| counter.load(Ordering::Relaxed);
-    format!(
-        "batch summary: links={} plan={} ms untestable={} queue-full={} deferred={} | fast ok={} hard-fail={} soft-fail={} {} ({}..{} ms) | real ok={} failed={} {} skipped-unreachable={} ({}..{} ms) | levels overlap | wall={} ms stopped={} flushes={} staged-left={}",
-        shared.plan_len(),
-        shared.plan_ms.load(Ordering::Relaxed),
-        load(&counters.untestable),
-        load(&counters.queue_full),
-        load(&counters.deferred),
-        load(&counters.fast_ok),
-        load(&counters.fast_hard_failed),
-        load(&counters.fast_soft_failed),
-        class_histogram(&counters.fast_fail),
-        shared.fast_started_ms.load(Ordering::Relaxed),
-        shared.fast_ended_ms.load(Ordering::Relaxed),
-        load(&counters.real_ok),
-        load(&counters.real_failed),
-        class_histogram(&counters.real_fail),
-        load(&counters.unreachable),
-        shared.real_started_ms.load(Ordering::Relaxed),
-        shared.real_ended_ms.load(Ordering::Relaxed),
-        shared.started.elapsed().as_millis(),
-        shared.stop.load(Ordering::Relaxed),
-        shared.writer.flush_count(),
-        shared.writer.staged_len(),
-    )
+    // ONE level (spec D14): a run is EITHER the Fast Test (the TCP probe) OR
+    // the merged Real Test (the native probe) — never both. The line says
+    // which, so a merged run's record does not describe a two-phase pipeline
+    // that no longer exists.
+    if shared.real_phase {
+        format!(
+            "batch summary: links={} plan={} ms untestable={} queue-full={} deferred={} | probes ok={} failed={} {} retired-unreachable={} groups-dropped={} groups-released={} | wall={} ms stopped={} flushes={} staged-left={}",
+            shared.plan_len(),
+            shared.plan_ms.load(Ordering::Relaxed),
+            load(&counters.untestable),
+            load(&counters.queue_full),
+            load(&counters.deferred),
+            load(&counters.probe_ok),
+            load(&counters.probe_failed),
+            class_histogram(&counters.probe_fail),
+            load(&counters.unreachable),
+            load(&counters.group_dropped),
+            load(&counters.group_released),
+            shared.started.elapsed().as_millis(),
+            shared.stop.load(Ordering::Relaxed),
+            shared.writer.flush_count(),
+            shared.writer.staged_len(),
+        )
+    } else {
+        format!(
+            "batch summary: links={} plan={} ms untestable={} queue-full={} deferred={} | fast ok={} hard-fail={} soft-fail={} {} | wall={} ms stopped={} flushes={} staged-left={}",
+            shared.plan_len(),
+            shared.plan_ms.load(Ordering::Relaxed),
+            load(&counters.untestable),
+            load(&counters.queue_full),
+            load(&counters.deferred),
+            load(&counters.fast_ok),
+            load(&counters.fast_hard_failed),
+            load(&counters.fast_soft_failed),
+            class_histogram(&counters.fast_fail),
+            shared.started.elapsed().as_millis(),
+            shared.stop.load(Ordering::Relaxed),
+            shared.writer.flush_count(),
+            shared.writer.staged_len(),
+        )
+    }
 }
 
 /// Count one failure into its class bucket.
@@ -1782,7 +1819,7 @@ async fn run_task_chain(
                 // TCP handshake, not a native handshake, and the one limit
                 // that matters — the one that bounds native handshakes — is
                 // `real_ping_concurrency`.
-                shared.mark_started(&shared.fast_started_ms);
+                shared.mark_started(&shared.started_ms);
                 // The MERGED pipeline (spec D1): in a real-phase batch there is
                 // NO separate TCP ping. The probe's own TRANSPORT stage
                 // measures the same thing the fast probe measured, and the
@@ -1838,7 +1875,7 @@ async fn run_task_chain(
             TaskKind::RealPing => {
                 // Defensive: the batch never queues, so this arm is reached only
                 // when another chain held this link's gate and promoted our id.
-                shared.mark_started(&shared.real_started_ms);
+                shared.mark_started(&shared.started_ms);
                 shared.run_real_task(&link, id).await;
             }
             _ => return, // SpeedTest/UdpTest tasks are not part of the batch
@@ -2181,7 +2218,7 @@ impl BatchShared {
         match self.sched.schedule(&link, TaskKind::RealPing).await {
             ScheduleOutcome::Started(id) => {
                 self.pending_real.fetch_add(1, Ordering::Relaxed);
-                self.mark_started(&self.real_started_ms);
+                self.mark_started(&self.started_ms);
                 self.run_real_task(&link, id).await;
 
                 drop(permit);
@@ -2794,7 +2831,7 @@ impl BatchShared {
                 bump_class(&self.counters.fast_fail, *class);
             }
             (_, ProbeOutcome::Ok { .. }) => {
-                self.counters.real_ok.fetch_add(1, Ordering::Relaxed);
+                self.counters.probe_ok.fetch_add(1, Ordering::Relaxed);
             }
             (_, ProbeOutcome::Failed { text, class, .. }) => {
                 // One counter, one meaning. A config-level refusal is
@@ -2807,8 +2844,8 @@ impl BatchShared {
                 if is_untestable_text(text) {
                     self.counters.untestable.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    self.counters.real_failed.fetch_add(1, Ordering::Relaxed);
-                    bump_class(&self.counters.real_fail, *class);
+                    self.counters.probe_failed.fetch_add(1, Ordering::Relaxed);
+                    bump_class(&self.counters.probe_fail, *class);
                 }
             }
         }
@@ -2873,13 +2910,13 @@ impl BatchShared {
     fn note_settled(&self, kind: TaskKind) {
         match kind {
             TaskKind::FastPing => {
-                self.mark_settled(&self.fast_ended_ms);
+                self.mark_settled(&self.ended_ms);
                 if self.pending_fast.fetch_sub(1, Ordering::Relaxed) == 1 {
                     self.settled.notify_waiters();
                 }
             }
             TaskKind::RealPing => {
-                self.mark_settled(&self.real_ended_ms);
+                self.mark_settled(&self.ended_ms);
                 if self.pending_real.fetch_sub(1, Ordering::Relaxed) == 1 {
                     self.settled.notify_waiters();
                 }
@@ -4705,24 +4742,25 @@ mod tests {
         counters.fast_ok.store(7, Ordering::Relaxed);
         counters.fast_hard_failed.store(5, Ordering::Relaxed);
         counters.fast_soft_failed.store(3, Ordering::Relaxed);
-        counters.real_ok.store(2, Ordering::Relaxed);
-        counters.real_failed.store(4, Ordering::Relaxed);
+        counters.probe_ok.store(2, Ordering::Relaxed);
+        counters.probe_failed.store(4, Ordering::Relaxed);
         counters.untestable.store(1, Ordering::Relaxed);
         counters.unreachable.store(5, Ordering::Relaxed);
         counters.deferred.store(6, Ordering::Relaxed);
         counters.queue_full.store(8, Ordering::Relaxed);
         shared.plan_ms.store(120, Ordering::Relaxed);
-        shared.fast_started_ms.store(3, Ordering::Relaxed);
-        shared.fast_ended_ms.store(180, Ordering::Relaxed);
-        shared.real_started_ms.store(60, Ordering::Relaxed);
-        shared.real_ended_ms.store(340, Ordering::Relaxed);
+        shared.started_ms.store(3, Ordering::Relaxed);
+        shared.ended_ms.store(340, Ordering::Relaxed);
         // The classes are what a fix is aimed at: `hard-fail=5` alone cannot
         // say whether the run failed on timeouts, DNS or refusals.
         bump_class(&counters.fast_fail, ProbeClass::Timeout);
         bump_class(&counters.fast_fail, ProbeClass::Timeout);
         bump_class(&counters.fast_fail, ProbeClass::Dns);
-        bump_class(&counters.real_fail, ProbeClass::Tls);
+        bump_class(&counters.probe_fail, ProbeClass::Tls);
 
+        // The batch is a REAL-phase one (spec D14: ONE level), so the line
+        // carries the merged vocabulary — a two-phase line would describe a
+        // pipeline that no longer exists.
         let line = summary_line(&shared);
         for expected in [
             "links=4",
@@ -4730,13 +4768,40 @@ mod tests {
             "untestable=1",
             "queue-full=8",
             "deferred=6",
-            "fast ok=7 hard-fail=5 soft-fail=3 [timeout=2 dns=1] (3..180 ms)",
-            "real ok=2 failed=4 [tls=1] skipped-unreachable=5 (60..340 ms)",
+            "probes ok=2 failed=4 [tls=1] retired-unreachable=5",
             "stopped=false",
             "staged-left=0",
         ] {
             assert!(line.contains(expected), "missing {expected:?} in: {line}");
         }
+        assert!(
+            !line.contains("fast ok="),
+            "a merged run's record must not describe a fast phase it never ran: {line}"
+        );
+        assert!(
+            !line.contains("real ok="),
+            "the merged run's counters are the probe's, under the probe's name: {line}"
+        );
+    }
+
+    /// The FAST-ONLY run's line carries ITS vocabulary — the two runs are
+    /// different commands, and neither line describes the other.
+    #[tokio::test]
+    async fn the_fast_only_run_summarizes_in_its_own_vocabulary() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1)];
+        let h = harness(rows.clone()).await;
+        let params = build_params(&h, plan_from_rows(&rows), false, false);
+        let shared = BatchShared::new(params);
+        shared.counters.fast_ok.store(7, Ordering::Relaxed);
+        shared.counters.fast_hard_failed.store(5, Ordering::Relaxed);
+        bump_class(&shared.counters.fast_fail, ProbeClass::Timeout);
+
+        let line = summary_line(&shared);
+        assert!(line.contains("fast ok=7 hard-fail=5"), "{line}");
+        assert!(
+            !line.contains("probes ok="),
+            "a fast-only run never probed: {line}"
+        );
     }
 
     /// T5's fail-closed arm, which sat untested inside a closure that was
@@ -4828,12 +4893,12 @@ mod tests {
             "a config-level refusal is untestability"
         );
         assert_eq!(
-            shared.counters.real_failed.load(Ordering::Relaxed),
+            shared.counters.probe_failed.load(Ordering::Relaxed),
             0,
             "and it is NOT a failed probe — one fact, one counter"
         );
         assert!(
-            shared.counters.real_fail.lock().is_empty(),
+            shared.counters.probe_fail.lock().is_empty(),
             "so it contributes no failure class either"
         );
 
@@ -4844,7 +4909,7 @@ mod tests {
             TestType::RealPing,
             &ProbeOutcome::soft_failure("timeout on probe attempt (limit 5s)"),
         );
-        assert_eq!(shared.counters.real_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.counters.probe_failed.load(Ordering::Relaxed), 1);
         assert_eq!(
             shared.counters.untestable.load(Ordering::Relaxed),
             1,
@@ -4994,6 +5059,71 @@ mod tests {
         assert_eq!(
             failed.latency.real_delay, None,
             "a failed probe has no real span"
+        );
+    }
+
+    /// The FAST TEST's own contract (spec T3.3/D7): it writes a fast delay and
+    /// NOTHING else, and it never clears a config-class marker or a purge
+    /// verdict.
+    ///
+    /// The fast probe is a TCP handshake: it proves the endpoint is reachable,
+    /// and nothing about the CONFIG. So it must not touch the real delay, the
+    /// auth flag or the exit IP, and it must leave an existing `[real]` marker
+    /// and an existing purge verdict exactly as they were — a transport
+    /// handshake is not evidence about either.
+    #[tokio::test]
+    async fn the_fast_test_writes_only_the_fast_delay() {
+        use leas_db::models::{ErrorInfo, Latency, ProfileErr, PurgeReason};
+
+        let mut rows = vec![fake_row(1, "10.0.0.1", 1)];
+        // The row carries a config-class marker AND a purge verdict: the fast
+        // test must leave both alone.
+        rows[0].links[0].error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "timeout on probe attempt (limit 5s)".into(),
+        });
+        rows[0].links[0].purge_reason = Some(PurgeReason::RealityFallback);
+        // A real delay and an auth flag are already on the row: the fast
+        // test must not overwrite them either.
+        rows[0].links[0].latency = Latency {
+            real_delay: Some(90),
+            fast_delay: None,
+            ip: Some("1.2.3.4".to_string()),
+            auth: Some(1),
+        };
+
+        let mut h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        // A FAST-ONLY batch (`real_phase == false`).
+        let handle = start_test_batch(&mut h, plan, false, false);
+        handle.await.unwrap();
+        await_batch_done(&mut h.state).await;
+
+        let link = &h.state.endpoints[0].links[0];
+        assert_eq!(
+            link.latency.fast_delay,
+            Some(10),
+            "the fast test writes the transport span: {link:?}"
+        );
+        assert_eq!(
+            link.latency.real_delay,
+            Some(90),
+            "and leaves the real delay alone: {link:?}"
+        );
+        assert_eq!(
+            link.latency.ip,
+            Some("1.2.3.4".to_string()),
+            "and the exit IP: {link:?}"
+        );
+        assert_eq!(link.latency.auth, Some(1), "and the auth flag: {link:?}");
+        assert!(
+            matches!(link.error.as_ref().map(|e| e.kind), Some(ProfileErr::Real)),
+            "a transport handshake never clears a config-class marker: {link:?}"
+        );
+        assert_eq!(
+            link.purge_reason,
+            Some(PurgeReason::RealityFallback),
+            "and never clears a purge verdict: {link:?}"
         );
     }
 
@@ -5562,20 +5692,20 @@ mod tests {
         let params = build_params(&h, plan, true, false);
         let meters = params.meters.clone();
         let shared = BatchShared::new(params);
-        shared.counters.real_ok.store(4, Ordering::Relaxed);
-        shared.counters.real_failed.store(6, Ordering::Relaxed);
+        shared.counters.probe_ok.store(4, Ordering::Relaxed);
+        shared.counters.probe_failed.store(6, Ordering::Relaxed);
         meters.main.done.store(17, Ordering::Relaxed);
         shared.pending_real.store(2, Ordering::Relaxed);
         shared.pending_deferred.store(1, Ordering::Relaxed);
-        bump_class(&shared.counters.real_fail, ProbeClass::Timeout);
-        bump_class(&shared.counters.real_fail, ProbeClass::Timeout);
-        bump_class(&shared.counters.real_fail, ProbeClass::Dns);
+        bump_class(&shared.counters.probe_fail, ProbeClass::Timeout);
+        bump_class(&shared.counters.probe_fail, ProbeClass::Timeout);
+        bump_class(&shared.counters.probe_fail, ProbeClass::Dns);
 
         let line = interrupted_summary_line(&shared);
         for expected in [
             "batch interrupted at quit:",
             "batch summary:",
-            "real ok=4 failed=6 [timeout=2 dns=1]",
+            "probes ok=4 failed=6 [timeout=2 dns=1]",
             "settled=17",
             "in-flight=3",
         ] {

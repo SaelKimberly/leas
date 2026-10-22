@@ -225,12 +225,29 @@ pub(crate) fn apply_test_result(
         }
         TestType::SpeedTest => row.speed_bps = speed_bps.map(|v| v as i64),
     }
-    row.error = None;
+    // The marker's clearing follows the SAME rule as the verdict's: only a
+    // probe that carries evidence about the CONFIG clears a config-class
+    // marker. A TCP handshake proves the endpoint is reachable and nothing
+    // about the config, so the Fast Test must leave a `[real]` marker alone
+    // (spec T3.3/D7, ADR 0006 decision 8) — clearing it would erase the
+    // record of a config failure on the strength of a transport handshake.
+    //
+    // A FAST-class marker IS cleared by a fast success: the fast probe is the
+    // one that produced it, and a fresh success supersedes it.
+    let config_evidence = matches!(test_type, TestType::RealPing | TestType::SpeedTest);
+    if config_evidence
+        || row
+            .error
+            .as_ref()
+            .is_some_and(|e| e.kind == ProfileErr::Fast)
+    {
+        row.error = None;
+    }
     // A data-carrying success THROUGH the tunnel proves the config works: a
     // real probe built the tunnel from this link's own config, a speed test
     // carried bytes over it. A TCP handshake proves neither, so `TcpPing` and
     // `UdpTest` leave the verdict alone.
-    if matches!(test_type, TestType::RealPing | TestType::SpeedTest) && row.purge_reason.is_some() {
+    if config_evidence && row.purge_reason.is_some() {
         row.purge_reason = None;
         return Some(LinkGroups::RESULT.union(LinkGroups::PURGE));
     }

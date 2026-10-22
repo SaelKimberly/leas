@@ -1412,8 +1412,8 @@ async fn flow_cost_network() {
     if let Some(shared) = slot.get() {
         use std::sync::atomic::Ordering;
         println!("[summary] {}", summary_line(shared));
-        let done = u64::from(shared.counters.real_ok.load(Ordering::Relaxed))
-            + u64::from(shared.counters.real_failed.load(Ordering::Relaxed));
+        let done = u64::from(shared.counters.probe_ok.load(Ordering::Relaxed))
+            + u64::from(shared.counters.probe_failed.load(Ordering::Relaxed));
         println!(
             "[network] real results {done} in {:.1} s = {:.2} results/s",
             elapsed.as_secs_f64(),
