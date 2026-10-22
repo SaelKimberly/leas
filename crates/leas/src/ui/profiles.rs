@@ -1307,7 +1307,7 @@ const GRID_COLUMNS: [(usize, &str, u16); 13] = [
     (5, "White", 9),    // whitelist tokens
     (6, "Protocol", 24),
     (7, "Fast", 7),   // the transport span (spec D2)
-    (8, "Auth", 3),   // the quad-state success flag (spec D3)
+    (8, "Auth", 4),   // the quad-state success flag (spec D3)
     (9, "Real", 7),   // the real span, or the failure marker
     (10, "Stab", 7),  // representative link's ring, successes/attempts
     (11, "Out", 5),   // exit flag
