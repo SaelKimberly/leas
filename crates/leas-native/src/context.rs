@@ -100,12 +100,39 @@ impl NativeConnectParams {
 pub struct LinkContext {
     pub params: NativeConnectParams,
     pub target: crate::addr::TargetAddr,
+    /// The auth-ack slot the tunnel's read path reports into (spec D3). The
+    /// family connect functions seed their streams with it; the probe reads
+    /// it when the attempt is over.
+    pub ack: crate::protocol::AuthAckSlot,
 }
 
 impl LinkContext {
+    /// A context whose auth-ack slot is seeded with the family's initial
+    /// state (spec D3): a family with a server ack starts `Unknown` (nothing
+    /// observed yet), a family without one starts `NotApplicable`.
+    ///
+    /// The slot lives HERE, not on a connect-function parameter, because the
+    /// tunnel's read path is what observes the ack — and that path is built
+    /// deep inside the family connect functions, which already receive the
+    /// context. Threading the slot through every signature would touch six
+    /// functions to carry one field the context already owns.
     #[must_use]
-    pub const fn new(params: NativeConnectParams, target: crate::addr::TargetAddr) -> Self {
-        Self { params, target }
+    pub fn with_auth_ack(params: NativeConnectParams, target: crate::addr::TargetAddr) -> Self {
+        let ack = crate::protocol::initial_auth_ack(&params.protocol);
+        Self {
+            params,
+            target,
+            ack: crate::protocol::AuthAckSlot::new(ack),
+        }
+    }
+
+    #[must_use]
+    pub fn new(params: NativeConnectParams, target: crate::addr::TargetAddr) -> Self {
+        Self {
+            params,
+            target,
+            ack: crate::protocol::AuthAckSlot::new(crate::protocol::AuthAck::NotApplicable),
+        }
     }
 
     /// The proxy server's socket address: `resolved_ip` override, else the

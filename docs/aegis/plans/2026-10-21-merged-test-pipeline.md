@@ -377,18 +377,19 @@ need a real endpoint; the probe-level equivalents are pinned by the tests
 `a_mux_row_probes_over_one_connection`,
 `a_failed_probe_still_reports_the_transport_span`).
 
-**Two acceptance items are OPEN, and the smoke does not close either:**
+**One acceptance item is OPEN, and the smoke does not close it:**
 
-1. **T2.2's Auth flag has no engine producer.** The probe reads no server
-   ack yet, so the Auth column renders BLANK in production. The column, the
-   quad-state enum (`AuthState`), the storage (`latency_auth`) and the glyphs
-   are all in place; the ACK READ is not. The `✓`/`✗`/`·` in the captured
-   screen came from hand-seeded fixture data — they prove the RENDERING, not
-   the producer. D1's three outcomes are therefore only two-thirds real: the
-   measured and transport-only outcomes work, and the "measured" row's auth
-   cell is empty until the ack is read.
-2. **The throughput measurement is not taken.** The clause above is the plan's
+1. **The throughput measurement is not taken.** The clause above is the plan's
    own stop-for-review gate, and it stays open.
+
+**T2.2's Auth flag producer LANDED after the smoke** (2026-10-22): the
+protocol phase installs an auth-ack slot on the link context, the tunnel's own
+read path reports into it (a VLESS response header IS the acceptance; an EOF
+during the peel is POSITIVE rejection evidence; a non-vless peer makes the ack
+NotApplicable), and the probe reports the observed state with its result.
+`apply_test_result` persists it into `latency_auth`. Pinned by
+`the_peel_reports_the_ack_into_its_slot` — the same fixture-data caveat that
+applied to the screen capture does NOT apply to the producer any more.
 
 **The throughput claim is still OPEN.** It needs the old and the new pipeline
 over the same live corpus, and the corpus here has no reachable server. The

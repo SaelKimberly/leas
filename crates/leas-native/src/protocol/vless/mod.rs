@@ -92,7 +92,10 @@ async fn connect_encrypted(
             step: "vless mlkem request write",
             limit: timeout,
         })??;
-    Ok(Box::new(VlessClientStream::new(Box::new(conn))))
+    Ok(Box::new(VlessClientStream::with_ack_slot(
+        Box::new(conn),
+        ctx.ack.clone(),
+    )))
 }
 
 /// Plain VLESS connect: request header without addons, then the tunnel.
@@ -111,7 +114,10 @@ async fn connect_plain(
             limit: timeout,
         })??;
 
-    Ok(Box::new(VlessClientStream::new(stream)))
+    Ok(Box::new(VlessClientStream::with_ack_slot(
+        stream,
+        ctx.ack.clone(),
+    )))
 }
 
 /// Vision (`xtls-rprx-vision` / `xtls-rprx-vision-udp443`) connect path
@@ -182,7 +188,7 @@ async fn connect_vision(
     // buffers it via EncodeResponseHeader + SetFlushNext and flushes both
     // together) — is consumed by the peel, so the codec's UUID gate never
     // sees it and the multiplexer/payload never sees it either.
-    let peeled: BoxStream = Box::new(VlessClientStream::new(stream));
+    let peeled: BoxStream = Box::new(VlessClientStream::with_ack_slot(stream, ctx.ack.clone()));
     let vision = VisionStream::new(peeled, uuid);
     Ok(Box::new(vision))
 }
@@ -366,7 +372,7 @@ pub async fn connect_mux(
 /// Plain mux connect: request header without addons (`cmd = CMD_MUX`),
 /// then the multiplexer over the peeled tunnel.
 async fn connect_mux_plain(
-    _ctx: &LinkContext,
+    ctx: &LinkContext,
     stream: BoxStream,
     uuid: [u8; 16],
 ) -> Result<MuxClient<BoxStream>, NativeError> {
@@ -382,7 +388,7 @@ async fn connect_mux_plain(
 
     // The mux frame stream rides the peeled tunnel: the server's `[0,0]`
     // response header is consumed on the first read, then frames flow.
-    let peeled: BoxStream = Box::new(VlessClientStream::new(stream));
+    let peeled: BoxStream = Box::new(VlessClientStream::with_ack_slot(stream, ctx.ack.clone()));
     Ok(MuxClient::new(peeled))
 }
 
@@ -452,7 +458,7 @@ async fn connect_mux_vision(
     // wrapping the VisionReader (outbound.go getResponse), so neither the
     // VisionReader nor the mux dispatcher ever sees the `[0,0]` (the same
     // composition as the TCP vision path `connect_vision`).
-    let peeled: BoxStream = Box::new(VlessClientStream::new(stream));
+    let peeled: BoxStream = Box::new(VlessClientStream::with_ack_slot(stream, ctx.ack.clone()));
     let vision = VisionStream::new(peeled, uuid);
     Ok(MuxClient::new(Box::new(vision)))
 }

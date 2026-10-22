@@ -615,6 +615,11 @@ pub enum CoreEvent {
         /// `remove_failed_servers` read the kind as a verdict. `None` = the
         /// test type decides.
         marker_kind: Option<leas_db::models::ProfileErr>,
+        /// What the PROTOCOL stage saw of the server's ack (spec D3), from
+        /// the batch's merged probe. `None` for every other path (a TCP
+        /// handshake never reaches a protocol phase, and the single Real
+        /// Test's event carries the flag through its own field).
+        auth_ack: Option<leas_native::protocol::AuthAck>,
     },
     /// Result of a version check for a proxy backend.
     UpdateCheckResult {

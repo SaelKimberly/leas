@@ -239,6 +239,7 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 error,
                 purge: None,
                 marker_kind: None,
+                auth_ack: None,
             },
             "tcp_ping_result",
         );
@@ -320,6 +321,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         error: Some("Protocol row not found for real ping".to_string()),
                         purge: None,
                         marker_kind: None,
+                        auth_ack: None,
                     },
                     "real_ping_protocol_missing",
                 );
@@ -339,6 +341,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         error: Some(format!("Failed to load protocol: {e}")),
                         purge: None,
                         marker_kind: None,
+                        auth_ack: None,
                     },
                     "real_ping_protocol_load",
                 );
@@ -363,6 +366,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                     error: Some(untestable_marker_text(&reason)),
                     purge: None,
                     marker_kind: None,
+                    auth_ack: None,
                 },
                 "real_ping_untestable",
             );
@@ -433,6 +437,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 test_type: TestType::RealPing,
                 latency_ms,
                 transport_ms,
+                auth_ack: None,
                 speed_bps: None,
                 ip_info,
                 error,
@@ -496,6 +501,7 @@ pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64
                 error,
                 purge: None,
                 marker_kind: None,
+                auth_ack: None,
             },
             "speed_test_result",
         );
@@ -554,6 +560,7 @@ pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 error,
                 purge: None,
                 marker_kind: None,
+                auth_ack: None,
             },
             "udp_test_result",
         );
@@ -694,6 +701,10 @@ enum ProbeOutcome {
         /// transport (spec D2). The Fast metric.
         transport_ms: Option<u64>,
         ip_info: Option<String>,
+        /// What the PROTOCOL stage saw of the server's ack (spec D3). `None`
+        /// for a fast-probe outcome (the TCP handshake never reaches a
+        /// protocol phase).
+        auth_ack: Option<leas_native::protocol::AuthAck>,
     },
     Failed {
         text: String,
@@ -723,6 +734,10 @@ enum ProbeOutcome {
         /// hung. The merged pipeline's "not measurable" outcome (spec D1)
         /// reads THIS.
         transport_failed: bool,
+        /// What the PROTOCOL stage saw of the server's ack (spec D3). `None`
+        /// for a fast-probe outcome (the TCP handshake never reaches a
+        /// protocol phase) and for a failure this module raised itself.
+        auth_ack: Option<leas_native::protocol::AuthAck>,
     },
 }
 
@@ -742,6 +757,7 @@ impl ProbeOutcome {
             // A config-level refusal is not a transport failure: the config
             // never got as far as a connection.
             transport_failed: false,
+            auth_ack: None,
         }
     }
 }
@@ -897,6 +913,8 @@ impl BatchProbeRunner for EngineProbeRunner {
                     // the transport span (spec D2).
                     transport_ms: Some(dur.as_millis() as u64),
                     ip_info: None,
+                    // A TCP handshake never reaches a protocol phase.
+                    auth_ack: None,
                 },
                 Err(e) => {
                     let (class, hard) = classify_fast_failure(&e);
@@ -917,6 +935,7 @@ impl BatchProbeRunner for EngineProbeRunner {
                         text: e.to_string(),
                         evidence: None,
                         transport_ms: None,
+                        auth_ack: None,
                     }
                 }
             }
@@ -948,6 +967,7 @@ impl BatchProbeRunner for EngineProbeRunner {
                         latency_ms: Some(result.latency_ms),
                         transport_ms: result.transport_ms,
                         ip_info,
+                        auth_ack: Some(result.auth_ack),
                     }
                 }
                 Err(e) => ProbeOutcome::Failed {
@@ -957,6 +977,7 @@ impl BatchProbeRunner for EngineProbeRunner {
                     evidence: e.evidence,
                     transport_ms: e.transport_ms,
                     transport_failed: e.transport_failed,
+                    auth_ack: Some(e.auth_ack),
                 },
             }
         })
@@ -2708,11 +2729,13 @@ impl BatchShared {
     /// import moves every endpoint's ordering keys) used to drop those results
     /// silently. Staging here is what makes "emitted == persisted" hold.
     fn stage_result(&self, link: &ProfileStats, test_type: TestType, outcome: &ProbeOutcome) {
-        let (latency_ms, transport_ms, ip_info, error, purge, marker_kind) = match outcome {
+        let (latency_ms, transport_ms, ip_info, error, purge, marker_kind, auth_ack) = match outcome
+        {
             ProbeOutcome::Ok {
                 latency_ms,
                 transport_ms,
                 ip_info,
+                auth_ack,
             } => (
                 *latency_ms,
                 *transport_ms,
@@ -2720,12 +2743,14 @@ impl BatchShared {
                 None,
                 None,
                 None,
+                *auth_ack,
             ),
             ProbeOutcome::Failed {
                 text,
                 evidence,
                 transport_ms,
                 transport_failed,
+                auth_ack,
                 ..
             } => (
                 None,
@@ -2738,6 +2763,7 @@ impl BatchShared {
                 // outcome): the transport never came up, so the row is not a
                 // config verdict.
                 transport_failed.then_some(leas_db::models::ProfileErr::Fast),
+                *auth_ack,
             ),
         };
         let mut row = link.clone();
@@ -2777,6 +2803,7 @@ impl BatchShared {
             error,
             purge,
             marker_kind,
+            auth_ack,
         ) {
             self.writer.stage(&row, groups);
         }
@@ -2849,11 +2876,13 @@ impl BatchShared {
                 }
             }
         }
-        let (latency_ms, transport_ms, ip_info, error, purge, marker_kind) = match outcome {
+        let (latency_ms, transport_ms, ip_info, error, purge, marker_kind, auth_ack) = match outcome
+        {
             ProbeOutcome::Ok {
                 latency_ms,
                 transport_ms,
                 ip_info,
+                auth_ack,
             } => (
                 *latency_ms,
                 *transport_ms,
@@ -2861,12 +2890,14 @@ impl BatchShared {
                 None,
                 None,
                 None,
+                *auth_ack,
             ),
             ProbeOutcome::Failed {
                 text,
                 evidence,
                 transport_ms,
                 transport_failed,
+                auth_ack,
                 ..
             } => (
                 None,
@@ -2879,6 +2910,7 @@ impl BatchShared {
                 // outcome): the transport never came up, so the row is not a
                 // config verdict.
                 transport_failed.then_some(leas_db::models::ProfileErr::Fast),
+                *auth_ack,
             ),
         };
         let endpoint_id = link.endpoint_id.get();
@@ -2900,6 +2932,7 @@ impl BatchShared {
                 error,
                 purge,
                 marker_kind,
+                auth_ack,
             },
             "batch_ping_result",
         );
@@ -2965,6 +2998,7 @@ impl BatchShared {
                 error: Some(text.to_string()),
                 purge: None,
                 marker_kind: None,
+                auth_ack: None,
             },
             "untestable_marker",
         );
@@ -3220,6 +3254,7 @@ async fn run_fill_exit_ips(params: FillExitIpsParams) {
                 error: None,
                 purge: None,
                 marker_kind: None,
+                auth_ack: None,
             });
         }
     }
@@ -3544,11 +3579,13 @@ mod tests {
         fn new() -> Self {
             Self {
                 fast_outcome: ProbeOutcome::Ok {
+                    auth_ack: None,
                     latency_ms: Some(10),
                     transport_ms: Some(10),
                     ip_info: None,
                 },
                 real_outcome: Mutex::new(ProbeOutcome::Ok {
+                    auth_ack: None,
                     latency_ms: Some(50),
                     transport_ms: Some(10),
                     ip_info: Some("1.2.3.4".to_string()),
@@ -4358,6 +4395,7 @@ mod tests {
         // link 2; link 3 is fine.
         h.runner.set_real_outcome(|index| match index {
             0 => ProbeOutcome::Failed {
+                auth_ack: None,
                 text: "IO: Connection refused (os error 111)".to_string(),
                 class: ProbeClass::Refused,
                 hard: false,
@@ -4367,6 +4405,7 @@ mod tests {
                 transport_failed: true,
             },
             1 => ProbeOutcome::Failed {
+                auth_ack: None,
                 text: "TLS error: handshake error: alert: 2 40".to_string(),
                 class: ProbeClass::Tls,
                 hard: false,
@@ -4376,6 +4415,7 @@ mod tests {
                 transport_failed: false,
             },
             _ => ProbeOutcome::Ok {
+                auth_ack: None,
                 latency_ms: Some(50),
                 transport_ms: Some(10),
                 ip_info: Some("1.2.3.4".to_string()),
@@ -4485,6 +4525,7 @@ mod tests {
         // span is 12 ms and the config did not work. The merged row keeps the
         // transport span beside the failure marker (spec D12).
         *h.runner.real_outcome.lock() = ProbeOutcome::Failed {
+            auth_ack: None,
             text: "timeout on probe attempt (limit 5s)".to_string(),
             class: ProbeClass::Timeout,
             hard: false,
@@ -4614,6 +4655,7 @@ mod tests {
             &link,
             TestType::TcpPing,
             &ProbeOutcome::Ok {
+                auth_ack: None,
                 latency_ms: Some(12),
                 transport_ms: Some(12),
                 ip_info: None,
@@ -4632,6 +4674,7 @@ mod tests {
             &link,
             TestType::RealPing,
             &ProbeOutcome::Ok {
+                auth_ack: None,
                 latency_ms: Some(40),
                 transport_ms: Some(12),
                 ip_info: None,
@@ -4648,6 +4691,7 @@ mod tests {
             &link,
             TestType::RealPing,
             &ProbeOutcome::Failed {
+                auth_ack: None,
                 text: "timeout".to_string(),
                 class: ProbeClass::Timeout,
                 hard: false,
@@ -5020,6 +5064,7 @@ mod tests {
         // entry, and a failed first protocol does not suppress the siblings.
         h.runner.set_real_outcome(|index| match index {
             0 => ProbeOutcome::Failed {
+                auth_ack: None,
                 text: "timeout".to_string(),
                 class: ProbeClass::Timeout,
                 hard: false,
@@ -5029,6 +5074,7 @@ mod tests {
                 transport_failed: false,
             },
             _ => ProbeOutcome::Ok {
+                auth_ack: None,
                 latency_ms: Some(50),
                 transport_ms: Some(10),
                 ip_info: Some("1.2.3.4".to_string()),
@@ -5566,6 +5612,7 @@ mod tests {
         h.runner.fast_by_addr.lock().insert(
             "10.0.0.2".to_string(),
             ProbeOutcome::Failed {
+                auth_ack: None,
                 text: "IO: Connection refused (os error 111)".to_string(),
                 class: ProbeClass::Refused,
                 hard: true,

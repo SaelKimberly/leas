@@ -156,6 +156,7 @@ impl BatchProbeRunner for NullRunner {
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
         Box::pin(async move {
             ProbeOutcome::Ok {
+                auth_ack: None,
                 latency_ms: Some(10),
                 transport_ms: Some(10),
                 ip_info: None,
@@ -172,6 +173,7 @@ impl BatchProbeRunner for NullRunner {
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
         Box::pin(async move {
             ProbeOutcome::Ok {
+                auth_ack: None,
                 latency_ms: Some(50),
                 transport_ms: Some(10),
                 ip_info: Some("1.2.3.4".to_owned()),
@@ -335,11 +337,13 @@ async fn flow_cost_report() {
     let params = batch_params(&state, tx, Vec::new(), true, 200, Arc::new(NullRunner));
     let shared = Arc::new(BatchShared::new(params));
     let outcome_ok = ProbeOutcome::Ok {
+        auth_ack: None,
         latency_ms: Some(37),
         transport_ms: Some(10),
         ip_info: Some("1.2.3.4".to_owned()),
     };
     let outcome_err = ProbeOutcome::Failed {
+        auth_ack: None,
         text: "connection timed out".to_owned(),
         class: ProbeClass::Timeout,
         hard: true,
@@ -385,6 +389,7 @@ async fn flow_cost_report() {
         host.clone(),
         port,
         ProbeOutcome::Failed {
+            auth_ack: None,
             text: "connection timed out after 5000 ms".to_owned(),
             class: ProbeClass::Timeout,
             hard: true,
@@ -563,6 +568,7 @@ async fn flow_cost_report() {
         dedup_cache.insert(
             key.clone(),
             ProbeOutcome::Ok {
+                auth_ack: None,
                 latency_ms: Some(9),
                 transport_ms: Some(9),
                 ip_info: None,
@@ -1727,6 +1733,7 @@ async fn hit_miss_rows(hit: bool) -> Vec<TableRow> {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         });
     }
     while state.poll_core_events().await {}

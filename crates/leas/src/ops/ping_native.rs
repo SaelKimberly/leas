@@ -121,6 +121,10 @@ pub struct ProbeFailure {
     /// the transport did not come up, so the probe cannot pass where the dial
     /// did not.
     pub transport_failed: bool,
+    /// What the PROTOCOL stage saw of the server's ack (spec D3), when the
+    /// stage ran. `NotApplicable` for a transport-stage failure (no protocol
+    /// phase ever ran) and for a failure this module raised itself.
+    pub auth_ack: leas_native::protocol::AuthAck,
 }
 
 impl ProbeFailure {
@@ -154,6 +158,7 @@ impl ProbeFailure {
             evidence: err.evidence(),
             transport_ms: None,
             transport_failed: is_transport_failure(err),
+            auth_ack: leas_native::protocol::AuthAck::NotApplicable,
         }
     }
 
@@ -169,6 +174,7 @@ impl ProbeFailure {
             evidence: None,
             transport_ms: None,
             transport_failed: false,
+            auth_ack: leas_native::protocol::AuthAck::NotApplicable,
         }
     }
 }
@@ -241,6 +247,8 @@ pub struct NativeProbeResult {
     /// This is the Fast metric (spec D2) — the same unit in the Fast Test
     /// (endpoint scope) and as stage 1 of the Real Test (link scope).
     pub transport_ms: Option<u64>,
+    /// What the PROTOCOL stage saw of the server's ack (spec D3).
+    pub auth_ack: leas_native::protocol::AuthAck,
 }
 
 /// One parsed probe URL: the pieces `probe::fetch` needs.
@@ -298,10 +306,11 @@ pub async fn real_ping(
         parse_probe_url(req.ping_url).map_err(|e| ProbeFailure::local(ProbeClass::Config, e))?;
     let params = probe_params(endpoint, addresses, config, &target);
 
-    let (latency_ms, transport_ms) = probe_attempts(&params, &target, req).await?;
+    let (latency_ms, transport_ms, auth_ack) = probe_attempts(&params, &target, req).await?;
     Ok(NativeProbeResult {
         latency_ms,
         transport_ms,
+        auth_ack,
     })
 }
 
@@ -355,7 +364,7 @@ async fn probe_attempts(
     params: &NativeConnectParams,
     target: &ProbeUrl,
     req: &NativeProbeReq<'_>,
-) -> Result<(u64, Option<u64>), ProbeFailure> {
+) -> Result<(u64, Option<u64>, leas_native::protocol::AuthAck), ProbeFailure> {
     let attempts = req.retries.max(1);
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..attempts {
@@ -381,13 +390,16 @@ async fn probe_attempts(
                         r.status,
                         r.elapsed.as_millis() as u64,
                         r.transport_span.map(|s| s.as_millis() as u64),
+                        r.auth_ack,
                     )
                 })
                 .map_err(|e| {
-                    // The transport span rides along with the failure: the
-                    // transport was alive, the config was not (spec D12).
+                    // The transport span and the ack ride along with the
+                    // failure: the transport was alive and the protocol stage
+                    // SAW something (spec D12, D3).
                     let mut failure = ProbeFailure::from_engine(e.error());
                     failure.transport_ms = e.transport_span.map(|s| s.as_millis() as u64);
+                    failure.auth_ack = e.auth_ack;
                     failure
                 })
         });
@@ -398,21 +410,27 @@ async fn probe_attempts(
     // attempt failed — the transport span of the last failure (the transport
     // was alive even though the config was not).
     let mut best_transport: Option<u64> = None;
+    let mut best_ack: Option<leas_native::protocol::AuthAck> = None;
     let mut last_error: Option<ProbeFailure> = None;
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok(Ok((status, ms, transport))) if (200..300).contains(&status) => {
+            Ok(Ok((status, ms, transport, ack))) if (200..300).contains(&status) => {
                 best = Some(best.map_or(ms, |b| b.min(ms)));
                 if best == Some(ms) {
                     best_transport = transport;
+                    best_ack = Some(ack);
                 }
             }
-            Ok(Ok((status, _, transport))) => {
+            Ok(Ok((status, _, transport, ack))) => {
                 // A non-2xx answer: the transport was alive (the probe reached
-                // the target), so the span is kept on the failure.
+                // the target), so the span is kept on the failure. The ack is
+                // the tunnel's own observation — the protocol stage SAW
+                // something, and a non-2xx from the TARGET says nothing about
+                // the config, so the flag still reports it.
                 let mut failure =
                     ProbeFailure::local(ProbeClass::Http, format!("unexpected status {status}"));
                 failure.transport_ms = transport;
+                failure.auth_ack = ack;
                 last_error = Some(failure);
             }
             Ok(Err(e)) => {
@@ -432,7 +450,11 @@ async fn probe_attempts(
     }
 
     if let Some(ms) = best {
-        return Ok((ms, best_transport));
+        return Ok((
+            ms,
+            best_transport,
+            best_ack.unwrap_or(leas_native::protocol::AuthAck::NotApplicable),
+        ));
     }
     // The failure carries the transport span when the transport stage
     // completed: the row then says "the server is up, the config is

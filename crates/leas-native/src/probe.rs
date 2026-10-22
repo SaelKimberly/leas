@@ -31,6 +31,7 @@ use crate::BoxStream;
 use crate::addr::TargetAddr;
 use crate::context::NativeConnectParams;
 use crate::error::NativeError;
+use crate::protocol::AuthAck;
 use crate::transport::http::body::{IncomingReader, ReqBody};
 use crate::transport::http::conn::h1_client;
 
@@ -81,6 +82,9 @@ pub struct ProbeResponse {
     /// This is the Fast metric (spec D2): the same unit in the Fast Test
     /// (endpoint scope) and as stage 1 of the Real Test (link scope).
     pub transport_span: Option<Duration>,
+    /// What the PROTOCOL stage saw of the server's authentication ack (spec
+    /// D3). `NotApplicable` for a family with no server ack.
+    pub auth_ack: AuthAck,
 }
 
 /// A failed probe: the engine's error PLUS the transport span the attempt
@@ -100,15 +104,21 @@ pub struct ProbeError {
     /// The TRANSPORT span, when the transport stage completed before the
     /// failure. `None` when the transport stage itself failed.
     pub transport_span: Option<Duration>,
+    /// What the PROTOCOL stage saw of the server's ack (spec D3). A
+    /// transport-stage failure never reached a protocol phase, so this is
+    /// `NotApplicable` there.
+    pub auth_ack: AuthAck,
 }
 
 impl ProbeError {
-    /// A failure with no transport measurement (the transport stage failed).
+    /// A failure with no transport measurement and no ack (the transport
+    /// stage failed, so no protocol phase ever ran).
     #[must_use]
     pub const fn new(error: NativeError) -> Self {
         Self {
             error,
             transport_span: None,
+            auth_ack: AuthAck::NotApplicable,
         }
     }
 
@@ -186,8 +196,13 @@ pub async fn fetch(
     // PROTOCOL stage's work. The SAME predicate the inbound dial uses, so the
     // probe cannot report a plugin row as "server unreachable" when the real
     // cause is a missing mux frame (v2ray-plugin's server mandates mux).
+    // The auth-ack slot: the tunnel's read path reports into it (spec D3).
+    // It is cloned out of the context BEFORE the attempt moves it, so the
+    // caller can read the observation after the attempt is over — including
+    // on the failure paths, where the error type would otherwise lose it.
+    let ctx = crate::context::LinkContext::with_auth_ack(params.clone(), params.target.clone());
+    let ack_slot = ctx.ack.clone();
     let attempt = async move {
-        let ctx = crate::context::LinkContext::new(params.clone(), params.target.clone());
         let tunnel = if params.mux {
             // The mux multiplexer rides the DIAL the transport stage made —
             // one connection for the whole attempt, so the transport span
@@ -205,24 +220,29 @@ pub async fn fetch(
         .await
         .map_err(|_| {
             // The transport span rides along with the failure: the transport
-            // was alive, the protocol stage was not (spec D12).
+            // was alive, the protocol stage was not (spec D12). The ack is
+            // whatever the tunnel saw — a timeout while the peel was pending
+            // is the UNKNOWN state, not a rejection (spec D3).
             ProbeError {
                 error: NativeError::Timeout {
                     step: "probe attempt",
                     limit: req.timeout,
                 },
                 transport_span: Some(transport_span),
+                auth_ack: ack_slot.get(),
             }
         })?
         .map_err(|error| ProbeError {
             error,
             transport_span: Some(transport_span),
+            auth_ack: ack_slot.get(),
         })?;
     // The probe's latency is the whole span, the dial included — the same span
     // the subprocess probe measured through its local SOCKS hop.
     Ok(ProbeResponse {
         elapsed: started.elapsed(),
         transport_span: Some(transport_span),
+        auth_ack: ack_slot.get(),
         ..response
     })
 }
@@ -277,10 +297,11 @@ pub async fn fetch_over<S: crate::Stream + 'static>(
         status,
         body,
         elapsed,
-        // The stream-level half has no transport stage of its own: the caller
-        // passes an ALREADY-connected stream. The dial's span belongs to
-        // `fetch`, which is the only path that measures it.
+        // The stream-level half has no transport stage or ack of its own: the
+        // caller passes an ALREADY-connected stream. The dial's span belongs
+        // to `fetch`, and the ack's slot is read there too.
         transport_span: None,
+        auth_ack: AuthAck::NotApplicable,
     })
 }
 

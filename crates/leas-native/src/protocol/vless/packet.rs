@@ -120,7 +120,9 @@ impl ReadState {
     fn new(mode: PacketMode) -> Self {
         Self {
             mode,
-            peel: Peel::new(),
+            // The UDP peel has no probe slot: the auth flag is a
+            // TCP-probe fact (the flag rides the probe's own tunnel).
+            peel: Peel::new(crate::protocol::AuthAckSlot::default()),
             frames: FrameReader::new(),
         }
     }

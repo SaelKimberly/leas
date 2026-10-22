@@ -42,6 +42,113 @@ fn not_impl(feature: &str) -> Result<BoxStream, NativeError> {
     })
 }
 
+/// What the PROTOCOL stage saw of the server's authentication ack.
+///
+/// The quad-state flag's source (spec D3). The distinction that matters is
+/// between an ack that was OBSERVED and one that was merely POSSIBLE:
+///
+/// - `Ok` — the ack arrived. The server accepted this config.
+/// - `Failed` — POSITIVE rejection evidence: an EOF during the peel, an auth
+///   error, a framing error. Only positive evidence may produce this state.
+/// - `NotApplicable` — the family has no server ack at all (Trojan, SS-AEAD),
+///   or the engine cannot serve the row.
+/// - `Unknown` — the ack was possible but was not observed in time (a lazy
+///   sing-box server + a slow target).
+///
+/// `Unknown` is the state that must never be silently `Failed`: sing-box
+/// writes the VLESS response header LAZILY (only before the first
+/// application-data write), so a slow target means the ack never arrives, and
+/// recording that as a rejection would persist a false negative
+/// indistinguishable from a wrong UUID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthAck {
+    /// The ack arrived — the server accepted this config.
+    Ok,
+    /// Positive rejection evidence.
+    Failed,
+    /// The family has no server ack, or the engine cannot serve the row.
+    #[default]
+    NotApplicable,
+    /// The ack was possible but was not observed in time.
+    Unknown,
+}
+
+/// The shared slot the ack is reported through.
+///
+/// The ack is observed INSIDE the tunnel's own read path — the response
+/// header is peeled on the first read, which happens during the probe's
+/// target-TLS handshake, not during the protocol phase. The slot is what
+/// carries the observation back out: the protocol phase installs the family's
+/// initial state (an ack is possible → `Unknown`; the family has none →
+/// `NotApplicable`), the tunnel's own read path UPDATES it when it sees the
+/// ack or its rejection, and the probe reads it when the attempt is over.
+///
+/// An `Arc` because the tunnel crosses a `Box<dyn Stream>` boundary (the
+/// target TLS wrap) that no downcast can cross back, and a plain cell would
+/// move the observation with the stream.
+#[derive(Debug, Clone, Default)]
+pub struct AuthAckSlot(std::sync::Arc<std::sync::Mutex<AuthAck>>);
+
+impl AuthAckSlot {
+    /// A slot seeded with the family's initial state.
+    #[must_use]
+    pub fn new(initial: AuthAck) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(initial)))
+    }
+
+    /// Record an observation.
+    pub fn set(&self, ack: AuthAck) {
+        *self.0.lock().expect("auth-ack slot poisoned") = ack;
+    }
+
+    /// Read the observation.
+    #[must_use]
+    pub fn get(&self) -> AuthAck {
+        *self.0.lock().expect("auth-ack slot poisoned")
+    }
+}
+
+impl AuthAck {
+    /// The stored integer (`latency_auth`), aligned with the TUI's
+    /// `AuthState` mapping: 1 = ok, 2 = failed, 3 = n-a, 4 = unknown.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        match self {
+            Self::Ok => 1,
+            Self::Failed => 2,
+            Self::NotApplicable => 3,
+            Self::Unknown => 4,
+        }
+    }
+}
+
+/// The ack state a family STARTS with, before anything is observed (spec D3).
+///
+/// The families whose server sends an ack start at `Unknown`: the ack is
+/// possible, and nothing has been observed yet. The families with no server
+/// ack (Trojan, SS-AEAD) start at `NotApplicable`, and stay there.
+#[must_use]
+pub fn initial_auth_ack(protocol: &ProtocolConfig) -> AuthAck {
+    match protocol {
+        // The response header IS the ack, but it is LAZY (sing-box writes it
+        // only before the first application-data write), so an unobserved ack
+        // is not a rejection — the state starts unknown.
+        ProtocolConfig::Vless(_) | ProtocolConfig::Vmess(_) => AuthAck::Unknown,
+        // SS2022: the response header echoes the client's salt. The same
+        // laziness argument applies to the reply's arrival. Classic-AEAD
+        // Shadowsocks has no server ack at all.
+        ProtocolConfig::Ss(cfg) => match ss::resolve_method(cfg) {
+            Ok(method) if method.family == ss::method::SsFamily::Blake3_2022 => AuthAck::Unknown,
+            _ => AuthAck::NotApplicable,
+        },
+        // Every other family the engine serves has no server ack; every
+        // family it does not serve never reaches a protocol phase at all
+        // (the capability gate marks those rows), so `NotApplicable` is the
+        // honest state for both.
+        _ => AuthAck::NotApplicable,
+    }
+}
+
 /// Run the protocol phase: handshake + tunnel over the given stream.
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     match &ctx.params.protocol {

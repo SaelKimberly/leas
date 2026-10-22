@@ -162,6 +162,10 @@ pub(crate) fn apply_test_result(
     // so the row is a transport failure, not a config verdict. `None` = the
     // test type decides (every other path).
     marker_kind: Option<ProfileErr>,
+    // What the PROTOCOL stage saw of the server's ack (spec D3), from the
+    // batch's merged probe. `None` = no protocol phase ran (a TCP handshake)
+    // or the caller has none — the flag is left exactly as it was.
+    auth_ack: Option<leas_native::protocol::AuthAck>,
 ) -> Option<LinkGroups> {
     if let Some(err) = error {
         if err == "Cancelled" {
@@ -172,6 +176,9 @@ pub(crate) fn apply_test_result(
         // beside the failure marker instead of a blank.
         if let Some(transport_ms) = transport_ms {
             row.latency.fast_delay = Some(transport_ms as i32);
+        }
+        if let Some(ack) = auth_ack {
+            row.latency.auth = Some(ack.as_i64());
         }
         // Persisted failure marker — the profiles Test column renders
         // `[fast]`/`[real]` from `link.error.kind`; the measurement (if any)
@@ -216,6 +223,10 @@ pub(crate) fn apply_test_result(
             }
             if let Some(transport_ms) = transport_ms {
                 row.latency.fast_delay = Some(transport_ms as i32);
+            }
+            // The ack is the protocol stage's observation (spec D3).
+            if let Some(ack) = auth_ack {
+                row.latency.auth = Some(ack.as_i64());
             }
         }
         TestType::TcpPing | TestType::UdpTest => {
@@ -705,6 +716,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 error,
                 purge,
                 marker_kind,
+                auth_ack,
             } => {
                 // The test result mutates link latency/speed/error and the
                 // testing_details map — the profiles display cache must
@@ -764,6 +776,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                 error.as_deref(),
                                 purge,
                                 marker_kind,
+                                auth_ack,
                             ) {
                                 // STABILITY, single pings only. A batch stages
                                 // its own samples (its rows are off-page here),
@@ -1474,6 +1487,7 @@ mod tests {
             Some("timeout after 5s"),
             Some(PurgeReason::TransportRejected),
             None,
+            None,
         )
         .expect("changed");
         assert_eq!(
@@ -1494,6 +1508,7 @@ mod tests {
             Some("REALITY error: received real certificate"),
             Some(PurgeReason::RealityFallback),
             None,
+            None,
         )
         .expect("changed");
         assert!(groups.contains(LinkGroups::PURGE), "the verdict moved");
@@ -1510,6 +1525,7 @@ mod tests {
             Some("timeout on probe attempt (limit 5s)"),
             None,
             None,
+            None,
         )
         .expect("changed");
         assert!(!groups.contains(LinkGroups::PURGE));
@@ -1520,6 +1536,7 @@ mod tests {
             &mut link,
             TestType::TcpPing,
             Some(42),
+            None,
             None,
             None,
             None,
@@ -1540,6 +1557,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("changed");
         assert!(groups.contains(LinkGroups::PURGE), "the verdict moved back");
@@ -1556,6 +1574,7 @@ mod tests {
                 None,
                 None,
                 Some("Cancelled"),
+                None,
                 None,
                 None,
             ),
@@ -1583,6 +1602,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("changed");
         assert!(groups.contains(LinkGroups::PURGE));
@@ -1596,6 +1616,7 @@ mod tests {
             None,
             None,
             Some("Connection refused"),
+            None,
             None,
             None,
         )
@@ -1819,6 +1840,7 @@ mod tests {
                 error: None,
                 purge: None,
                 marker_kind: None,
+                auth_ack: None,
             })
             .expect("result");
             let _ = state.poll_core_events().await;
@@ -1987,6 +2009,7 @@ mod tests {
                 error: None,
                 purge: None,
                 marker_kind: None,
+                auth_ack: None,
             })
             .await
             .expect("send");
@@ -2389,6 +2412,7 @@ mod tests {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2433,6 +2457,7 @@ mod tests {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2490,6 +2515,7 @@ mod tests {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2537,6 +2563,7 @@ mod tests {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2581,6 +2608,7 @@ mod tests {
             error: Some("timeout".to_string()),
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2621,6 +2649,7 @@ mod tests {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2657,6 +2686,7 @@ mod tests {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2698,6 +2728,7 @@ mod tests {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2735,6 +2766,7 @@ mod tests {
             error: Some("Cancelled".to_string()),
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2828,6 +2860,7 @@ mod tests {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
@@ -2851,6 +2884,7 @@ mod tests {
             error: None,
             purge: None,
             marker_kind: None,
+            auth_ack: None,
         })
         .await
         .unwrap();
