@@ -366,40 +366,26 @@ fn batch_bars(
     let Some(meters) = &state.batch_progress else {
         return (None, None);
     };
-    let fast = || {
+    let main = || {
         let (done, total) = (
-            meters.fast.done.load(Ordering::Relaxed),
-            meters.fast.total.load(Ordering::Relaxed),
+            meters.main.done.load(Ordering::Relaxed),
+            meters.main.total.load(Ordering::Relaxed),
         );
-        progress::bar_line("Fast", done, total, meters.fast.eta_secs(), width, theme)
+        progress::bar_line("Test", done, total, meters.main.eta_secs(), width, theme)
     };
     let pages = (
         meters.plan_pages_done.load(Ordering::Relaxed),
         meters.plan_pages_total.load(Ordering::Relaxed),
     );
-    let fast_line = if pages.1 > 0 && pages.0 < pages.1 {
+    let main_line = if pages.1 > 0 && pages.0 < pages.1 {
         Line::from(Span::styled(
             format!("planning {}/{} pages", pages.0, pages.1),
             ThemeStyles::footer_label(theme),
         ))
     } else {
-        fast()
+        main()
     };
-    let real_total = meters.real.total.load(Ordering::Relaxed);
-    if real_total == 0 {
-        // Nothing real to report (a fast-only batch, or no candidate yet): the
-        // single bar takes the first row.
-        return (Some(fast_line), None);
-    }
-    let real = progress::bar_line(
-        "Real",
-        meters.real.done.load(Ordering::Relaxed),
-        real_total,
-        meters.real.eta_secs(),
-        width,
-        theme,
-    );
-    (Some(real), Some(fast_line))
+    (Some(main_line), None)
 }
 
 #[cfg(test)]
@@ -452,15 +438,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fast_only_batch_puts_its_bar_on_the_first_row() {
+    async fn the_single_batch_bar_puts_its_counters_on_the_first_row() {
         let meters = BatchMeters::default();
-        meters.fast.total.store(100, Ordering::Relaxed);
-        meters.fast.done.store(25, Ordering::Relaxed);
+        meters.main.total.store(100, Ordering::Relaxed);
+        meters.main.done.store(25, Ordering::Relaxed);
         let state = state_with_meters(meters).await;
         let lines = render_panel(&state);
         // The fieldset's top rule is line 0, so content row N is line N:
         // row 3 = line 3, row 4 = line 4.
-        assert!(lines[3].contains("Fast"), "bar on row 3: {:?}", lines[3]);
+        assert!(lines[3].contains("Test"), "bar on row 3: {:?}", lines[3]);
         assert!(lines[3].contains("25/100"), "counters: {:?}", lines[3]);
         assert!(
             lines[3].contains('█') || lines[3].contains('░'),
@@ -475,27 +461,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_and_fast_bars_stack_with_real_first() {
+    async fn the_single_batch_bar_carries_the_counters_and_the_eta() {
         let meters = BatchMeters::default();
-        meters.fast.total.store(34562, Ordering::Relaxed);
-        meters.fast.done.store(8123, Ordering::Relaxed);
-        meters.real.total.store(17051, Ordering::Relaxed);
-        meters.real.done.store(1234, Ordering::Relaxed);
+        meters.main.total.store(17051, Ordering::Relaxed);
+        meters.main.done.store(1234, Ordering::Relaxed);
+        // 1000 milli-results/s → 15817 remaining seconds at the sampled rate
+        // (17051 − 1234), which the bar renders as `~4h23m`.
+        meters.main.rate_milli.store(1000, Ordering::Relaxed);
         let state = state_with_meters(meters).await;
         let lines = render_panel(&state);
         assert!(
-            lines[3].contains("Real") && lines[3].contains("1234/17051"),
-            "real bar on row 3: {:?}",
+            lines[3].contains("Test") && lines[3].contains("1234/17051"),
+            "the merged bar on row 3: {:?}",
             lines[3]
         );
+        assert!(lines[3].contains("~4h23m"), "eta: {:?}", lines[3]);
+        // One level, one bar: neither old half's label survives.
         assert!(
-            lines[4].contains("Fast") && lines[4].contains("8123/34562"),
-            "fast bar on row 4: {:?}",
-            lines[4]
+            !lines[3].contains("Fast") && !lines[3].contains("Real"),
+            "no stale half labels: {:?}",
+            lines[3]
         );
-        // The stat cells keep their own columns beside the bars.
         assert!(lines[3].contains("TCP:"), "stat cells kept: {:?}", lines[3]);
-        assert!(lines[4].contains("📊"), "stat cells kept: {:?}", lines[4]);
     }
 
     #[tokio::test]
@@ -503,7 +490,7 @@ mod tests {
         let meters = BatchMeters::default();
         meters.plan_pages_done.store(1, Ordering::Relaxed);
         meters.plan_pages_total.store(92, Ordering::Relaxed);
-        meters.fast.total.store(200, Ordering::Relaxed);
+        meters.main.total.store(200, Ordering::Relaxed);
         let state = state_with_meters(meters).await;
         let lines = render_panel(&state);
         assert!(

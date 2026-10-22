@@ -29,19 +29,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         let progress_text = state.batch_progress.as_ref().map_or_else(
             || " Testing...".to_string(),
             |m| {
-                let fast_done = m.fast.done.load(Ordering::Relaxed);
-                let fast_total = m.fast.total.load(Ordering::Relaxed);
-                let real_done = m.real.done.load(Ordering::Relaxed);
-                let real_total = m.real.total.load(Ordering::Relaxed);
-                match (fast_total, real_total) {
-                    (0, _) => " Testing...".to_string(),
-                    // Both levels, the fast one first: they run at the same time,
-                    // so the pair is `F done/total · R done/total`. The compact
-                    // panel bar and the Actions Log bars carry the ETAs.
-                    (fast_total, real_total) if real_total > 0 => {
-                        format!(" Testing: F {fast_done}/{fast_total} · R {real_done}/{real_total}")
-                    }
-                    (fast_total, _) => format!(" Testing: F {fast_done}/{fast_total}"),
+                let done = m.main.done.load(Ordering::Relaxed);
+                let total = m.main.total.load(Ordering::Relaxed);
+                match total {
+                    0 => " Testing...".to_string(),
+                    // One level: the pair is `done/total`. The panel bar and
+                    // the Actions Log bar carry the ETA.
+                    total => format!(" Testing: {done}/{total}"),
                 }
             },
         );

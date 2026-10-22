@@ -345,17 +345,13 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
                 crate::ops::ping::interrupted_summary_line(shared),
             );
         } else {
-            let (fast_done, fast_total) = (
-                meters.fast.done.load(Ordering::Relaxed),
-                meters.fast.total.load(Ordering::Relaxed),
-            );
-            let (real_done, real_total) = (
-                meters.real.done.load(Ordering::Relaxed),
-                meters.real.total.load(Ordering::Relaxed),
+            let (main_done, main_total) = (
+                meters.main.done.load(Ordering::Relaxed),
+                meters.main.total.load(Ordering::Relaxed),
             );
             tracing::info!(
                 target: "tui::ops::ping",
-                "batch interrupted at quit: fast {fast_done}/{fast_total} probe(s), real {real_done}/{real_total} probe(s) reported, no batch summary; staged writes flushed, {} left staged",
+                "batch interrupted at quit: test {main_done}/{main_total} probe(s) reported, no batch summary; staged writes flushed, {} left staged",
                 state.link_stage.staged_len(),
             );
         }
@@ -589,7 +585,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     })
                     .unwrap_or_default();
                 match label {
-                    "Fast Ping (Selected)" => {
+                    "Fast Test (Selected)" => {
                         if on_sub || !multi {
                             if let Some(id) = proto_id {
                                 state.start_tcp_ping(ep_id.unwrap_or_default(), id);
@@ -598,7 +594,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                             state.start_endpoint_batch_ping();
                         }
                     }
-                    "Real Ping (Selected)" => {
+                    "Real Test (Selected)" => {
                         if on_sub || !multi {
                             if let Some(id) = proto_id {
                                 state.start_real_ping(ep_id.unwrap_or_default(), id);
@@ -617,19 +613,22 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                             state.start_udp_test(ep_id.unwrap_or_default(), id);
                         }
                     }
-                    "Fast Ping (All Profiles)" => state.start_batch_ping(),
-                    "Fast + Real Ping (All Profiles)" => state.start_batch_then_real_ping(),
-                    "Fast + Real Ping (Successful)" => {
+                    "Fast Test (All Profiles)" => state.start_batch_ping(),
+                    "Real Test (All Profiles)" => state.start_batch_then_real_ping(),
+                    "Real Test (Successful)" => {
                         state.start_batch_then_real_ping_scoped(PlanScope::Successful);
                     }
-                    "Fast + Real Ping (New)" => {
+                    "Real Test (New)" => {
                         state.start_batch_then_real_ping_scoped(PlanScope::New);
                     }
-                    "Fast + Real Ping (Successful + New)" => {
+                    "Real Test (Successful + New)" => {
                         state.start_batch_then_real_ping_scoped(PlanScope::SuccessfulAndNew);
                     }
-                    "Fast + Real Ping (Failed)" => {
+                    "Real Test (Failed)" => {
                         state.start_batch_then_real_ping_scoped(PlanScope::Failed);
+                    }
+                    "Fill Exit IPs (Successful)" => {
+                        state.start_fill_exit_ips(PlanScope::Successful);
                     }
                     "Remove Bad Servers" => state.remove_failed_servers().await,
                     "Retry Failed DNS Lookups" => state.retry_failed_dns(),
@@ -1488,17 +1487,18 @@ enum SpeedTestMenuItem {
 }
 
 const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
-    SpeedTestMenuItem::Item("Fast Ping (Selected)"),
-    SpeedTestMenuItem::Item("Real Ping (Selected)"),
+    SpeedTestMenuItem::Item("Fast Test (Selected)"),
+    SpeedTestMenuItem::Item("Real Test (Selected)"),
     SpeedTestMenuItem::Item("Speed Test (Selected)"),
     SpeedTestMenuItem::Item("UDP Test (Selected)"),
     SpeedTestMenuItem::Separator,
-    SpeedTestMenuItem::Item("Fast Ping (All Profiles)"),
-    SpeedTestMenuItem::Item("Fast + Real Ping (All Profiles)"),
-    SpeedTestMenuItem::Item("Fast + Real Ping (Successful)"),
-    SpeedTestMenuItem::Item("Fast + Real Ping (New)"),
-    SpeedTestMenuItem::Item("Fast + Real Ping (Successful + New)"),
-    SpeedTestMenuItem::Item("Fast + Real Ping (Failed)"),
+    SpeedTestMenuItem::Item("Fast Test (All Profiles)"),
+    SpeedTestMenuItem::Item("Real Test (All Profiles)"),
+    SpeedTestMenuItem::Item("Real Test (Successful)"),
+    SpeedTestMenuItem::Item("Real Test (New)"),
+    SpeedTestMenuItem::Item("Real Test (Successful + New)"),
+    SpeedTestMenuItem::Item("Real Test (Failed)"),
+    SpeedTestMenuItem::Item("Fill Exit IPs (Successful)"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Item("Retry Failed DNS Lookups"),
     SpeedTestMenuItem::Item("Compact Duplicate Endpoints"),

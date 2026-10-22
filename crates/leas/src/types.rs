@@ -605,6 +605,16 @@ pub enum CoreEvent {
         /// not classify one — including the batch, which stages its own result
         /// and never routes the verdict through this event.
         purge: Option<leas_db::models::PurgeReason>,
+        /// The failure marker's KIND, when the failure's own class of evidence
+        /// decides it rather than the test type.
+        ///
+        /// A merged probe whose TRANSPORT stage failed writes the `[fast]`
+        /// marker (spec D1's "not measurable" outcome) even though it was a
+        /// real probe: the transport never came up, so the row is a transport
+        /// failure, not a config verdict — and the purge classifier and
+        /// `remove_failed_servers` read the kind as a verdict. `None` = the
+        /// test type decides.
+        marker_kind: Option<leas_db::models::ProfileErr>,
     },
     /// Result of a version check for a proxy backend.
     UpdateCheckResult {
@@ -687,13 +697,12 @@ pub enum ConfirmAction {
     DiscardSettings,
 }
 
-/// Live meters for one probe level (fast or real): candidates known so far,
+/// Live meters for one probe level: candidates known so far,
 /// settles done, and a sampled rate for the remaining-time estimate.
 ///
 /// `u32`, not `u16`: a batch plans every link in the feed, and a feed can exceed
-/// 65,535 links. The fast level's `total` grows with the plan walk and the real
-/// level's with the candidates that walk makes known — both can only grow, and
-/// `done` counts items already in `total`.
+/// 65,535 links. A level's `total` grows as the pipeline makes items known —
+/// it can only grow, and `done` counts items already in `total`.
 #[derive(Debug, Default)]
 pub struct PhaseMeters {
     pub total: AtomicU32,
@@ -718,18 +727,20 @@ impl PhaseMeters {
     }
 }
 
-/// Per-batch meters: the plan walk and the two probe levels.
+/// Per-batch meters: the plan walk and the probe level.
 ///
 /// Written by the batch task and read by the render path, which is why there is
 /// no per-result progress event — a feed-wide batch sent ~34k of them, and each
 /// described state this shared `Arc` already carries.
 #[derive(Debug, Default)]
 pub struct BatchMeters {
-    /// Pages of the plan walk, for the "planning" state of the fast bar.
+    /// Pages of the plan walk, for the "planning" state of the test bar.
     pub plan_pages_done: AtomicU32,
     pub plan_pages_total: AtomicU32,
-    pub fast: PhaseMeters,
-    pub real: PhaseMeters,
+    /// The merged test pipeline has ONE probe level, so ONE bar: the old
+    /// `fast`/`real` pair collapsed into a single pair of counters.
+    /// The maintenance meters (`MaintMeters`) are untouched.
+    pub main: PhaseMeters,
 }
 
 /// Meters for the maintenance commands (`ops::compact`), read by the same

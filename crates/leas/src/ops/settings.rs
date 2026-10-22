@@ -261,10 +261,6 @@ pub async fn build_settings_fields(
                     state.config.speed_test.real_ping_concurrency.to_string(),
                 ),
                 (
-                    "fast_ping_concurrency".into(),
-                    state.config.speed_test.fast_ping_concurrency.to_string(),
-                ),
-                (
                     "real_ping_test_all_protocols".into(),
                     state
                         .config
@@ -503,9 +499,6 @@ fn apply_settings_fields(
             }
             if let Ok(v) = get_str("real_ping_concurrency").parse::<usize>() {
                 state.config.speed_test.real_ping_concurrency = v;
-            }
-            if let Ok(v) = get_str("fast_ping_concurrency").parse::<usize>() {
-                state.config.speed_test.fast_ping_concurrency = v;
             }
             state.config.speed_test.real_ping_test_all_protocols =
                 get_str("real_ping_test_all_protocols") == "true";

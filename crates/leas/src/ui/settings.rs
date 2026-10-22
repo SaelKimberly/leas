@@ -1226,7 +1226,6 @@ fn form_field_defs_for_section(
             ("real_ping_timeout_secs", "Real Ping Timeout", "Duration"),
             ("real_ping_retries", "Real Ping Retries", "Number"),
             ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
-            ("fast_ping_concurrency", "Fast Ping Concurrency", "Number"),
             (
                 "real_ping_test_all_protocols",
                 "Real Ping Test All Protocols",

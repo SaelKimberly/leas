@@ -107,6 +107,20 @@ pub struct ProbeFailure {
     /// transport span, so the panel can say "the server is up, the config is
     /// not". `None` when the transport stage itself failed.
     pub transport_ms: Option<u64>,
+    /// Whether the TRANSPORT stage itself failed — the connection never came
+    /// up.
+    ///
+    /// This is an explicit flag, NOT a class test: the engine reports both
+    /// `Timeout { step: "probe transport" }` (stage 1) and
+    /// `Timeout { step: "probe attempt" }` (stage 2+) as the SAME class
+    /// (`Timeout`), so a class test would call a protocol-stage hang a
+    /// transport failure — and retire a working server as unreachable. That
+    /// is the false negative the 2026-09-15 audit found.
+    ///
+    /// The merged pipeline's "not measurable" outcome (spec D1) reads THIS:
+    /// the transport did not come up, so the probe cannot pass where the dial
+    /// did not.
+    pub transport_failed: bool,
 }
 
 impl ProbeFailure {
@@ -139,6 +153,7 @@ impl ProbeFailure {
             text: err.to_string(),
             evidence: err.evidence(),
             transport_ms: None,
+            transport_failed: is_transport_failure(err),
         }
     }
 
@@ -153,7 +168,46 @@ impl ProbeFailure {
             text: text.into(),
             evidence: None,
             transport_ms: None,
+            transport_failed: false,
         }
+    }
+}
+
+/// Whether the error means the TRANSPORT never came up.
+///
+/// The TRANSPORT stage's own failures, named by the engine's TYPED error:
+/// the stage-1 deadline (`Timeout { step: "probe transport" }`), a refused
+/// socket, a name that did not resolve, no route, an unreachable network, and
+/// the dial itself.
+///
+/// The stage-2+ deadline (`Timeout { step: "probe attempt" }`) is NOT one: the
+/// transport was up and the protocol stage hung, so the server is alive and
+/// the config is what failed. The two share a class, so the STAGE is what
+/// decides — a class test would retire a working server.
+fn is_transport_failure(err: &NativeError) -> bool {
+    match err {
+        // The stage-1 deadline: the dial did not finish inside the transport
+        // budget. The `step` is what distinguishes it from the stage-2
+        // deadline, which shares the class.
+        NativeError::Timeout {
+            step: "probe transport",
+            ..
+        }
+        | NativeError::Dial(_) => true,
+        // A refused socket, a name that did not resolve, no route and an
+        // unreachable network are all "the transport never came up". The
+        // engine reports the first two as `Dial` and the OS code inside it;
+        // the last two arrive as `Io` with the matching `ErrorKind`.
+        NativeError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::NetworkDown
+                | std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::TimedOut
+        ),
+        _ => false,
     }
 }
 
@@ -607,6 +661,52 @@ mod tests {
         // "send everything to Protocol".
         let tls = leas_native::error::NativeError::Tls("alert 2 40".into());
         assert_eq!(ProbeFailure::from_engine(&tls).class, ProbeClass::Tls);
+    }
+
+    /// The STAGE decides whether the transport failed — never the class.
+    ///
+    /// The engine reports the stage-1 deadline (`probe transport`) and the
+    /// stage-2+ deadline (`probe attempt`) as the SAME class (`Timeout`), so a
+    /// class test would call a protocol-stage hang a transport failure — and
+    /// retire a working server as unreachable. That is the false negative the
+    /// 2026-09-15 audit found.
+    #[test]
+    fn the_transport_failure_flag_reads_the_stage_not_the_class() {
+        use leas_native::error::NativeError;
+        // The stage-1 deadline: the dial did not finish. The transport failed.
+        let stage1 = ProbeFailure::from_engine(&NativeError::Timeout {
+            step: "probe transport",
+            limit: std::time::Duration::from_secs(5),
+        });
+        assert!(
+            stage1.transport_failed,
+            "the transport stage's own deadline IS a transport failure"
+        );
+        // The stage-2 deadline: the transport was up, the protocol stage hung.
+        let stage2 = ProbeFailure::from_engine(&NativeError::Timeout {
+            step: "probe attempt",
+            limit: std::time::Duration::from_secs(5),
+        });
+        assert!(
+            !stage2.transport_failed,
+            "a protocol-stage hang is NOT a transport failure — the server is up"
+        );
+        assert_eq!(
+            stage1.class, stage2.class,
+            "the two share a class, which is exactly why the flag exists"
+        );
+        // A refused socket IS a transport failure.
+        let refused = ProbeFailure::from_engine(&NativeError::Dial("refused".into()));
+        assert!(
+            refused.transport_failed,
+            "a refused socket is a transport failure"
+        );
+        // A TLS failure is NOT: the transport was up.
+        let tls = ProbeFailure::from_engine(&NativeError::Tls("alert 2 40".into()));
+        assert!(
+            !tls.transport_failed,
+            "a TLS failure is a CONFIG failure — the transport was up"
+        );
     }
 
     /// A failure that happened AFTER the dial keeps the transport span

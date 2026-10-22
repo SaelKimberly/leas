@@ -155,6 +155,13 @@ pub(crate) fn apply_test_result(
     ip_info: Option<&str>,
     error: Option<&str>,
     purge: Option<PurgeReason>,
+    // The failure marker's KIND, when the failure's own class of evidence
+    // decides it rather than the test type. A merged probe whose TRANSPORT
+    // stage failed writes the `[fast]` marker (spec D1's "not measurable"
+    // outcome) even though it was a real probe: the transport never came up,
+    // so the row is a transport failure, not a config verdict. `None` = the
+    // test type decides (every other path).
+    marker_kind: Option<ProfileErr>,
 ) -> Option<LinkGroups> {
     if let Some(err) = error {
         if err == "Cancelled" {
@@ -169,8 +176,15 @@ pub(crate) fn apply_test_result(
         // Persisted failure marker — the profiles Test column renders
         // `[fast]`/`[real]` from `link.error.kind`; the measurement (if any)
         // stays, so a dead host does not erase a previously measured delay.
+        //
+        // The KIND is the failure's own class of evidence, not the test type's:
+        // a merged probe whose TRANSPORT stage failed writes the `[fast]`
+        // marker (spec D1's "not measurable" outcome) even though the probe
+        // was a real one. Forcing `Real` there would record a dead transport
+        // as a config failure — and the purge classifier and
+        // `remove_failed_servers` read the kind as a verdict.
         row.error = Some(ErrorInfo {
-            kind: err_kind_for(test_type),
+            kind: marker_kind.unwrap_or_else(|| err_kind_for(test_type)),
             text: cap_error_text(err),
         });
         // Only a real probe carries evidence; a fast result can never set a
@@ -673,6 +687,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 ip_info,
                 error,
                 purge,
+                marker_kind,
             } => {
                 // The test result mutates link latency/speed/error and the
                 // testing_details map — the profiles display cache must
@@ -731,6 +746,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                 ip_info.as_deref(),
                                 error.as_deref(),
                                 purge,
+                                marker_kind,
                             ) {
                                 // STABILITY, single pings only. A batch stages
                                 // its own samples (its rows are off-page here),
@@ -1440,6 +1456,7 @@ mod tests {
             None,
             Some("timeout after 5s"),
             Some(PurgeReason::TransportRejected),
+            None,
         )
         .expect("changed");
         assert_eq!(
@@ -1459,6 +1476,7 @@ mod tests {
             None,
             Some("REALITY error: received real certificate"),
             Some(PurgeReason::RealityFallback),
+            None,
         )
         .expect("changed");
         assert!(groups.contains(LinkGroups::PURGE), "the verdict moved");
@@ -1474,6 +1492,7 @@ mod tests {
             None,
             Some("timeout on probe attempt (limit 5s)"),
             None,
+            None,
         )
         .expect("changed");
         assert!(!groups.contains(LinkGroups::PURGE));
@@ -1484,6 +1503,7 @@ mod tests {
             &mut link,
             TestType::TcpPing,
             Some(42),
+            None,
             None,
             None,
             None,
@@ -1502,6 +1522,7 @@ mod tests {
             Some("198.51.100.9 | DE"),
             None,
             None,
+            None,
         )
         .expect("changed");
         assert!(groups.contains(LinkGroups::PURGE), "the verdict moved back");
@@ -1518,6 +1539,7 @@ mod tests {
                 None,
                 None,
                 Some("Cancelled"),
+                None,
                 None,
             ),
             None,
@@ -1543,6 +1565,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("changed");
         assert!(groups.contains(LinkGroups::PURGE));
@@ -1556,6 +1579,7 @@ mod tests {
             None,
             None,
             Some("Connection refused"),
+            None,
             None,
         )
         .expect("changed");
@@ -1777,6 +1801,7 @@ mod tests {
                 ip_info: None,
                 error: None,
                 purge: None,
+                marker_kind: None,
             })
             .expect("result");
             let _ = state.poll_core_events().await;
@@ -1944,6 +1969,7 @@ mod tests {
                 ip_info: None,
                 error: None,
                 purge: None,
+                marker_kind: None,
             })
             .await
             .expect("send");
@@ -2345,6 +2371,7 @@ mod tests {
             ip_info: None,
             error: None,
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2388,6 +2415,7 @@ mod tests {
             ip_info: None,
             error: None,
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2444,6 +2472,7 @@ mod tests {
             ip_info: Some("5.6.7.8|US".to_string()),
             error: None,
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2490,6 +2519,7 @@ mod tests {
             ip_info: Some("1.2.3.4|US".to_string()),
             error: None,
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2533,6 +2563,7 @@ mod tests {
             ip_info: None,
             error: Some("timeout".to_string()),
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2572,6 +2603,7 @@ mod tests {
             ip_info: None,
             error: None,
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2607,6 +2639,7 @@ mod tests {
             ip_info: None,
             error: None,
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2647,6 +2680,7 @@ mod tests {
             ip_info: Some("1.2.3.4|US".to_string()),
             error: None,
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2683,6 +2717,7 @@ mod tests {
             ip_info: None,
             error: Some("Cancelled".to_string()),
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2775,6 +2810,7 @@ mod tests {
             ip_info: None,
             error: None,
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();
@@ -2797,6 +2833,7 @@ mod tests {
             ip_info: None,
             error: None,
             purge: None,
+            marker_kind: None,
         })
         .await
         .unwrap();

@@ -432,6 +432,31 @@ The `rank_weight_meta` stamp folded `STAB_VERSION` 2 into
 `rank_stab` / `rank_proven` once on the first open. Plans/timings unchanged:
 the index columns and their meanings are identical, only the numbers changed.
 
+### 8.3 The merged pipeline's two delays (2026-10-22)
+
+Spec `2026-10-21-merged-test-pipeline-design` D2/D6/D16, ADR 0016. The row
+now carries TWO delays and an auth flag, and the law reads them as before:
+
+* **The bands do NOT move.** Real `0..5`, fast `6..11`, untested `12`, error
+  `13`/`14`, DNS `15`, purged `16` — the same numbers as before the merge.
+* **"Is it real?" is now "`latency_real_delay` is non-null".** It used to be
+  the `latency` discriminator column (`'real'` / `'fast'`), which the merge
+  DROPPED — it was what made the two delays mutually exclusive, and the merged
+  row needs both. A row's provenance is now carried by WHICH delay column is
+  populated: a real delay outranks a fast one of any delay, so the real one is
+  read first and the fast one only when there is no real measurement
+  (`endpoint_rank::RankLink::new`).
+* **The Auth flag is NOT a band term.** `latency_auth` is a quad-state
+  success flag (ok / failed / n-a / unknown), and a flag is a statement about
+  the CONFIG's acceptance, not a measurement of its speed. A row whose auth is
+  `failed` keeps its band: the band says how fast it is, the flag says
+  whether it works, and the two are independent facts. (The `failed` state
+  requires positive rejection evidence and never earns a purge verdict — ADR
+  0006's amendment.)
+* **The exit IP is not a band term either.** `latency_ip` is a fact about
+  WHERE the traffic emerged, and it ages on its own — `Fill Exit IPs` never
+  rewrites the real delay (spec D11).
+
 ## 9. What is retired
 
 | gone | replaced by |

@@ -1022,6 +1022,14 @@ impl AppState {
     pub fn start_batch_then_real_ping_scoped(&mut self, scope: leas_db::profiles_query::PlanScope) {
         ping::start_batch_then_real_ping_scoped(self, scope);
     }
+    /// Fill the exit IPs of a scope's links — its own command, its own scope,
+    /// its own bar and its own rate limiter (spec D10/D11).
+    ///
+    /// It NEVER rewrites the real delay: the exit IP and the real span are
+    /// independently-aged facts in one row.
+    pub fn start_fill_exit_ips(&mut self, scope: leas_db::profiles_query::PlanScope) {
+        ping::start_fill_exit_ips(self, scope);
+    }
     /// Fast-ping every link of the selected endpoint (collapsed multi-protocol rows).
     pub fn start_endpoint_batch_ping(&mut self) {
         ping::start_endpoint_batch_ping(self);

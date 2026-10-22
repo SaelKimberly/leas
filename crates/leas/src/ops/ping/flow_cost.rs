@@ -207,7 +207,6 @@ fn batch_params(
         ip_provider: IpProvider::IpApi,
         defer_delay: Duration::from_millis(50),
         real_concurrency: 64,
-        fast_concurrency: 64,
         page_size,
         error_ttl_hours: None,
         dns_cache_ttl_secs: 86400,
@@ -346,6 +345,7 @@ async fn flow_cost_report() {
         hard: true,
         evidence: None,
         transport_ms: None,
+        transport_failed: true,
     };
     let stage_result_acc = bench_sync(4096, || {
         let link = &links_all[black_box(0)];
@@ -390,6 +390,7 @@ async fn flow_cost_report() {
             hard: true,
             evidence: None,
             transport_ms: None,
+            transport_failed: true,
         },
     ))
     .fold(HashMap::new(), |mut m, (h, p, o)| {
@@ -1397,7 +1398,6 @@ async fn flow_cost_network() {
         Arc::new(EngineProbeRunner),
     );
     params.real_concurrency = concurrency;
-    params.fast_concurrency = concurrency;
     params.real_timeout = budget;
     params.dedup_endpoints = false;
     params.ping_url = PING_URL.to_owned();
@@ -1726,6 +1726,7 @@ async fn hit_miss_rows(hit: bool) -> Vec<TableRow> {
             ip_info: None,
             error: None,
             purge: None,
+            marker_kind: None,
         });
     }
     while state.poll_core_events().await {}

@@ -600,8 +600,6 @@ pub struct SpeedTestConfig {
     pub real_ping_retries: u32,
     #[serde(default = "default_real_ping_concurrency")]
     pub real_ping_concurrency: usize,
-    #[serde(default = "default_fast_ping_concurrency")]
-    pub fast_ping_concurrency: usize,
     #[serde(default = "default_real_ping_test_all_protocols")]
     pub real_ping_test_all_protocols: bool,
     /// "Clear error after": persisted failure markers (`ProfileStats.error`)
@@ -644,10 +642,6 @@ const fn default_real_ping_concurrency() -> usize {
     100
 }
 
-const fn default_fast_ping_concurrency() -> usize {
-    200
-}
-
 const fn default_real_ping_test_all_protocols() -> bool {
     false
 }
@@ -674,7 +668,6 @@ impl Default for SpeedTestConfig {
             real_ping_timeout_secs: default_real_ping_timeout_secs(),
             real_ping_retries: default_real_ping_retries(),
             real_ping_concurrency: default_real_ping_concurrency(),
-            fast_ping_concurrency: default_fast_ping_concurrency(),
             real_ping_test_all_protocols: default_real_ping_test_all_protocols(),
             error_ttl_hours: None,
             task_queue_limit: default_task_queue_limit(),

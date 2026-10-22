@@ -58,8 +58,10 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | `Port`       | 6     | Port, right-aligned                          |
 | `White`      | 9     | Whitelist membership tokens: `SNI` / `CIDR` / `SNI+CIDR` / `—` (replaces the old flag glyphs; DNS-unresolved lives in the Test cell's `[name]`) |
 | `Protocol`   | 24    | `protocol/transport/security` (e.g. `vless/tcp/reality`), center-aligned |
-| `Test`       | 7     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). The cell describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index`, the argmin of the ordering key) — the same link the `ID` column names, so the two cells cannot disagree. Labels survive restarts; the Speed Test `error_ttl_hours` setting clears them. The header's `↑` arrow is the fixed sort (`PageSort::Test`, ascending): sorting is deliberately not user-changeable, to avoid database contention |
-| `Stab`       | 7     | The REPRESENTATIVE link's stability ring as `successes/attempts` (e.g. `14/16`; `—` no samples yet) — the same link the `Test`/`ID` cells describe. Colored by success rate (green ≥80%, yellow ≥50%, red below; dashed = no samples). A stable server keeps its position and a healthy Stab cell even when its latest real ping failed (spec `2026-10-20-stab-alive-design`) |
+| `Fast`       | 7     | The TRANSPORT measurement `[ 12 ]` — the time to establish the endpoint's transport, colored (green <500ms, yellow ≥500ms, red ≥1000ms). It is INDEPENDENT of the `Real` cell: a row whose transport answered but whose config did not shows a number here BESIDE the `Real` cell's failure marker. A row with no transport measurement shows blanks (spec `2026-10-21-merged-test-pipeline-design` D2) |
+| `Auth`       | 3     | The config's ACCEPTANCE flag: `✓` the server accepted it, `✗` positive rejection evidence, `·` the family has no server ack (or the engine cannot serve the row), `?` the ack was possible but was not observed in time. Blank = never observed, which is NOT the same fact as `?`. A flag is not a band term: it never changes the row's place in the order (spec D3) |
+| `Real`       | 7     | The real probe's delay `[ 12 ]`, colored as `Fast`; red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). The cell describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index`, the argmin of the ordering key) — the same link the `ID`, `Fast` and `Auth` cells name, so the cells cannot disagree. Labels survive restarts; the Speed Test `error_ttl_hours` setting clears them. The header's `↑` arrow is the fixed sort (`PageSort::Test`, ascending): sorting is deliberately not user-changeable, to avoid database contention |
+| `Stab`       | 7     | The REPRESENTATIVE link's stability ring as `successes/attempts` (e.g. `14/16`; `—` no samples yet) — the same link the `Real`/`Fast`/`Auth`/`ID` cells describe. Colored by success rate (green ≥80%, yellow ≥50%, red below; dashed = no samples). A stable server keeps its position and a healthy Stab cell even when its latest real ping failed (spec `2026-10-20-stab-alive-design`) |
 | `Out`        | 5     | Exit country flag, same `<flag>-<ISO>` idiom as `Flag`; `—` unknown |
 | `Exit`       | 14    | Exit IP of the active link's persisted real ping (`—` none); survives reruns |
 
@@ -360,17 +362,18 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 
 ```
 ┌─ Speed Test ─────────────────────────────────────────┐
-│  Fast Ping (Selected)                                  │
-│  Real Ping (Selected)                                 │
+│  Fast Test (Selected)                                  │
+│  Real Test (Selected)                                 │
 │  Speed Test (Selected)                                │
 │  UDP Test (Selected)                                  │
 │  ─────                                                │
-│  Fast Ping (All Profiles)                               │
-│  Fast + Real Ping (All Profiles)                        │
-│  Fast + Real Ping (Successful)                          │
-│  Fast + Real Ping (New)                                 │
-│  Fast + Real Ping (Successful + New)                    │
-│  Fast + Real Ping (Failed)                              │
+│  Fast Test (All Profiles)                               │
+│  Real Test (All Profiles)                               │
+│  Real Test (Successful)                                 │
+│  Real Test (New)                                        │
+│  Real Test (Successful + New)                           │
+│  Real Test (Failed)                                     │
+│  Fill Exit IPs (Successful)                            │
 │  Sort by Test                                         │
 │  Remove Bad Servers                                   │
 │  Retry Failed DNS Lookups                             │
@@ -414,19 +417,49 @@ Output header:
 
 File export writes directly to the confirmed destination. A write failure can leave a partial destination; the UI reports the error and does not claim success.
 
-**Batch behavior (Fast Ping / Real Ping / Fast+Real on All Profiles):** the
+**Batch behavior (Fast Test / Real Test on All Profiles):** the
 "All Profiles" entry points test the whole DATABASE — every (protocol,
 endpoint) link it holds, not the rows the tab currently shows — so a filtered
 or paged view does not narrow a run (only links imported after the run starts
-can be missed). The batch runs on a per-profile (protocol, endpoint) task queue — one live test
+can be missed).
+
+**One probe, two measurements.** The Real Test is ONE probe per link, and it
+produces two independent facts: the **transport span** (the time to establish
+the endpoint's transport — the `Fast` column) and the **real span** (the
+probe's own request time — the `Real` column). They do not overlap, and the
+transport span survives a failure: a row whose server answered but whose
+config did not shows `[ 12 ]` in `Fast` and `[real]` in `Real` — "the server
+is up, the config is not". A row with a transport failure has neither
+measurement and shows the transport failure marker.
+
+**The endpoint's links are probed one at a time.** The walk's order is
+unchanged (`PageSort::Test` — the working servers first), and an endpoint's
+links are contiguous in it. At the group's entry the endpoint's FIRST
+protocol is probed and its siblings wait for that verdict: the endpoint
+succeeded → the whole group is dropped (no probe, no marker, no delay, no
+exit IP for any of its links); the endpoint did not succeed → the siblings
+are probed too, and a sibling that fails writes its own marker. There is no
+second barrier check and no cancel-on-winner: a sibling already in flight
+completes and records its full result, because its config is a different
+config and may route elsewhere.
+
+**`Fill Exit IPs (Successful)`** is its own command: it fetches the exit IP
+for the Successful band's links, on its own rate limiter (the free IP-API
+tiers publish ~45 requests/minute, so a fill that asks as fast as it can is
+refused by every provider). It writes the exit IP and the country flag and
+**never** the real delay — the two are independently-aged facts in one row.
+
+The batch runs on a per-profile (protocol, endpoint) task queue — one live test
 per profile, further tests queued FIFO up to `task_queue_limit` (default 3,
 `0` disables queueing). Profiles whose queue is full are skipped with a
 warning. Profiles whose DNS failed recently are deferred and retried after
 `dns_failure_defer_secs` (default 5s). Both settings live in Settings → Speed
-Test and apply immediately.
+Test and apply immediately. The probe concurrency is
+`real_ping_concurrency` — the ONE limit, and it bounds the native
+handshakes.
 
 **Error labels:** failed tests mark the profile (`[fast]`/`[real]`/`[name]`
-in the Test column). The label reflects the endpoint's ACTIVE (preferred)
+in the Real column). The label reflects the endpoint's ACTIVE (preferred)
 link, and only when it has NO measured delay — a link that carries both a
 successful measurement and a later failure marker still shows its delay (the
 expanded panel keeps per-link markers). One exception: a profile the native
@@ -499,8 +532,9 @@ Rows:
   `Alt+↑`/`Alt+↓` adjustment (clamped so pane 1 keeps ≥6 rows); the compact bar
   is 1 row, and below 20 terminal rows it is always selected.
 - The table drops columns by width priority when the pane is narrow: `Exit`,
-  then `Out`, then `White`, then `Stab` disappear, and `Address` shrinks toward
-  a 12-cell floor — `Test` (with the fixed sort arrow) is protected.
+  then `Out`, then `White`, then `Stab`, then `Auth`, then `Fast` disappear,
+  and `Address` shrinks toward a 12-cell floor — `Real` (with the fixed sort
+  arrow) is protected.
 
 Tracing integration (backend logging):
 - TUI internals emit `tracing` events via `tracing-subscriber` with a

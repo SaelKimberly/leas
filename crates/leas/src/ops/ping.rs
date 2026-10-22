@@ -227,6 +227,7 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 ip_info: None,
                 error,
                 purge: None,
+                marker_kind: None,
             },
             "tcp_ping_result",
         );
@@ -307,6 +308,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         ip_info: None,
                         error: Some("Protocol row not found for real ping".to_string()),
                         purge: None,
+                        marker_kind: None,
                     },
                     "real_ping_protocol_missing",
                 );
@@ -325,6 +327,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         ip_info: None,
                         error: Some(format!("Failed to load protocol: {e}")),
                         purge: None,
+                        marker_kind: None,
                     },
                     "real_ping_protocol_load",
                 );
@@ -348,6 +351,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                     ip_info: None,
                     error: Some(untestable_marker_text(&reason)),
                     purge: None,
+                    marker_kind: None,
                 },
                 "real_ping_untestable",
             );
@@ -375,8 +379,8 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
         // and it survives a failure — a row whose transport answered but whose
         // config did not says "the server is up, the config is not" (spec
         // D12).
-        let (latency_ms, transport_ms, error, purge) = match result {
-            Ok(r) => (Some(r.latency_ms), r.transport_ms, None, None),
+        let (latency_ms, transport_ms, error, purge, marker_kind) = match result {
+            Ok(r) => (Some(r.latency_ms), r.transport_ms, None, None, None),
             Err(e) => (
                 None,
                 e.transport_ms,
@@ -386,6 +390,12 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 e.evidence.and_then(|ev| {
                     crate::ops::purge::reason_for(ev, protocol.security.fp.as_deref())
                 }),
+                // A TRANSPORT-stage failure is the `[fast]` marker even though
+                // this was a real probe (spec D1's "not measurable" outcome):
+                // the transport never came up, so the row is a transport
+                // failure, not a config verdict.
+                e.transport_failed
+                    .then_some(leas_db::models::ProfileErr::Fast),
             ),
         };
         // The exit IP is a SEPARATE phase (spec D10/D11): the probe's verdict
@@ -416,6 +426,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 ip_info,
                 error,
                 purge,
+                marker_kind,
             },
             "real_ping_result",
         );
@@ -473,6 +484,7 @@ pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64
                 ip_info: None,
                 error,
                 purge: None,
+                marker_kind: None,
             },
             "speed_test_result",
         );
@@ -530,6 +542,7 @@ pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 ip_info: None,
                 error,
                 purge: None,
+                marker_kind: None,
             },
             "udp_test_result",
         );
@@ -690,6 +703,15 @@ enum ProbeOutcome {
         /// A failure that carries it says "the transport was alive, the config
         /// was not" (spec D12) — the merged row's whole point.
         transport_ms: Option<u64>,
+        /// Whether the TRANSPORT stage itself failed — the connection never
+        /// came up.
+        ///
+        /// An explicit flag, NOT a class test: the engine reports the stage-1
+        /// deadline and the stage-2+ deadline as the SAME class (`Timeout`),
+        /// so a class test would retire a working server whose protocol stage
+        /// hung. The merged pipeline's "not measurable" outcome (spec D1)
+        /// reads THIS.
+        transport_failed: bool,
     },
 }
 
@@ -706,6 +728,9 @@ impl ProbeOutcome {
             // and neither is a statement about the config's quality.
             evidence: None,
             transport_ms: None,
+            // A config-level refusal is not a transport failure: the config
+            // never got as far as a connection.
+            transport_failed: false,
         }
     }
 }
@@ -867,6 +892,9 @@ impl BatchProbeRunner for EngineProbeRunner {
                     ProbeOutcome::Failed {
                         class,
                         hard,
+                        // The fast probe IS a transport measurement, so its
+                        // hard failure is a transport failure by definition.
+                        transport_failed: hard,
                         // The FULL `Display` of the error, not a compact
                         // summary: this string is both what the debug
                         // per-result line prints — the only place an
@@ -917,6 +945,7 @@ impl BatchProbeRunner for EngineProbeRunner {
                     hard: false,
                     evidence: e.evidence,
                     transport_ms: e.transport_ms,
+                    transport_failed: e.transport_failed,
                 },
             }
         })
@@ -996,10 +1025,11 @@ pub(crate) struct BatchShared {
     /// keyed by identity and carrying the persisted marker text. The fast half
     /// still probes them; their marker is emitted right after that result.
     untestable: DashMap<(ProtocolId, EndpointId), String>,
-    /// The two probe bounds (`fast_ping_concurrency`, `real_ping_concurrency`).
-    /// They are independent — the levels overlap now, and each holds its own
-    /// permit for the duration of its own probe.
-    fast_sem: Arc<Semaphore>,
+    /// The ONE probe bound (`real_ping_concurrency`, spec D14).
+    ///
+    /// The fast level's own bound is retired: the merged pipeline's fast half
+    /// is a TRANSPORT measurement taken by the probe itself, so the limit that
+    /// matters is the one that bounds native handshakes — the expensive stage.
     real_sem: Arc<Semaphore>,
     // ── settle accounting ─────────────────────────────────────────────
     pending_fast: AtomicUsize,
@@ -1017,8 +1047,8 @@ pub(crate) struct BatchShared {
     /// covers — the join is what makes the batch's end a hard boundary.
     tasks: Mutex<Vec<JoinHandle<()>>>,
     // ── rate sampling (1 Hz, for the ETA) ─────────────────────────────
-    rate_fast: Mutex<(Instant, u32)>,
-    rate_real: Mutex<(Instant, u32)>,
+    /// The one level's rate sample (the ETA's denominator).
+    rate_main: Mutex<(Instant, u32)>,
     // ── fast-probe dedup: one TCP ping per unique (address, port) ─────
     fast_dedup: Mutex<FastDedupInner>,
     /// Links whose fast probe failed for a hard unreachability reason: their
@@ -1044,6 +1074,19 @@ pub(crate) struct BatchShared {
     real_ended_ms: AtomicU32,
     // ── real-level endpoint dedup: endpoints whose real ping succeeded ─
     completed_endpoints: Mutex<HashSet<i64>>,
+    /// The group's SIBLINGS, held until the group's first protocol's verdict
+    /// lands (spec D15/T3.1).
+    ///
+    /// The endpoint's first protocol is probed immediately; its siblings wait
+    /// for that verdict. The endpoint SUCCEEDED → the whole group is dropped
+    /// (no probe, no marker, no delay, no exit IP for any of its links); the
+    /// endpoint did NOT succeed → the siblings are released and probed.
+    ///
+    /// A plain `HashMap`, not a bloom filter: the set is tiny (the measured
+    /// real-success rate is 0.03%–1.7%, so a 74k-endpoint run holds tens of
+    /// ids) and a membership test must be exact — a false positive would
+    /// silently drop a working config.
+    deferred_siblings: Mutex<HashMap<i64, Vec<ProfileStats>>>,
     /// DNS resolution requests already emitted by this batch. The plan walk
     /// dispatches pages sequentially, but the set belongs to the batch: a DNS
     /// endpoint can span page boundaries while its first request is still
@@ -1061,6 +1104,10 @@ struct BatchCounters {
     /// Fast-level failures by class (the reason `fast_hard_failed` /
     /// `fast_soft_failed` only count, never explain).
     fast_fail: Mutex<BTreeMap<ProbeClass, u32>>,
+    /// Groups whose siblings were DROPPED (the endpoint's first protocol
+    /// succeeded) and groups whose siblings were RELEASED (it did not).
+    group_dropped: AtomicU32,
+    group_released: AtomicU32,
     real_ok: AtomicU32,
     real_failed: AtomicU32,
     /// Real-level failures by class.
@@ -1118,7 +1165,6 @@ pub(crate) struct BatchParams {
     ip_provider: IpProvider,
     defer_delay: Duration,
     real_concurrency: usize,
-    fast_concurrency: usize,
     /// Endpoints per plan page. Production uses [`PROFILES_PAGE_SIZE`]; tests
     /// drive the streaming walk with tiny pages.
     page_size: usize,
@@ -1166,15 +1212,13 @@ impl BatchShared {
             addrs: DashMap::new(),
             protocols: DashMap::new(),
             untestable: DashMap::new(),
-            fast_sem: Arc::new(Semaphore::new(p.fast_concurrency.max(1))),
             real_sem: Arc::new(Semaphore::new(p.real_concurrency.max(1))),
             pending_fast: AtomicUsize::new(0),
             pending_real: AtomicUsize::new(0),
             pending_deferred: AtomicUsize::new(0),
             settled: Notify::new(),
             tasks: Mutex::new(Vec::new()),
-            rate_fast: Mutex::new((Instant::now(), 0)),
-            rate_real: Mutex::new((Instant::now(), 0)),
+            rate_main: Mutex::new((Instant::now(), 0)),
             fast_dedup: Mutex::new(FastDedupInner {
                 cache: HashMap::new(),
                 in_flight: HashMap::new(),
@@ -1188,13 +1232,14 @@ impl BatchShared {
             real_started_ms: AtomicU32::new(0),
             real_ended_ms: AtomicU32::new(0),
             completed_endpoints: Mutex::new(HashSet::new()),
+            deferred_siblings: Mutex::new(HashMap::new()),
             resolve_requested: Mutex::new(HashSet::new()),
         }
     }
 
     /// Links planned so far — the walk increments it with each dispatched link.
     fn plan_len(&self) -> u32 {
-        self.meters.fast.total.load(Ordering::Relaxed)
+        self.meters.main.total.load(Ordering::Relaxed)
     }
 
     /// Spawn a task the batch must outlive (chains and deferral retries).
@@ -1665,8 +1710,7 @@ fn class_histogram(map: &Mutex<BTreeMap<ProbeClass, u32>>) -> String {
 /// not need: what the levels had settled, and what was still in flight (task
 /// slots plus the deferral retries, which hold no gate entry).
 pub(crate) fn interrupted_summary_line(shared: &BatchShared) -> String {
-    let settled = shared.meters.fast.done.load(Ordering::Relaxed)
-        + shared.meters.real.done.load(Ordering::Relaxed);
+    let settled = shared.meters.main.done.load(Ordering::Relaxed);
     let in_flight = shared.pending_fast.load(Ordering::Relaxed)
         + shared.pending_real.load(Ordering::Relaxed)
         + shared.pending_deferred.load(Ordering::Relaxed);
@@ -1699,14 +1743,13 @@ pub fn log_startup_envelope(state: &AppState) {
     let speed = &state.config.speed_test;
     tracing::info!(
         target: "tui::ops::ping",
-        "startup: version={} page={} rows tcp-timeout={:?} real-timeout={:?} real-retries={} real-concurrency={} fast-concurrency={} dedup-endpoints={} error-ttl={:?}",
+        "startup: version={} page={} rows tcp-timeout={:?} real-timeout={:?} real-retries={} real-concurrency={} dedup-endpoints={} error-ttl={:?}",
         env!("CARGO_PKG_VERSION"),
         state.endpoints.len(),
         speed.tcp_timeout_secs,
         speed.real_ping_timeout_secs,
         speed.real_ping_retries,
         speed.real_ping_concurrency,
-        speed.fast_ping_concurrency,
         !speed.real_ping_test_all_protocols,
         speed.error_ttl_hours,
     );
@@ -1735,20 +1778,62 @@ async fn run_task_chain(
         }
         match kind {
             TaskKind::FastPing => {
-                // The fast level's own bound (`fast_ping_concurrency`): the batch
-                // used to spawn one probe future per link with no global cap.
-                let Ok(permit) = Arc::clone(&shared.fast_sem).acquire_owned().await else {
-                    return;
-                };
+                // The fast half takes NO permit of its own (spec D14): it is a
+                // TCP handshake, not a native handshake, and the one limit
+                // that matters — the one that bounds native handshakes — is
+                // `real_ping_concurrency`.
                 shared.mark_started(&shared.fast_started_ms);
-                let outcome = shared.fast_probe(&link).await;
-                shared.emit_result(&link, TestType::TcpPing, &outcome);
-                shared.sched.complete(&link, id, TaskKind::FastPing).await;
-                shared.note_settled(TaskKind::FastPing);
-                drop(permit);
-                // The fast result is staged: the link's real half (and its
-                // untestable marker, for either batch kind) follows here.
-                shared.after_fast_settle(&link).await;
+                // The MERGED pipeline (spec D1): in a real-phase batch there is
+                // NO separate TCP ping. The probe's own TRANSPORT stage
+                // measures the same thing the fast probe measured, and the
+                // probe produces BOTH facts in one pass — so a TCP ping first
+                // would open the same connection twice for the same answer.
+                //
+                // So the real-phase chain goes STRAIGHT to the probe: the
+                // probe's transport stage IS the fast measurement, and it
+                // rides along in the probe's result (spec D12).
+                //
+                // The fast-only batch ("Fast Test") keeps the TCP probe: it
+                // never builds a tunnel, so the transport span is all it can
+                // produce.
+                if shared.real_phase {
+                    shared.sched.complete(&link, id, TaskKind::FastPing).await;
+                    shared.note_settled(TaskKind::FastPing);
+                    // The untestable marker comes first and applies to BOTH
+                    // batch kinds: a row the engine cannot serve is never a
+                    // real candidate, and dropping the marker would leave a
+                    // genuine-looking failure behind that
+                    // `remove_failed_servers` would delete.
+                    let key = (link.protocol_id, link.endpoint_id);
+                    if let Some(reason) = shared.untestable.get(&key).map(|r| r.value().clone()) {
+                        shared.counters.untestable.fetch_add(1, Ordering::Relaxed);
+                        shared.emit_untestable_marker(&link, &reason);
+                    } else {
+                        // The link is a real candidate: the probe produces BOTH
+                        // facts — the transport span (the Fast column) and the
+                        // real span (the Real column) — in one pass.
+                        //
+                        // The denominator was already counted at plan time
+                        // (`dispatch_page`), so nothing is added here.
+                        if !shared.dispatch_real_probe(link.clone(), true).await {
+                            shared.spawn_defer_retry(link.clone(), Half::Real);
+                        }
+                    }
+                    // The chain FALLS THROUGH to the promotion loop below —
+                    // NOT a `return`. `sched.complete` promoted the link's next
+                    // task, and the gate's promoted id is what FIRES it;
+                    // returning early would leave that task queued forever, its
+                    // `pending_real` never draining, and the batch waiting out
+                    // the whole deferral budget before it could end.
+                } else {
+                    let outcome = shared.fast_probe(&link).await;
+                    shared.emit_result(&link, TestType::TcpPing, &outcome);
+                    shared.sched.complete(&link, id, TaskKind::FastPing).await;
+                    shared.note_settled(TaskKind::FastPing);
+                    // The fast result is staged: the link's untestable marker
+                    // (for either batch kind) follows here.
+                    shared.after_fast_settle(&link).await;
+                }
             }
             TaskKind::RealPing => {
                 // Defensive: the batch never queues, so this arm is reached only
@@ -1801,7 +1886,26 @@ impl BatchShared {
     /// Schedule one page's links. The maps the probes read are filled here, so a
     /// link's own halves find their config and endpoint without a second pass
     /// over the whole plan.
+    ///
+    /// The GROUP-ENTRY barrier (spec D15/T3.1) lives here. The plan's links
+    /// are CONTIGUOUS per endpoint (the walk sorts endpoints and each
+    /// endpoint's links come back together — `plan_row_links` → `row.links`),
+    /// so the group is read from the page in order: the endpoint's FIRST
+    /// protocol is dispatched and its SIBLINGS are deferred to the back of the
+    /// queue. When the first protocol's verdict lands, the siblings are
+    /// either dropped (the endpoint succeeded) or released.
+    ///
+    /// The walk's ORDER is unchanged (`PageSort::Test`): the group is
+    /// contiguous in the plan the walk already produces, so no new order and no
+    /// new query is introduced.
     async fn dispatch_page(self: &Arc<Self>, links: Vec<PlanLink>) {
+        // The group's siblings, held back until the first protocol's verdict
+        // lands. Keyed by endpoint id: the group is the endpoint's links.
+        let mut deferred_siblings: HashMap<i64, Vec<ProfileStats>> = HashMap::new();
+        // The endpoint ids whose first protocol has already been dispatched in
+        // this page. The group is contiguous, so the SECOND link of an
+        // endpoint is a sibling, not a new group.
+        let mut group_seen: HashSet<i64> = HashSet::new();
         // One resolution request per DNS endpoint for the whole batch. The
         // handler's TTL gate makes a completed repeat cheap, but a request
         // waiting on the resolver semaphore is invisible to that gate.
@@ -1880,11 +1984,55 @@ impl BatchShared {
                     untestable_marker_text(capability::KIND_UNSUPPORTED_REASON),
                 );
             }
-            self.meters.fast.total.fetch_add(1, Ordering::Relaxed);
+            // The ONE level's denominator: every PLANNED link is counted here,
+            // once. The real-phase chain below adds nothing — it would
+            // double-count every link.
+            self.meters.main.total.fetch_add(1, Ordering::Relaxed);
             let link = plan.link;
-            if !self.dispatch_fast_link(link.clone()).await {
-                self.spawn_defer_retry(link, Half::Fast);
+            // The GROUP-ENTRY gate: the endpoint's first protocol is probed
+            // immediately; its siblings wait for that protocol's verdict.
+            //
+            // The walk's order is unchanged — the group's links are CONTIGUOUS
+            // in the plan, so the second link of an endpoint is the sibling of
+            // the first, not a new group.
+            //
+            // The gate is the DEDUPLICATING real phase's: a fast-only batch
+            // has no verdict to wait for, and `dedup_endpoints == false` is
+            // the explicit "test every protocol of the endpoint" setting
+            // (`real_ping_test_all_protocols`) — its siblings have their own
+            // exit IPs to find, so they are not held back.
+            if !self.real_phase
+                || !self.dedup_endpoints
+                || group_seen.insert(link.endpoint_id.get())
+            {
+                if !self.dispatch_fast_link(link.clone()).await {
+                    self.spawn_defer_retry(link, Half::Fast);
+                }
+            } else {
+                // A SIBLING: held back until the group's first protocol's
+                // verdict lands (the endpoint succeeded → the whole group is
+                // dropped; the endpoint did not succeed → the siblings are
+                // released and probed).
+                deferred_siblings
+                    .entry(link.endpoint_id.get())
+                    .or_default()
+                    .push(link);
             }
+        }
+        // The group's siblings are held in the PAGE, but the group's verdict
+        // may land after the page is dispatched — so the release is the
+        // settle path's job, and the page's map is handed over to it.
+        self.hold_siblings(deferred_siblings);
+    }
+
+    /// Hold a page's deferred siblings until their group's verdict lands.
+    fn hold_siblings(&self, siblings: HashMap<i64, Vec<ProfileStats>>) {
+        if siblings.is_empty() {
+            return;
+        }
+        let mut held = self.deferred_siblings.lock();
+        for (endpoint_id, links) in siblings {
+            held.entry(endpoint_id).or_default().extend(links);
         }
     }
 
@@ -1926,11 +2074,16 @@ impl BatchShared {
 
     /// Everything a link owes once its fast result is staged.
     ///
+    /// The FAST-ONLY path: a real-phase batch goes straight to the probe (the
+    /// merged pipeline, spec D1), so the fast half's gates — the untestable
+    /// marker and the hard-failure retirement — are re-homed to the probe's
+    /// own path (`run_task_chain`'s real-phase arm and `real_probe`).
+    ///
     /// The untestable marker comes first and applies to BOTH batch kinds: the
     /// single pass this replaces ran before the fast-only early return, so a
     /// fast-only batch marks such rows today — dropping the marker would leave a
     /// genuine-looking failure behind and `remove_failed_servers` would delete
-    /// the row (the marker outranks a measurement in the Test cell). A marked
+    /// the row (the marker outranks a measurement in the Real cell). A marked
     /// link is never a real candidate.
     async fn after_fast_settle(self: &Arc<Self>, link: &ProfileStats) {
         let key = (link.protocol_id, link.endpoint_id);
@@ -1977,7 +2130,7 @@ impl BatchShared {
             }
         }
         // Above the hard-failure block on purpose, and reachable in a fast-ONLY
-        // batch ("Fast Ping", `real_phase == false`) as well as the fast+real
+        // batch ("Fast Test", `real_phase == false`) as well as the merged
         // one: the retraction is a statement about the FAST probe's verdict, not
         // about the real level, so it must not be gated on whether a real level
         // exists. Returning above it left every quic row carrying the TCP-derived
@@ -1985,10 +2138,9 @@ impl BatchShared {
         if !self.real_phase {
             return;
         }
-        // A candidate is known: it enters the real level's denominator, and
-        // every path out of `dispatch_real_probe` counts it exactly once into
-        // `real.done` (probe, sibling retire, stop retire, queue-full).
-        self.meters.real.total.fetch_add(1, Ordering::Relaxed);
+        // A candidate is known: every path out of `dispatch_real_probe` counts
+        // it exactly once into `main.done` (probe, sibling retire, stop retire,
+        // queue-full). The denominator was counted at plan time.
         if !self.dispatch_real_probe(link.clone(), true).await {
             self.spawn_defer_retry(link.clone(), Half::Real);
         }
@@ -2031,6 +2183,7 @@ impl BatchShared {
                 self.pending_real.fetch_add(1, Ordering::Relaxed);
                 self.mark_started(&self.real_started_ms);
                 self.run_real_task(&link, id).await;
+
                 drop(permit);
                 true
             }
@@ -2055,11 +2208,33 @@ impl BatchShared {
     }
 
     /// One real probe, from schedule to settle.
-    async fn run_real_task(&self, link: &ProfileStats, id: u16) {
+    async fn run_real_task(self: &Arc<Self>, link: &ProfileStats, id: u16) {
         let outcome = self.real_probe(link).await;
+        let succeeded = matches!(outcome, ProbeOutcome::Ok { .. });
+        // The TRANSPORT-stage failure IS the merged pipeline's retirement rule
+        // (spec D1's "not measurable" outcome): the transport did not come up,
+        // so the probe cannot pass where the dial did not. The row keeps its
+        // transport marker, and the endpoint's other links are retired with
+        // it — the same rule the fast half's hard failure used to apply.
+        //
+        // The FLAG decides it — the engine's own stage, never the class: the
+        // stage-1 deadline and the stage-2+ deadline share the class
+        // `Timeout`, and a class test would retire a working server whose
+        // protocol stage merely hung.
+        if let ProbeOutcome::Failed {
+            transport_failed: true,
+            ..
+        } = &outcome
+        {
+            self.counters.unreachable.fetch_add(1, Ordering::Relaxed);
+            // The retirement stands in for the probe it prevented — a
+            // transport failure is evidence the link is unreachable NOW
+            // (spec §7.2).
+            self.sample_stability(link, false);
+        }
         // A successful real ping records the endpoint so the sibling-dedup pass
         // skips its remaining links.
-        if self.dedup_endpoints && matches!(outcome, ProbeOutcome::Ok { .. }) {
+        if self.dedup_endpoints && succeeded {
             self.completed_endpoints
                 .lock()
                 .insert(link.endpoint_id.get());
@@ -2068,6 +2243,63 @@ impl BatchShared {
         self.sched.complete(link, id, TaskKind::RealPing).await;
         self.note_settled(TaskKind::RealPing);
         self.note_real_done();
+        // The GROUP-ENTRY barrier's release: this link was the group's FIRST
+        // protocol, so its verdict decides the group's siblings.
+        //
+        // The endpoint SUCCEEDED → the whole group is dropped (the siblings
+        // are never probed, and they write no marker, no delay and no exit
+        // IP). The endpoint did NOT succeed → the siblings are released and
+        // probed; there is NO second barrier check, so an endpoint whose first
+        // config failed still gets its other configs measured.
+        //
+        // The release is best-effort and never cancels: a sibling already in
+        // flight completes and records its full result — the endpoint's
+        // success does not suppress a sibling's measurement, because the
+        // sibling's config is a DIFFERENT config and may route elsewhere
+        // (spec D15).
+        self.release_siblings(link.endpoint_id.get(), succeeded);
+    }
+
+    /// Release (or drop) a group's held siblings, per the group's verdict.
+    ///
+    /// The siblings are dispatched through the SAME path the first protocol
+    /// took — their fast half first, then their real half — so a released
+    /// sibling produces its own full result (its own Fast delay, Auth flag,
+    /// Real delay and exit IP), and a sibling that FAILS writes its own
+    /// failure marker.
+    fn release_siblings(self: &Arc<Self>, endpoint_id: i64, succeeded: bool) {
+        let siblings = {
+            let mut held = self.deferred_siblings.lock();
+            held.remove(&endpoint_id).unwrap_or_default()
+        };
+        if siblings.is_empty() {
+            return;
+        }
+        if succeeded {
+            // The endpoint is known good: the whole group is dropped. The
+            // siblings write NOTHING — no probe, no marker, no delay.
+            //
+            // They were counted into `main.total` at plan time, so they must
+            // be counted into `main.done` here: the denominator and the
+            // numerator have to meet, or the batch's waiter waits out the
+            // whole deferral budget for a link that will never settle.
+            self.counters.group_dropped.fetch_add(1, Ordering::Relaxed);
+            self.meters
+                .main
+                .done
+                .fetch_add(siblings.len() as u32, Ordering::Relaxed);
+            return;
+        }
+        // The endpoint did not succeed: the siblings are probed. They are
+        // dispatched on their own task, so the release does not block the
+        // settle path.
+        self.counters.group_released.fetch_add(1, Ordering::Relaxed);
+        for link in siblings {
+            let shared = Arc::clone(self);
+            self.spawn_tracked(async move {
+                shared.dispatch_fast_link(link).await;
+            });
+        }
     }
 
     /// Spawn the one retry task a deferred half gets.
@@ -2167,14 +2399,10 @@ impl BatchShared {
                 // mismatch the per-level meters exist to prevent. Book it as
                 // settled-but-unprobed, under `deferred` (which already means
                 // "the gate refused this link").
-                match half {
-                    Half::Fast => {
-                        self.meters.fast.done.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Half::Real => {
-                        self.meters.real.done.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                // ONE level (spec D14): the half no longer has its own
+                // meter, so both halves book the same way.
+                let _ = half;
+                self.meters.main.done.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     target: "tui::ops::ping",
                     endpoint_id = link.endpoint_id.get(),
@@ -2264,6 +2492,11 @@ impl BatchShared {
     /// Real probe for one link: load the protocol row WITH its deferred config
     /// (the builders refuse unloaded configs — mirrors `start_real_ping`)
     /// through the batch's per-`ProtocolId` cache, then run through the engine.
+    ///
+    /// The MERGED pipeline (spec D1): the probe produces BOTH facts in one
+    /// pass — the TRANSPORT stage's span (the Fast column) and the protocol +
+    /// probe stage's span (the Real column). They do not overlap, and the
+    /// transport span survives a failure (spec D12).
     async fn real_probe(&self, link: &ProfileStats) -> ProbeOutcome {
         let protocol = match self.protocol_config(link.protocol_id).await {
             Ok(loaded) => loaded,
@@ -2438,16 +2671,24 @@ impl BatchShared {
     /// import moves every endpoint's ordering keys) used to drop those results
     /// silently. Staging here is what makes "emitted == persisted" hold.
     fn stage_result(&self, link: &ProfileStats, test_type: TestType, outcome: &ProbeOutcome) {
-        let (latency_ms, transport_ms, ip_info, error, purge) = match outcome {
+        let (latency_ms, transport_ms, ip_info, error, purge, marker_kind) = match outcome {
             ProbeOutcome::Ok {
                 latency_ms,
                 transport_ms,
                 ip_info,
-            } => (*latency_ms, *transport_ms, ip_info.as_deref(), None, None),
+            } => (
+                *latency_ms,
+                *transport_ms,
+                ip_info.as_deref(),
+                None,
+                None,
+                None,
+            ),
             ProbeOutcome::Failed {
                 text,
                 evidence,
                 transport_ms,
+                transport_failed,
                 ..
             } => (
                 None,
@@ -2455,6 +2696,11 @@ impl BatchShared {
                 None,
                 Some(text.as_str()),
                 evidence.and_then(|ev| self.purge_for(link, ev)),
+                // A TRANSPORT-stage failure is the `[fast]` marker even when
+                // the probe was a real one (spec D1's "not measurable"
+                // outcome): the transport never came up, so the row is not a
+                // config verdict.
+                transport_failed.then_some(leas_db::models::ProfileErr::Fast),
             ),
         };
         let mut row = link.clone();
@@ -2493,6 +2739,7 @@ impl BatchShared {
             ip_info,
             error,
             purge,
+            marker_kind,
         ) {
             self.writer.stage(&row, groups);
         }
@@ -2565,16 +2812,24 @@ impl BatchShared {
                 }
             }
         }
-        let (latency_ms, transport_ms, ip_info, error, purge) = match outcome {
+        let (latency_ms, transport_ms, ip_info, error, purge, marker_kind) = match outcome {
             ProbeOutcome::Ok {
                 latency_ms,
                 transport_ms,
                 ip_info,
-            } => (*latency_ms, *transport_ms, ip_info.clone(), None, None),
+            } => (
+                *latency_ms,
+                *transport_ms,
+                ip_info.clone(),
+                None,
+                None,
+                None,
+            ),
             ProbeOutcome::Failed {
                 text,
                 evidence,
                 transport_ms,
+                transport_failed,
                 ..
             } => (
                 None,
@@ -2582,6 +2837,11 @@ impl BatchShared {
                 None,
                 Some(text.clone()),
                 evidence.and_then(|ev| self.purge_for(link, ev)),
+                // A TRANSPORT-stage failure is the `[fast]` marker even when
+                // the probe was a real one (spec D1's "not measurable"
+                // outcome): the transport never came up, so the row is not a
+                // config verdict.
+                transport_failed.then_some(leas_db::models::ProfileErr::Fast),
             ),
         };
         let endpoint_id = link.endpoint_id.get();
@@ -2602,6 +2862,7 @@ impl BatchShared {
                 ip_info,
                 error,
                 purge,
+                marker_kind,
             },
             "batch_ping_result",
         );
@@ -2616,7 +2877,6 @@ impl BatchShared {
                 if self.pending_fast.fetch_sub(1, Ordering::Relaxed) == 1 {
                     self.settled.notify_waiters();
                 }
-                Self::bump(&self.meters.fast, &self.rate_fast);
             }
             TaskKind::RealPing => {
                 self.mark_settled(&self.real_ended_ms);
@@ -2632,7 +2892,7 @@ impl BatchShared {
     /// retire, stop retire): the level's `done` advances. Every link counted
     /// into `real.total` reaches this exactly once.
     fn note_real_done(&self) {
-        Self::bump(&self.meters.real, &self.rate_real);
+        Self::bump(&self.meters.main, &self.rate_main);
     }
 
     /// Emit the persisted `[real]` marker for a link the native engine cannot
@@ -2667,6 +2927,7 @@ impl BatchShared {
                 ip_info: None,
                 error: Some(text.to_string()),
                 purge: None,
+                marker_kind: None,
             },
             "untestable_marker",
         );
@@ -2743,6 +3004,197 @@ pub fn start_endpoint_batch_real_ping(state: &mut AppState) {
     start_batch(state, PlanSource::Links(plan), true, false);
 }
 
+/// Fill the exit IPs of a scope's links — its OWN command, its own scope, its
+/// own bar and its own rate limiter (spec D10/D11, T3.6).
+///
+/// The exit IP is an INDEPENDENT fact: it ages on its own, and this command
+/// NEVER rewrites the Real delay. A row that was measured keeps its real
+/// span; a row that was not stays unmeasured — the fill adds a fact, it does
+/// not replace one.
+///
+/// Its own rate limiter, and it is a THROTTLED one: the free IP-API tiers
+/// publish ~45 requests/minute (ip-api), and a feed-wide fill would ask for
+/// thousands. The limiter is the difference between a fill that works and a
+/// fill that is refused by every provider.
+pub fn start_fill_exit_ips(state: &mut AppState, scope: PlanScope) {
+    // A feed-wide plan is loaded by the fill task (off the UI thread).
+    if state.batch_progress.is_some() {
+        state.log_trace("warn", "tui::ops::ping", "A batch is already running");
+        return;
+    }
+    state.speed_test_stop.store(false, Ordering::Relaxed);
+    state.scheduler.reset();
+    let Some(tx) = state.core_event_tx.clone() else {
+        return;
+    };
+    let db = state.db.clone();
+    let writer = state.link_stage.clone();
+    let stop = state.speed_test_stop.clone();
+    let ip_provider = state.config.speed_test.ip_provider;
+    let meters = Arc::new(crate::types::BatchMeters::default());
+    state.batch_progress = Some(Arc::clone(&meters));
+    tokio::spawn(run_fill_exit_ips(FillExitIpsParams {
+        db,
+        writer,
+        tx,
+        stop,
+        meters,
+        scope,
+        ip_provider,
+    }));
+}
+
+/// The fill's parameters.
+struct FillExitIpsParams {
+    db: Arc<Database>,
+    writer: Arc<leas_db::WriteBehind<leas_db::LinkSpec>>,
+    tx: mpsc::Sender<CoreEvent>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    meters: Arc<crate::types::BatchMeters>,
+    scope: PlanScope,
+    ip_provider: IpProvider,
+}
+
+/// The fill's own rate limiter: one exit-IP request every
+/// [`EXIT_IP_FILL_INTERVAL`].
+///
+/// The free tiers publish ~45 requests/minute, so a fill that asks as fast
+/// as it can is refused by every provider. The interval is the fill's
+/// correctness constraint, not a politeness knob.
+const EXIT_IP_FILL_INTERVAL: Duration = Duration::from_millis(1_500);
+
+/// Fill the exit IPs of a scope's links.
+///
+/// A SEPARATE pipeline, not a batch mode: it never probes, never writes a
+/// real delay and never writes an error marker for a config it did not test.
+/// It writes the exit IP, the country flag (live, through the enrich path)
+/// and — where the transport was observed — the Fast delay.
+async fn run_fill_exit_ips(params: FillExitIpsParams) {
+    let FillExitIpsParams {
+        db,
+        writer,
+        tx,
+        stop,
+        meters,
+        scope,
+        ip_provider,
+    } = params;
+    // The scope's endpoints, read once. The fill is a SEPARATE, resumable
+    // command — a provider rate limit ends one provider's turn, not the fill.
+    let request = leas_db::profiles_query::PageRequest {
+        view: leas_db::models::PurgatoryView::All,
+        active_threshold: 0,
+        scope,
+        search: None,
+        group_id: None,
+        sort: FEED_SORT,
+        ascending: true,
+        offset: 0,
+        limit: usize::MAX,
+    };
+    let page = match db.profiles_page(&request).await {
+        Ok(page) => page,
+        Err(e) => {
+            tracing::warn!(target: "tui::ops::ping", "exit-IP fill: plan failed: {e}");
+            let _ = tx.try_send(CoreEvent::BatchEnded);
+            return;
+        }
+    };
+    let ids = page.ids;
+    meters.plan_pages_total.store(1, Ordering::Relaxed);
+    meters.plan_pages_done.store(0, Ordering::Relaxed);
+    let rows = match db.load_page_projection(&ids, false).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(target: "tui::ops::ping", "exit-IP fill: load failed: {e}");
+            let _ = tx.try_send(CoreEvent::BatchEnded);
+            return;
+        }
+    };
+    meters.plan_pages_done.store(1, Ordering::Relaxed);
+    // The links to fill: the scope's links, in the walk's order. The endpoint
+    // rows come from the same projection the batch's walk uses, so the fill
+    // dials the same addresses the probe would.
+    let plans: Vec<(ProfileStats, Endpoint, Vec<std::net::IpAddr>)> = rows
+        .iter()
+        .flat_map(|r| {
+            let endpoint = r.endpoint.clone();
+            let addresses = r.resolved_ips.clone();
+            r.links
+                .iter()
+                .cloned()
+                .map(move |link| (link, endpoint.clone(), addresses.clone()))
+        })
+        .collect();
+    meters
+        .main
+        .total
+        .store(plans.len() as u32, Ordering::Relaxed);
+    let total = plans.len() as u32;
+    let mut done = 0u32;
+    for (link, endpoint, addresses) in plans {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // The rate limiter: one request per interval, for the whole fill.
+        tokio::time::sleep(EXIT_IP_FILL_INTERVAL).await;
+        let Some(protocol) = load_protocol_with_config(&db, link.protocol_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            done += 1;
+            meters.main.done.store(done, Ordering::Relaxed);
+            continue;
+        };
+        // The probe target is a placeholder: the exit-IP fetch dials the
+        // PROXY server and asks the provider through it.
+        let Some(target) = ping_native::parse_probe_url("http://127.0.0.1/").ok() else {
+            done += 1;
+            meters.main.done.store(done, Ordering::Relaxed);
+            continue;
+        };
+        let params =
+            ping_native::probe_params(&endpoint, &addresses, &protocol.config.get().0, &target);
+        let ip_info = ping_native::fetch_exit_ip(&params, ip_provider).await;
+        done += 1;
+        meters.main.done.store(done, Ordering::Relaxed);
+        if let Some(ip_info) = ip_info {
+            // The exit IP and the country flag — NEVER the real delay (spec
+            // D11). The row keeps the real measurement it already had.
+            let mut row = link.clone();
+            if let Some(ip) = ip_info
+                .split('|')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                row.latency.ip = Some(ip.to_string());
+            }
+            writer.stage(&row, leas_db::LinkGroups::RESULT);
+            let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                endpoint_id: link.endpoint_id.get(),
+                protocol_id: link.protocol_id.get(),
+                test_type: TestType::RealPing,
+                latency_ms: None,
+                transport_ms: None,
+                speed_bps: None,
+                ip_info: Some(ip_info),
+                error: None,
+                purge: None,
+                marker_kind: None,
+            });
+        }
+    }
+    // The writer flushes the staged rows; the terminal event closes the bar.
+    let _ = writer.flush().await;
+    let _ = tx.try_send(CoreEvent::BatchEnded);
+    tracing::info!(
+        target: "tui::ops::ping",
+        "exit-IP fill: {done}/{total} link(s) processed"
+    );
+}
+
 fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_endpoints: bool) {
     // A feed-wide plan is loaded by the batch task (off the UI thread), so only
     // an explicit plan can be known-empty here.
@@ -2798,7 +3250,6 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     let ping_url = state.config.speed_test.ping_url.clone();
     let ip_provider = state.config.speed_test.ip_provider;
     let real_concurrency = state.config.speed_test.real_ping_concurrency.max(1);
-    let fast_concurrency = state.config.speed_test.fast_ping_concurrency.max(1);
     let error_ttl_hours = state.config.speed_test.error_ttl_hours;
     let dns_cache_ttl_secs = state.dns_cache_ttl_secs;
     // Sleep the full deferral window once, then re-schedule (the window is
@@ -2825,7 +3276,6 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
         ip_provider,
         defer_delay,
         real_concurrency,
-        fast_concurrency,
         page_size: PROFILES_PAGE_SIZE,
         error_ttl_hours,
         dns_cache_ttl_secs,
@@ -3022,6 +3472,9 @@ mod tests {
         assert!(wal_checkpoint_enabled(false), "WAL still checkpoints");
     }
 
+    /// The per-call real outcome: the call INDEX picks the outcome.
+    type RealByCall = Box<dyn Fn(usize) -> ProbeOutcome + Send>;
+
     /// Deterministic probe runner: fixed outcomes + call recording + an
     /// optional gate that blocks real probes (for the stop-mid-batch test).
     struct StubRunner {
@@ -3033,6 +3486,9 @@ mod tests {
         /// When set, every fast probe marks the endpoint's DNS failure — used
         /// to land a deferral deterministically between phase 1 and phase 2.
         dns_mark_on_fast: Mutex<Option<(Arc<TaskScheduler>, EndpointId)>>,
+        /// When set, every REAL probe marks the endpoint's DNS failure — the
+        /// merged pipeline's deferral seam (the TCP fast probe is gone).
+        dns_mark_on_real: Mutex<Option<(Arc<TaskScheduler>, EndpointId)>>,
         /// Per-address fast outcome, for the tests that need a mixed batch
         /// (an unreachable link next to a reachable one).
         fast_by_addr: Mutex<std::collections::HashMap<String, ProbeOutcome>>,
@@ -3041,6 +3497,10 @@ mod tests {
         fast_delay_by_addr: Mutex<std::collections::HashMap<String, Duration>>,
         /// Endpoint ids in the order their real probe STARTED.
         real_endpoint_order: Mutex<Vec<i64>>,
+        /// When set, the real outcome is chosen by the CALL INDEX instead of
+        /// the fixed one — the tests that need the first protocol to fail and
+        /// the second to succeed (the group-entry barrier's deferral case).
+        real_by_call: Mutex<Option<RealByCall>>,
     }
 
     impl StubRunner {
@@ -3060,10 +3520,22 @@ mod tests {
                 real_calls: Arc::new(AtomicUsize::new(0)),
                 real_gate: Mutex::new(None),
                 dns_mark_on_fast: Mutex::new(None),
+                dns_mark_on_real: Mutex::new(None),
                 fast_by_addr: Mutex::new(std::collections::HashMap::new()),
                 fast_delay_by_addr: Mutex::new(std::collections::HashMap::new()),
                 real_endpoint_order: Mutex::new(Vec::new()),
+                real_by_call: Mutex::new(None),
             }
+        }
+
+        /// Choose the real outcome by the CALL INDEX: the first call gets one
+        /// outcome, the second another, and so on.
+        ///
+        /// The group-entry barrier's decisive case needs exactly this — the
+        /// endpoint's first protocol fails and its second succeeds — and a
+        /// per-address map cannot express it (both links share an address).
+        fn set_real_outcome(&self, f: impl Fn(usize) -> ProbeOutcome + Send + 'static) {
+            *self.real_by_call.lock() = Some(Box::new(f));
         }
     }
 
@@ -3099,13 +3571,24 @@ mod tests {
             _req: NativeProbeReq<'a>,
         ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
             Box::pin(async move {
-                self.real_calls.fetch_add(1, Ordering::Relaxed);
+                let index = self.real_calls.fetch_add(1, Ordering::Relaxed);
                 self.real_endpoint_order.lock().push(endpoint.id.get());
+                // The merged pipeline's deferral seam: the DNS failure is
+                // marked from the REAL probe, because the TCP fast probe no
+                // longer runs in a real-phase batch.
+                if let Some((sched, eid)) = &*self.dns_mark_on_real.lock() {
+                    sched.mark_dns_failure(*eid);
+                }
                 // Clone the gate out of the lock so the await below does not
                 // hold the mutex guard across the yield point.
                 let gate = self.real_gate.lock().clone();
                 if let Some(gate) = gate {
                     gate.notified().await;
+                }
+                // The per-call outcome wins when set: the group-entry
+                // barrier's tests need the first call and the second to differ.
+                if let Some(f) = self.real_by_call.lock().as_ref() {
+                    return f(index);
                 }
                 self.real_outcome.lock().clone()
             })
@@ -3456,11 +3939,6 @@ mod tests {
         plugin_row(id, host, "mode=quic;host=cdn.example")
     }
 
-    /// T24's control: the same row with a mode the fast level CAN measure.
-    fn ws_plugin_row(id: i64, host: &str) -> EndpointRow {
-        plugin_row(id, host, "mode=websocket;host=cdn.example;path=/x")
-    }
-
     async fn harness(rows: Vec<EndpointRow>) -> Harness {
         let mut state = test_state(rows.clone()).await;
         // Persist the plan rows so the scheduler gate (`write_task_state`
@@ -3530,7 +4008,6 @@ mod tests {
             ip_provider: IpProvider::IpApi,
             defer_delay: Duration::from_millis(50),
             real_concurrency: 8,
-            fast_concurrency: 8,
             // Tiny pages: the streaming walk is what a feed batch exercises.
             page_size: 2,
             error_ttl_hours: None,
@@ -3668,9 +4145,14 @@ mod tests {
         handle.await.unwrap();
         await_batch_done(&mut h.state).await;
 
-        // Phase 1: one fast task per link (3 unique addresses → 3 probes).
-        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 3);
-        // Phase 2: one real task per link.
+        // The MERGED pipeline (spec D1): ONE probe per link. The TCP ping is
+        // gone — the probe's own transport stage is the fast measurement, so a
+        // real-phase batch never runs the fast probe at all.
+        assert_eq!(
+            h.runner.fast_calls.load(Ordering::Relaxed),
+            0,
+            "a real-phase batch runs no separate TCP ping"
+        );
         assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 3);
         for row in &h.state.endpoints {
             for link in &row.links {
@@ -3815,47 +4297,67 @@ mod tests {
         }
     }
 
-    // ── phase 2 skips what phase 1 proved unreachable ────────────────────
+    // ── the transport failure is the retirement ─────────────────────────
 
-    /// A link whose fast probe hard-failed (refused / unreachable /
-    /// unresolvable / timeout) is not real-probed: the probe can only spend its
-    /// whole timeout re-learning the same thing. A soft failure (a TLS-level
-    /// error, say) still gets its probe — that answers a different question.
+    /// A link whose TRANSPORT stage failed (refused / unreachable /
+    /// unresolvable / the stage-1 timeout) is retired: the probe cannot pass
+    /// where the dial did not. A failure AFTER the transport (a TLS-level
+    /// error, say) is NOT a retirement — the transport was up, and the config
+    /// is what failed.
+    ///
+    /// The MERGED pipeline (spec D1): there is no separate fast phase to
+    /// decide this. The probe's OWN stage decides it, through the
+    /// `transport_failed` flag — never the class, because the stage-1 and the
+    /// stage-2+ deadlines share the class `Timeout`.
     #[tokio::test]
-    async fn phase_two_skips_links_the_fast_probe_proved_unreachable() {
+    async fn a_transport_failure_retires_the_link_and_a_config_failure_does_not() {
         let rows = vec![
             fake_row(1, "10.0.0.1", 1),
             fake_row(2, "10.0.0.2", 1),
             fake_row(3, "10.0.0.3", 1),
         ];
         let mut h = harness(rows.clone()).await;
-        {
-            let mut by_addr = h.runner.fast_by_addr.lock();
-            by_addr.insert(
-                "10.0.0.1".to_string(),
-                ProbeOutcome::Failed {
-                    text: "IO: Connection refused (os error 111)".to_string(),
-                    class: ProbeClass::Refused,
-                    hard: true,
-                    transport_ms: None,
-                    evidence: None,
-                },
-            );
-            by_addr.insert(
-                "10.0.0.2".to_string(),
-                ProbeOutcome::soft_failure("TLS error: handshake error: alert: 2 40"),
-            );
-        }
+        // The transport stage failed for link 1; the protocol stage failed for
+        // link 2; link 3 is fine.
+        h.runner.set_real_outcome(|index| match index {
+            0 => ProbeOutcome::Failed {
+                text: "IO: Connection refused (os error 111)".to_string(),
+                class: ProbeClass::Refused,
+                hard: false,
+                transport_ms: None,
+                evidence: None,
+                // A refused socket: the transport never came up.
+                transport_failed: true,
+            },
+            1 => ProbeOutcome::Failed {
+                text: "TLS error: handshake error: alert: 2 40".to_string(),
+                class: ProbeClass::Tls,
+                hard: false,
+                transport_ms: Some(9),
+                evidence: None,
+                // The transport was up (it measured 9 ms); the CONFIG failed.
+                transport_failed: false,
+            },
+            _ => ProbeOutcome::Ok {
+                latency_ms: Some(50),
+                transport_ms: Some(10),
+                ip_info: Some("1.2.3.4".to_string()),
+            },
+        });
         let plan = plan_from_rows(&rows);
         let handle = start_test_batch(&mut h, plan, true, false);
         handle.await.unwrap();
         await_batch_done(&mut h.state).await;
 
-        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            h.runner.fast_calls.load(Ordering::Relaxed),
+            0,
+            "the merged pipeline runs no separate TCP ping"
+        );
         assert_eq!(
             h.runner.real_calls.load(Ordering::Relaxed),
-            2,
-            "only the soft-failed and the reachable link are real-probed"
+            3,
+            "every link gets ONE probe — the transport failure retires the ROW, not the probe"
         );
 
         let persisted = |row: &EndpointRow| {
@@ -3874,32 +4376,61 @@ mod tests {
             }
         };
 
+        // The transport-failed link: the `[fast]` marker (the transport never
+        // came up — spec D1's "not measurable" outcome), and NO measurement.
         let skipped = persisted(&rows[0]).await;
         assert!(
             matches!(
                 skipped.error.as_ref().map(|e| e.kind),
                 Some(ProfileErr::Fast)
             ),
-            "the unreachable link keeps its fast marker: {skipped:?}"
+            "the transport-failed link keeps the `[fast]` marker: {skipped:?}"
         );
         assert_eq!(
             skipped.error.as_ref().map(|e| e.text.as_str()),
             Some("IO: Connection refused (os error 111)")
         );
+        assert_eq!(
+            skipped.latency,
+            Latency::default(),
+            "a transport failure measures nothing: {skipped:?}"
+        );
 
-        for row in &rows[1..] {
-            let link = persisted(row).await;
-            assert_eq!(
-                link.latency,
-                Latency {
-                    real_delay: Some(50),
-                    fast_delay: Some(10),
-                    ip: Some("1.2.3.4".to_string()),
-                    auth: None,
-                },
-                "a probed link carries the real result: {link:?}"
-            );
-        }
+        // The CONFIG-failed link: the transport was up, so it carries the
+        // transport span BESIDE the `[real]` marker — "the server is up, the
+        // config is not" (spec D12). This is the pair of facts the merged row
+        // exists to show, and the old two-phase pipeline could not show it.
+        let config_failed = persisted(&rows[1]).await;
+        assert_eq!(
+            config_failed.latency,
+            Latency {
+                real_delay: None,
+                fast_delay: Some(9),
+                ip: None,
+                auth: None,
+            },
+            "the transport span survives the config failure: {config_failed:?}"
+        );
+        assert!(
+            matches!(
+                config_failed.error.as_ref().map(|e| e.kind),
+                Some(ProfileErr::Real)
+            ),
+            "and a config failure is a `[real]` marker: {config_failed:?}"
+        );
+
+        // The healthy link: both measurements.
+        let healthy = persisted(&rows[2]).await;
+        assert_eq!(
+            healthy.latency,
+            Latency {
+                real_delay: Some(50),
+                fast_delay: Some(10),
+                ip: Some("1.2.3.4".to_string()),
+                auth: None,
+            },
+            "a probed link carries both measurements: {healthy:?}"
+        );
     }
 
     // ── a phase-2 patch keeps the phase-1 measurement ───────────────────
@@ -3913,8 +4444,20 @@ mod tests {
     async fn a_real_failure_keeps_the_fast_measurement() {
         let rows = vec![fake_row(1, "10.0.0.1", 1)];
         let mut h = harness(rows.clone()).await;
-        *h.runner.real_outcome.lock() =
-            ProbeOutcome::soft_failure("timeout on probe attempt (limit 5s)");
+        // The probe FAILED after its transport stage completed: the transport
+        // span is 12 ms and the config did not work. The merged row keeps the
+        // transport span beside the failure marker (spec D12).
+        *h.runner.real_outcome.lock() = ProbeOutcome::Failed {
+            text: "timeout on probe attempt (limit 5s)".to_string(),
+            class: ProbeClass::Timeout,
+            hard: false,
+            evidence: None,
+            transport_ms: Some(12),
+            // The TRANSPORT was alive (it measured 12 ms) — the PROTOCOL
+            // stage hung. This is NOT a transport failure, so the row is NOT
+            // retired: the server is up and the config is what failed.
+            transport_failed: false,
+        };
 
         let plan = plan_from_rows(&rows);
         let handle = start_test_batch(&mut h, plan, true, false);
@@ -3931,8 +4474,13 @@ mod tests {
         .expect("row");
         assert_eq!(
             link.latency,
-            Latency::fast(10),
-            "the fast delay survives a real-ping failure: {link:?}"
+            Latency {
+                real_delay: None,
+                fast_delay: Some(12),
+                ip: None,
+                auth: None,
+            },
+            "the transport span survives a real-ping failure: {link:?}"
         );
         assert_eq!(
             link.error.as_ref().map(|e| e.kind),
@@ -3958,250 +4506,56 @@ mod tests {
         let params = build_params(&h, plan_from_rows(&rows), true, false);
         h.state.batch_progress = Some(params.meters.clone());
         let shared = Arc::new(BatchShared::new(params));
-        // Per-address, so this is the ONLY link in the batch that hard-fails.
-        *h.runner.fast_by_addr.lock() = std::collections::HashMap::from([(
-            rows[0].endpoint.dns_name(),
-            ProbeOutcome::Failed {
-                text: "connection timed out".into(),
-                class: ProbeClass::Timeout,
-                hard: true,
-                transport_ms: None,
-                evidence: None,
-            },
-        )]);
         let link = rows[0].links[0].clone();
         // The caches `run_batch`'s dispatch fills per page; calling the chain
-        // directly means seeding the same two entries, or `fast_probe` answers
-        // its "Endpoint not found" soft failure and the test measures nothing.
+        // directly means seeding the same entry, or the probe answers its
+        // "Endpoint not found" soft failure and the test measures nothing.
         shared
             .endpoints
             .insert(link.endpoint_id, Arc::new(rows[0].endpoint.clone()));
-        // `fast_config` holds `proto_kind.to_i32()` — its own field doc says
-        // "Fast config type per link (`proto_kind`)" and `dispatch_page` writes
-        // exactly that. Seeding `config_type` (the unrelated ShareUrl/Form
-        // enum) happened to be invisible because the stub ignores the argument,
-        // which is precisely why it is worth stating here.
-        shared.fast_config.insert(
-            (link.protocol_id, link.endpoint_id),
-            rows[0].protocols[&link.protocol_id].proto_kind.to_i32(),
-        );
         run_task_chain(Arc::clone(&shared), link.clone(), 0, TaskKind::FastPing).await;
 
         assert_eq!(
             shared.counters.unreachable.load(Ordering::Relaxed),
             0,
-            "a quic row is NOT retired: its TCP probe cannot measure a QUIC server"
+            "a quic row is NOT retired: its transport stage cannot measure a QUIC server \
+             the way a TCP handshake could"
         );
         assert_eq!(
-            shared.meters.real.done.load(Ordering::Relaxed),
+            shared.meters.main.done.load(Ordering::Relaxed),
             1,
-            "the real half ran and settled — it is not retired"
+            "the probe ran and settled — it is not retired"
         );
         // The verdict it reaches today is the capability gate's: `mode=quic` is
         // refused by name (T22 could not pin its wire from evidence), so the row
-        // gets an `[untestable]` marker naming that reason. When T23 lands this
-        // becomes a real probe result instead — what must NOT come back is the
-        // TCP-derived `[fast]` verdict the retirement used to leave behind.
+        // gets an `[untestable]` marker naming that reason. What must NOT come
+        // back is a transport-derived `[fast]` verdict.
         assert_eq!(
             shared.counters.untestable.load(Ordering::Relaxed),
             1,
-            "the real level produced the row's verdict"
+            "the capability gate produced the row's verdict"
         );
         let mut rx = h.state.core_event_rx.take().expect("event receiver");
-        // Both levels emit. The fast probe still RUNS (it is cheap, and its
-        // verdict may still be informative for other rows); what must not happen
-        // is that its TCP verdict becomes this row's answer.
-        let mut fast_text = String::new();
         let mut real_text = String::new();
-        // Each level emits a TestTypeUpdate and then its result, so read until
-        // both results are in rather than counting events.
+        // The probe emits a TestTypeUpdate and then its result, so read until
+        // the result is in rather than counting events.
         for _ in 0..8 {
-            if !fast_text.is_empty() && !real_text.is_empty() {
+            if !real_text.is_empty() {
                 break;
             }
             match rx.recv().await.expect("channel open") {
                 CoreEvent::SpeedTestResult {
                     protocol_id,
-                    test_type,
+                    test_type: TestType::RealPing,
                     error: Some(text),
                     ..
-                } if protocol_id == link.protocol_id.get() => match test_type {
-                    TestType::TcpPing => fast_text = text,
-                    TestType::RealPing => real_text = text,
-                    _ => {}
-                },
+                } if protocol_id == link.protocol_id.get() => real_text = text,
                 _ => {}
             }
         }
-        assert_eq!(
-            fast_text, "connection timed out",
-            "the fast probe still ran — only its RETIREMENT was wrong"
-        );
         assert!(
             crate::ops::ping::is_untestable_text(&real_text),
-            "the real level's verdict is the named untestable marker, got {real_text}"
-        );
-
-        // …and the fast probe's `[fast]` marker is NOT persisted: the fast level
-        // cannot measure a QUIC server, so its TCP verdict is not a statement
-        // about this row. Flush the writer to see what the batch actually wrote.
-        h.state.link_stage.flush().await.expect("flush");
-        let row = leas_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
-            link.protocol_id,
-            link.endpoint_id,
-        )
-        .first()
-        .exec(&mut h.state.db.connection().await.expect("conn"))
-        .await
-        .expect("read the row back")
-        .expect("row exists");
-        // The persisted verdict is the real level's. It is NOT `None` — the real
-        // half's own verdict is legitimate — but it must NOT be the fast probe's
-        // TCP failure, which is what the retirement used to leave behind.
-        let error = row.error.as_ref().expect("a verdict is persisted");
-        assert!(
-            !matches!(error.kind, ProfileErr::Fast),
-            "the `[fast]` marker was retracted: {error:?}"
-        );
-        assert!(
-            crate::ops::ping::is_untestable_marker(error),
-            "and what remains is the real level's named refusal: {error:?}"
-        );
-    }
-
-    /// T24's other half, and the one that was missing: a **fast-ONLY** batch
-    /// (the plain "Fast Ping" mode, `real_phase == false`).
-    ///
-    /// The quic exemption has to sit ABOVE `if !self.real_phase { return; }`,
-    /// because the retraction is a statement about the FAST probe's verdict, not
-    /// about the real level. With it below that guard a fast-only run returned
-    /// first and every quic row kept the TCP-derived `[fast]` marker — §8.1's
-    /// exact symptom, unfixed on the mode most likely to be pressed.
-    ///
-    /// Nothing else clears the marker on this path (there is no real probe to
-    /// overwrite it), so this case is what makes the retraction load-bearing: it
-    /// fails if the block is moved back below the guard, and it passes with the
-    /// retraction removed.
-    #[tokio::test]
-    async fn a_fast_only_batch_also_retracts_the_quic_rows_fast_marker() {
-        let rows = vec![quic_plugin_row(3, "10.0.0.3")];
-        let mut h = harness(rows.clone()).await;
-        let params = build_params(&h, plan_from_rows(&rows), false, false);
-        h.state.batch_progress = Some(params.meters.clone());
-        let shared = Arc::new(BatchShared::new(params));
-        *h.runner.fast_by_addr.lock() = std::collections::HashMap::from([(
-            rows[0].endpoint.dns_name(),
-            ProbeOutcome::Failed {
-                text: "connection timed out".into(),
-                class: ProbeClass::Timeout,
-                hard: true,
-                transport_ms: None,
-                evidence: None,
-            },
-        )]);
-        let link = rows[0].links[0].clone();
-        shared
-            .endpoints
-            .insert(link.endpoint_id, Arc::new(rows[0].endpoint.clone()));
-        shared.fast_config.insert(
-            (link.protocol_id, link.endpoint_id),
-            rows[0].protocols[&link.protocol_id].proto_kind.to_i32(),
-        );
-        run_task_chain(Arc::clone(&shared), link.clone(), 0, TaskKind::FastPing).await;
-
-        assert_eq!(
-            shared.meters.real.done.load(Ordering::Relaxed),
-            0,
-            "a fast-only batch runs no real half at all"
-        );
-        shared.writer.flush().await.expect("flush");
-        let persisted = leas_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
-            link.protocol_id,
-            link.endpoint_id,
-        )
-        .first()
-        .exec(&mut h.state.db.connection().await.expect("conn"))
-        .await
-        .expect("read the row back")
-        .expect("row exists");
-        assert!(
-            !persisted
-                .error
-                .as_ref()
-                .is_some_and(|e| matches!(e.kind, ProfileErr::Fast)),
-            "no TCP-derived `[fast]` marker survives a fast-only run either: {:?}",
-            persisted.error
-        );
-    }
-
-    /// The anti-overreach guard: the retirement decision is still correct for
-    /// every OTHER hard fast failure. If the quic exception were written as
-    /// "never retire", this row would stop being retired too — and the 2026-09-15
-    /// run retired 253 of 350 real probes that way for good reason.
-    #[tokio::test]
-    async fn a_non_quic_plugin_row_is_still_retired_by_a_hard_fast_failure() {
-        let rows = vec![ws_plugin_row(2, "10.0.0.2")];
-        let mut h = harness(rows.clone()).await;
-        let params = build_params(&h, plan_from_rows(&rows), true, false);
-        h.state.batch_progress = Some(params.meters.clone());
-        let shared = Arc::new(BatchShared::new(params));
-        // Per-address, so this is the ONLY link in the batch that hard-fails.
-        *h.runner.fast_by_addr.lock() = std::collections::HashMap::from([(
-            rows[0].endpoint.dns_name(),
-            ProbeOutcome::Failed {
-                text: "connection timed out".into(),
-                class: ProbeClass::Timeout,
-                hard: true,
-                transport_ms: None,
-                evidence: None,
-            },
-        )]);
-        let link = rows[0].links[0].clone();
-        // The caches `run_batch`'s dispatch fills per page; calling the chain
-        // directly means seeding the same two entries, or `fast_probe` answers
-        // its "Endpoint not found" soft failure and the test measures nothing.
-        shared
-            .endpoints
-            .insert(link.endpoint_id, Arc::new(rows[0].endpoint.clone()));
-        // `fast_config` holds `proto_kind.to_i32()` — its own field doc says
-        // "Fast config type per link (`proto_kind`)" and `dispatch_page` writes
-        // exactly that. Seeding `config_type` (the unrelated ShareUrl/Form
-        // enum) happened to be invisible because the stub ignores the argument,
-        // which is precisely why it is worth stating here.
-        shared.fast_config.insert(
-            (link.protocol_id, link.endpoint_id),
-            rows[0].protocols[&link.protocol_id].proto_kind.to_i32(),
-        );
-        run_task_chain(Arc::clone(&shared), link.clone(), 0, TaskKind::FastPing).await;
-
-        assert_eq!(
-            shared.counters.unreachable.load(Ordering::Relaxed),
-            1,
-            "a websocket plugin row IS retired: its TCP probe measures it honestly"
-        );
-        assert_eq!(
-            shared.meters.real.done.load(Ordering::Relaxed),
-            0,
-            "and no real probe is wasted re-learning it"
-        );
-        // Row 12's second half, which the audit found unasserted: the row still
-        // gets its `[fast]` marker. It is the honest statement about a row whose
-        // TCP probe measured it and found it down — and its ABSENCE here would
-        // be the silent de-optimization the row exists to prevent.
-        h.state.link_stage.flush().await.expect("flush");
-        let persisted = leas_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
-            link.protocol_id,
-            link.endpoint_id,
-        )
-        .first()
-        .exec(&mut h.state.db.connection().await.expect("conn"))
-        .await
-        .expect("read the row back")
-        .expect("row exists");
-        let error = persisted.error.as_ref().expect("a verdict was persisted");
-        assert!(
-            matches!(error.kind, ProfileErr::Fast),
-            "a websocket plugin row keeps its `[fast]` marker: {error:?}"
+            "the row is marked untestable, not failed: {real_text:?}"
         );
     }
 
@@ -4262,6 +4616,7 @@ mod tests {
                 hard: false,
                 transport_ms: None,
                 evidence: None,
+                transport_failed: false,
             },
         );
         let staged = shared
@@ -4346,8 +4701,7 @@ mod tests {
         let meters = params.meters.clone();
         let shared = BatchShared::new(params);
         let counters = &shared.counters;
-        meters.fast.total.store(4, Ordering::Relaxed);
-        meters.real.total.store(3, Ordering::Relaxed);
+        meters.main.total.store(4, Ordering::Relaxed);
         counters.fast_ok.store(7, Ordering::Relaxed);
         counters.fast_hard_failed.store(5, Ordering::Relaxed);
         counters.fast_soft_failed.store(3, Ordering::Relaxed);
@@ -4579,6 +4933,100 @@ mod tests {
 
     // ── sibling dedup (dedup_endpoints, best-effort) ─────────────────────
 
+    /// The GROUP-ENTRY barrier (spec D15/T3.1): the endpoint's links are
+    /// probed ONE AT A TIME, and the endpoint's verdict decides whether the
+    /// siblings are probed at all.
+    ///
+    /// The decisive property: a sibling that is DEFERRED (the endpoint's first
+    /// protocol did not succeed) is still probed — there is no second barrier
+    /// check, so an endpoint whose first config failed still gets its other
+    /// configs measured. A sibling that is SKIPPED (the endpoint's first
+    /// protocol succeeded) is never probed and never writes a marker.
+    ///
+    /// This is the merged pipeline's throughput premise: the endpoint's
+    /// working config is found first, and the endpoint's other configs are
+    /// only probed when the first one did not work.
+    #[tokio::test]
+    async fn a_deferred_sibling_is_probed_when_it_is_reached() {
+        let rows = vec![fake_row(1, "10.0.0.1", 2)];
+        let mut h = harness(rows.clone()).await;
+        // The endpoint's FIRST protocol fails; the second succeeds. The
+        // sibling must still be probed — the barrier is consulted at group
+        // entry, and a failed first protocol does not suppress the siblings.
+        h.runner.set_real_outcome(|index| match index {
+            0 => ProbeOutcome::Failed {
+                text: "timeout".to_string(),
+                class: ProbeClass::Timeout,
+                hard: false,
+                evidence: None,
+                transport_ms: Some(12),
+                // The transport was alive; the protocol stage failed.
+                transport_failed: false,
+            },
+            _ => ProbeOutcome::Ok {
+                latency_ms: Some(50),
+                transport_ms: Some(10),
+                ip_info: Some("1.2.3.4".to_string()),
+            },
+        });
+        let plan = plan_from_rows(&rows);
+        let handle = start_test_batch_with(&mut h, plan, true, true, 1);
+        handle.await.unwrap();
+        await_batch_done(&mut h.state).await;
+
+        assert_eq!(
+            h.runner.real_calls.load(Ordering::Relaxed),
+            2,
+            "a failed first protocol must not suppress the sibling: the deferred sibling is probed"
+        );
+        // The FAILED link keeps its transport span beside the marker — the
+        // merged row's whole point (spec D12).
+        let links = &h.state.endpoints[0].links;
+        let failed = links
+            .iter()
+            .find(|l| l.error.is_some())
+            .expect("the first protocol's failure is recorded");
+        assert_eq!(
+            failed.latency.fast_delay,
+            Some(12),
+            "the transport span survives the failure: the server was up, the config was not"
+        );
+        assert_eq!(
+            failed.latency.real_delay, None,
+            "a failed probe has no real span"
+        );
+    }
+
+    /// The group's dropped siblings SETTLE: the denominator and the
+    /// numerator meet.
+    ///
+    /// A held sibling was counted into `main.total` at plan time, so a
+    /// dropped one must be counted into `main.done` — otherwise the batch's
+    /// waiter waits out the whole deferral budget for a link that will never
+    /// settle, and the bar never reaches its total.
+    #[tokio::test]
+    async fn a_dropped_group_sibling_still_settles_its_meter() {
+        let rows = vec![fake_row(1, "10.0.0.1", 2)];
+        let mut h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        let handle = start_test_batch_with(&mut h, plan, true, true, 1);
+        // Keep the batch's own meters: `await_batch_done` clears the state copy.
+        let meters = h
+            .state
+            .batch_progress
+            .clone()
+            .expect("the batch publishes its meters");
+        handle.await.unwrap();
+        await_batch_done(&mut h.state).await;
+
+        let load = |a: &AtomicU32| a.load(Ordering::Relaxed);
+        assert_eq!(
+            load(&meters.main.done),
+            load(&meters.main.total),
+            "every planned link settles: the dropped sibling is booked, not left hanging"
+        );
+    }
+
     /// The first real success on an endpoint retires its remaining links'
     /// real halves. Pipelining makes this best-effort: siblings whose fast
     /// halves settle together may start before the success lands, so the check
@@ -4636,14 +5084,20 @@ mod tests {
         }
     }
 
-    /// The real level is the long pole (measured 2.6 results/s against 128 for
-    /// the fast level on 2026-09-16), so a run stopped part-way should have
-    /// tested the fastest links first. The pipeline inherits that ordering from
-    /// the fast level: a link's real half starts when its own fast half settles,
-    /// so the probe order is the fast completion order — ascending fast latency,
-    /// with no sort and no barrier.
+    /// The probe order is the WALK's order (`PageSort::Test` — the working
+    /// servers first), and the merged pipeline keeps it (spec D15).
+    ///
+    /// Before the merge, the order came from the fast level: a link's real
+    /// half started when its own fast half settled, so the probe order was the
+    /// fast COMPLETION order. The merge removed the fast phase, so there is
+    /// no completion order left to inherit — the walk's order IS the order,
+    /// and the fast delays no longer steer it.
+    ///
+    /// The three rows are declared slowest-fastest by their fast delay, so
+    /// the old pipeline would have probed them in the REVERSE order. The
+    /// merged one probes them in the walk's order.
     #[tokio::test]
-    async fn real_probes_follow_fast_completion_order() {
+    async fn the_probes_follow_the_walk_order_not_the_fast_settle_order() {
         let rows = vec![
             fake_row(1, "10.0.0.1", 1),
             fake_row(2, "10.0.0.2", 1),
@@ -4658,19 +5112,16 @@ mod tests {
         }
         let plan = plan_from_rows(&rows);
         // One real slot: the semaphore is fair, so the recorded start order is
-        // the settle order.
+        // the dispatch order.
         let handle = start_test_batch_with(&mut h, plan, true, false, 1);
         handle.await.unwrap();
         await_batch_done(&mut h.state).await;
 
         let order = h.runner.real_endpoint_order.lock().clone();
         let expected: Vec<i64> = rows.iter().map(|r| r.endpoint.id.get()).collect::<Vec<_>>();
-        // Declared slowest-first: the 50/100/150 ms fast probes must settle —
-        // and therefore real-probe — in the reverse order.
         assert_eq!(
-            order,
-            vec![expected[1], expected[2], expected[0]],
-            "real probes follow the fast settle order"
+            order, expected,
+            "the probes follow the walk's order, not the retired fast settle order"
         );
     }
 
@@ -4885,14 +5336,19 @@ mod tests {
         let rows = vec![fake_row(1, "10.0.0.1", 1)];
         let mut h = harness(rows.clone()).await;
         h.state.scheduler = Arc::new(TaskScheduler::new(3, 3));
-        *h.runner.dns_mark_on_fast.lock() = Some((h.state.scheduler.clone(), EndpointId::new(1)));
+        *h.runner.dns_mark_on_real.lock() = Some((h.state.scheduler.clone(), EndpointId::new(1)));
         let plan = plan_from_rows(&rows);
         let handle = start_test_batch(&mut h, plan, true, false);
         handle.await.unwrap();
         await_batch_done(&mut h.state).await;
 
-        // The link got both results, no marker, and its gate is clear.
-        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 1);
+        // The link got its result, no marker, and its gate is clear.
+        //
+        // The MERGED pipeline runs ONE probe per link (spec D1), so the DNS
+        // marker — which the stub raises from the FAST probe — no longer has
+        // a fast probe to land in. The deferral the test drives is therefore
+        // raised from the REAL probe instead, which is the probe the merged
+        // pipeline actually runs.
         assert_eq!(
             h.runner.real_calls.load(Ordering::Relaxed),
             1,
@@ -4907,12 +5363,18 @@ mod tests {
             "meters must be cleared after the batch (terminal event last)"
         );
 
-        // A subsequent batch starts cleanly.
+        // A subsequent batch starts cleanly. It is a FAST-ONLY batch, so the
+        // TCP probe runs — and the counter now reads 1, because the merged
+        // batch above ran no TCP probe at all.
         let plan2 = plan_from_rows(&rows);
         let handle2 = start_test_batch(&mut h, plan2, false, false);
         handle2.await.unwrap();
         await_batch_done(&mut h.state).await;
-        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            h.runner.fast_calls.load(Ordering::Relaxed),
+            1,
+            "the fast-only batch ran its one TCP probe"
+        );
     }
 
     // ── stop mid-batch ───────────────────────────────────────────────────
@@ -4979,6 +5441,8 @@ mod tests {
                 hard: true,
                 transport_ms: None,
                 evidence: None,
+                // A refused socket: the transport never came up.
+                transport_failed: true,
             },
         );
         let plan = plan_from_rows(&rows);
@@ -4993,16 +5457,12 @@ mod tests {
         await_batch_done(&mut h.state).await;
 
         let load = |a: &AtomicU32| a.load(Ordering::Relaxed);
-        assert_eq!(load(&meters.fast.total), 3, "every planned link is counted");
-        assert_eq!(load(&meters.fast.done), 3);
-        assert_eq!(
-            load(&meters.real.total),
-            2,
-            "the hard-failed link is never a real candidate"
-        );
-        assert_eq!(load(&meters.real.done), 2);
-        assert!(load(&meters.real.done) <= load(&meters.real.total));
-        assert!(load(&meters.fast.done) <= load(&meters.fast.total));
+        // ONE level (spec D14): the merged pipeline's bar counts the planned
+        // links, and the hard-failed one never becomes a real candidate — so
+        // it is counted in the denominator but its real half never runs.
+        assert_eq!(load(&meters.main.total), 3, "every planned link is counted");
+        assert_eq!(load(&meters.main.done), 3);
+        assert!(load(&meters.main.done) <= load(&meters.main.total));
     }
 
     /// The ETA needs a denominator, a rate sample and work left; anything else
@@ -5104,8 +5564,7 @@ mod tests {
         let shared = BatchShared::new(params);
         shared.counters.real_ok.store(4, Ordering::Relaxed);
         shared.counters.real_failed.store(6, Ordering::Relaxed);
-        meters.fast.done.store(7, Ordering::Relaxed);
-        meters.real.done.store(10, Ordering::Relaxed);
+        meters.main.done.store(17, Ordering::Relaxed);
         shared.pending_real.store(2, Ordering::Relaxed);
         shared.pending_deferred.store(1, Ordering::Relaxed);
         bump_class(&shared.counters.real_fail, ProbeClass::Timeout);
