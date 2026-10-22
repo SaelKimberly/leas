@@ -396,8 +396,24 @@ read path reports into it (a VLESS response header IS the acceptance; an EOF
 during the peel is POSITIVE rejection evidence; a non-vless peer makes the ack
 NotApplicable), and the probe reports the observed state with its result.
 `apply_test_result` persists it into `latency_auth`. Pinned by
-`the_peel_reports_the_ack_into_its_slot` — the same fixture-data caveat that
-applied to the screen capture does NOT apply to the producer any more.
+`the_peel_reports_the_ack_into_its_slot` and
+`the_auth_ack_is_persisted_per_state_and_null_when_never_observed` — the same
+fixture-data caveat that applied to the screen capture does NOT apply to the
+producer any more.
+
+**The producer's per-family scope, stated precisely.** The slot is seeded
+with the family's honest initial state: `Unknown` for VLESS, VMess, SS2022 and
+Hysteria2 (all four have a server ack), `NotApplicable` for Trojan and
+classic-AEAD SS (no ack). The OBSERVATION is wired for VLESS only — its peel
+is the one stream whose decision points are instrumented. A VMess, SS2022 or
+Hysteria2 row therefore reads `Unknown` (4) on success, not `Ok` (1): the
+glyph is honest (the ack was possible and unobserved-by-us) but it is not the
+`Ok` those families can produce. Wiring the three is mechanical — VMess's
+`ReadState::Dead` paths are the rejection evidence and `PeelPayload`
+completion the acceptance; SS2022's `validate_response_header` already
+returns Ok/Err; Hysteria2's `runtime_auth` already checks status 233 — but
+each needs its decision point instrumented, which is a separate, mechanical
+slice.
 
 **The throughput claim is still OPEN.** It needs the old and the new pipeline
 over the same live corpus, and the corpus here has no reachable server. The

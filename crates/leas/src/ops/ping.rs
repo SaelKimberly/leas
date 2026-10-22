@@ -394,8 +394,15 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
         // and it survives a failure — a row whose transport answered but whose
         // config did not says "the server is up, the config is not" (spec
         // D12).
-        let (latency_ms, transport_ms, error, purge, marker_kind) = match result {
-            Ok(r) => (Some(r.latency_ms), r.transport_ms, None, None, None),
+        let (latency_ms, transport_ms, error, purge, marker_kind, auth_ack) = match result {
+            Ok(r) => (
+                Some(r.latency_ms),
+                r.transport_ms,
+                None,
+                None,
+                None,
+                Some(r.auth_ack),
+            ),
             Err(e) => (
                 None,
                 e.transport_ms,
@@ -411,6 +418,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 // failure, not a config verdict.
                 e.transport_failed
                     .then_some(leas_db::models::ProfileErr::Fast),
+                Some(e.auth_ack),
             ),
         };
         // The exit IP is a SEPARATE phase (spec D10/D11): the probe's verdict
@@ -437,7 +445,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 test_type: TestType::RealPing,
                 latency_ms,
                 transport_ms,
-                auth_ack: None,
+                auth_ack,
                 speed_bps: None,
                 ip_info,
                 error,
@@ -3003,7 +3011,7 @@ impl BatchShared {
                 error: Some(text.to_string()),
                 purge: None,
                 marker_kind: None,
-                auth_ack: None,
+                auth_ack: Some(leas_native::protocol::AuthAck::NotApplicable),
             },
             "untestable_marker",
         );

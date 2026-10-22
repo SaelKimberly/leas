@@ -1587,6 +1587,68 @@ mod tests {
     /// A speed test rides an established tunnel, so its success is a
     /// data-carrying proof too — it clears a verdict, and its own failures
     /// (which carry no evidence) never set one.
+    ///
+    /// The AUTH column's write path (spec D3): the ack the probe observed is
+    /// persisted as its stored integer, and a probe that never reached a
+    /// protocol phase leaves the column NULL.
+    ///
+    /// The smoke captured hand-seeded glyphs; this test closes the loop the
+    /// smoke could not — it pins the mapping the producer's output goes
+    /// through, per state, at the one function every writer shares.
+    #[test]
+    fn the_auth_ack_is_persisted_per_state_and_null_when_never_observed() {
+        use crate::ops::profiles::test_support::fake_row;
+        use leas_db::models::AuthState;
+        use leas_native::protocol::AuthAck;
+
+        // Each observed state writes its stored integer.
+        for (ack, want) in [
+            (AuthAck::Ok, AuthState::Ok),
+            (AuthAck::Failed, AuthState::Failed),
+            (AuthAck::NotApplicable, AuthState::NotApplicable),
+            (AuthAck::Unknown, AuthState::Unknown),
+        ] {
+            let mut link = fake_row(1, "h.example", 1).links.remove(0);
+            let _ = apply_test_result(
+                &mut link,
+                TestType::RealPing,
+                Some(50),
+                Some(12),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ack),
+            );
+            assert_eq!(
+                link.latency.auth,
+                want.as_i64(),
+                "the {ack:?} ack persists as {want:?}"
+            );
+        }
+
+        // A probe that never reached a protocol phase (the fast path) leaves
+        // the column NULL — "never observed", not "observed and unknown".
+        let mut link = fake_row(1, "h.example", 1).links.remove(0);
+        let _ = apply_test_result(
+            &mut link,
+            TestType::TcpPing,
+            Some(42),
+            Some(42),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            link.latency.auth, None,
+            "a fast probe's NULL is the never-observed state, not Unknown"
+        );
+    }
+
     #[test]
     fn a_speed_test_success_also_clears_the_verdict() {
         let mut link = fake_row(1, "h.example", 1).links.remove(0);

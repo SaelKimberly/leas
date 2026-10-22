@@ -130,10 +130,14 @@ impl AuthAck {
 #[must_use]
 pub fn initial_auth_ack(protocol: &ProtocolConfig) -> AuthAck {
     match protocol {
-        // The response header IS the ack, but it is LAZY (sing-box writes it
-        // only before the first application-data write), so an unobserved ack
-        // is not a rejection — the state starts unknown.
-        ProtocolConfig::Vless(_) | ProtocolConfig::Vmess(_) => AuthAck::Unknown,
+        // The ack-capable families. The response header IS the ack, but it is
+        // LAZY (sing-box writes it only before the first application-data
+        // write), so an unobserved ack is not a rejection — the state starts
+        // unknown. Hysteria2's h3 auth exchange verifies status 233
+        // (`quic.rs` `runtime_auth`): the ack exists there too.
+        ProtocolConfig::Vless(_) | ProtocolConfig::Vmess(_) | ProtocolConfig::Hysteria2(_) => {
+            AuthAck::Unknown
+        }
         // SS2022: the response header echoes the client's salt. The same
         // laziness argument applies to the reply's arrival. Classic-AEAD
         // Shadowsocks has no server ack at all.
