@@ -722,7 +722,7 @@ struct RealCellFacts<'a> {
     /// and the cell's precedence needs both halves of the answer: the name
     /// marker needs `is_dns` AND `!resolved` AND no transport measurement.
     dns: DnsFacts,
-    /// The native engine cannot serve this row (`[n/a]`).
+    /// The native engine cannot serve this row (`[n-a]`).
     untestable: bool,
     /// The purge verdict's label, when the row is a Purgatory row.
     purged: Option<&'a str>,
@@ -791,9 +791,10 @@ fn test_cell_content(facts: &RealCellFacts<'_>, theme: &opaline::Theme) -> (Stri
         // own: the marker text names the reason, and the label says which
         // question was never asked.
         //
-        // `n/a` is the same word D3 uses for the Auth flag's "not
-        // applicable" state — the two say the same thing about the same row.
-        return (format!("[{}]", center_cell("n/a", 4)), bad);
+        // `n-a` is the same word D3 uses for the Auth flag's "not
+        // applicable" state — the two say the same thing about the same row,
+        // and one vocabulary for the concept is the point.
+        return (format!("[{}]", center_cell("n-a", 4)), bad);
     }
     if let Some(label) = facts.purged {
         // Only reachable when every link of the endpoint is purged (the Active
@@ -2962,7 +2963,7 @@ mod tests {
             &theme,
         );
         assert_eq!(
-            t, "[ n/a]",
+            t, "[ n-a]",
             "the engine was never asked, so the label must not claim the probe failed"
         );
         assert_eq!(s.fg, Some(theme.color("error").into()));
