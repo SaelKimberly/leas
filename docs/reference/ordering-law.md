@@ -520,6 +520,26 @@ The correction:
 See ADR 0003's 2026-10-22 amendment and
 `docs/aegis/plans/2026-10-09-stab-bin.md`'s T4 correction.
 
+### 8.5 A transport failure contradicts the transport measurement (2026-10-22)
+
+The `Fast` column IS the transport measurement, and the `[fast]` marker says
+"the transport did not come up". A number beside that marker reads as the
+opposite, so the row tells two stories at once — the 2026-10-22 report showed
+a 74 ms transport span beside a `[fast]` marker, on a row whose last
+successful probe had measured the transport at 2,975 ms.
+
+The rule: **the newest verdict wins the cell.** A `[fast]` marker suppresses
+the Fast column's number, exactly as the Real cell's marker outranks a stale
+delay. The stored measurement is not wrong — it is HISTORY (an earlier
+attempt's span) — so it is kept, and the write path clears it only for a
+transport-stage failure (the one failure that contradicts it).
+
+A `[real]` marker does NOT suppress the number: the transport was alive, so
+the span is the CURRENT measurement, and the pair is the merged row's whole
+point ("the server is up, the config is not" — spec D12).
+
+On the live corpus this affected 65 rows.
+
 ## 9. What is retired
 
 | gone | replaced by |

@@ -177,6 +177,26 @@ pub(crate) fn apply_test_result(
         if let Some(transport_ms) = transport_ms {
             row.latency.fast_delay = Some(transport_ms as i32);
         }
+        // A TRANSPORT-stage failure CONTRADICTS the transport measurement, so
+        // it clears it.
+        //
+        // The Fast column IS the transport measurement, and the `[fast]`
+        // marker says "the transport did not come up". A STALE number beside
+        // that marker reads as "the transport is fine" — the opposite of what
+        // the marker says, and the row then tells two stories at once (the
+        // 2026-10-22 report: a 74 ms transport span beside a `[fast]` marker,
+        // on a row whose last successful probe measured the transport at
+        // 2,975 ms).
+        //
+        // So the latest attempt's transport stage wins: it measured the
+        // transport and the transport failed, so there is no current
+        // transport measurement and the column is blank. The STALE real delay
+        // stays (a failure does not erase a measurement — the law demotes the
+        // link through the stab band instead), and the Real cell's marker
+        // already outranks it in the display.
+        if marker_kind == Some(ProfileErr::Fast) {
+            row.latency.fast_delay = None;
+        }
         if let Some(ack) = auth_ack {
             row.latency.auth = Some(ack.as_i64());
         }
@@ -1650,6 +1670,84 @@ mod tests {
         assert_eq!(
             link.latency.auth, None,
             "a fast probe's NULL is the never-observed state, not Unknown"
+        );
+    }
+
+    /// A TRANSPORT-stage failure clears the transport measurement.
+    ///
+    /// The Fast column IS the transport measurement and the `[fast]` marker
+    /// says "the transport did not come up". A stale number beside that marker
+    /// reads as the opposite — the row tells two stories at once, which is the
+    /// inconsistency the 2026-10-22 report showed (a 74 ms transport span
+    /// beside a `[fast]` marker, on a row whose last successful probe
+    /// measured the transport at 2,975 ms).
+    ///
+    /// The latest attempt's transport stage wins: it measured the transport
+    /// and the transport failed, so there is no current transport measurement.
+    ///
+    /// A PROTOCOL-stage failure is the opposite case and does NOT clear: the
+    /// transport was alive, so the span is the current measurement and the
+    /// marker is `[real]` (spec D12's "the server is up, the config is not").
+    #[test]
+    fn a_transport_failure_clears_the_transport_measurement() {
+        use crate::ops::profiles::test_support::fake_row;
+        use leas_db::models::{Latency, ProfileErr};
+
+        // ── the transport stage failed ──
+        let mut link = fake_row(1, "h.example", 1).links.remove(0);
+        link.latency = Latency {
+            real_delay: Some(2975),
+            fast_delay: Some(74),
+            ip: None,
+            auth: None,
+        };
+        let _ = apply_test_result(
+            &mut link,
+            TestType::RealPing,
+            None,
+            // No span: the transport stage failed, so nothing was measured.
+            None,
+            None,
+            None,
+            Some("timeout on probe transport (limit 5s)"),
+            None,
+            Some(ProfileErr::Fast),
+            None,
+        );
+        assert_eq!(
+            link.latency.fast_delay, None,
+            "the transport measurement is contradicted by the marker: {link:?}"
+        );
+        assert_eq!(
+            link.latency.real_delay,
+            Some(2975),
+            "the STALE real delay stays — a failure does not erase a measurement: {link:?}"
+        );
+        assert_eq!(
+            link.error.as_ref().map(|e| e.kind),
+            Some(ProfileErr::Fast),
+            "and the marker is the transport one: {link:?}"
+        );
+
+        // ── the protocol stage failed: the transport was alive ──
+        let mut link = fake_row(1, "h.example", 1).links.remove(0);
+        link.latency = Latency::default();
+        let _ = apply_test_result(
+            &mut link,
+            TestType::RealPing,
+            None,
+            Some(74),
+            None,
+            None,
+            Some("timeout on probe attempt (limit 5s)"),
+            None,
+            Some(ProfileErr::Real),
+            None,
+        );
+        assert_eq!(
+            link.latency.fast_delay,
+            Some(74),
+            "the transport was alive, so its span is the current measurement: {link:?}"
         );
     }
 

@@ -673,11 +673,32 @@ fn fast_cell_content(delay: Option<i32>, theme: &opaline::Theme) -> (String, Sty
 /// A link with no transport measurement (never probed, or the transport
 /// stage itself failed) renders blanks: there is no number to show, and a
 /// placeholder would read as a measurement.
+///
+/// **A `[fast]` marker SUPPRESSES the number.** The Fast column IS the
+/// transport measurement, and the marker says "the transport did not come
+/// up" — a number beside that marker reads as the opposite, so the row tells
+/// two stories at once (the 2026-10-22 report: a 74 ms transport span beside
+/// a `[fast]` marker, on a row whose last successful probe measured the
+/// transport at 2,975 ms).
+///
+/// The suppression is at the DISPLAY because the stored measurement is not
+/// wrong — it is HISTORY (an earlier attempt's span), and the law keeps
+/// measurements and demotes the link instead of erasing them. The newest
+/// verdict wins the cell, exactly as the Real cell's marker outranks a stale
+/// delay.
 fn compute_fast_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) -> (String, Style) {
     let representative = row
         .representative_link_index(!resolved)
         .and_then(|i| row.links.get(i));
-    fast_cell_content(representative.and_then(|l| l.latency.fast_delay), theme)
+    let contradicted = representative
+        .and_then(|l| l.error.as_ref())
+        .is_some_and(|e| e.kind == leas_db::models::ProfileErr::Fast);
+    let delay = if contradicted {
+        None
+    } else {
+        representative.and_then(|l| l.latency.fast_delay)
+    };
+    fast_cell_content(delay, theme)
 }
 
 /// Compute the Auth cell for one endpoint row: the quad-state success flag's
@@ -1913,6 +1934,45 @@ mod tests {
         assert!(fast.contains("12"), "the transport span shows: {fast:?}");
         assert_eq!(real, "[real]", "the real verdict shows the marker");
         assert_eq!(auth, "   ", "no auth observation renders blanks");
+    }
+
+    /// A `[fast]` marker SUPPRESSES the Fast column's number.
+    ///
+    /// The Fast column IS the transport measurement, and the marker says "the
+    /// transport did not come up". A number beside that marker reads as the
+    /// opposite — the row tells two stories at once, which is the
+    /// inconsistency the 2026-10-22 report showed (a 74 ms transport span
+    /// beside a `[fast]` marker, on a row whose last successful probe measured
+    /// the transport at 2,975 ms).
+    ///
+    /// The stored measurement is not wrong — it is HISTORY (an earlier
+    /// attempt's span). The newest verdict wins the cell, exactly as the Real
+    /// cell's marker outranks a stale delay.
+    #[test]
+    fn a_transport_failure_marker_suppresses_the_fast_number() {
+        use crate::ops::profiles::test_support::fake_row;
+        use leas_db::models::{ErrorInfo, Latency, ProfileErr};
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let mut row = fake_row(1, "1.2.3.4", 1);
+        row.links[0].latency = Latency {
+            real_delay: Some(2975),
+            fast_delay: Some(74),
+            ip: None,
+            auth: None,
+        };
+        row.links[0].error = Some(ErrorInfo {
+            kind: ProfileErr::Fast,
+            text: "timeout on probe transport (limit 5s)".into(),
+        });
+
+        let (fast, _) = compute_fast_cell(&row, true, &theme);
+        let (real, _) = compute_test_cell(&row, true, &theme);
+        assert_eq!(
+            fast.trim(),
+            "",
+            "the transport measurement is contradicted by the marker: {fast:?}"
+        );
+        assert_eq!(real, "[fast]", "and the marker stands: {real:?}");
     }
 
     /// The Auth cell's four states (spec D3), and the fifth: never observed.
