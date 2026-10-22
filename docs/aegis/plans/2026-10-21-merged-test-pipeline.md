@@ -379,8 +379,16 @@ need a real endpoint; the probe-level equivalents are pinned by the tests
 
 **One acceptance item is OPEN, and the smoke does not close it:**
 
-1. **The throughput measurement is not taken.** The clause above is the plan's
-   own stop-for-review gate, and it stays open.
+1. **The throughput measurement is not taken — and cannot be from this
+   environment.** The plan's own stop-for-review gate (`flow_cost_network`,
+   behind `perf-lab`) requires a COPY of a real feed whose endpoints are
+   REACHABLE: the in-repo fixture is synthetic (`synthetic-node.example`, no
+   DNS record), and the only live corpus is the user's own database, which an
+   agent must not copy or probe. The structural claim — one connection per
+   link instead of two, one probe instead of a ping plus a probe — is
+   code-verifiable and pinned by the tests; the MEASURED ratio needs a run on
+   a machine that holds a live feed, which is a human step, not an agent
+   step.
 
 **T2.2's Auth flag producer LANDED after the smoke** (2026-10-22): the
 protocol phase installs an auth-ack slot on the link context, the tunnel's own
