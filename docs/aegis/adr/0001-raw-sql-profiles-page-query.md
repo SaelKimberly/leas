@@ -111,3 +111,16 @@ an endpoint to tier 5), so the comparator is the single implementation again and
 `profiles_link_pairs`, `profiles_failed_ids`, `profiles_enrich_seed_ids` and the
 public `profiles_count` wrapper were callerless and are gone; the page's total
 comes back with the page.
+
+## Amendment — 2026-10-22: the DNS band no longer sinks a measured link
+
+The amendment above records that "the law sinks every link of such an endpoint
+to tier 5". That is **no longer the law** (see ADR 0003's 2026-10-22
+amendment): a MEASURED link keeps its measurement's band, because the probe
+dials the DNS name and the OS resolves it without persisting the resolution.
+A working server sorted below the failures; it does not any more.
+
+The retirement of `profile_link_order`/`order_links` still stands — one
+implementation of the link order, `RankLink::key` — and the guard
+(`load_page_rows_preserves_page_and_link_order`) still pins the pair. Only
+the tier-5 claim is corrected.

@@ -130,8 +130,10 @@ Two properties the numbering encodes, both load-bearing:
   fast probe is a TCP handshake; a real probe dials through the tunnel and
   fetches. They are not the same evidence.
 * **`dns unresolved` (15) sits below every measured band but above nothing
-  else**, and is an *endpoint*-level fact, not a link fact — every link of an
-  unresolved endpoint collapses to it (§6).
+  else**, and is an *endpoint*-level fact, not a link fact — the UNMEASURED
+  links of an unresolved endpoint collapse to it (§6). A measured link keeps
+  its own band: the probe dials the name and the OS resolves it, so an empty
+  address set is not evidence that the name fails.
 
 Bins 13/14 fold the persisted failure marker; 16 is the purge sink (§5).
 
@@ -305,11 +307,20 @@ follow-up `UPDATE` re-sets `band` after the `INSERT OR REPLACE` but **not**
 
 Two endpoint-level overrides sit above the measured bands:
 
-* **DNS unresolved (bin 15).** A DNS host with no address row collapses every
-  link into bin 15 (`dns_unresolved_endpoint(domain, has_address)`). A failed
-  lookup is the same state: it stamps `resolved_at` and leaves the address set
-  empty. An IP literal is *not* this state — its address is its `endpoint_ip`
-  row.
+* **DNS unresolved (bin 15).** A DNS host with no address row sinks its
+  **unmeasured** links into bin 15 (`dns_unresolved_endpoint(domain,
+  has_address)`). A failed lookup is the same state: it stamps `resolved_at`
+  and leaves the address set empty. An IP literal is *not* this state — its
+  address is its `endpoint_ip` row.
+
+  **A MEASURED link is not sunk (2026-10-22).** The probe dials the DNS name
+  and lets the OS resolve it, WITHOUT persisting the resolution — so a DNS
+  endpoint the probe reached has an empty address set AND a measurement. The
+  band therefore needs POSITIVE evidence of "unresolved": a measured link
+  keeps its measurement's band, and bin 15 is for the links that were never
+  measured. Before that, a working server sorted below the failures — the band
+  is the first term of the ordering key, and bin 15 sits below every
+  real-error band (13).
 * **Purged (bin 16).** A link carrying a `purge_reason` sits below every live
   band, so an endpoint's representative link is a live one whenever any live
   link exists. An all-purged endpoint still gets a deterministic position, for
@@ -338,9 +349,16 @@ never answered for" while the user has already proved it. Membership is
 therefore its own column, and the key's `stab_bin` orders *within* that
 membership.
 
-A **DNS-unresolved** endpoint is never proven: the host cannot be dialled, so it
-is not in the working pool. The old bin list excluded it structurally (its links
-collapse to bin 15); under the proven-first partition the exclusion is stated.
+A **DNS-unresolved** endpoint is not proven: the host cannot be dialled, so it
+is not in the working pool. The old bin list excluded it structurally (its
+UNMEASURED links collapse to bin 15); under the proven-first partition the
+exclusion is stated.
+**A MEASURED DNS endpoint IS proven (2026-10-22).** The probe dials the name
+and the OS resolves it, so the host CAN be dialled — the empty address set is
+the probe's not persisting the resolution, not the name failing. The
+exclusion therefore applies only to an endpoint with no measurement at all.
+(The same correction as the band law, one level up: the flag alone does not
+decide.)
 
 Bins 6..11 (fast success, no real success) match no scope — pre-existing, and
 inherited by this partition.
@@ -470,6 +488,37 @@ now carries TWO delays and an auth flag, and the law reads them as before:
 * **The exit IP is not a band term either.** `latency_ip` is a fact about
   WHERE the traffic emerged, and it ages on its own — `Fill Exit IPs` never
   rewrites the real delay (spec D11).
+
+### 8.4 A measured DNS link keeps its band (2026-10-22)
+
+The DNS band (15) needs **positive evidence** of "unresolved", and the flag
+alone does not supply it.
+
+The probe dials the DNS *name* and lets the OS resolve it, **without
+persisting the resolution** — so a DNS endpoint the probe reached has an
+**empty address set AND a measurement**. The old law read the empty address
+set as "the name does not resolve" and filed the link in band 15, which sits
+BELOW every real-error band (13). The band is the first term of the ordering
+key, so a working server sorted below the failures: the ordering law,
+inverted. The 2026-10-22 report saw it on the live corpus — a real success
+(426 ms) below 1,223 real-error rows.
+
+The correction:
+
+* **Band 15 is for the links that were NEVER measured.** A measured link keeps
+  its measurement's band: the transport came up, so the name resolved.
+* **`rank_proven` gets the same correction.** A measured DNS endpoint is
+  proven like an IP-literal one — the flag's premise ("the host cannot be
+  dialled") is false for an endpoint the probe reached. A FAST measurement
+  counts too: a TCP handshake to the endpoint's address is proof the host is
+  dialable.
+* **`STAB_VERSION` 2 → 3** — the band law is an input to the stored keys, so
+  every stored `rank_bin` re-derives on the first open. On the live corpus
+  that moved 58 measured endpoints out of band 15 and left zero measured
+  endpoints filed as unresolved.
+
+See ADR 0003's 2026-10-22 amendment and
+`docs/aegis/plans/2026-10-09-stab-bin.md`'s T4 correction.
 
 ## 9. What is retired
 

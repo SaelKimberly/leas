@@ -161,6 +161,13 @@ Decisions this changed:
   the law's order for that pair (protocols 99 before 13 on a fresh failure beat a live
   measurement).
 
+  > **Superseded 2026-10-22 (ADR 0003 amendment, `STAB_VERSION` 2 → 3):** the "tier 5 sinks
+  > every link" clause is **no longer the law**. A MEASURED link keeps its measurement's band:
+  > the probe dials the DNS name and the OS resolves it, without persisting the resolution, so
+  > a DNS endpoint the probe reached has an empty address set AND a measurement — and the old
+  > reading put a working server below the failures. The retirement of the SQL link order still
+  > stands (one implementation, `RankLink::key`); only the tier-5 claim is corrected.
+
 ## 8. Delivered — phases 2 and 3
 
 **Phase 2 (gate, writes, import, retention)**

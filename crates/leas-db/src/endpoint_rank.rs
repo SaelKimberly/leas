@@ -445,13 +445,21 @@ fn endpoint_addr_key(row: &EndpointRow) -> Vec<u8> {
     }
 }
 
-/// True when the endpoint is a DNS host whose resolution has not landed —
-/// the flag that collapses its links into one band (decision 16, tier 5).
+/// True when the endpoint is a DNS host whose resolution has not landed.
 ///
 /// The second input is "does it have any resolved address", which the
 /// `endpoint_ip` table answers (`EndpointRow::resolved_ips`). A failed lookup
 /// is not a different state: it stamps `resolved_at` and leaves the address
 /// set empty, which is exactly the unresolved band this flag is for.
+///
+/// **The flag alone does NOT sink a link (2026-10-22).** The probe dials the
+/// DNS NAME and lets the OS resolve it, WITHOUT persisting the resolution — so
+/// a DNS endpoint the probe reached has an EMPTY address set AND a
+/// measurement. The bin law therefore needs POSITIVE evidence of
+/// "unresolved": a MEASURED link keeps its measurement's band, and this flag
+/// only sinks the links that were never measured. Before that, a working
+/// server sorted below the failures (the band is the first term of the
+/// ordering key, and the DNS band sits below every real-error band).
 #[must_use]
 pub const fn dns_unresolved_endpoint(domain: &str, has_address: bool) -> bool {
     !domain.is_empty() && !has_address
@@ -1506,6 +1514,67 @@ mod tests {
         assert!(
             lower_id.key(false) < newer.key(false),
             "protocol id is the last tiebreak"
+        );
+    }
+
+    /// A DNS endpoint with a FAST-measured link beside a sibling holding a
+    /// real-success ring IS proven.
+    ///
+    /// The case the 2026-10-22 correction opened: the fast probe is a TCP
+    /// handshake to the endpoint's address, so a successful one is PROOF the
+    /// host is dialable — the same proof a real measurement gives, for the
+    /// question "can this endpoint be dialled?". The sibling's real-success
+    /// ring then supplies the working-pool evidence. An endpoint that was
+    /// never measured at all keeps the exclusion (its name may not resolve).
+    ///
+    /// The alternative — narrowing `measured_any` to REAL measurements only —
+    /// would leave a dialable endpoint out of the working pool because the
+    /// evidence happened to be a handshake rather than a tunnel. The band law
+    /// takes the same view: a fast-measured link keeps the FAST band, not the
+    /// DNS band.
+    #[test]
+    fn a_fast_measured_dns_link_admits_its_proven_sibling() {
+        // A fast-measured link: the transport came up, so the name resolved.
+        let mut fast = link(1, Some(false), 30, 10);
+        fast.proven = false;
+        // A sibling whose ring holds a real success.
+        let mut real = link(2, None, 0, 10);
+        real.proven = true;
+        let row = compute_rank(
+            EndpointId::new(7),
+            "h.example",
+            "",
+            Vec::new(),
+            // The endpoint's address set is empty — the probe never persisted
+            // the resolution.
+            true,
+            &[fast, real],
+        )
+        .expect("rank");
+        assert_eq!(
+            row.rank.proven, 1,
+            "a dialable endpoint whose sibling worked IS in the working pool"
+        );
+    }
+
+    /// A DNS endpoint with NO measurement at all keeps the exclusion: its name
+    /// may not resolve, so it is not in the working pool.
+    #[test]
+    fn an_unmeasured_dns_endpoint_is_not_proven() {
+        let mut real = link(2, None, 0, 10);
+        real.proven = true;
+        let row = compute_rank(
+            EndpointId::new(7),
+            "h.example",
+            "",
+            Vec::new(),
+            true,
+            &[real],
+        )
+        .expect("rank");
+        assert_eq!(
+            row.rank.proven, 0,
+            "an endpoint with no measurement may not resolve at all: it stays out"
         );
     }
 

@@ -190,6 +190,13 @@ blank, tiers 3/4 → the marker, tier 5 → `[name]`, tier 6 → the purge label
 (reachable only when every link is purged, because tier 6 sits below every live
 band — which is what the purge label's own comment always claimed).
 
+**Corrected 2026-10-22:** tier 5 → `[name]` is the UNMEASURED case only. A
+measured link keeps its measurement's band, so it never renders `[name]` — the
+probe dialled the name and the OS resolved it, so the empty address set is not
+evidence that the name fails. The tier-5 marker also renders as `[ n/a]`
+rather than `[real]` when the engine could not serve the row (no probe ran at
+all).
+
 Deliberate behaviour change: the cell no longer follows
 `selected_protocol`/`manual_protocol_override`. The ordering law's tier ignores
 the override, and a cell that honoured it could not report the endpoint's band.
@@ -276,3 +283,26 @@ out of all four scoped menus.
   widen from 8 to 16 column-set combinations.
 - **Remove Bad Servers is not gated by stability** — the user can still delete
   the pool this feature curates, deliberately.
+
+## Amendment — 2026-10-22: a MEASURED link is never in the DNS band
+
+The "tier 5 collapses every link of an unresolved endpoint" reading above (in
+the Consequences bullet, the `profile_link_order` bullet, and the
+`dns_unresolved_endpoint` doc) is **no longer the law**.
+
+The probe dials the DNS *name* and lets the OS resolve it, **without persisting
+the resolution** — so a DNS endpoint the probe reached has an **empty address
+set AND a measurement**. The old law read the empty address set as "the name
+does not resolve" and filed such a link in the DNS band, which sits BELOW every
+real-error band: a working server sorted below the failures. The ordering law,
+inverted. The 2026-10-22 report saw it on the live corpus.
+
+The correction: the DNS band needs **positive evidence** of "unresolved". A
+**measured** link keeps its measurement's band; the band is for the links that
+were never measured. The same correction applies to `rank_proven` (a measured
+DNS endpoint is proven like an IP-literal one), because the flag's premise —
+"the host cannot be dialled" — is false for an endpoint the probe reached.
+
+`STAB_VERSION` 2 → 3: the band law is an input to the stored keys, so every
+stored `rank_bin` re-derives on the first open. The amendment to ADR 0001
+below and to `docs/reference/ordering-law.md` §6 carry the same correction.
