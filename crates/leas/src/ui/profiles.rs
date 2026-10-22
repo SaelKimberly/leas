@@ -686,6 +686,14 @@ fn fast_cell_content(delay: Option<i32>, theme: &opaline::Theme) -> (String, Sty
 /// measurements and demotes the link instead of erasing them. The newest
 /// verdict wins the cell, exactly as the Real cell's marker outranks a stale
 /// delay.
+///
+/// **It is the INVERSE of the `[name]` suppression, and that is the point:**
+/// there, the MARKER was the false fact (the probe reached the endpoint, so
+/// the name DID resolve) and the measurement was true — so the marker goes.
+/// Here, the marker is FRESH (the transport just failed) and the measurement
+/// is STALE (an earlier attempt's span) — so the number goes. Which fact is
+/// false decides which one the cell drops; dropping the live one would hide
+/// a failure, and dropping the stale one would present history as health.
 fn compute_fast_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) -> (String, Style) {
     let representative = row
         .representative_link_index(!resolved)

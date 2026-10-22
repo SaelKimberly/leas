@@ -177,6 +177,15 @@ pub(crate) fn apply_test_result(
         if let Some(transport_ms) = transport_ms {
             row.latency.fast_delay = Some(transport_ms as i32);
         }
+        // The failure's RESOLVED marker kind — the kind the row will carry.
+        //
+        // It is resolved ONCE, here, because two decisions read it: the
+        // marker that is written, and whether the transport measurement is
+        // contradicted. The kind comes from `marker_kind` when the caller
+        // knows it (a merged probe's transport-stage failure) and from the
+        // test type otherwise — so the fast-only batch and the single Fast
+        // Test reach the same `[fast]` marker through `err_kind_for(TcpPing)`.
+        let kind = marker_kind.unwrap_or_else(|| err_kind_for(test_type));
         // A TRANSPORT-stage failure CONTRADICTS the transport measurement, so
         // it clears it.
         //
@@ -194,7 +203,7 @@ pub(crate) fn apply_test_result(
         // stays (a failure does not erase a measurement — the law demotes the
         // link through the stab band instead), and the Real cell's marker
         // already outranks it in the display.
-        if marker_kind == Some(ProfileErr::Fast) {
+        if kind == ProfileErr::Fast {
             row.latency.fast_delay = None;
         }
         if let Some(ack) = auth_ack {
@@ -211,7 +220,7 @@ pub(crate) fn apply_test_result(
         // as a config failure — and the purge classifier and
         // `remove_failed_servers` read the kind as a verdict.
         row.error = Some(ErrorInfo {
-            kind: marker_kind.unwrap_or_else(|| err_kind_for(test_type)),
+            kind,
             text: cap_error_text(err),
         });
         // Only a real probe carries evidence; a fast result can never set a
@@ -1748,6 +1757,43 @@ mod tests {
             link.latency.fast_delay,
             Some(74),
             "the transport was alive, so its span is the current measurement: {link:?}"
+        );
+
+        // ── the FAST-ONLY path reaches the same `[fast]` marker ──
+        //
+        // The fast-only batch and the single Fast Test do not carry a
+        // `marker_kind`: they reach the transport marker through
+        // `err_kind_for(TcpPing)`. The contradiction is the same — a TCP
+        // handshake that failed says the transport did not come up, so the
+        // stored span is history — and the clear must fire there too.
+        let mut link = fake_row(1, "h.example", 1).links.remove(0);
+        link.latency = Latency {
+            real_delay: None,
+            fast_delay: Some(74),
+            ip: None,
+            auth: None,
+        };
+        let _ = apply_test_result(
+            &mut link,
+            TestType::TcpPing,
+            None,
+            None,
+            None,
+            None,
+            Some("IO: Connection refused (os error 111)"),
+            None,
+            // No `marker_kind`: the kind comes from the test type.
+            None,
+            None,
+        );
+        assert_eq!(
+            link.error.as_ref().map(|e| e.kind),
+            Some(ProfileErr::Fast),
+            "the fast-only path's marker is the transport one: {link:?}"
+        );
+        assert_eq!(
+            link.latency.fast_delay, None,
+            "and it clears the stale transport measurement too: {link:?}"
         );
     }
 

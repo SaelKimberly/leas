@@ -538,6 +538,21 @@ A `[real]` marker does NOT suppress the number: the transport was alive, so
 the span is the CURRENT measurement, and the pair is the merged row's whole
 point ("the server is up, the config is not" — spec D12).
 
+**The write path clears it too, on the RESOLVED marker kind.** The kind a row
+carries is `marker_kind` when the caller knows it (a merged probe's
+transport-stage failure) and the test type's own kind otherwise — so the
+fast-only batch and the single Fast Test reach the same `[fast]` marker
+through `err_kind_for(TcpPing)`. The clear must read the RESOLVED kind, or
+those paths keep the stale span.
+
+**It is the INVERSE of the `[name]` rule, and that is the point.** There the
+MARKER was the false fact (the probe reached the endpoint, so the name DID
+resolve) and the measurement was true — so the marker goes. Here the marker is
+FRESH (the transport just failed) and the measurement is STALE (an earlier
+attempt's span) — so the number goes. Which fact is false decides which one
+the cell drops: dropping the live one hides a failure, and dropping the stale
+one presents history as health.
+
 On the live corpus this affected 65 rows.
 
 ## 9. What is retired
