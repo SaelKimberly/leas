@@ -744,16 +744,20 @@ appended when updates are available for installed backends.
 2. Press `t` to open the speed test menu
 3. Navigate with `↑↓` (skips the separator line)
 4. Press `Enter` on the test type:
-   - **Fast Ping** — auto-selects TCP or UDP/QUIC adapter based on protocol.
-     On a collapsed endpoint row with >1 protocols this runs an
-     **endpoint-scoped batch** (all protocols of the endpoint); on an expanded
-     panel sub-row it pings the **exact protocol**
-   - **Real Ping** — measures response time through the proxy (same scoping)
+   - **Fast Test** — the transport measurement on its own: the time to
+     establish the endpoint's transport, auto-selecting a TCP or UDP/QUIC
+     adapter based on protocol. On a collapsed endpoint row with >1 protocols
+     this runs an **endpoint-scoped batch** (all protocols of the endpoint); on
+     an expanded panel sub-row it pings the **exact protocol**
+   - **Real Test** — ONE probe through the proxy, producing two facts: the
+     transport span (the `Fast` column) and the probe's own span (the `Real`
+     column). Same scoping as the Fast Test.
    - **Speed Test** — downloads a test payload to measure throughput
    - **UDP Test** — tests UDP forwarding
-   - **Fast Ping (All Profiles)** — batch fast pings every link in the database
-   - **Fast + Real Ping (All Profiles)** — the same fast phase, then a real ping per reachable link (links the fast phase proved unreachable are skipped, and rows the native engine cannot serve are marked `[real]` instead of probed)
-   - **Fast + Real Ping (Successful / New / Successful + New / Failed)** — the same run narrowed to a scope of the feed: endpoints that achieved a real success; endpoints nothing has answered for yet (untested); those two together; or those whose links all failed (including a DNS name that never resolved). The scope reads the endpoint's stored test tier, so it is a filter on the plan, not a different pipeline. A scoped run freezes its endpoint list before the first probe, so an endpoint leaving the scope mid-run is still tested.
+   - **Fast Test (All Profiles)** — batch transport measurements over every link in the database
+   - **Real Test (All Profiles)** — one probe per link over the whole database (a link whose transport failed is retired; rows the native engine cannot serve are marked instead of probed)
+   - **Real Test (Successful / New / Successful + New / Failed)** — the same run narrowed to a scope of the feed: endpoints that achieved a real success; endpoints nothing has answered for yet (untested); those two together; or those whose links all failed (including a DNS name that never resolved). The scope reads the endpoint's stored test tier, so it is a filter on the plan, not a different pipeline. A scoped run freezes its endpoint list before the first probe, so an endpoint leaving the scope mid-run is still tested.
+   - **Fill Exit IPs (Successful)** — fetches the exit IP for the Successful band's links, on its own rate limiter (the free IP-API tiers publish ~45 requests/minute). It writes the exit IP and the country flag and **never** the real delay — the two are independently-aged facts in one row.
    - **Sort by Test** — re-sorts the table by test priority (real successes by delay, then the failure bands)
    - **Remove Bad Servers** — removes profiles with failed tests
    - **Retry Failed DNS Lookups** — re-resolves every DNS-name endpoint whose address set is empty (never attempted or previously failed), bypassing the TTL. Purgatory rows are included. Results appear as usual resolutions; the actions panel logs how many lookups were dispatched.
