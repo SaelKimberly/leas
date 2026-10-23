@@ -682,7 +682,11 @@ impl Database {
     /// sum to `total`; `alive` and `reliable` are orthogonal filters that
     /// overlap any subset.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
-    pub async fn profiles_aggregate(&self, req: &PageRequest, live_alive: bool) -> Result<AggregateCounts> {
+    pub async fn profiles_aggregate(
+        &self,
+        req: &PageRequest,
+        live_alive: bool,
+    ) -> Result<AggregateCounts> {
         let _ = self.drain_dirty_ranks().await;
         let sql = aggregate_sql(req, live_alive);
         // Same executor branch as every other read here: the direct turso
@@ -694,10 +698,8 @@ impl Database {
             let mut conn = self.connection().await?;
             sql.exec(&mut conn).await?
         };
-        rows.first().map_or_else(
-            || Ok(AggregateCounts::default()),
-            AggregateCounts::decode,
-        )
+        rows.first()
+            .map_or_else(|| Ok(AggregateCounts::default()), AggregateCounts::decode)
     }
 
     /// One page of the feed walk's ids plus (optionally) the feed-wide count.

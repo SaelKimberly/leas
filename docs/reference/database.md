@@ -496,6 +496,7 @@ flowchart LR
 | --- | --- | --- |
 | `profiles_page` | count + ordered ids | drives from `endpoint_rank`; the default order is a covering-index scan |
 | `profiles_anchor` | count of rows sorting before a key tuple | used to re-anchor the window after a re-sort moved the selection |
+| `profiles_aggregate` | `COUNT(*)` + six `SUM(CASE WHEN …)` arms | the Details panel's bucket counts, one statement per scope (global = live `rank_newest_seen` vs the TTL; view = the swept `band`); the partition arms are `PlanScope::predicate` verbatim. Raw SQL (cause C7) |
 | `load_page_projection` | one hydration statement, ids inlined | the page's rows (display columns only; the three deferred JSON carriers stay unloaded) |
 | `load_page_rows` | typed `in_list` reads + in-memory join | the reference implementation the projection is pinned against |
 | `update_endpoint_resolution` | `UPDATE endpoints` + `endpoint_ip` set rewrite + rank refresh | one transaction, retried on write contention |

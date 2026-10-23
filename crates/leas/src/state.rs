@@ -11,13 +11,13 @@ use leas_core::grpc_client;
 use leas_core::log_heed::HeedLogStorage;
 use leas_core::speed_test::TestType;
 use leas_db::Database;
-use leas_db::models::PurgatoryView;
-use leas_db::profiles_query::{AggregateCounts, PageRequest, PageSort, PlanScope};
 use leas_db::hash::stable_hash;
+use leas_db::models::PurgatoryView;
 use leas_db::models::{
     Endpoint, EndpointGroup, EndpointId, Group, HostType, Latency, ProfileStats, Protocol,
     ProtocolId, RoutingRule, Security, TrafficStats, Transport,
 };
+use leas_db::profiles_query::{AggregateCounts, PageRequest, PageSort, PlanScope};
 use leas_proto::proto_spec::common::TransportConfig;
 use leas_proto::proto_spec::{
     EndpointEssentials, HostKind, ParsedProto, ProtoSpec, ProtocolConfig,

@@ -14,7 +14,6 @@
 //!
 //! Design: spec `2026-10-22-details-metrics-tasks-design.md` §14.
 
-
 use leas_db::models::PurgatoryView;
 use leas_db::profiles_query::{PageRequest, PageSort, PlanScope};
 
@@ -84,7 +83,10 @@ pub fn is_busy(state: &AppState) -> bool {
 /// never re-armed.
 pub fn enqueue(state: &mut AppState, spec: TaskSpec) {
     let identity = spec.identity();
-    let duplicate = state.task_queue.iter().any(|queued| queued.identity() == identity)
+    let duplicate = state
+        .task_queue
+        .iter()
+        .any(|queued| queued.identity() == identity)
         || state
             .running_task
             .as_ref()
@@ -113,7 +115,11 @@ pub fn stop(state: &mut AppState) {
     state
         .speed_test_stop
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    state.log_trace("info", "tui::ops::job_scheduler", "scheduler stopped (queue paused)");
+    state.log_trace(
+        "info",
+        "tui::ops::job_scheduler",
+        "scheduler stopped (queue paused)",
+    );
 }
 
 /// Resume draining a paused queue (spec D40).
@@ -354,7 +360,6 @@ pub fn discard_queue_on_quit(state: &mut AppState) {
     state.scheduler_paused = false;
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,22 +392,39 @@ mod tests {
     #[tokio::test]
     async fn enqueue_ignores_a_duplicate_identity() {
         let mut state = sched_state().await;
-        enqueue(&mut state, spec(TaskKind::RealTest, PlanScope::New, "Real Test (New)"));
+        enqueue(
+            &mut state,
+            spec(TaskKind::RealTest, PlanScope::New, "Real Test (New)"),
+        );
         assert_eq!(state.task_queue.len(), 1, "the first enqueue lands");
 
-        enqueue(&mut state, spec(TaskKind::RealTest, PlanScope::New, "Real Test (New)"));
+        enqueue(
+            &mut state,
+            spec(TaskKind::RealTest, PlanScope::New, "Real Test (New)"),
+        );
         assert_eq!(state.task_queue.len(), 1, "a queued duplicate is ignored");
 
         // A DIFFERENT scope is a different task — it must not be deduped.
-        enqueue(&mut state, spec(TaskKind::RealTest, PlanScope::Failed, "Real Test (Failed)"));
-        assert_eq!(state.task_queue.len(), 2, "a different scope is a distinct task");
+        enqueue(
+            &mut state,
+            spec(TaskKind::RealTest, PlanScope::Failed, "Real Test (Failed)"),
+        );
+        assert_eq!(
+            state.task_queue.len(),
+            2,
+            "a different scope is a distinct task"
+        );
     }
 
     /// A running task is never re-armed (spec D33).
     #[tokio::test]
     async fn enqueue_ignores_a_task_that_is_already_running() {
         let mut state = sched_state().await;
-        let running = spec(TaskKind::RealTest, PlanScope::Successful, "Real Test (Successful)");
+        let running = spec(
+            TaskKind::RealTest,
+            PlanScope::Successful,
+            "Real Test (Successful)",
+        );
         state.running_task = Some(running.clone());
 
         enqueue(&mut state, running);
@@ -411,7 +433,10 @@ mod tests {
             0,
             "a running duplicate must not re-queue"
         );
-        assert!(state.running_task.is_some(), "the running task is untouched");
+        assert!(
+            state.running_task.is_some(),
+            "the running task is untouched"
+        );
     }
 
     /// Two different rows are two different tasks — the endpoint is part of the
@@ -419,19 +444,32 @@ mod tests {
     #[tokio::test]
     async fn enqueue_distinguishes_two_selected_endpoints() {
         let mut state = sched_state().await;
-        enqueue(&mut state, selected(TaskKind::FastTest, "Fast Test (Selected)"));
+        enqueue(
+            &mut state,
+            selected(TaskKind::FastTest, "Fast Test (Selected)"),
+        );
         let mut other = selected(TaskKind::FastTest, "Fast Test (Selected)");
         other.endpoint = Some((3, 4));
         enqueue(&mut state, other);
-        assert_eq!(state.task_queue.len(), 2, "different endpoints are different tasks");
+        assert_eq!(
+            state.task_queue.len(),
+            2,
+            "different endpoints are different tasks"
+        );
     }
 
     /// `d` removes a queued task by index (spec D39).
     #[tokio::test]
     async fn remove_queued_deletes_by_index() {
         let mut state = sched_state().await;
-        enqueue(&mut state, spec(TaskKind::RealTest, PlanScope::New, "first"));
-        enqueue(&mut state, spec(TaskKind::RealTest, PlanScope::Failed, "second"));
+        enqueue(
+            &mut state,
+            spec(TaskKind::RealTest, PlanScope::New, "first"),
+        );
+        enqueue(
+            &mut state,
+            spec(TaskKind::RealTest, PlanScope::Failed, "second"),
+        );
 
         remove_queued(&mut state, 0);
         assert_eq!(state.task_queue.len(), 1);
@@ -448,7 +486,10 @@ mod tests {
         let mut state = sched_state().await;
         assert!(!is_busy(&state), "idle is not busy");
 
-        enqueue(&mut state, spec(TaskKind::RealTest, PlanScope::New, "queued"));
+        enqueue(
+            &mut state,
+            spec(TaskKind::RealTest, PlanScope::New, "queued"),
+        );
         assert!(is_busy(&state), "a queued task makes the scheduler busy");
 
         state.task_queue.clear();
@@ -466,7 +507,10 @@ mod tests {
     #[tokio::test]
     async fn drain_skips_a_stale_scope_and_keeps_the_scheduler_idle() {
         let mut state = sched_state().await;
-        enqueue(&mut state, spec(TaskKind::RealTest, PlanScope::New, "Real Test (New)"));
+        enqueue(
+            &mut state,
+            spec(TaskKind::RealTest, PlanScope::New, "Real Test (New)"),
+        );
 
         drain(&mut state).await;
         assert!(
@@ -483,7 +527,10 @@ mod tests {
     #[tokio::test]
     async fn drain_does_nothing_while_paused() {
         let mut state = sched_state().await;
-        enqueue(&mut state, spec(TaskKind::RealTest, PlanScope::New, "queued"));
+        enqueue(
+            &mut state,
+            spec(TaskKind::RealTest, PlanScope::New, "queued"),
+        );
         stop(&mut state);
 
         drain(&mut state).await;
@@ -502,13 +549,19 @@ mod tests {
 
         // Nothing running: a stray event.
         handle_terminal(&mut state, TerminalEvent::BatchEnded);
-        assert!(state.task_history.is_empty(), "a stray event records nothing");
+        assert!(
+            state.task_history.is_empty(),
+            "a stray event records nothing"
+        );
 
         // A match finishes the task.
         let running = spec(TaskKind::RealTest, PlanScope::New, "Real Test (New)");
         state.running_task = Some(running);
         handle_terminal(&mut state, TerminalEvent::BatchEnded);
-        assert!(state.running_task.is_none(), "the match clears the running task");
+        assert!(
+            state.running_task.is_none(),
+            "the match clears the running task"
+        );
         assert_eq!(state.task_history.len(), 1, "the match records the outcome");
         assert_eq!(state.task_history[0].label, "Real Test (New)");
 
@@ -533,7 +586,10 @@ mod tests {
     #[tokio::test]
     async fn discard_queue_on_quit_empties_everything() {
         let mut state = sched_state().await;
-        enqueue(&mut state, spec(TaskKind::RealTest, PlanScope::New, "queued"));
+        enqueue(
+            &mut state,
+            spec(TaskKind::RealTest, PlanScope::New, "queued"),
+        );
         state.running_task = Some(spec(TaskKind::Compact, PlanScope::All, "Compact"));
         state.scheduler_paused = true;
 
@@ -637,10 +693,7 @@ mod tests {
         state.refresh_aggregates().await;
         let cache = state.aggregates.expect("the refresh populates the cache");
         assert_eq!(
-            cache.counts.proven
-                + cache.counts.untested
-                + cache.counts.failed
-                + cache.counts.other,
+            cache.counts.proven + cache.counts.untested + cache.counts.failed + cache.counts.other,
             cache.counts.total,
             "the partition sums to the total even on an empty db"
         );

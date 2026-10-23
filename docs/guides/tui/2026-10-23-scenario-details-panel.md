@@ -100,3 +100,14 @@ The aggregate's SQL and the `alive` arm's live-vs-swept split are covered by
 `leas-db`'s integration tests (`aggregate_buckets_partition_the_total`,
 `aggregate_alive_is_live_for_the_global_scope`). The Tasks pane's keys are
 covered by `scenario-tasks-pane`.
+
+## Verdict
+
+| Run | Result |
+|---|---|
+| 2026-10-23, 120x40 | **pass** — the three-tab bar cycles (`]` from Details lands on Metrics, `[` returns); both group headers render with an empty store; the aggregate column shows the partition block (`proven`/`untested`/`failed`/`other`), a blank line, then the orthogonal block (`alive`/`reliable`), then `View: Active`; `F1` collapses to the one-line global aggregate (`total` present, no `rows 1-N of M`, no `Server:`) and `F1` again restores the panel; `resize("80x24")` stacks the columns |
+| 2026-10-23, 80x24 | **pass** — the two columns stack (facts first, the aggregate block after) |
+
+Notes: the fixture store (`seeded/data.db`) ages out of the Active view after
+the 7-day TTL, so the aggregate numbers read `0` — the layout, not the data, is
+what this scenario pins.

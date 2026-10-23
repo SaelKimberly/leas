@@ -528,10 +528,7 @@ async fn aggregate_buckets_partition_the_total() {
     let db = seed_fixture().await;
     let req = request(PageSort::Test, true, 0, 100);
 
-    let counts = db
-        .profiles_aggregate(&req, false)
-        .await
-        .expect("aggregate");
+    let counts = db.profiles_aggregate(&req, false).await.expect("aggregate");
 
     // e1, e2, e4, e5, e7 are proven; e5's representative is untested but a
     // sibling holds the real success, so it is proven, NOT new.
@@ -559,10 +556,7 @@ async fn aggregate_view_total_matches_the_page_count() {
     let req = request(PageSort::Test, true, 0, 100);
 
     let page = db.profiles_page(&req).await.expect("page");
-    let counts = db
-        .profiles_aggregate(&req, false)
-        .await
-        .expect("aggregate");
+    let counts = db.profiles_aggregate(&req, false).await.expect("aggregate");
 
     assert_eq!(
         counts.total, page.total,
@@ -592,17 +586,11 @@ async fn aggregate_alive_is_live_for_the_global_scope() {
     let mut req = request(PageSort::Test, true, 0, 100);
     req.active_threshold = i64::MAX;
 
-    let live = db
-        .profiles_aggregate(&req, true)
-        .await
-        .expect("aggregate");
+    let live = db.profiles_aggregate(&req, true).await.expect("aggregate");
     assert_eq!(live.alive, 0, "a future bound means nothing is live");
 
     // The swept `band` disagrees — that is exactly why the global arm is live.
-    let swept = db
-        .profiles_aggregate(&req, false)
-        .await
-        .expect("aggregate");
+    let swept = db.profiles_aggregate(&req, false).await.expect("aggregate");
     assert_eq!(swept.alive, 8, "the swept band still calls every row alive");
     assert_ne!(
         swept.alive, live.alive,
@@ -628,14 +616,23 @@ async fn the_direct_aggregate_matches_the_toasty_aggregate() {
     let mem_db = seed_fixture().await;
     let req = request(PageSort::Test, true, 0, 100);
 
-    let direct = file_db.profiles_aggregate(&req, false).await.expect("direct");
-    let toasty = mem_db.profiles_aggregate(&req, false).await.expect("toasty");
+    let direct = file_db
+        .profiles_aggregate(&req, false)
+        .await
+        .expect("direct");
+    let toasty = mem_db
+        .profiles_aggregate(&req, false)
+        .await
+        .expect("toasty");
 
     assert_eq!(
         direct, toasty,
         "the direct reader and the toasty path must agree on every bucket"
     );
-    assert_eq!(direct.proven + direct.untested + direct.failed + direct.other, direct.total);
+    assert_eq!(
+        direct.proven + direct.untested + direct.failed + direct.other,
+        direct.total
+    );
 }
 
 /// The walk page is the page query minus its per-page count: same ids in the

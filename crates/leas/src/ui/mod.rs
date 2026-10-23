@@ -1,18 +1,18 @@
 pub mod add_server;
+pub mod details;
 pub mod export;
 pub mod logs;
-pub mod details;
 pub mod metrics;
 pub mod native_activity;
-pub mod tasks;
 pub mod profiles;
 pub mod settings;
 pub mod status_bar;
+pub mod tasks;
 pub mod theme;
 pub mod widgets;
+use crate::ops::job_scheduler::{self, TaskKind, TaskSpec};
 use crate::ui::theme::ThemeStyles;
 use crate::{AppMode, AppState, ConfirmAction};
-use crate::ops::job_scheduler::{self, TaskKind, TaskSpec};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -650,79 +650,106 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     }
                     "Speed Test (Selected)" => {
                         if let Some(id) = proto_id {
-                            job_scheduler::enqueue(state, TaskSpec {
-                                kind: TaskKind::SpeedTest,
-                                scope: PlanScope::All,
-                                endpoint: Some((ep_id.unwrap_or_default(), id)),
-                                label: label.to_string(),
-                            });
+                            job_scheduler::enqueue(
+                                state,
+                                TaskSpec {
+                                    kind: TaskKind::SpeedTest,
+                                    scope: PlanScope::All,
+                                    endpoint: Some((ep_id.unwrap_or_default(), id)),
+                                    label: label.to_string(),
+                                },
+                            );
                         }
                     }
                     "UDP Test (Selected)" => {
                         if let Some(id) = proto_id {
-                            job_scheduler::enqueue(state, TaskSpec {
-                                kind: TaskKind::UdpTest,
-                                scope: PlanScope::All,
-                                endpoint: Some((ep_id.unwrap_or_default(), id)),
-                                label: label.to_string(),
-                            });
+                            job_scheduler::enqueue(
+                                state,
+                                TaskSpec {
+                                    kind: TaskKind::UdpTest,
+                                    scope: PlanScope::All,
+                                    endpoint: Some((ep_id.unwrap_or_default(), id)),
+                                    label: label.to_string(),
+                                },
+                            );
                         }
                     }
                     "Fast Test (All Profiles)" => {
-                        job_scheduler::enqueue(state, TaskSpec {
-                            kind: TaskKind::FastTest,
-                            scope: PlanScope::All,
-                            endpoint: None,
-                            label: label.to_string(),
-                        });
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::FastTest,
+                                scope: PlanScope::All,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
                     }
                     "Real Test (All Profiles)" => {
-                        job_scheduler::enqueue(state, TaskSpec {
-                            kind: TaskKind::RealTest,
-                            scope: PlanScope::All,
-                            endpoint: None,
-                            label: label.to_string(),
-                        });
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::RealTest,
+                                scope: PlanScope::All,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
                     }
                     "Real Test (Successful)" => {
-                        job_scheduler::enqueue(state, TaskSpec {
-                            kind: TaskKind::RealTest,
-                            scope: PlanScope::Successful,
-                            endpoint: None,
-                            label: label.to_string(),
-                        });
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::RealTest,
+                                scope: PlanScope::Successful,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
                     }
                     "Real Test (New)" => {
-                        job_scheduler::enqueue(state, TaskSpec {
-                            kind: TaskKind::RealTest,
-                            scope: PlanScope::New,
-                            endpoint: None,
-                            label: label.to_string(),
-                        });
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::RealTest,
+                                scope: PlanScope::New,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
                     }
                     "Real Test (Successful + New)" => {
-                        job_scheduler::enqueue(state, TaskSpec {
-                            kind: TaskKind::RealTest,
-                            scope: PlanScope::SuccessfulAndNew,
-                            endpoint: None,
-                            label: label.to_string(),
-                        });
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::RealTest,
+                                scope: PlanScope::SuccessfulAndNew,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
                     }
                     "Real Test (Failed)" => {
-                        job_scheduler::enqueue(state, TaskSpec {
-                            kind: TaskKind::RealTest,
-                            scope: PlanScope::Failed,
-                            endpoint: None,
-                            label: label.to_string(),
-                        });
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::RealTest,
+                                scope: PlanScope::Failed,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
                     }
                     "Fill Exit IPs (Successful)" => {
-                        job_scheduler::enqueue(state, TaskSpec {
-                            kind: TaskKind::FillExitIps,
-                            scope: PlanScope::Successful,
-                            endpoint: None,
-                            label: label.to_string(),
-                        });
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::FillExitIps,
+                                scope: PlanScope::Successful,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
                     }
                     // Immediate, but disabled while the scheduler is busy (D45):
                     // a destructive one-shot must not run alongside a job.
@@ -730,20 +757,26 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         state.remove_failed_servers().await;
                     }
                     "Retry Failed DNS Lookups" => {
-                        job_scheduler::enqueue(state, TaskSpec {
-                            kind: TaskKind::DnsRetry,
-                            scope: PlanScope::All,
-                            endpoint: None,
-                            label: label.to_string(),
-                        });
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::DnsRetry,
+                                scope: PlanScope::All,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
                     }
                     "Compact Duplicate Endpoints" => {
-                        job_scheduler::enqueue(state, TaskSpec {
-                            kind: TaskKind::Compact,
-                            scope: PlanScope::All,
-                            endpoint: None,
-                            label: label.to_string(),
-                        });
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::Compact,
+                                scope: PlanScope::All,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
                     }
                     // The scheduler's stop (spec D19): cancel the running task
                     // and PAUSE the queue. `state.stop_speed_test()` would set
@@ -814,7 +847,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         // else: fall through to main handler for quit/tab/help/etc.
     }
-
 
     // Details tab: the facts column scrolls with its OWN offset (spec D25) —
     // not the native ring's module-global `SCROLL`.
@@ -1557,10 +1589,7 @@ fn render(frame: &mut Frame, state: &AppState) {
             "Metrics",
             matches!(state.pane2_tab, crate::Pane2Tab::Metrics),
         ),
-        (
-            "Tasks",
-            matches!(state.pane2_tab, crate::Pane2Tab::Tasks),
-        ),
+        ("Tasks", matches!(state.pane2_tab, crate::Pane2Tab::Tasks)),
     ];
     let p2_border = if pane2_focused {
         ThemeStyles::container_border_focused(theme)
@@ -1894,32 +1923,31 @@ mod tests {
 
         // A non-zero ring so a scroll would be observable.
         for i in 0..12u64 {
-            state.native_activity.entries.push_back(crate::NativeActivityEntry {
-                conn_id: i,
-                opened_ms: 0,
-                kind: leas_native::telemetry::TraceKind::Tcp,
-                dest: format!("10.0.0.{i}:443"),
-                protocol: String::new(),
-                transport: String::new(),
-                security: leas_native::telemetry::TraceSecurity::Plain,
-                up: 0,
-                down: 0,
-                closed: false,
-                duration_ms: 0,
-                error: None,
-            });
+            state
+                .native_activity
+                .entries
+                .push_back(crate::NativeActivityEntry {
+                    conn_id: i,
+                    opened_ms: 0,
+                    kind: leas_native::telemetry::TraceKind::Tcp,
+                    dest: format!("10.0.0.{i}:443"),
+                    protocol: String::new(),
+                    transport: String::new(),
+                    security: leas_native::telemetry::TraceSecurity::Plain,
+                    up: 0,
+                    down: 0,
+                    closed: false,
+                    duration_ms: 0,
+                    error: None,
+                });
         }
         crate::ui::native_activity::reset_scroll();
 
         let before = state.pane2_rows();
-        let scroll_before = crate::ui::native_activity::scroll_offset(
-            state.native_activity.entries.len(),
-        );
+        let scroll_before =
+            crate::ui::native_activity::scroll_offset(state.native_activity.entries.len());
 
-        let alt_up = Event::Key(KeyEvent::new(
-            KeyCode::Up,
-            KeyModifiers::ALT,
-        ));
+        let alt_up = Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
         handle_event(&alt_up, &mut state).await;
 
         assert_eq!(

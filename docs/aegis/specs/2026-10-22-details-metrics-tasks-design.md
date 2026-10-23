@@ -1,9 +1,9 @@
 # Design: Details Panel, DB Aggregates, Tasks Pane
 
 - **Date:** 2026-10-22
-- **Status:** proposed — awaiting user review
+- **Status:** **implemented 2026-10-23** (grilling interviews 2026-10-22 and 2026-10-23; executed in three slices — see the plan doc). Gate: `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo nextest run --workspace` **2550 passed (1 slow), 11 skipped**.
 - **Kind:** spec
-- **Owners:** `crates/leas/src/ui/` (Details, Metrics, Tasks pane, log row), `crates/leas/src/state.rs` (aggregate cache, scheduler queue/running/paused), `crates/leas/src/ops/scheduler.rs` (the scheduler), `crates/leas-db/src/profiles_query.rs` (the aggregate read)
+- **Owners:** `crates/leas/src/ui/` (Details, Metrics, Tasks pane, log row), `crates/leas/src/state.rs` (aggregate cache, scheduler queue/running/paused), `crates/leas/src/ops/job_scheduler.rs` (the job scheduler), `crates/leas-db/src/profiles_query.rs` (the aggregate read)
 - **Extends:** `2026-10-15-pane-tui-and-profiles-columns-design.md` (the pane-2 shell, D3 pane-2 heights, D4 screen homes, the `Details`/`Metrics` tab pair) — see §11 supersession map
 - **Reference read:** `thirdparty/xrat` — `crates/xrat-app/src/tui/view/configs/detail.rs:13-190`, `tui/view/shared.rs:13-138`, `tui/view/configs/runtime.rs:133-165`, `tui/data/snapshot.rs:80-94,149-177`, `tui/view/configs/testbar.rs:10-47`, `tui/theme.rs:13-16`
 

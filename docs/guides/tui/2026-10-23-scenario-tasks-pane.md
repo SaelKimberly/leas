@@ -101,3 +101,14 @@ close()
 The scheduler's enqueue/dedup/drain transitions are covered by `leas`'s
 `job_scheduler` unit tests (`enqueue_ignores_a_duplicate_identity`,
 `terminal_events_match_the_running_task`, `a_refused_spawn_does_not_hang_the_scheduler`).
+
+## Verdict
+
+| Run | Result |
+|---|---|
+| 2026-10-23, 120x40 | **pass** — the Tasks tab renders the idle bar (`no tasks — pick one from the Speed Test menu`); two feed-wide tasks enqueue from the menu (pane 1 focused, `t`, 4/5 downs, Enter) and both appear — one running (the bar's label, mirrored in the status bar as `Fast Test (All Profiles): 0/8`) and one queued (a list row); `d` empties the queue (`queue empty`) |
+
+Notes: the Selected variants need a selected row, and this fixture store is
+empty, so the scenario uses the feed-wide variants. The shell log row is
+covered by `scenario-details-panel`, which is idle and whose newest log line
+stays on screen.

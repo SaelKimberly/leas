@@ -10,11 +10,11 @@
 //! DISPLAY cache that lags (spec D24) — and renders `—` when the entry is
 //! absent. It never triggers a background fill.
 
+use leas_core::format_bytes;
+use leas_db::models::PurgatoryView;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use leas_core::format_bytes;
-use leas_db::models::PurgatoryView;
 
 use crate::types::EndpointInfo;
 use leas_db::models::ProfileStats;
@@ -125,7 +125,11 @@ fn render_facts(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
             // (the grid's own law — `profiles.rs:1155`); `endpoint_info` is a
             // display cache and must not replace them.
             let host = endpoint.display_host(&row.resolved_ips);
-            lines.push(field("Address", &format!("{host}:{}", endpoint.port), theme));
+            lines.push(field(
+                "Address",
+                &format!("{host}:{}", endpoint.port),
+                theme,
+            ));
 
             // The representative link's protocol — the same link the grid's
             // Test/Stab cells describe.
@@ -133,7 +137,10 @@ fn render_facts(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
                 let p = &protocol;
                 lines.push(field(
                     "Protocol",
-                    &format!("{}/{}/{}", p.proto_kind, p.transport.r#type, p.security.r#type),
+                    &format!(
+                        "{}/{}/{}",
+                        p.proto_kind, p.transport.r#type, p.security.r#type
+                    ),
                     theme,
                 ));
                 if let Some(sni) = &p.security.sni {
@@ -162,11 +169,7 @@ fn render_facts(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
                 },
                 theme,
             ));
-            lines.push(field(
-                "Whitelist",
-                &white_tokens(info),
-                theme,
-            ));
+            lines.push(field("Whitelist", &white_tokens(info), theme));
 
             // The ACTIVE link's persisted real-ping IP wins; the display cache
             // is the fallback — the grid's exact precedence (`profiles.rs:1183`).
@@ -208,23 +211,33 @@ fn render_facts(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
             lines.push(field("Last Seen", &format_epoch(link.last_seen_at), theme));
             lines.push(field(
                 "Last Used",
-                &link.last_used_at.map_or_else(|| EMPTY.to_string(), format_epoch),
+                &link
+                    .last_used_at
+                    .map_or_else(|| EMPTY.to_string(), format_epoch),
                 theme,
             ));
             lines.push(field(
                 "Real Delay",
-                &link.latency.real_delay.map_or_else(|| EMPTY.to_string(), |d| format!("{d}ms")),
+                &link
+                    .latency
+                    .real_delay
+                    .map_or_else(|| EMPTY.to_string(), |d| format!("{d}ms")),
                 theme,
             ));
             lines.push(field(
                 "Fast Delay",
-                &link.latency.fast_delay.map_or_else(|| EMPTY.to_string(), |d| format!("{d}ms")),
+                &link
+                    .latency
+                    .fast_delay
+                    .map_or_else(|| EMPTY.to_string(), |d| format!("{d}ms")),
                 theme,
             ));
             lines.push(field("Auth", auth_label(link.latency.auth), theme));
             lines.push(field(
                 "Speed",
-                &link.speed_bps.map_or_else(|| EMPTY.to_string(), |s| format!("{s}bps")),
+                &link
+                    .speed_bps
+                    .map_or_else(|| EMPTY.to_string(), |s| format!("{s}bps")),
                 theme,
             ));
             lines.push(field("Stability", &stability(link), theme));
@@ -254,7 +267,11 @@ fn render_facts(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
 fn finish_facts(frame: &mut Frame, area: Rect, state: &AppState, lines: Vec<Line>) {
     // The facts column scrolls with its own offset.
     let offset = state.details_scroll.min(lines.len().saturating_sub(1));
-    let visible: Vec<Line> = lines.into_iter().skip(offset).take(area.height as usize).collect();
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(offset)
+        .take(area.height as usize)
+        .collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
 
@@ -275,12 +292,16 @@ fn white_tokens(info: Option<&EndpointInfo>) -> String {
     }
 }
 
-const fn auth_label(auth: Option<i64>) -> &'static str {
-    match auth {
-        Some(1) => "ok",
-        Some(2) => "failed",
-        Some(3) => "n/a",
-        _ => EMPTY,
+/// The link's auth flag, via the crate's `AuthState` (the grid's own law —
+/// `profiles.rs::auth_glyph`), so the panel and the grid cannot disagree.
+fn auth_label(auth: Option<i64>) -> &'static str {
+    use leas_db::models::AuthState;
+    match auth.and_then(AuthState::from_i64) {
+        Some(AuthState::Ok) => "ok",
+        Some(AuthState::Failed) => "failed",
+        Some(AuthState::NotApplicable) => "n/a",
+        Some(AuthState::Unknown) => "unknown",
+        None => EMPTY,
     }
 }
 
@@ -292,14 +313,13 @@ fn stability(link: &ProfileStats) -> String {
     format!("{successes}/{}", link.stab_len)
 }
 
+/// The stored epoch seconds as `YYYY-MM-DD HH:MM:SS` (the crate's single
+/// timestamp law), or `—` when the value is absent.
 fn format_epoch(secs: i64) -> String {
     if secs <= 0 {
         return EMPTY.to_string();
     }
-    let dt = jiff::Timestamp::from_second(secs)
-        .map_or_else(|_| EMPTY.to_string(), |t| t.to_string());
-    // The panel shows a short form; the full timestamp is in the DB.
-    dt.split('T').next().unwrap_or(EMPTY).to_string()
+    crate::format_ts(secs)
 }
 
 /// The right column: the database's own status.
@@ -369,5 +389,109 @@ fn view_label(state: &AppState) -> String {
         view.to_string()
     } else {
         format!("{view} / {}", state.search_query)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A state with the aggregate cache populated — the event loop refreshes it
+    /// on the first tick, so the tests must do the same.
+    async fn state_with_aggregates() -> AppState {
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        state.refresh_aggregates().await;
+        state
+    }
+
+    /// Render the pane at `width` into a 120x24 `TestBackend` and flatten it.
+    fn render_at(state: &AppState, width: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, frame.area(), state))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The empty test DB has no selected row. Both group headers must still be
+    /// present — the panel's shape must not change with the selection (spec §6).
+    #[tokio::test]
+    async fn renders_both_group_headers_with_no_selection() {
+        let state = state_with_aggregates().await;
+        let out = render_at(&state, 120);
+        assert!(out.contains("Server"), "the Server group header is missing");
+        assert!(out.contains("Link"), "the Link group header is missing");
+        assert!(
+            out.contains("no server selected"),
+            "the empty-selection hint is missing"
+        );
+    }
+
+    /// Compact shows the GLOBAL bucket counts only (spec D16): no view total
+    /// (the Profiles footer's `rows a-b of N` owns it) and no server identity
+    /// (the footer's `Server:` line owns it).
+    #[tokio::test]
+    async fn compact_omits_the_view_total_and_server_identity() {
+        let state = state_with_aggregates().await;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render_compact(frame, frame.area(), &state))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for x in 0..buffer.area.width {
+            out.push_str(buffer[(x, 0)].symbol());
+        }
+        assert!(
+            out.contains("total"),
+            "the global counts are missing: {out}"
+        );
+        assert!(
+            out.contains("alive"),
+            "the global counts are missing: {out}"
+        );
+        assert!(
+            !out.contains("View:"),
+            "compact must not repeat the view total"
+        );
+        assert!(
+            !out.contains("Server:"),
+            "compact must not repeat the footer's server identity"
+        );
+    }
+
+    /// Below 100 cols the two columns STACK: the facts column first, the
+    /// aggregate block after (spec D9).
+    #[tokio::test]
+    async fn stacked_below_100_cols() {
+        let state = state_with_aggregates().await;
+        let narrow = render_at(&state, 80);
+        let wide = render_at(&state, 120);
+        // At 120 cols the aggregate block sits beside the facts; at 80 it sits
+        // below. The facts column is always present, so compare the row where
+        // `DB` appears.
+        let db_row_wide = wide
+            .lines()
+            .position(|l| l.contains("DB "))
+            .expect("the wide render has the aggregate block");
+        let db_row_narrow = narrow
+            .lines()
+            .position(|l| l.contains("DB "))
+            .expect("the narrow render has the aggregate block");
+        assert!(
+            db_row_narrow > db_row_wide,
+            "below 100 cols the aggregate block must sit below the facts \
+             (wide row {db_row_wide}, narrow row {db_row_narrow})"
+        );
     }
 }

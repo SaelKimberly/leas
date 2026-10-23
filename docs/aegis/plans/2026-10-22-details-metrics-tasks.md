@@ -4,8 +4,8 @@
 |---|---|
 | Date | 2026-10-23 |
 | Spec | `docs/aegis/specs/2026-10-22-details-metrics-tasks-design.md` |
-| Status | ready to execute |
-| Owner | `crates/leas/src/ui/`, `crates/leas/src/state.rs`, `crates/leas/src/ops/scheduler.rs` (new), `crates/leas-db/src/profiles_query.rs` |
+| Status | **executed 2026-10-23** — all three slices landed; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo nextest run --workspace` **2550 passed (1 slow), 11 skipped**; `cargo fmt --all` applied. The `tui-test` scenarios `scenario-details-panel` and `scenario-tasks-pane` were run live against the debug binary (both pass). The older scenario documents (`scenario-profiles-menus-states`, `scenario-tiny-80x14`, `live-resize`) still describe the pre-redesign shell and are historical evidence, not re-runnable as written. |
+| Owner | `crates/leas/src/ui/` (details, tasks, metrics, log row), `crates/leas/src/state.rs`, `crates/leas/src/ops/job_scheduler.rs` (new), `crates/leas-db/src/profiles_query.rs` |
 | Baseline | `cargo nextest run --workspace` green; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean |
 
 ## Goal

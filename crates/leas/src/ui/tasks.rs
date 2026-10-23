@@ -9,8 +9,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{LineGauge, Paragraph};
 
-use crate::ui::theme::ThemeStyles;
 use crate::AppState;
+use crate::ui::theme::ThemeStyles;
 
 /// The bar's label column, so the bar starts at a fixed x.
 const LABEL_WIDTH: usize = 24;
@@ -86,7 +86,10 @@ fn bar_label(state: &AppState) -> (String, f64) {
         (_, _, 0) => String::new(),
         _ => {
             let remaining = u64::from(total - done) * 1000 / u64::from(rate_milli);
-            format!(" {}", crate::ui::widgets::progress::format_eta(Some(remaining)))
+            format!(
+                " {}",
+                crate::ui::widgets::progress::format_eta(Some(remaining))
+            )
         }
     };
     let label = match total {
@@ -188,7 +191,13 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
             ThemeStyles::hint(theme),
         )));
     }
-    for (i, task) in state.task_queue.iter().enumerate().skip(offset).take(visible_rows) {
+    for (i, task) in state
+        .task_queue
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_rows)
+    {
         let marker = if i == cursor { "► " } else { "  " };
         let style = if i == cursor {
             ThemeStyles::table_row_selected(theme)
@@ -202,7 +211,11 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
     }
     if total > visible_rows {
         lines.push(Line::from(Span::styled(
-            format!("  ↑↓ scroll — rows {}-{} of {total}", offset + 1, (offset + visible_rows).min(total)),
+            format!(
+                "  ↑↓ scroll — rows {}-{} of {total}",
+                offset + 1,
+                (offset + visible_rows).min(total)
+            ),
             ThemeStyles::hint(theme),
         )));
     }
