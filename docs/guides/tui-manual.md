@@ -254,12 +254,18 @@ row out of view, so the third line is truncated to fit and ends with `...`.
 
 ---
 
-### Metrics (pane 2 tab)
+### Metrics (pane 2 `Metrics` tab)
+
+The dynamic view: **connection status**, the connected session's traffic, the
+native core's connection ring, and core system stats. The Actions Log's content
+moved here — its connection-status row is the `status` section, and its log tail
+is the shell-level log row below the pane (not a frozen row inside it).
 
 One scrollable view merging the former Statistics and Native Activity screens —
 the pane frame supplies the border; sections are flat labelled rows:
-
 ```
+status
+  ○ Disconnected
 session
   edge-a.example:443 [xray]
   today ↑1.0KB ↓2.1KB · total ↑9.8KB ↓19.5KB
@@ -271,6 +277,9 @@ core
   api http://127.0.0.1:62789
 ```
 
+- **status** — the connection indicator and state (`● Connected [xray]`,
+  `⠋ Connecting...`, `⏹ Error: ...`, `○ Disconnected`); the Actions Log's
+  connection row, relocated here.
 - **session** — the CONNECTED profile's traffic (today/total, up/down from the
   link's persisted `profile_stats` plus the session delta); `not connected —
   select a profile and press Ctrl+Enter` when nothing is connected.
@@ -584,14 +593,6 @@ a time is structural: the scheduler is the only path into the spawn functions.
 schedulable (no meters, destructive). They stay immediate with their `y/n`
 confirmation, and are disabled while the scheduler is busy.
 
-### Metrics (pane 2 `Metrics` tab)
-
-The dynamic view: connection status, the connected session's traffic, the native
-core's connection ring, and core system stats. The Actions Log's content moved
-here — its connection-status row is the `status` section, and its log tail is
-the shell-level log row below the pane (not a frozen row inside it).
-- Key operations (connect, disconnect, speed test, subscription updates)
-  emit tracing events for real-time visibility
 
 ---
 
