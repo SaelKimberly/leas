@@ -17,13 +17,46 @@ use ratatui::widgets::Paragraph;
 use crate::AppState;
 use crate::ui::theme::ThemeStyles;
 use leas_core::{API_ENDPOINT, CoreType, format_bytes, format_uptime};
+use ratatui::style::Style;
 
 pub use crate::ui::native_activity::{handle_key, reset_scroll};
+
+/// The connection indicator — the icon the Actions Log used to own (spec D1).
+pub fn connection_icon(state: &AppState) -> (&'static str, Style) {
+    let theme = state.theme();
+    if state.connecting {
+        ("⠋", ThemeStyles::spinner(theme))
+    } else if state.connected_core.is_some() {
+        ("●", ThemeStyles::success(theme))
+    } else if state.connection_error.is_some() {
+        ("⏹", ThemeStyles::error(theme))
+    } else if state.connected_protocol_id.is_some() {
+        ("⏏", ThemeStyles::warning(theme))
+    } else {
+        ("○", ThemeStyles::hint(theme))
+    }
+}
 
 /// Render the merged metrics view into `area` (pane-2 inner rect).
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
     let mut lines: Vec<Line> = Vec::new();
+
+    // ── Connection status (absorbed from the Actions Log, spec D1) ────────
+    // Dynamic, so it lives here rather than in the static Details panel. The
+    // log tail that used to be two frozen rows is now the shell-level log row.
+    lines.push(section("status", theme));
+    let (icon, icon_style) = connection_icon(state);
+    let status_text = if state.connecting {
+        format!("{icon} Connecting...")
+    } else if let Some(core) = &state.connected_core {
+        format!("{icon} Connected [{core}]")
+    } else if let Some(err) = &state.connection_error {
+        format!("{icon} Error: {err}")
+    } else {
+        format!("{icon} Disconnected")
+    };
+    lines.push(Line::from(Span::styled(status_text, icon_style)));
 
     // ── Session ───────────────────────────────────────────────────────────
     lines.push(section("session", theme));

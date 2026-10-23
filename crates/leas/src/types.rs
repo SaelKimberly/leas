@@ -202,27 +202,34 @@ impl Pane1Tab {
     }
 }
 
-/// Bottom pane's tabs (spec D4): the actions log and the merged metrics view.
+/// Bottom pane's tabs (spec §14): the static details panel, the merged
+/// metrics view, and the job queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane2Tab {
     Details,
     Metrics,
+    Tasks,
 }
 
 impl Pane2Tab {
-    pub const ALL: &'static [Self] = &[Self::Details, Self::Metrics];
+    pub const ALL: &'static [Self] = &[Self::Details, Self::Metrics, Self::Tasks];
 
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
             Self::Details => Self::Metrics,
-            Self::Metrics => Self::Details,
+            Self::Metrics => Self::Tasks,
+            Self::Tasks => Self::Details,
         }
     }
 
     #[must_use]
     pub const fn prev(self) -> Self {
-        self.next()
+        match self {
+            Self::Details => Self::Tasks,
+            Self::Metrics => Self::Details,
+            Self::Tasks => Self::Metrics,
+        }
     }
 }
 

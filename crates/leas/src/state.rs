@@ -11,10 +11,12 @@ use leas_core::grpc_client;
 use leas_core::log_heed::HeedLogStorage;
 use leas_core::speed_test::TestType;
 use leas_db::Database;
+use leas_db::models::PurgatoryView;
+use leas_db::profiles_query::{AggregateCounts, PageRequest, PageSort, PlanScope};
 use leas_db::hash::stable_hash;
 use leas_db::models::{
     Endpoint, EndpointGroup, EndpointId, Group, HostType, Latency, ProfileStats, Protocol,
-    ProtocolId, PurgatoryView, RoutingRule, Security, TrafficStats, Transport,
+    ProtocolId, RoutingRule, Security, TrafficStats, Transport,
 };
 use leas_proto::proto_spec::common::TransportConfig;
 use leas_proto::proto_spec::{
@@ -31,6 +33,26 @@ use crate::types::{
     NativeActivityLog, Pane1Tab, Pane2Tab, SectionList, SettingsSearch, SettingsSection,
     SplitRightPane,
 };
+
+/// The scope an [`AggregateCache`] was computed for.
+///
+/// Two caches with the same key describe the same set; a change to any field
+/// discards the cache (spec D21 — refresh on filter change and job events,
+/// never on a timer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateKey {
+    pub view: PurgatoryView,
+    pub search: Option<String>,
+    pub group_id: Option<String>,
+    pub scope: PlanScope,
+}
+
+/// The cached aggregate counts plus the key they were computed for.
+#[derive(Debug, Clone)]
+pub struct AggregateCache {
+    pub counts: AggregateCounts,
+    pub key: AggregateKey,
+}
 
 /// Global UI/connection state.
 #[allow(
@@ -180,6 +202,30 @@ pub struct AppState {
     /// because the fill is its own command with its own lifecycle: it starts
     /// when the user asks for it and ends when its last link is settled.
     pub fill_progress: Option<Arc<crate::types::FillMeters>>,
+    /// The scheduler's queue: the tasks waiting to run, earliest first
+    /// (spec §14). In-memory, process lifetime — a restart drops it.
+    pub task_queue: std::collections::VecDeque<crate::ops::job_scheduler::TaskSpec>,
+    /// The task currently running, if any. `None` when the scheduler is idle.
+    /// There is never more than one: the scheduler is the only entry point.
+    pub running_task: Option<crate::ops::job_scheduler::TaskSpec>,
+    /// Whether the queue is paused (`s`) — the contents survive for `r`.
+    pub scheduler_paused: bool,
+    /// The tasks that have finished, newest last. Read by the Tasks pane's
+    /// history and by the quit path.
+    pub task_history: Vec<crate::ops::job_scheduler::TaskSpec>,
+    /// The cached aggregate counts + the scope key they were computed for.
+    /// `None` until the first refresh; a scope change discards it (spec D21).
+    pub aggregates: Option<AggregateCache>,
+    /// Set when a job finishes (its terminal event) — the counts changed, so
+    /// the next tick refreshes. Filter changes are detected by the key
+    /// comparison in the event loop, so they need no flag.
+    pub aggregates_dirty: std::cell::Cell<bool>,
+    /// The Details pane's own scroll offset — NOT the native ring's
+    /// (`native_activity::SCROLL` is a module-global counting back from the
+    /// newest ring entry, so sharing it would couple two unrelated surfaces).
+    pub details_scroll: usize,
+    /// The Tasks pane's cursor over the queued list (spec D38).
+    pub tasks_cursor: usize,
     /// The running batch's shared state (counters, class histograms, phase
     /// timings), published by `run_batch` once its plan resolves — the value
     /// comes from the batch task, hence `OnceLock` over `LazyLock`/`Mutex`.
@@ -263,16 +309,92 @@ impl AppState {
     }
 
     /// Effective pane-2 height in rows: the user override, else the per-tab
-    /// default (Details 8 / Metrics 14 — spec D3).
+    /// default (Details 12 / Metrics 16 / Tasks 10 — spec §14).
     pub const fn pane2_rows(&self) -> u16 {
         if self.pane2_height > 0 {
             self.pane2_height
         } else {
             match self.pane2_tab {
-                crate::types::Pane2Tab::Details => 8,
-                crate::types::Pane2Tab::Metrics => 14,
+                crate::types::Pane2Tab::Details => 12,
+                crate::types::Pane2Tab::Metrics => 16,
+                crate::types::Pane2Tab::Tasks => 10,
             }
         }
+    }
+
+    /// The scope key the aggregates are computed for.
+    ///
+    /// The view group's key is the CURRENT filter (view + search + group), so
+    /// the panel and the footer cannot disagree. The global group has no
+    /// filter — its key is the same for every view.
+    #[must_use]
+    pub fn aggregate_key(&self) -> AggregateKey {
+        AggregateKey {
+            view: self.purgatory_view,
+            search: (!self.search_query.is_empty()).then(|| self.search_query.clone()),
+            // The tab never narrows by group (`ProfilesLoad::from` hardcodes
+            // `group_id: None`), so the aggregate must not either.
+            group_id: None,
+            scope: PlanScope::All,
+        }
+    }
+
+    /// The Active-window bound, computed the same way the page query does
+    /// (`ops/profiles.rs::page_request`), so the panel's view group and the
+    /// table's membership cannot drift.
+    fn active_threshold(&self) -> i64 {
+        let now = leas_db::models::now_epoch();
+        match self.purgatory_view {
+            PurgatoryView::Active | PurgatoryView::Purgatory => {
+                now.saturating_sub(self.purgatory_ttl_secs)
+            }
+            PurgatoryView::All => 0,
+        }
+    }
+
+    /// Refresh the cached aggregates for the current scope.
+    ///
+    /// Called on a filter/view/search/group change and on a job event — never on
+    /// a timer (spec D21): the counts freeze while idle, and `alive` drifts
+    /// against the wall clock until the next refresh.
+    pub async fn refresh_aggregates(&mut self) {
+        let key = self.aggregate_key();
+        let req = PageRequest {
+            view: key.view,
+            active_threshold: self.active_threshold(),
+            search: key.search.clone(),
+            group_id: key.group_id.clone(),
+            scope: key.scope,
+            sort: PageSort::Test,
+            ascending: true,
+            offset: 0,
+            limit: 1,
+        };
+        // The view group: the swept `band`, so it describes the same set the
+        // table shows.
+        let view = self
+            .db
+            .profiles_aggregate(&req, false)
+            .await
+            .unwrap_or_default();
+        // The global group: live liveness, computed against the wall clock.
+        let global = self
+            .db
+            .profiles_aggregate(&req, true)
+            .await
+            .unwrap_or_default();
+        self.aggregates = Some(AggregateCache {
+            counts: AggregateCounts {
+                total: view.total,
+                alive: global.alive,
+                proven: view.proven,
+                reliable: view.reliable,
+                untested: view.untested,
+                failed: view.failed,
+                other: view.other,
+            },
+            key,
+        });
     }
 
     /// ISO-3166 alpha-2 for an outbound IP from the in-memory cache (None =
@@ -663,6 +785,14 @@ impl AppState {
             batch_progress: None,
             maint_progress: None,
             fill_progress: None,
+            task_queue: std::collections::VecDeque::new(),
+            running_task: None,
+            details_scroll: 0,
+            tasks_cursor: 0,
+            scheduler_paused: false,
+            task_history: Vec::new(),
+            aggregates: None,
+            aggregates_dirty: Cell::new(false),
             batch: None,
             term_height: Cell::new(80),
             heed_storage: None,

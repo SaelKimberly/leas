@@ -516,6 +516,128 @@ async fn plan_scopes_select_by_materialized_tier() {
     assert_eq!(walked.1, Some(1));
 }
 
+/// The aggregate buckets are the crate's OWN partition, verbatim.
+///
+/// `seed_fixture` builds eight endpoints with known ranks, including **e5 — a
+/// proven endpoint whose representative is its UNTESTED sibling (bin 12)**.
+/// The partition law is `rank_proven` FIRST, then the bin, so e5 counts in
+/// `proven` and NOT in `untested`. Dropping the `rank_proven = 0` guard from
+/// the `untested` arm would double-count it — the defect this test pins.
+#[tokio::test]
+async fn aggregate_buckets_partition_the_total() {
+    let db = seed_fixture().await;
+    let req = request(PageSort::Test, true, 0, 100);
+
+    let counts = db
+        .profiles_aggregate(&req, false)
+        .await
+        .expect("aggregate");
+
+    // e1, e2, e4, e5, e7 are proven; e5's representative is untested but a
+    // sibling holds the real success, so it is proven, NOT new.
+    assert_eq!(counts.proven, 5, "e5 must be proven, not untested");
+    assert_eq!(counts.untested, 1, "only e3 is untested");
+    assert_eq!(counts.failed, 1, "only e6 carries a failure marker");
+    // e8 is the stability discriminator: a measured link with a ring that holds
+    // no success, so it is proven=0 and its bin is neither 12 nor 13-15.
+    assert_eq!(counts.other, 1, "e8 is measured but not proven");
+    assert_eq!(counts.total, 8);
+
+    // The four partition members are pairwise disjoint and sum to the total.
+    assert_eq!(
+        counts.proven + counts.untested + counts.failed + counts.other,
+        counts.total,
+        "the partition must sum to the total"
+    );
+}
+
+/// The view group's total equals the page query's total for the same filter —
+/// the panel and the footer cannot disagree.
+#[tokio::test]
+async fn aggregate_view_total_matches_the_page_count() {
+    let db = seed_fixture().await;
+    let req = request(PageSort::Test, true, 0, 100);
+
+    let page = db.profiles_page(&req).await.expect("page");
+    let counts = db
+        .profiles_aggregate(&req, false)
+        .await
+        .expect("aggregate");
+
+    assert_eq!(
+        counts.total, page.total,
+        "the view aggregate and the page count share one predicate builder"
+    );
+}
+
+/// The global `alive` arm is LIVE: a row whose `band = 0` but whose
+/// `rank_newest_seen` has aged past the TTL is NOT alive.
+///
+/// The fixture's rows are all stale (`band = 1`), so the test first forces
+/// `band = 0` — the state a swept band is in just before the reband tick —
+/// and then queries with a future bound. The live arm reads
+/// `rank_newest_seen` (old, so 0); the swept arm reads `band` (0, so 8).
+#[tokio::test]
+async fn aggregate_alive_is_live_for_the_global_scope() {
+    let db = seed_fixture().await;
+    {
+        let mut conn = db.connection().await.expect("conn");
+        toasty::sql::statement("UPDATE endpoint_rank SET band = 0")
+            .exec(&mut conn)
+            .await
+            .expect("force the swept band");
+    }
+
+    // A threshold far in the future: nothing is "seen within the window".
+    let mut req = request(PageSort::Test, true, 0, 100);
+    req.active_threshold = i64::MAX;
+
+    let live = db
+        .profiles_aggregate(&req, true)
+        .await
+        .expect("aggregate");
+    assert_eq!(live.alive, 0, "a future bound means nothing is live");
+
+    // The swept `band` disagrees — that is exactly why the global arm is live.
+    let swept = db
+        .profiles_aggregate(&req, false)
+        .await
+        .expect("aggregate");
+    assert_eq!(swept.alive, 8, "the swept band still calls every row alive");
+    assert_ne!(
+        swept.alive, live.alive,
+        "the live arm must not read the swept band"
+    );
+}
+
+/// The aggregate on the DIRECT turso reader must match the toasty path — the
+/// file db takes `exec_raw`, the in-memory one the toasty branch. Production
+/// opens with the direct reader, so this is the branch that ships.
+#[tokio::test]
+async fn the_direct_aggregate_matches_the_toasty_aggregate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_db = Database::open(dir.path().join("agg-direct.db"))
+        .await
+        .expect("file db");
+    assert!(
+        file_db.uses_direct_reader(),
+        "a file db has a direct reader"
+    );
+    seed_into(&file_db).await;
+
+    let mem_db = seed_fixture().await;
+    let req = request(PageSort::Test, true, 0, 100);
+
+    let direct = file_db.profiles_aggregate(&req, false).await.expect("direct");
+    let toasty = mem_db.profiles_aggregate(&req, false).await.expect("toasty");
+
+    assert_eq!(
+        direct, toasty,
+        "the direct reader and the toasty path must agree on every bucket"
+    );
+    assert_eq!(direct.proven + direct.untested + direct.failed + direct.other, direct.total);
+}
+
 /// The walk page is the page query minus its per-page count: same ids in the
 /// same order at every offset, and the total is returned only when the walk asks
 /// for it — once, not once per page (the `O(feed²/200)` the batch plan loader

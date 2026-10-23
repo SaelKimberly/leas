@@ -16,13 +16,14 @@ and starts the other.
 
 ## Shell — two panes, no top-level tabs
 
-The window is two framed panes plus a status bar:
+The window is two framed panes, a shell-level log row, and a status bar:
 
 ```
 ┌ 1: [Profiles]  Logs ────────────────────────────────────┐
 │ …table or log viewer…                                    │
-├ 2: Details  [Metrics] ──────────────────────────────────┤
-│ …actions log / traffic+native+sys metrics…               │
+├ 2: Details  Metrics  [Tasks] ────────────────────────────┤
+│ …server facts + DB aggregates / metrics / job queue…      │
+└ live log tail ───────────────────────────────────────────┘
 └ status bar ──────────────────────────────────────────────┘
 ```
 
@@ -30,8 +31,13 @@ The window is two framed panes plus a status bar:
   accent-bold, the active tab bracketed and accent-bold (`[Profiles]`), inactive
   tabs plain. Focused pane draws an accent border, the other a muted one.
 - **Pane 1 tabs**: `Profiles` (endpoint table) and `Logs` (live core log viewer).
-- **Pane 2 tabs**: `Details` (the Actions Log panel) and `Metrics` (traffic +
-  native-core connection ring + core system stats, one scrollable view).
+- **Pane 2 tabs**: `Details` (the selected server's static facts + the DB's
+  aggregate status), `Metrics` (connection status + traffic + native-core
+  connection ring + core system stats, one scrollable view), and `Tasks` (the
+  job queue).
+- **Log row**: a shell-level row between pane 2's bottom border and the status
+  bar, carrying the newest log line. It is outside pane 2's frame, so the pane
+  stays a complete rectangle; it is dropped when pane 2 collapses to one row.
 - **Pane keys**: `Tab`/`Shift+Tab` or `1`/`2` move focus; `[`/`]` cycle the focused
   pane's tabs; `Alt+↑`/`Alt+↓` resize pane 2 (pane 2 focused; clamped 3..half the
   terminal, session-only); `F1` toggles pane 2's compact one-line bar.
@@ -386,12 +392,19 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 ```
 
 - `↑↓` — navigate (skips separator lines)
-- `Enter` — run selected test
+- `Enter` — **enqueue** the selected task (see the Tasks pane)
 - `Esc` — close menu
 - `?` — open help overlay
-- `s` — stop running tests (works when progress shown in status bar)
 
-Progress is shown in the status bar during batch tests (`Testing: {completed}/{total}` or `Testing...`).
+The schedulable items enqueue: the six Real/Fast Test variants, the four
+Selected variants, `Fill Exit IPs (Successful)`, `Retry Failed DNS Lookups`, and
+`Compact Duplicate Endpoints`. `Stop Testing` cancels the running task and
+pauses the queue (the Tasks pane's `s`/`r` do the same). `Remove Bad Servers`
+and `Clear All Stats` stay immediate with their `y/n` confirmation and are
+disabled while the scheduler is busy.
+
+Progress is shown in the status bar (`{Task}: {done}/{total}`) and, with the
+queue, in the Tasks pane.
 ### Export Menu
 
 Open with `Ctrl+E` from Profiles. First choose scope, then destination:
@@ -485,70 +498,98 @@ keyboard shortcuts grouped by current context (Profiles, Settings, Statistics,
 Logs, or Native Activity). `Esc` or `?` closes.
 
 
-### Actions Log (pane 2 `Details` tab)
+### Details (pane 2 `Details` tab)
 
-A live state information panel showing current system state, connection info,
-test results, and recent log lines. Supports two views toggled with `F1`:
+The selected server's static fact sheet plus the database's own status. The
+selected server is the pane-1 cursor row (`filtered_profiles().nth(selected_index)`) — the same law the footer and Metrics use, so a search filter can never make three surfaces disagree.
 
-**Compact bar** (1 line; also selected automatically in terminals under 20 rows
-so the table keeps its viewport):
-
-```
-⠋ VMess/my-server 1.2.3.4:443 | TCP:45ms RP:120ms SPD:15Mbps | ⬆1.2GB ⬇3.4GB | Info Xray 1.8.0 started
-```
-
-Connection indicators:
-- `⠋` yellow — connecting
-- `●` green — connected
-- `⏹` red — error
-- `⏏` yellow — disconnected (profile selected but not connected)
-- `○` gray — no profile
-
-Segments (compact): server info, test results (only when available), traffic,
-last core log snippet.
-
-**Full panel** (8 rows; the pane-2 default height):
+**Layout** — two columns: facts (left) and aggregates (right). Below ~100 cols
+they stack: facts first, then the aggregate block.
 
 ```
- ● Connected [xray]
- 🖥 VLESS  us.example.com:443
- ⏱ TCP:45ms  RP:120ms  SPD:15Mbps
- 📊 ⬆1.2GB  ⬇3.4GB    💾 64.2MB
- 📋 Core: [Info] Xray 1.8.0 started
- 📋 TUI:  [Info] Connected [xray] (core)
+Server            │ DB 74,012
+  Address host:443│   proven    41,900
+  Protocol vless… │   untested  28,932
+  …               │   failed     2,996
+Link              │   other       184
+  Real Delay 120ms│
+  …               │ alive       3,180
+                  │ reliable   12,004
+                  │
+                  │ View: Active / <query>
+                  │   proven     2,900
 ```
 
-Rows:
-1. Connection status (icon + state + backend type)
-2. Server info (protocol, remarks, address, port)
-3. Test results (TCP ping, real ping, speed — `-` for unavailable)
-4. Traffic (upload/download from stats API) and memory usage
-5. Last core log line (from core process stderr/log channel)
-6. Last TUI log line (from `tracing` events, with target tag)
+**The two blocks are not one list.** The four **partition** counts
+(`proven`/`untested`/`failed`/`other`) are pairwise disjoint and sum to the
+group's total. `alive` and `reliable` are **orthogonal filters** over the same
+rows and overlap any partition member — they are drawn as a separate block so
+they cannot be added into the partition.
+
+- `proven` — the endpoint has ≥1 live unpurged link with a real success.
+- `untested` — not proven AND never measured.
+- `failed` — not proven AND carrying a failure marker.
+- `other` — not proven and in no other bucket (measured, but the ring holds no success).
+- `alive` — seen within the TTL window. The **global** group computes this live
+  (`rank_newest_seen` vs the TTL); the **view** group uses the swept `band`, so
+  it describes the same set the table shows. The two can differ by up to the
+  10-minute reband interval.
+- `reliable` — the **representative link's** success rate ≥ 75% (≥4 samples).
+
+**Sources.** The `Server` group reads the loaded row's persisted addresses for
+resolution (the grid's own law); `endpoint_info` is a display cache that lags,
+so a missing entry renders `—` and the panel never triggers a background fill.
+The `Link` group reads the **representative link** — the same link the grid's
+Test/Stab cells describe.
 
 **Behavior:**
-- `F1` toggles between compact and full at any time
-- Pane 2's height follows the active tab (Details 8 rows, Metrics 14) plus any
-  `Alt+↑`/`Alt+↓` adjustment (clamped so pane 1 keeps ≥6 rows); the compact bar
-  is 1 row, and below 20 terminal rows it is always selected.
-- The table drops columns by width priority when the pane is narrow: `Exit`,
-  then `Out`, then `White`, then `Stab`, then `Auth`, then `Fast` disappear,
-  and `Address` shrinks toward a 12-cell floor — `Real` (with the fixed sort
-  arrow) is protected.
+- `↑↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the facts column (its own offset, not
+  the native ring's); the aggregate column is pinned and clipped from the
+  bottom, so the global numbers are never the ones a short pane eats.
+- `F1` collapses pane 2 to the one-line compact bar.
+- Pane 2's height follows the active tab (Details 12 rows, Metrics 16, Tasks 10)
+  plus any `Alt+↑`/`Alt+↓` adjustment (clamped so pane 1 keeps ≥6 rows).
 
-Tracing integration (backend logging):
-- TUI internals emit `tracing` events via `tracing-subscriber` with a
-  custom `TuiLogLayer` that forwards events to the core event channel
-- Events carry a `target` field (`core`, `tui`, `speedtest`, `subscription`)
-- Viewable in the Actions Log pane, the Logs tab, and the configured log file
-  (`logging.log_to_file` / `logging.log_file_path`)
-- **Stderr mirror is opt-in via `LEAS_STDERR_LOG`** — set it to anything
-  other than empty/`0`/`false` to add a stderr `tracing` layer. `RUST_LOG`
-  alone does NOT enable it; it only supplies that layer's directives once the
-  mirror is on (default `leas=info`). Only usable with stderr redirected —
-  unguarded stderr writes corrupt the alternate-screen TUI, so terminal
-  debugging is `LEAS_STDERR_LOG=1 leas 2>stderr.log`. The Actions Log,
-  Logs tab and log file capture everything regardless
+### Tasks (pane 2 `Tasks` tab)
+
+The job queue: the running task's progress bar on top, the queued tasks below
+(earliest first). The running task is the bar's label, **not** a list row — its
+progress is never drawn twice.
+
+```
+Real Test (Successful) 1,240/3,000 ~12m ━━━●──────────
+  ► Fill Exit IPs (Successful)
+    Compact Duplicate Endpoints
+```
+
+The bar is a `LineGauge` with a manual thumb at the fill boundary; it is themed
+from the same tokens as the settings download bar. The bar's label names the
+scheduler state when nothing runs: `paused — N queued, press r to resume`,
+`no tasks — pick one from the Speed Test menu`, or `queued: …`.
+
+**Keys (Tasks-tab-scoped):**
+- `↑↓` move the cursor over the queued list; the list scrolls to keep it visible.
+- `d` deletes the selected queued task (no confirmation — it is a reversible
+  queue edit; a log line makes the removal visible).
+- `s` cancels the running task and **pauses** the queue (the contents survive).
+- `r` resumes draining the paused queue.
+
+**Scheduling.** The Speed Test menu is the entry point: picking an item
+**enqueues** it rather than starting it. A duplicate identity — `(kind, scope)`
+for batched tasks, `(kind, test type, endpoint)` for the Selected variants —
+is ignored, so a task can never be queued or re-armed while it runs. One job at
+a time is structural: the scheduler is the only path into the spawn functions.
+
+**Destructive one-shots.** `Remove Bad Servers` and `Clear All Stats` are not
+schedulable (no meters, destructive). They stay immediate with their `y/n`
+confirmation, and are disabled while the scheduler is busy.
+
+### Metrics (pane 2 `Metrics` tab)
+
+The dynamic view: connection status, the connected session's traffic, the native
+core's connection ring, and core system stats. The Actions Log's content moved
+here — its connection-status row is the `status` section, and its log tail is
+the shell-level log row below the pane (not a frozen row inside it).
 - Key operations (connect, disconnect, speed test, subscription updates)
   emit tracing events for real-time visibility
 
@@ -593,6 +634,7 @@ appended when updates are available for installed backends.
 | Pane 1 · Logs          | `[↑↓] Scroll  [c] Clear  [t] Targets  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
 | Pane 2 · Details       | `[↑↓] Scroll  [F1] Compact  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
 | Pane 2 · Metrics       | `[↑↓] Scroll  [Alt+↑↓] Resize  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 2 · Tasks         | `[↑↓] Select  [d] Delete  [s] Stop  [r] Resume  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
 | Settings popup (sections) | `[↑↓] Navigate  [←] Collapse  [→] Fields  [/] Filter  [Enter] Open  [Esc] Close` |
 | Settings popup (fields)   | `[Tab/Shift+Tab] Field  [Space] Advance  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back` |
 | Settings popup (filtering) | `[type] Filter  [Enter] Apply  [Ctrl+U] Clear  [Esc] Cancel` |

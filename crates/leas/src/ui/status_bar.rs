@@ -16,6 +16,30 @@ fn spinner_char() -> char {
     SPINNER_CHARS[tick as usize % SPINNER_CHARS.len()]
 }
 
+/// The running task's `(done, total)`, read from the slot its kind sets.
+///
+/// Mirrors `ui::tasks::running_meters`; the status bar and the Tasks pane must
+/// read the same slot or their numbers can disagree.
+fn running_task_meters(state: &AppState) -> (u32, u32) {
+    use Ordering::Relaxed;
+    if let Some(m) = &state.batch_progress {
+        return (m.main.done.load(Relaxed), m.main.total.load(Relaxed));
+    }
+    if let Some(m) = &state.fill_progress {
+        return (m.look.done.load(Relaxed), m.look.total.load(Relaxed));
+    }
+    if let Some(m) = &state.maint_progress {
+        let name = (m.name.done.load(Relaxed), m.name.total.load(Relaxed));
+        let comp = (m.comp.done.load(Relaxed), m.comp.total.load(Relaxed));
+        return match (name.1, comp.1) {
+            (0, 0) => name,
+            (0, _) => comp,
+            _ => name,
+        };
+    }
+    (0, 0)
+}
+
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
     let (left_text, left_style) = if state.connecting {
@@ -25,6 +49,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         )
     } else if state.speed_test_stop.load(Ordering::Relaxed) {
         (" ■ Stopping...".to_string(), ThemeStyles::error(theme))
+    } else if let Some(task) = &state.running_task {
+        // The at-a-glance surface: the RUNNING task's name + done/total. The
+        // Tasks pane carries the queue; both read the same meters.
+        let (done, total) = running_task_meters(state);
+        let text = match total {
+            0 => format!(" {} …", task.label),
+            _ => format!(" {}: {done}/{total}", task.label),
+        };
+        (text, ThemeStyles::warning(theme))
     } else if state.batch_progress.is_some() || !state.testing_profiles.is_empty() {
         let progress_text = state.batch_progress.as_ref().map_or_else(
             || " Testing...".to_string(),
@@ -33,8 +66,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 let total = m.main.total.load(Ordering::Relaxed);
                 match total {
                     0 => " Testing...".to_string(),
-                    // One level: the pair is `done/total`. The panel bar and
-                    // the Actions Log bar carry the ETA.
                     total => format!(" Testing: {done}/{total}"),
                 }
             },
@@ -264,6 +295,10 @@ fn build_hints(state: &AppState) -> String {
                         }
                         crate::Pane2Tab::Details => {
                             " [↑↓] Scroll  [F1] Compact  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                                .to_string()
+                        }
+                        crate::Pane2Tab::Tasks => {
+                            " [↑↓] Select  [d] Delete  [s] Stop  [r] Resume  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
                                 .to_string()
                         }
                     }

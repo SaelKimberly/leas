@@ -21,6 +21,7 @@ The invariants a change must respect. Detail lives in the sibling `reference/` p
 - **The Profiles tab is a SQL page** (`PROFILES_PAGE_SIZE = 200`), hydrated in one statement; ordering/filter/count are SQL. ADR 0001.
 - **`profile_stats` writes are write-behind.** `ops/link_writer.rs` owns every mutation, staged by column group (RESULT / PURGE / TRAFFIC) and flushed as one multi-row upsert window. ADR 0002, decision 22.
 - **Test-cell truth.** The Test column describes the endpoint's *representative* link (argmin of the link key), not `active_link()`.
+- **Aggregate reads are raw SQL, one per scope.** The Details panel's bucket counts (`profiles_query.rs::profiles_aggregate`) are a derived partition over `endpoint_rank`; toasty's typed builders have no `COUNT`/`SUM` projection, so they are the crate's two inventoried raw-SQL sites (cause C7, `reference/database-manual-sql.md §2`). The partition arms are `PlanScope::predicate` verbatim — `rank_proven` FIRST, then the bin — so a proven endpoint carrying bin 12 counts once, and the four members sum to the total. ADR: `aegis/specs/2026-10-22-details-metrics-tasks-design.md` §5.
 
 ## Enrichment & networking
 

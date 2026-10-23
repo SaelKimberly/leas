@@ -699,6 +699,10 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
                     state.filter_cache_valid.set(false);
                 }
+                crate::ops::job_scheduler::handle_terminal(
+                    state,
+                    crate::ops::job_scheduler::TerminalEvent::CompactFinished,
+                );
             }
             CoreEvent::DnsRetryTargets { targets } => {
                 let count = targets.len();
@@ -722,6 +726,10 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 state.log_trace("info", "tui::ops::compact", "DNS retry: complete");
                 state.maint_progress = None;
                 crate::ops::enrich::set_resolve_progress(None);
+                crate::ops::job_scheduler::handle_terminal(
+                    state,
+                    crate::ops::job_scheduler::TerminalEvent::MaintenanceDone,
+                );
             }
             CoreEvent::TestTypeUpdate {
                 endpoint_id,
@@ -1135,6 +1143,10 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // further result will re-place a row.
                 state.last_result_reload.set(None);
                 state.filter_cache_valid.set(false);
+                crate::ops::job_scheduler::handle_terminal(
+                    state,
+                    crate::ops::job_scheduler::TerminalEvent::BatchEnded,
+                );
             }
             CoreEvent::HostFeaturesLoaded(checker) => {
                 state.host_features = Some(checker);

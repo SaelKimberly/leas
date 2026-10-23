@@ -1,9 +1,10 @@
-pub mod actions_log;
 pub mod add_server;
 pub mod export;
 pub mod logs;
+pub mod details;
 pub mod metrics;
 pub mod native_activity;
+pub mod tasks;
 pub mod profiles;
 pub mod settings;
 pub mod status_bar;
@@ -11,6 +12,7 @@ pub mod theme;
 pub mod widgets;
 use crate::ui::theme::ThemeStyles;
 use crate::{AppMode, AppState, ConfirmAction};
+use crate::ops::job_scheduler::{self, TaskKind, TaskSpec};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -254,6 +256,22 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             events_seen = true;
         }
 
+        // Refresh the aggregate cache when the filter scope changed or a job
+        // finished. A filter change is a key comparison (cheap, per tick); a
+        // job event sets the dirty flag in `handle_terminal`. No timer — the
+        // counts freeze while idle (spec D21).
+        let key = state.aggregate_key();
+        let scope_changed = state.aggregates.as_ref().is_none_or(|a| a.key != key);
+        if scope_changed || state.aggregates_dirty.replace(false) {
+            state.refresh_aggregates().await;
+        }
+
+        // Drain the job queue. A task enqueued by the UI (the menu) starts here,
+        // and so does the next head after a terminal event — `poll_core_events`
+        // just cleared the running task's meters. The drain is a no-op when
+        // nothing is running, the queue is empty, or the scheduler is paused.
+        crate::ops::job_scheduler::drain(state).await;
+
         // Refetch the Profiles page when something invalidated it: a ping
         // result (the row must move to its new place), a search keystroke, a
         // sort or view change, a delete. The reload preserves the selection by
@@ -356,6 +374,11 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             );
         }
     }
+
+    // The job queue is in-memory (spec D34): quitting cancels the running task
+    // and discards the queue, logging each queued task that never ran so the
+    // loss is visible rather than silent.
+    crate::ops::job_scheduler::discard_queue_on_quit(state);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture)?;
@@ -586,55 +609,147 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     .unwrap_or_default();
                 match label {
                     "Fast Test (Selected)" => {
-                        if on_sub || !multi {
-                            if let Some(id) = proto_id {
-                                state.start_tcp_ping(ep_id.unwrap_or_default(), id);
-                            }
+                        let spec = if on_sub || !multi {
+                            proto_id.map(|id| TaskSpec {
+                                kind: TaskKind::FastTest,
+                                scope: PlanScope::All,
+                                endpoint: Some((ep_id.unwrap_or_default(), id)),
+                                label: label.to_string(),
+                            })
                         } else {
-                            state.start_endpoint_batch_ping();
+                            Some(TaskSpec {
+                                kind: TaskKind::MultiFastTest,
+                                scope: PlanScope::All,
+                                endpoint: None,
+                                label: label.to_string(),
+                            })
+                        };
+                        if let Some(spec) = spec {
+                            job_scheduler::enqueue(state, spec);
                         }
                     }
                     "Real Test (Selected)" => {
-                        if on_sub || !multi {
-                            if let Some(id) = proto_id {
-                                state.start_real_ping(ep_id.unwrap_or_default(), id);
-                            }
+                        let spec = if on_sub || !multi {
+                            proto_id.map(|id| TaskSpec {
+                                kind: TaskKind::RealTest,
+                                scope: PlanScope::All,
+                                endpoint: Some((ep_id.unwrap_or_default(), id)),
+                                label: label.to_string(),
+                            })
                         } else {
-                            state.start_endpoint_batch_real_ping();
+                            Some(TaskSpec {
+                                kind: TaskKind::MultiRealTest,
+                                scope: PlanScope::All,
+                                endpoint: None,
+                                label: label.to_string(),
+                            })
+                        };
+                        if let Some(spec) = spec {
+                            job_scheduler::enqueue(state, spec);
                         }
                     }
                     "Speed Test (Selected)" => {
                         if let Some(id) = proto_id {
-                            state.start_speed_test(ep_id.unwrap_or_default(), id);
+                            job_scheduler::enqueue(state, TaskSpec {
+                                kind: TaskKind::SpeedTest,
+                                scope: PlanScope::All,
+                                endpoint: Some((ep_id.unwrap_or_default(), id)),
+                                label: label.to_string(),
+                            });
                         }
                     }
                     "UDP Test (Selected)" => {
                         if let Some(id) = proto_id {
-                            state.start_udp_test(ep_id.unwrap_or_default(), id);
+                            job_scheduler::enqueue(state, TaskSpec {
+                                kind: TaskKind::UdpTest,
+                                scope: PlanScope::All,
+                                endpoint: Some((ep_id.unwrap_or_default(), id)),
+                                label: label.to_string(),
+                            });
                         }
                     }
-                    "Fast Test (All Profiles)" => state.start_batch_ping(),
-                    "Real Test (All Profiles)" => state.start_batch_then_real_ping(),
+                    "Fast Test (All Profiles)" => {
+                        job_scheduler::enqueue(state, TaskSpec {
+                            kind: TaskKind::FastTest,
+                            scope: PlanScope::All,
+                            endpoint: None,
+                            label: label.to_string(),
+                        });
+                    }
+                    "Real Test (All Profiles)" => {
+                        job_scheduler::enqueue(state, TaskSpec {
+                            kind: TaskKind::RealTest,
+                            scope: PlanScope::All,
+                            endpoint: None,
+                            label: label.to_string(),
+                        });
+                    }
                     "Real Test (Successful)" => {
-                        state.start_batch_then_real_ping_scoped(PlanScope::Successful);
+                        job_scheduler::enqueue(state, TaskSpec {
+                            kind: TaskKind::RealTest,
+                            scope: PlanScope::Successful,
+                            endpoint: None,
+                            label: label.to_string(),
+                        });
                     }
                     "Real Test (New)" => {
-                        state.start_batch_then_real_ping_scoped(PlanScope::New);
+                        job_scheduler::enqueue(state, TaskSpec {
+                            kind: TaskKind::RealTest,
+                            scope: PlanScope::New,
+                            endpoint: None,
+                            label: label.to_string(),
+                        });
                     }
                     "Real Test (Successful + New)" => {
-                        state.start_batch_then_real_ping_scoped(PlanScope::SuccessfulAndNew);
+                        job_scheduler::enqueue(state, TaskSpec {
+                            kind: TaskKind::RealTest,
+                            scope: PlanScope::SuccessfulAndNew,
+                            endpoint: None,
+                            label: label.to_string(),
+                        });
                     }
                     "Real Test (Failed)" => {
-                        state.start_batch_then_real_ping_scoped(PlanScope::Failed);
+                        job_scheduler::enqueue(state, TaskSpec {
+                            kind: TaskKind::RealTest,
+                            scope: PlanScope::Failed,
+                            endpoint: None,
+                            label: label.to_string(),
+                        });
                     }
                     "Fill Exit IPs (Successful)" => {
-                        state.start_fill_exit_ips(PlanScope::Successful);
+                        job_scheduler::enqueue(state, TaskSpec {
+                            kind: TaskKind::FillExitIps,
+                            scope: PlanScope::Successful,
+                            endpoint: None,
+                            label: label.to_string(),
+                        });
                     }
-                    "Remove Bad Servers" => state.remove_failed_servers().await,
-                    "Retry Failed DNS Lookups" => state.retry_failed_dns(),
-                    "Compact Duplicate Endpoints" => state.compact_duplicate_endpoints(),
-                    "Stop Testing" => state.stop_speed_test(),
-                    "Clear All Stats" => {
+                    // Immediate, but disabled while the scheduler is busy (D45):
+                    // a destructive one-shot must not run alongside a job.
+                    "Remove Bad Servers" if !job_scheduler::is_busy(state) => {
+                        state.remove_failed_servers().await;
+                    }
+                    "Retry Failed DNS Lookups" => {
+                        job_scheduler::enqueue(state, TaskSpec {
+                            kind: TaskKind::DnsRetry,
+                            scope: PlanScope::All,
+                            endpoint: None,
+                            label: label.to_string(),
+                        });
+                    }
+                    "Compact Duplicate Endpoints" => {
+                        job_scheduler::enqueue(state, TaskSpec {
+                            kind: TaskKind::Compact,
+                            scope: PlanScope::All,
+                            endpoint: None,
+                            label: label.to_string(),
+                        });
+                    }
+                    // The scheduler's stop (spec D19): cancel the running task
+                    // and PAUSE the queue. `state.stop_speed_test()` would set
+                    // the flag without pausing, so `r` could never resume.
+                    "Stop Testing" => job_scheduler::stop(state),
+                    "Clear All Stats" if !job_scheduler::is_busy(state) => {
                         state.confirmation = Some(crate::ConfirmAction::ClearStats);
                     }
                     _ => {}
@@ -689,10 +804,91 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 | KeyCode::PageDown
                 | KeyCode::Home
                 | KeyCode::End
-        ) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        ) && !key.modifiers.contains(KeyModifiers::CONTROL)
+            // `Alt+↑/↓` resizes pane 2 (`Alt+Up`/`Alt+Down` below); without this
+            // the arm swallows the chord and the resize never fires (spec D26).
+            && !key.modifiers.contains(KeyModifiers::ALT);
         if is_native_activity_key {
             native_activity::handle_key(state, key);
             return;
+        }
+        // else: fall through to main handler for quit/tab/help/etc.
+    }
+
+
+    // Details tab: the facts column scrolls with its OWN offset (spec D25) —
+    // not the native ring's module-global `SCROLL`.
+    if matches!(state.pane2_tab, crate::Pane2Tab::Details)
+        && matches!(state.focused_pane, crate::FocusedPane::Pane2)
+        && matches!(state.mode, crate::AppMode::List)
+    {
+        let page = 5usize;
+        match key.code {
+            KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.details_scroll = state.details_scroll.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.details_scroll = state.details_scroll.saturating_add(1);
+                return;
+            }
+            KeyCode::PageUp if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.details_scroll = state.details_scroll.saturating_sub(page);
+                return;
+            }
+            KeyCode::PageDown if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.details_scroll = state.details_scroll.saturating_add(page);
+                return;
+            }
+            KeyCode::Home if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.details_scroll = 0;
+                return;
+            }
+            KeyCode::End if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // The render clamps the offset to the line count.
+                state.details_scroll = usize::MAX / 2;
+                return;
+            }
+            _ => {}
+        }
+    }
+    // Tasks tab: the queue's own keys (spec §14.4). Tasks-tab-scoped, so `d`
+    // does not collide with the Profiles tab's delete-profile, and `s`/`r` do
+    // not collide with the global stop-test.
+    if matches!(state.pane2_tab, crate::Pane2Tab::Tasks)
+        && matches!(state.focused_pane, crate::FocusedPane::Pane2)
+        && matches!(state.mode, crate::AppMode::List)
+    {
+        let queue_len = state.task_queue.len();
+        match key.code {
+            KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.tasks_cursor = state.tasks_cursor.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if queue_len > 0 && state.tasks_cursor + 1 < queue_len {
+                    state.tasks_cursor += 1;
+                }
+                return;
+            }
+            KeyCode::Char('d') => {
+                crate::ops::job_scheduler::remove_queued(state, state.tasks_cursor);
+                // The cursor must not point past the shrunken queue.
+                let len = state.task_queue.len();
+                if len > 0 && state.tasks_cursor >= len {
+                    state.tasks_cursor = len - 1;
+                }
+                return;
+            }
+            KeyCode::Char('s') => {
+                crate::ops::job_scheduler::stop(state);
+                return;
+            }
+            KeyCode::Char('r') => {
+                crate::ops::job_scheduler::resume(state);
+                return;
+            }
+            _ => {}
         }
         // else: fall through to main handler for quit/tab/help/etc.
     }
@@ -1070,18 +1266,13 @@ fn render_pane1(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState
     }
 }
 
-/// Pane 2 content (spec §6): Details (actions log) or Metrics (merged
-/// statistics + native activity + traffic counters).
+/// Pane 2 content (spec §6): Details (the selected server's facts + the DB
+/// aggregates) or Metrics (the merged dynamic view).
 fn render_pane2(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     match state.pane2_tab {
-        crate::Pane2Tab::Details => {
-            if state.actions_compact {
-                actions_log::render_compact(frame, area, state);
-            } else {
-                actions_log::render_full_inner(frame, area, state);
-            }
-        }
+        crate::Pane2Tab::Details => details::render(frame, area, state),
         crate::Pane2Tab::Metrics => metrics::render(frame, area, state),
+        crate::Pane2Tab::Tasks => tasks::render(frame, area, state),
     }
 }
 
@@ -1312,17 +1503,26 @@ fn render(frame: &mut Frame, state: &AppState) {
     let pane2_rows = if state.actions_compact || small {
         1
     } else {
-        // Leave pane 1 at least 6 rows (border + header + rows + footer).
-        state.pane2_rows().min(area.height.saturating_sub(7)).max(3)
+        // Leave pane 1 at least 6 rows (border + header + rows + footer) and
+        // the log row + status bar their 2.
+        state.pane2_rows().min(area.height.saturating_sub(8)).max(3)
     };
+    // The shell-level log row: dropped when pane 2 is compact (no room) and on
+    // small terminals, where pane 1 keeps the viewport.
+    let log_row = pane2_rows > 1 && !small;
+    let mut constraints = vec![
+        Constraint::Min(6),             // 0: pane 1
+        Constraint::Length(pane2_rows), // 1: pane 2
+    ];
+    if log_row {
+        constraints.push(Constraint::Length(1)); // 2: log row
+    }
+    constraints.push(Constraint::Length(1)); // last: status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(6),             // 0: pane 1
-            Constraint::Length(pane2_rows), // 1: pane 2
-            Constraint::Length(1),          // 2: status bar
-        ])
+        .constraints(constraints)
         .split(area);
+    let status_index = chunks.len() - 1;
 
     // Pane 1: framed, inline tab bar, content.
     let p1_tabs: &[(&str, bool)] = &[
@@ -1357,6 +1557,10 @@ fn render(frame: &mut Frame, state: &AppState) {
             "Metrics",
             matches!(state.pane2_tab, crate::Pane2Tab::Metrics),
         ),
+        (
+            "Tasks",
+            matches!(state.pane2_tab, crate::Pane2Tab::Tasks),
+        ),
     ];
     let p2_border = if pane2_focused {
         ThemeStyles::container_border_focused(theme)
@@ -1364,7 +1568,9 @@ fn render(frame: &mut Frame, state: &AppState) {
         ThemeStyles::container_border(theme)
     };
     if compact_p2 {
-        actions_log::render_compact(frame, chunks[1], state);
+        // Compact = one line of the GLOBAL bucket counts only (spec D16): no
+        // view total (the footer's), no server identity (the footer's).
+        details::render_compact(frame, chunks[1], state);
     } else {
         let p2_block = Block::default()
             .title(pane_title("2:", p2_tabs, None, theme))
@@ -1375,11 +1581,30 @@ fn render(frame: &mut Frame, state: &AppState) {
         render_pane2(frame, p2_inner, state);
     }
 
+    // The shell-level log row: the newest log line with its target tag, between
+    // pane 2's bottom border and the status bar (spec D13).
+    if log_row {
+        let newest = state.log_cache.iter().next_back();
+        let line = newest.map_or_else(
+            || Line::from(Span::styled("  —", ThemeStyles::hint(theme))),
+            |entry| {
+                Line::from(vec![
+                    Span::styled(format!("  {} ", entry.level), ThemeStyles::hint(theme)),
+                    Span::styled(
+                        format!("[{}] {}", entry.target, entry.message),
+                        ThemeStyles::footer_value(theme),
+                    ),
+                ])
+            },
+        );
+        frame.render_widget(Paragraph::new(line), chunks[status_index - 1]);
+    }
+
     // Overlays paint over the whole shell (spec D1).
     for kind in overlay_stack(state) {
         render_overlay(kind, frame, area, state);
     }
-    crate::ui::status_bar::render(frame, chunks[2], state);
+    crate::ui::status_bar::render(frame, chunks[status_index], state);
 }
 fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
     match &state.mode {
@@ -1508,6 +1733,20 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Clear All Stats"),
 ];
 
+/// Whether a speed-test menu item is greyed out.
+///
+/// `Stop Testing` is enabled exactly when the scheduler is busy (spec D45) —
+/// the old `testing_profiles.is_empty()` gate never saw a Compact or a DNS
+/// retry. The two destructive one-shots are the inverse: they are immediate
+/// (never queued) but disabled while anything is running or queued.
+fn menu_item_disabled(state: &AppState, label: &str) -> bool {
+    match label {
+        "Stop Testing" => !job_scheduler::is_busy(state),
+        "Remove Bad Servers" | "Clear All Stats" => job_scheduler::is_busy(state),
+        _ => false,
+    }
+}
+
 fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
     let selected = match &state.mode {
@@ -1526,8 +1765,7 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
             SpeedTestMenuItem::Separator => unreachable!(),
         };
         let prefix = if i == selected { "► " } else { "  " };
-        let is_stop_item = *label == "Stop Testing";
-        let is_disabled = is_stop_item && state.testing_profiles.is_empty();
+        let is_disabled = menu_item_disabled(state, label);
         let style = if is_disabled {
             ThemeStyles::hint(theme)
         } else if i == selected {
@@ -1637,5 +1875,113 @@ mod tests {
                 "{action:?} must render a prompt, got {text:?}"
             );
         }
+    }
+
+    /// The pane-2 scroll arm must not swallow `Alt+↑/↓`.
+    ///
+    /// The arm sits BEFORE the resize arm in `handle_key` and returned early on
+    /// any of the six scroll keys, so `Alt+Up` scrolled the native ring instead
+    /// of resizing pane 2 — a live defect (spec D26). The test drives both keys
+    /// from the `Metrics` tab with pane 2 focused and asserts the resize moves
+    /// `pane2_height` while the ring's scroll offset is untouched.
+    #[tokio::test]
+    async fn alt_arrows_resize_pane2_instead_of_scrolling_the_ring() {
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        state.focused_pane = crate::FocusedPane::Pane2;
+        state.pane2_tab = crate::Pane2Tab::Metrics;
+        state.mode = crate::AppMode::List;
+        state.term_height.set(30);
+
+        // A non-zero ring so a scroll would be observable.
+        for i in 0..12u64 {
+            state.native_activity.entries.push_back(crate::NativeActivityEntry {
+                conn_id: i,
+                opened_ms: 0,
+                kind: leas_native::telemetry::TraceKind::Tcp,
+                dest: format!("10.0.0.{i}:443"),
+                protocol: String::new(),
+                transport: String::new(),
+                security: leas_native::telemetry::TraceSecurity::Plain,
+                up: 0,
+                down: 0,
+                closed: false,
+                duration_ms: 0,
+                error: None,
+            });
+        }
+        crate::ui::native_activity::reset_scroll();
+
+        let before = state.pane2_rows();
+        let scroll_before = crate::ui::native_activity::scroll_offset(
+            state.native_activity.entries.len(),
+        );
+
+        let alt_up = Event::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::ALT,
+        ));
+        handle_event(&alt_up, &mut state).await;
+
+        assert_eq!(
+            state.pane2_height,
+            before.saturating_sub(2).max(3),
+            "Alt+Up must resize pane 2, not scroll the ring"
+        );
+        assert_eq!(
+            crate::ui::native_activity::scroll_offset(state.native_activity.entries.len()),
+            scroll_before,
+            "Alt+Up must not move the ring's scroll offset"
+        );
+
+        // The plain key still scrolls: the arm's exclusion is ALT-only.
+        let plain_up = Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        handle_event(&plain_up, &mut state).await;
+        assert_eq!(
+            crate::ui::native_activity::scroll_offset(state.native_activity.entries.len()),
+            scroll_before.saturating_add(1),
+            "plain Up still scrolls the ring"
+        );
+    }
+
+    /// The menu's disabled law (spec D45): `Stop Testing` is enabled exactly
+    /// when the scheduler is busy, and the two destructive one-shots are the
+    /// inverse — immediate, but never alongside a job.
+    #[tokio::test]
+    async fn menu_items_are_disabled_by_the_scheduler_busy_state() {
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+
+        assert!(
+            menu_item_disabled(&state, "Stop Testing"),
+            "idle: nothing to stop"
+        );
+        assert!(
+            !menu_item_disabled(&state, "Remove Bad Servers"),
+            "idle: the destructive one-shot is available"
+        );
+        assert!(!menu_item_disabled(&state, "Clear All Stats"));
+        assert!(
+            !menu_item_disabled(&state, "Real Test (New)"),
+            "schedulable items are never disabled by the busy state"
+        );
+
+        crate::ops::job_scheduler::enqueue(
+            &mut state,
+            TaskSpec {
+                kind: TaskKind::RealTest,
+                scope: leas_db::profiles_query::PlanScope::New,
+                endpoint: None,
+                label: "Real Test (New)".to_string(),
+            },
+        );
+
+        assert!(
+            !menu_item_disabled(&state, "Stop Testing"),
+            "busy: there is something to stop"
+        );
+        assert!(
+            menu_item_disabled(&state, "Remove Bad Servers"),
+            "busy: a destructive one-shot must not run alongside a job"
+        );
+        assert!(menu_item_disabled(&state, "Clear All Stats"));
     }
 }

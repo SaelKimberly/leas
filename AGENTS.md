@@ -33,7 +33,7 @@ This file is auto-detected project context: commands, structure, conventions. Th
 - Display files with `read`, never `cat`/`head`/`tail`/`ls`.
 
 ## Structure
-- `crates/leas` — binary: `main.rs`, `state.rs` (`AppState`), `types.rs`, `ops/` (connect, ping, events, scheduler, profiles, enrich, subscriptions, settings, updates, export, stream_import, db_monitor, clipboard, native_connect, ping_native, purge, compact), `ui/` (profiles, settings, logs, statistics, actions_log, native_activity, add_server, export, status_bar, theme, widgets).
+- `crates/leas` — binary: `main.rs`, `state.rs` (`AppState`), `types.rs`, `ops/` (connect, ping, events, scheduler — the PER-LINK ping gate —, **job_scheduler — the job queue / one-job-at-a-time gate**, profiles, enrich, subscriptions, settings, updates, export, stream_import, db_monitor, clipboard, native_connect, ping_native, purge, compact), `ui/` (profiles, settings, logs, statistics, **details** (pane-2 `Details`: the selected server's facts + the DB aggregates), **tasks** (pane-2 `Tasks`: the progress bar + the job queue), native_activity, add_server, export, status_bar, theme, widgets).
 - Other crates and their responsibilities: [`docs/architecture/architecture.md`](docs/architecture/architecture.md).
 
 ## Key Conventions

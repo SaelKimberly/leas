@@ -161,6 +161,61 @@ pub struct PageMeta {
     pub offset: usize,
 }
 
+/// The aggregate counts for one scope, as the Details panel renders them.
+///
+/// The four **partition members** — [`proven`][Self::proven],
+/// [`untested`][Self::untested], [`failed`][Self::failed],
+/// [`other`][Self::other] — are pairwise disjoint and sum to
+/// [`total`][Self::total]. [`alive`][Self::alive] and
+/// [`reliable`][Self::reliable] are **orthogonal**: they are filters over the
+/// same rows and overlap any partition member, so they must never be drawn as
+/// part of the partition (spec D28).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateCounts {
+    /// Every endpoint in the scope.
+    pub total: u64,
+    /// Seen within the TTL window — live (`rank_newest_seen`) for the global
+    /// group, the swept `band` for the view group.
+    pub alive: u64,
+    /// `rank_proven = 1` — any live unpurged link with a real success.
+    pub proven: u64,
+    /// The representative link's success rate ≥ 75% (`rank_stab <= 2`).
+    pub reliable: u64,
+    /// Not proven AND never measured (`rank_bin = 12`).
+    pub untested: u64,
+    /// Not proven AND a failure marker (`rank_bin` 13/14/15).
+    pub failed: u64,
+    /// Not proven and in no other bucket — measured but with no real success
+    /// in the ring (e.g. a fast-only-ok endpoint).
+    pub other: u64,
+}
+
+impl AggregateCounts {
+    fn decode(row: &Value) -> Result<Self> {
+        let Value::Record(record) = row else {
+            return Err(DatabaseError::Generic(format!(
+                "profiles_aggregate: unexpected row: {row:?}"
+            )));
+        };
+        // `SUM(CASE …)` over an empty set is NULL, not 0.
+        let field = |i: usize| -> Result<u64> {
+            match record.fields.get(i) {
+                Some(Value::I64(n)) => Ok(u64::try_from(*n).unwrap_or(0)),
+                _ => Ok(0),
+            }
+        };
+        Ok(Self {
+            total: field(0)?,
+            alive: field(1)?,
+            proven: field(2)?,
+            reliable: field(3)?,
+            untested: field(4)?,
+            failed: field(5)?,
+            other: field(6)?,
+        })
+    }
+}
+
 // ── SQL building ────────────────────────────────────────────────────────
 
 /// Statement text plus its ordered binds.
@@ -495,6 +550,37 @@ fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
     }
 }
 
+/// Build the aggregate statement for one scope.
+///
+/// `live_alive` picks the `alive` arm: `true` computes liveness live from
+/// `rank_newest_seen` against the TTL (the global group — the swept `band` can
+/// lag up to the reband interval); `false` uses the swept `band` (the view
+/// group, which must describe the same set the table shows).
+///
+/// The partition arms are the crate's OWN scope predicates, verbatim
+/// (`PlanScope::predicate`): `rank_proven` FIRST, then the bin. A proven
+/// endpoint carrying bin 12 is `proven`, NOT `untested` — dropping the
+/// `rank_proven = 0` guard would double-count it (spec D28).
+fn aggregate_sql(req: &PageRequest, live_alive: bool) -> Sql {
+    let mut sql = Sql::new();
+    sql.push("SELECT COUNT(*)");
+    if live_alive {
+        let threshold = sql.bind(req.active_threshold);
+        sql.push(&format!(
+            ", SUM(CASE WHEN k.rank_newest_seen >= {threshold} THEN 1 ELSE 0 END)"
+        ));
+    } else {
+        sql.push(", SUM(CASE WHEN k.band = 0 THEN 1 ELSE 0 END)");
+    }
+    sql.push(", SUM(CASE WHEN k.rank_proven = 1 THEN 1 ELSE 0 END)");
+    sql.push(", SUM(CASE WHEN k.rank_stab <= 2 THEN 1 ELSE 0 END)");
+    sql.push(", SUM(CASE WHEN k.rank_proven = 0 AND k.rank_bin = 12 THEN 1 ELSE 0 END)");
+    sql.push(", SUM(CASE WHEN k.rank_proven = 0 AND k.rank_bin IN (13, 14, 15) THEN 1 ELSE 0 END)");
+    sql.push(", SUM(CASE WHEN k.rank_proven = 0 AND k.rank_bin NOT IN (12, 13, 14, 15) THEN 1 ELSE 0 END)");
+    base_from_where(&mut sql, req, needs_endpoints(req));
+    sql
+}
+
 /// The view predicate: "has a link matching the window". `Active` and
 /// `Purgatory` share the one computed bound and differ only in direction.
 fn view_predicate(sql: &mut Sql, req: &PageRequest) {
@@ -583,6 +669,35 @@ impl Database {
         let rows = sql.exec(&mut conn).await?;
         let ids = rows.iter().map(decode_id).collect::<Result<Vec<_>>>()?;
         Ok(PageMeta { ids, total, offset })
+    }
+
+    /// The aggregate counts for one scope, as the Details panel renders them.
+    ///
+    /// `live_alive` picks the `alive` arm: `true` computes liveness live from
+    /// `rank_newest_seen` against the TTL (the global group — the swept `band`
+    /// can lag up to the reband interval); `false` uses the swept `band`
+    /// (the view group, which must describe the same set the table shows).
+    ///
+    /// The four partition members (`proven` / `untested` / `failed` / `other`)
+    /// sum to `total`; `alive` and `reliable` are orthogonal filters that
+    /// overlap any subset.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+    pub async fn profiles_aggregate(&self, req: &PageRequest, live_alive: bool) -> Result<AggregateCounts> {
+        let _ = self.drain_dirty_ranks().await;
+        let sql = aggregate_sql(req, live_alive);
+        // Same executor branch as every other read here: the direct turso
+        // connection in production, the pooled toasty path otherwise.
+        let rows = if let Some(direct) = &self.direct {
+            let conn = direct.lock().await;
+            sql.exec_raw(&conn).await?
+        } else {
+            let mut conn = self.connection().await?;
+            sql.exec(&mut conn).await?
+        };
+        rows.first().map_or_else(
+            || Ok(AggregateCounts::default()),
+            AggregateCounts::decode,
+        )
     }
 
     /// One page of the feed walk's ids plus (optionally) the feed-wide count.
