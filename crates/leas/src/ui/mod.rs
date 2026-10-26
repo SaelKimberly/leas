@@ -425,9 +425,122 @@ async fn handle_mouse(mouse: &MouseEvent, state: &mut AppState) {
         _ => {}
     }
 }
+
+/// Route a `Ctrl+V` to whichever text field currently owns the keystroke.
+///
+/// Returns `false` when the focused surface takes no pasted text, so the key
+/// falls through to its own dispatch.
+fn paste_into_focused_field(state: &mut AppState) -> bool {
+    // Import screen: the pasted payload is the share URL(s).
+    if matches!(state.mode, crate::AppMode::ImportUrl { .. }) {
+        return import_clipboard_payload(state);
+    }
+
+    // Settings split: paste into the focused field's value.
+    if let crate::AppMode::Settings {
+        mode: crate::SettingsMode::Split { right, .. },
+    } = &mut state.mode
+    {
+        // A selector and a boolean have no free text, so the payload is
+        // dropped rather than overwriting a choice the user made with Space.
+        let (fields, focus_index) = match right {
+            crate::SplitRightPane::Form {
+                section,
+                fields,
+                focus_index,
+                ..
+            } => {
+                if !settings::field_accepts_paste(*section, *focus_index) {
+                    return true;
+                }
+                (fields, *focus_index)
+            }
+            // The routing-rule and subscription-group forms declare no field
+            // types; every one of their fields is free text.
+            crate::SplitRightPane::RoutingForm {
+                fields,
+                focus_index,
+                ..
+            }
+            | crate::SplitRightPane::GroupForm {
+                fields,
+                focus_index,
+                ..
+            } => (fields, *focus_index),
+            _ => return false,
+        };
+        if focus_index >= fields.len() {
+            return true;
+        }
+        let Some(payload) = crate::ops::clipboard::get_text().ok() else {
+            return true;
+        };
+        let (_, val) = &mut fields[focus_index];
+        val.push_str(&payload);
+        return true;
+    }
+
+    // Profiles list: paste opens the import screen (the historical door).
+    if state.profiles_active() {
+        return import_clipboard_payload(state);
+    }
+
+    false
+}
+
+/// Paste the clipboard into the import screen, or into batch import when the
+/// payload holds more than one share URL. Returns `true` — the key is consumed
+/// either way, since the user asked for a paste and the screen must not also
+/// receive a literal `v`.
+fn import_clipboard_payload(state: &mut AppState) -> bool {
+    let Ok(clipboard_text) = crate::ops::clipboard::get_text() else {
+        return true;
+    };
+    let urls = subscription_url_split(&clipboard_text);
+    match urls.len() {
+        0 => {
+            state.mode = crate::AppMode::ImportUrl {
+                input: clipboard_text,
+                error: Some("No valid share URLs found".into()),
+            };
+        }
+        1 => {
+            state.mode = crate::AppMode::ImportUrl {
+                input: clipboard_text,
+                error: None,
+            };
+        }
+        _ => state.start_batch_import(&urls),
+    }
+    true
+}
 async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     // Delete confirmation: only y/n/esc — check before mode dispatch so
     // confirmation is handled even when inside a sub-mode like settings.
+
+    // Some Windows consoles deliver a Ctrl chord as a bare control character
+    // (`\x01`..`\x1A`) with NO `CONTROL` modifier instead of a `Char` + `CTRL`
+    // record — crossterm's Windows parser resolves that to `KeyCode::Char('\x05')`
+    // and drops the modifier (`event/sys/windows/parse.rs`). Every Ctrl chord in
+    // leas then arrives as an unknown character and does nothing, which is why
+    // `Ctrl+E` (export) shows no popup there. The Unix parser never produces
+    // these (`event/sys/unix/parse.rs` already maps `\x01`..`\x1A` to
+    // `Char(letter) + CONTROL`), so normalizing here cannot mask a real key.
+    let norm_key = if let KeyCode::Char(c) = key.code
+        // Matched on the `char`, never through `as u8`: the cast truncates, so
+        // `'\u{101}'` would alias onto 0x01 and silently become Ctrl+A.
+        && matches!(c, '\x01'..='\x1a')
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let mut norm_key = *key;
+        norm_key.code = KeyCode::Char((b'a' + (c as u32 - 1) as u8) as char);
+        norm_key.modifiers |= KeyModifiers::CONTROL;
+        norm_key
+    } else {
+        *key
+    };
+    let key = &norm_key;
+
     if state.confirmation.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => match state.confirmation.take() {
@@ -458,6 +571,18 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
             _ => {}
         }
+        return;
+    }
+    // Paste. crossterm's Windows backend has no bracketed-paste path at all
+    // (`event/sys/windows/parse.rs` never emits `Event::Paste`), so `Ctrl+V`
+    // is the only paste door there and it must read the clipboard itself.
+    // Routed here, before mode dispatch, so it reaches the subscription form's
+    // URL field as well as the Profiles import screen — gating it to the
+    // Profiles tab is what forced typing the URL by hand.
+    if key.code == KeyCode::Char('v')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && paste_into_focused_field(state)
+    {
         return;
     }
 
@@ -1181,30 +1306,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.clone_profile(id);
             }
         }
-        KeyCode::Char('v')
-            if key.modifiers.contains(KeyModifiers::CONTROL) && state.profiles_active() =>
-        {
-            let clipboard_text = crate::ops::clipboard::get_text().unwrap_or_default();
-
-            let urls = subscription_url_split(&clipboard_text);
-            match urls.len() {
-                0 => {
-                    state.mode = crate::AppMode::ImportUrl {
-                        input: clipboard_text,
-                        error: Some("No valid share URLs found".into()),
-                    };
-                }
-                1 => {
-                    state.mode = crate::AppMode::ImportUrl {
-                        input: clipboard_text,
-                        error: None,
-                    };
-                }
-                _ => {
-                    state.start_batch_import(&urls);
-                }
-            }
-        }
         KeyCode::Char('S')
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && key.modifiers.contains(KeyModifiers::SHIFT)
@@ -1832,6 +1933,7 @@ pub fn render_placeholder_screen(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     /// A Windows console reports a key-up record for every keypress, and
     /// crossterm maps it to `KeyEventKind::Release` — dispatching every
@@ -1859,6 +1961,36 @@ mod tests {
         handle_event(&f1(KeyEventKind::Press), &mut state).await;
         handle_event(&f1(KeyEventKind::Release), &mut state).await;
         assert!(!state.actions_compact);
+    }
+
+    /// A Ctrl chord can arrive as a bare C0 control character with no
+    /// `CONTROL` modifier instead of `Char(letter)` + `CONTROL`. `Ctrl+E` is the
+    /// documented export door (`tui-manual.md`), so the chord must reach the
+    /// dispatch as `Char('e')` + `CONTROL` — otherwise no export popup opens.
+    ///
+    /// The table drives both spellings of the same chord. Without the
+    /// normalization the control-character row falls through the whole match to
+    /// `_ => {}` and leaves the mode on `List`.
+    #[rstest]
+    #[case::ctrl_e_as_letter(KeyCode::Char('e'), KeyModifiers::CONTROL)]
+    #[case::ctrl_e_as_control_char(KeyCode::Char('\x05'), KeyModifiers::NONE)]
+    #[tokio::test]
+    async fn a_control_char_still_opens_the_export_popup(
+        #[case] code: KeyCode,
+        #[case] mods: KeyModifiers,
+    ) {
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        assert!(
+            state.profiles_active(),
+            "the export door is Profiles-tab-scoped"
+        );
+
+        handle_event(&Event::Key(KeyEvent::new(code, mods)), &mut state).await;
+
+        assert!(
+            matches!(state.mode, crate::AppMode::ExportScope { .. }),
+            "{code:?} + {mods:?} must reach the dispatch as Ctrl+E and open the export popup"
+        );
     }
 
     /// Every `ConfirmAction` variant must have prompt text, and the stack must
@@ -2011,5 +2143,82 @@ mod tests {
             "busy: a destructive one-shot must not run alongside a job"
         );
         assert!(menu_item_disabled(&state, "Clear All Stats"));
+    }
+
+    /// `Ctrl+V` must reach the subscription form's URL field.
+    ///
+    /// crossterm's Windows backend has no bracketed-paste path at all
+    /// (`event/sys/windows/parse.rs` never emits `Event::Paste`), so `Ctrl+V`
+    /// reading the clipboard is the only paste door there. The key used to be
+    /// gated to the Profiles tab, which is why adding a subscription forced
+    /// typing the URL by hand.
+    #[tokio::test]
+    async fn ctrl_v_pastes_into_the_subscription_url_field() {
+        let _clipboard =
+            crate::ops::clipboard::set_test_clipboard("https://example.invalid/feed?token=abc");
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        // `start_add_group` only fills the pane while the Settings split is
+        // already open, which is the state the real `a` key reaches it from;
+        // that key path also puts the focus on the right pane.
+        state.enter_settings().await;
+        if let crate::AppMode::Settings {
+            mode: crate::SettingsMode::Split { focus, .. },
+        } = &mut state.mode
+        {
+            *focus = crate::SplitFocus::Right;
+        }
+        crate::ops::subscriptions::start_add_group(&mut state);
+
+        // The URL field is the second one. `Down` advances the group form's
+        // own focus; `Tab` is consumed by the split's Tree level first.
+        handle_event(
+            &Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &mut state,
+        )
+        .await;
+        handle_event(
+            &Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            &mut state,
+        )
+        .await;
+
+        let crate::AppMode::Settings {
+            mode: crate::SettingsMode::Split { right, .. },
+        } = &state.mode
+        else {
+            panic!("the group form must still be open");
+        };
+        let crate::SplitRightPane::GroupForm {
+            fields,
+            focus_index,
+            ..
+        } = right
+        else {
+            panic!("expected the group form, got {right:?}");
+        };
+        assert_eq!(*focus_index, 1, "the URL field must be the focused one");
+        assert_eq!(
+            fields[1].1, "https://example.invalid/feed?token=abc",
+            "Ctrl+V must paste the clipboard into the focused URL field"
+        );
+    }
+
+    /// `Ctrl+V` on the Profiles list still opens the import screen — the
+    /// historical door, and the one the manual documents.
+    #[tokio::test]
+    async fn ctrl_v_on_profiles_still_opens_the_import_screen() {
+        let _clipboard = crate::ops::clipboard::set_test_clipboard("vmess://eyJ2IjoiMiJ9");
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+
+        handle_event(
+            &Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            &mut state,
+        )
+        .await;
+
+        assert!(
+            matches!(state.mode, crate::AppMode::ImportUrl { .. }),
+            "the Profiles-tab paste must still enter the import screen"
+        );
     }
 }

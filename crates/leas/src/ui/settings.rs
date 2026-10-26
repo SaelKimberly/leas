@@ -273,6 +273,22 @@ pub fn select_options(field_type: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Whether the focused field of `section`'s form accepts pasted free text.
+///
+/// A selector and a boolean have no free text: pasting into one would replace a
+/// value the user chose with Space, so the payload is dropped. An index past
+/// the declared fields (the form was opened with no data) takes nothing either.
+#[must_use]
+pub fn field_accepts_paste(section: SettingsSection, focus_index: usize) -> bool {
+    let defs = form_field_defs_for_section(section);
+    match defs.get(focus_index) {
+        Some((_key, _label, field_type)) => {
+            select_options(field_type).is_none() && *field_type != "Boolean"
+        }
+        None => false,
+    }
+}
+
 /// One step along a selector, wrapping past the last option back to the first
 /// (spec R2).
 ///

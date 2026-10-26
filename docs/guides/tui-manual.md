@@ -199,6 +199,7 @@ you just picked.
 | `Space` | Values | advance the focused selector (wraps); toggle a boolean |
 | `Backspace` | Values | erase text; on a boolean it toggles (no tail to erase) |
 | `Ctrl+S` | Values | validate and save the section |
+| `Ctrl+V` | Values, a form field | paste the clipboard into the focused text field (a selector or boolean takes nothing) |
 | `Tab`/`Shift+Tab` | Values | next / previous field |
 | `Ctrl+W` | anywhere | swap focus between Sections and Values |
 | `Esc` | popup | close (asks before discarding unsaved edits); while filtering, cancels the filter |
@@ -312,7 +313,10 @@ Status, Last Updated.
 
 **Group form** — fields: `name`, `subscription_url`, `user_agent`,
 `update_interval`, `core_type`. `Tab`/`Shift+Tab` navigates, `Enter` saves,
-`Esc` cancels.
+`Esc` cancels. `Ctrl+V` pastes the clipboard into the focused text field
+(the subscription URL is the common case — crossterm's Windows backend has no
+bracketed-paste path, so `Ctrl+V` reading the clipboard is the only paste door
+there).
 
 ---
 

@@ -13,7 +13,34 @@
 //! pulls it from the serving thread on demand. An environment with no display
 //! at all gets an error per call, never a panic — see [`CLIPBOARD`].
 
+// The test seam's `thread_local!` initializer is already a `const` block whose
+// `RefCell::new` is const-qualifiable, so `missing_const_for_thread_local` fires
+// on it anyway — the false positive in clippy#17566 (the repo's three
+// `leas-native` warnings are the same lint). An `allow` on the macro invocation
+// itself is ignored (it produces its own `unused_attributes` warning), so the
+// suppression sits at module level, where it reaches the expansion.
+#![allow(
+    clippy::missing_const_for_thread_local,
+    reason = "false positive on an already-const initializer: clippy#17566"
+)]
+
+#[cfg(test)]
+use std::cell::RefCell;
 use std::sync::{LazyLock, Mutex};
+
+// Test seam for `get_text`: a headless test host has no clipboard, so the paste
+// path is driven by installing a payload here.
+//
+// Strict and thread-local on purpose. An installed payload is authoritative; an
+// empty one reports "no clipboard" instead of falling through to a real handle.
+// Falling through let a test read whatever happened to be on the developer's
+// clipboard. Thread-local, because the slot used to be process-global: tests run
+// in parallel, so two of them raced on one payload and a passing test failed
+// whenever the other happened to run alongside it.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CLIPBOARD: RefCell<String> = const { RefCell::new(String::new()) };
+}
 
 /// The one handle, created on first use and kept for the process lifetime —
 /// the selection owner must outlive every individual copy.
@@ -63,10 +90,48 @@ pub fn set_text(text: String) -> Result<(), String> {
 }
 
 /// Read the current clipboard text. Used by the paste path.
+///
+/// The test seam is authoritative: an installed payload is returned as-is, and
+/// an empty one means "no clipboard" — never a fall-through to a real handle,
+/// which would read whatever happened to be on the developer's clipboard.
 pub fn get_text() -> Result<String, String> {
-    with_clipboard(|clipboard| {
-        clipboard
-            .get_text()
-            .map_err(|error| format!("clipboard get failed: {error}"))
-    })
+    #[cfg(test)]
+    {
+        test_clipboard()
+    }
+    #[cfg(not(test))]
+    {
+        with_clipboard(|clipboard| {
+            clipboard
+                .get_text()
+                .map_err(|error| format!("clipboard get failed: {error}"))
+        })
+    }
+}
+
+/// The test-only clipboard reader (see [`get_text`]).
+#[cfg(test)]
+fn test_clipboard() -> Result<String, String> {
+    TEST_CLIPBOARD.with(|slot| Ok(slot.borrow().clone()))
+}
+
+/// Install `payload` as the test clipboard and return a guard that clears it.
+#[cfg(test)]
+#[must_use]
+pub fn set_test_clipboard(payload: &str) -> TestClipboardGuard {
+    TEST_CLIPBOARD.with(|slot| *slot.borrow_mut() = payload.to_string());
+    TestClipboardGuard
+}
+
+/// Clears the test clipboard on drop, so a payload cannot leak into the next
+/// test on the same worker thread. The cell returns to its empty state, which
+/// the strict reader reports as "no clipboard".
+#[cfg(test)]
+pub struct TestClipboardGuard;
+
+#[cfg(test)]
+impl Drop for TestClipboardGuard {
+    fn drop(&mut self) {
+        TEST_CLIPBOARD.with(|slot| slot.borrow_mut().clear());
+    }
 }
