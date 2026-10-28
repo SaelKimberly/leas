@@ -12,11 +12,8 @@ use ratatui::widgets::{LineGauge, Paragraph};
 use crate::AppState;
 use crate::ui::theme::ThemeStyles;
 
-/// The bar's label column, so the bar starts at a fixed x.
-const LABEL_WIDTH: usize = 24;
-
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
-    if area.height < 3 || area.width < 20 {
+    if area.height < 4 || area.width < 20 {
         // Too small for a bar + a queue: show the bar's state as a hint.
         let theme = state.theme();
         frame.render_widget(
@@ -31,38 +28,44 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(1), // metrics line
+            Constraint::Length(1), // gauge line
+            Constraint::Min(1),    // queue
+        ])
         .split(area);
-    render_bar(frame, rows[0], state, theme);
-    render_queue(frame, rows[1], state, theme);
+    render_metrics(frame, rows[0], state, theme);
+    render_gauge(frame, rows[1], state, theme);
+    render_queue(frame, rows[2], state, theme);
 }
 
-/// The bar row: a `LineGauge` with a manual thumb overlay (spec D30).
-///
-/// `tui-slider` was rejected (it pulls `tui-nuances`, a second theme engine,
-/// and its `SliderStyle` is `Color`-based with no theme trait). The thumb is
-/// one cell at `floor(width * done/total)` — the same math `LineGauge` uses
-/// internally, so the thumb and the bar cannot disagree.
-fn render_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline::Theme) {
-    let (label, ratio) = bar_label(state);
-    let label = truncate(&label, LABEL_WIDTH);
+/// Metrics line: task name, counters, ETA — full width, never overlapped by
+/// the gauge below it.
+fn render_metrics(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline::Theme) {
+    let text = metrics_text(state);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            ThemeStyles::footer_value(theme),
+        ))),
+        area,
+    );
+}
 
+/// Gauge line: bare bar + thumb, full width, no label.
+fn render_gauge(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline::Theme) {
+    let ratio = gauge_ratio(state);
     let gauge = LineGauge::default()
         .ratio(ratio.clamp(0.0, 1.0))
-        .label(Line::from(Span::styled(
-            label,
-            ThemeStyles::footer_value(theme),
-        )))
+        .label(Line::from(""))
         .filled_symbol("━")
         .unfilled_symbol("─")
         .filled_style(ThemeStyles::progress_fill(theme))
         .unfilled_style(ThemeStyles::progress_bar(theme));
     frame.render_widget(gauge, area);
 
-    // The thumb: one cell at the fill boundary. `LineGauge` fills up to
-    // `floor(width * ratio)`, so the thumb sits on the first unfilled cell.
     let fill = (f64::from(area.width) * ratio).floor() as u16;
-    let thumb_x = area.x + (LABEL_WIDTH as u16).min(area.width.saturating_sub(1)) + fill;
+    let thumb_x = area.x + fill;
     if thumb_x < area.x + area.width && ratio > 0.0 && ratio < 1.0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -74,10 +77,10 @@ fn render_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline::
     }
 }
 
-/// The bar's label and ratio.
-fn bar_label(state: &AppState) -> (String, f64) {
+/// The metrics line text: `<label> <done>/<total> <eta>` or the idle/paused hint.
+fn metrics_text(state: &AppState) -> String {
     let Some(spec) = &state.running_task else {
-        return (bar_idle_label(state), 0.0);
+        return bar_idle_label(state);
     };
     let (done, total, rate_milli) = running_meters(state);
     let eta = match (total, done, rate_milli) {
@@ -92,16 +95,23 @@ fn bar_label(state: &AppState) -> (String, f64) {
             )
         }
     };
-    let label = match total {
+    match total {
         0 => format!("{} …", spec.label),
         _ => format!("{} {done}/{total}{eta}", spec.label),
-    };
-    let ratio = if total == 0 {
+    }
+}
+
+/// Fill ratio for the gauge (0.0–1.0).
+fn gauge_ratio(state: &AppState) -> f64 {
+    if state.running_task.is_none() {
+        return 0.0;
+    }
+    let (done, total, _) = running_meters(state);
+    if total == 0 {
         0.0
     } else {
         f64::from(done.min(total)) / f64::from(total)
-    };
-    (label, ratio)
+    }
 }
 
 /// The bar's label when nothing is running (spec D47).
@@ -154,16 +164,6 @@ fn running_meters(state: &AppState) -> (u32, u32, u32) {
         };
     }
     (0, 0, 0)
-}
-
-fn truncate(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
 }
 
 /// The queue list: the queued tasks only, earliest first.

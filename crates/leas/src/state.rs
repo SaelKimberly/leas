@@ -308,19 +308,19 @@ impl AppState {
             && matches!(self.pane1_tab, crate::types::Pane1Tab::Profiles)
     }
 
-    /// Effective pane-2 height in rows: the user override, else the per-tab
-    /// default (Details 12 / Metrics 16 / Tasks 10 — spec §14).
+    /// Effective pane-2 height in rows: the user override, else a single
+    /// default shared by every tab, so switching tabs never resizes the pane.
     pub const fn pane2_rows(&self) -> u16 {
         if self.pane2_height > 0 {
             self.pane2_height
         } else {
-            match self.pane2_tab {
-                crate::types::Pane2Tab::Details => 12,
-                crate::types::Pane2Tab::Metrics => 16,
-                crate::types::Pane2Tab::Tasks => 10,
-            }
+            Self::PANE2_DEFAULT_ROWS
         }
     }
+
+    /// Shared pane-2 default height (was Details 12 / Metrics 16 / Tasks 10;
+    /// collapsed to the max so all bottom panes render at equal height).
+    pub const PANE2_DEFAULT_ROWS: u16 = 16;
 
     /// The scope key the aggregates are computed for.
     ///

@@ -560,8 +560,8 @@ Test/Stab cells describe.
   the native ring's); the aggregate column is pinned and clipped from the
   bottom, so the global numbers are never the ones a short pane eats.
 - `F1` collapses pane 2 to the one-line compact bar.
-- Pane 2's height follows the active tab (Details 12 rows, Metrics 16, Tasks 10)
-  plus any `Alt+↑`/`Alt+↓` adjustment (clamped so pane 1 keeps ≥6 rows).
+- Pane 2's default height is uniform across tabs (16 rows) so switching never
+  resizes; `Alt+↑`/`Alt+↓` adjusts it (clamped so pane 1 keeps ≥6 rows).
 
 ### Tasks (pane 2 `Tasks` tab)
 

@@ -99,7 +99,7 @@ Every row below was decided in the grilling interview (2026-10-22).
 | D9 | **Two columns: facts left, aggregates right.** Below ~100 cols they stack full-width, aggregates after facts. | pane 2 is full terminal width; at 80 cols each column is ~38 cells |
 | D10 | **Two labelled groups inside the facts column: `Server` and `Link`.** | xrat has blank lines; labelled groups make ~18 rows scannable |
 | D11 | **The facts column scrolls; the aggregate column is pinned and clipped from the bottom.** The global group is above the view group. | the global numbers are the ones the user asked for first — clipping must not eat them |
-| D12 | **New pane-2 defaults: Details 12, Metrics 16.** The log row is always present on tall terminals. | 8 rows cannot show two labelled groups; pane 1 keeps ≥ 6 rows |
+| D12 | **New pane-2 defaults: Details 12, Metrics 16.** Superseded by D49 (now a single shared 16-row default). The log row is always present on tall terminals. | 8 rows cannot show two labelled groups; pane 1 keeps ≥ 6 rows |
 | D13 | **The log row is a shell-level row OUTSIDE pane 2's frame**, between pane 2's bottom border and the status bar. | keeps pane 2's frame a complete rectangle; the log row owns the row below the border, and pane 2's border is never overwritten (D14 retired) |
 | D14 | **RETIRED by the 2026-10-23 redesign.** The gauge-over-border decision is replaced by the Tasks pane (see §14). Pane 2 keeps its full rectangle; nothing overwrites its bottom border. | user redesign: the progress bar moves INTO a Tasks tab |
 | D15 | **RETIRED by the 2026-10-23 redesign** (the gauge's label moved into the Tasks pane's bar row — §14.2). | superseded by the Tasks pane |
@@ -146,7 +146,7 @@ Every row below was decided in the grilling interview (2026-10-22).
 | D46 | **The status bar keeps its progress line** and shows the RUNNING task's name + done/total (e.g. `Real Test (Successful): 1,240/3,000`) — the at-a-glance surface when the user is on Details/Metrics; the Tasks pane is the queue surface. Two surfaces, one meter source | |
 | D47 | **The Tasks pane's bar row always names the scheduler state**: idle → a muted hint ('no tasks — pick one from the Speed Test menu'); paused → `paused — N queued, press r to resume`; running → the task's label + bar | |
 | D48 | **Quitting cancels the running task and DISCARDS the queue**, logging a line per queued task that never ran. The existing interrupted-batch summary (`ui/mod.rs:340-358`) stays | |
-| D49 | **Pane-2 defaults: Details 12, Metrics 16, Tasks 10** — the bar (1-2 rows) + ~6-7 queue rows, scrolling if longer. The `Alt+↑/↓` clamp (3..`term/2`) and the pane-1 ≥6 floor are unchanged | |
+| D49 | ~~Per-tab defaults~~ **Superseded 2026-10-28: single shared default of 16 rows for all tabs**, so switching never resizes. The `Alt+↑/↓` clamp (3..`term/2`) and the pane-1 ≥6 floor unchanged | |
 | D50 | **D13 stays**: the shell-level log row remains, between pane 2's bottom border and the status bar |
 
 ## 4. Current-state inventory (evidence)
@@ -566,8 +566,8 @@ panel (§6), the aggregate read (§5) and the log row (§8.2) are unchanged.
 Pane 2 becomes `Details | Metrics | Tasks` (D29). The tab bar's third label
 fits at ≥60 cols; below that it drops by the same width-priority law the
 Profiles table uses. The `Alt+↑/↓` clamp (3..`term/2`) and the pane-1 ≥6 floor
-are unchanged; the per-tab default heights are Details 12 / Metrics 16 /
-**Tasks 10** (D49).
+are unchanged; pane-2's default height is a single shared 16 rows for every
+tab (D49, superseded 2026-10-28).
 
 ### 14.2 The progress bar
 
