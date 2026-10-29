@@ -865,6 +865,17 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                             },
                         );
                     }
+                    "Speed Test (Successful)" => {
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::SpeedTestBatch,
+                                scope: PlanScope::Successful,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
+                    }
                     "Fill Exit IPs (Successful)" => {
                         job_scheduler::enqueue(
                             state,
@@ -1853,6 +1864,7 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Real Test (New)"),
     SpeedTestMenuItem::Item("Real Test (Successful + New)"),
     SpeedTestMenuItem::Item("Real Test (Failed)"),
+    SpeedTestMenuItem::Item("Speed Test (Successful)"),
     SpeedTestMenuItem::Item("Fill Exit IPs (Successful)"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Item("Retry Failed DNS Lookups"),

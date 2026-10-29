@@ -305,6 +305,266 @@ pub async fn fetch_over<S: crate::Stream + 'static>(
     })
 }
 
+/// One download-speed request: the same two-stage shape as [`ProbeRequest`],
+/// plus the streaming-stop policy.
+///
+/// `max_duration` bounds the whole download; `min_duration` + `min_bytes` are
+/// the STOP gate (both must hold before the stream may end early): a number
+/// taken from a fraction of a second of a slow link's trickle is noise, and a
+/// fast link that finishes a small file in under `min_duration` has not shown
+/// its steady-state rate either.
+#[derive(Debug, Clone, Copy)]
+pub struct SpeedRequest<'a> {
+    /// Destination host (also the TLS server name when `https`).
+    pub host: &'a str,
+    pub port: u16,
+    pub https: bool,
+    /// Origin-form path, query string included.
+    pub path: &'a str,
+    /// Budget for the PROTOCOL stage (the handshake + the response HEAD).
+    pub timeout: Duration,
+    /// Budget for the TRANSPORT stage alone (the dial to the proxy server).
+    pub transport_timeout: Duration,
+    /// How long the download runs at most.
+    pub max_duration: Duration,
+    /// The minimum elapsed time before an early stop is allowed.
+    pub min_duration: Duration,
+    /// The minimum received bytes before an early stop is allowed.
+    pub min_bytes: u64,
+}
+
+/// A completed download-speed probe: the PEAK 1-second-windowed bytes per
+/// second.
+///
+/// Also the transport span (the Fast metric, spec D2) and the ack (spec D3) —
+/// the same two facts [`ProbeResponse`] reports, so a speed result lands on
+/// the row through the SAME columns a real probe fills.
+#[derive(Debug, Clone)]
+pub struct SpeedResponse {
+    /// Peak of the 1-second sliding windows, in BYTES per second (the cell
+    /// renders MiB/s; v2rayN reports the same statistic as MB/s).
+    pub peak_bytes_per_sec: u64,
+    /// The TRANSPORT span: the dial to the proxy server, the Fast metric.
+    pub transport_span: Duration,
+    /// What the PROTOCOL stage saw of the server's ack (spec D3).
+    pub auth_ack: AuthAck,
+}
+
+/// Dial `req.host:req.port` through `params` and DOWNLOAD `req.path`, measuring
+/// the peak 1-second-windowed throughput instead of buffering the body.
+///
+/// The same TWO-STAGE shape as [`fetch`] (spec D12): the TRANSPORT stage's
+/// budget is independent of the download's, so a slow transport cannot eat the
+/// measurement and the measurement cannot eat the dial. The streaming reads run
+/// under the download's own `max_duration` deadline, not the probe budget.
+pub async fn speed_fetch(
+    mut params: NativeConnectParams,
+    req: &SpeedRequest<'_>,
+) -> Result<SpeedResponse, ProbeError> {
+    params.target = TargetAddr::new(req.host, req.port);
+    // ── STAGE 1: TRANSPORT ──────────────────────────────────────────────
+    let target = params.target.clone();
+    let dial_params = params.clone();
+    let dial_started = Instant::now();
+    let dialed = Box::pin(tokio::time::timeout(
+        req.transport_timeout,
+        crate::chain::dial_transport(&dial_params, target),
+    ))
+    .await
+    .map_err(|_| {
+        ProbeError::new(NativeError::Timeout {
+            step: "probe transport",
+            limit: req.transport_timeout,
+        })
+    })?
+    .map_err(ProbeError::new)?;
+    let transport_span = dial_started.elapsed();
+
+    // ── STAGE 2: PROTOCOL + DOWNLOAD ────────────────────────────────────
+    let ctx = crate::context::LinkContext::with_auth_ack(params.clone(), params.target.clone());
+    let ack_slot = ctx.ack.clone();
+    let attempt = async move {
+        let tunnel = if params.mux {
+            let mux = crate::chain::finish_chain_mux(&ctx, dialed).await?;
+            crate::mux_session::open_session(mux, &params.target).await?
+        } else {
+            crate::chain::finish_chain(&ctx, dialed).await?
+        };
+        speed_over(tunnel, req).await
+    };
+    let peak = Box::pin(tokio::time::timeout(req.timeout, attempt))
+        .await
+        .map_err(|_| {
+            // Same rule as `fetch`: the transport span rides the failure, and
+            // a protocol-stage hang is NOT a transport failure.
+            ProbeError {
+                error: NativeError::Timeout {
+                    step: "probe attempt",
+                    limit: req.timeout,
+                },
+                transport_span: Some(transport_span),
+                auth_ack: ack_slot.get(),
+            }
+        })?
+        .map_err(|error| ProbeError {
+            error,
+            transport_span: Some(transport_span),
+            auth_ack: ack_slot.get(),
+        })?;
+    Ok(SpeedResponse {
+        peak_bytes_per_sec: peak,
+        transport_span,
+        auth_ack: ack_slot.get(),
+    })
+}
+
+/// Stream the response body of one download and return the PEAK 1-second
+/// windowed bytes-per-second.
+///
+/// The peak, not the average: v2rayN reports the fastest 1-second window
+/// (`DownloaderHelper.DownloadDataAsync4Speed` keeps `maxSpeed`), and matching
+/// that keeps a leas number comparable to the reference client's. The average
+/// over a window that includes TCP slow-start understates every link.
+///
+/// The stream stops when the body ends OR when BOTH stop gates hold
+/// (`min_duration` elapsed and `min_bytes` received) OR when `max_duration`
+/// expires — the first of those that happens.
+// Bytes-per-second math over u64 counters: the f64 round trip is exact at
+// network scales and the result renders one-decimal, so the cast lints are
+// deliberate here (the same allowance leas-core's throughput math carries).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub async fn speed_over<S: crate::Stream + 'static>(
+    io: S,
+    req: &SpeedRequest<'_>,
+) -> Result<u64, NativeError> {
+    let stream: BoxStream = if req.https {
+        let tls = client::connect(Box::new(io) as BoxStream, &tls_config(req.host))
+            .await
+            .map_err(target_leg_error)?;
+        Box::new(tls)
+    } else {
+        Box::new(io)
+    };
+    let mut sender = h1_client(stream).await?;
+    let request = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri(req.path)
+        .header(HOST, host_header_of(req.host, req.port, req.https))
+        .header(USER_AGENT, "leas/speedtest")
+        .body(ReqBody::Empty)
+        .map_err(|e| NativeError::Transport(format!("speed request: {e}")))?;
+    // The response HEAD is under the PROTOCOL budget (it proves the tunnel
+    // works); the BODY stream is under the download's own `max_duration`.
+    let response = tokio::time::timeout(req.timeout, sender.send_request(request))
+        .await
+        .map_err(|_| NativeError::Timeout {
+            step: "speed request",
+            limit: req.timeout,
+        })?
+        .map_err(|e| NativeError::Transport(format!("speed request: {e}")))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(NativeError::Transport(format!(
+            "speed test target answered {status}"
+        )));
+    }
+    let mut reader = tokio::io::BufReader::new(IncomingReader::new(response.into_body()));
+    let mut buf = vec![0u8; SPEED_READ_CHUNK];
+    // The peak of the 1-second windows.
+    let mut peak: u64 = 0;
+    // Bytes in the CURRENT (unsealed) window and the instant it opened.
+    let mut window_bytes: u64 = 0;
+    let started = Instant::now();
+    let mut window_start = started;
+    let deadline = started + req.max_duration;
+    let mut total: u64 = 0;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining == Duration::ZERO {
+            break;
+        }
+        let n = tokio::select! {
+            r = tokio::io::AsyncReadExt::read(&mut reader, &mut buf) => r,
+            () = tokio::time::sleep(remaining) => break,
+        };
+        let n = match n {
+            Ok(0) => break, // the body ended
+            Ok(n) => n,
+            Err(e) => {
+                return Err(NativeError::Transport(format!("speed body: {e}")));
+            }
+        };
+        total += n as u64;
+        window_bytes += n as u64;
+        let elapsed = window_start.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            // Seal the full second: the window's own bytes over the window's
+            // own length, so a window the deadline cut short is not graded as
+            // a whole one.
+            let secs = elapsed.as_secs_f64().max(0.001);
+            // Bytes/second over the sealed window; the f64 round trip is
+            // exact enough at network scales and the result lands on the row
+            // rounded to one decimal anyway.
+            let bps = window_bytes as f64 / secs;
+            if bps > peak as f64 {
+                peak = bps as u64;
+            }
+            window_bytes = 0;
+            window_start = Instant::now();
+        }
+        // The early-stop gate: BOTH the minimum time and the minimum bytes
+        // must hold. A stop on time alone grades a trickle; a stop on bytes
+        // alone grades a fast link on a small file.
+        if started.elapsed() >= req.min_duration && total >= req.min_bytes {
+            break;
+        }
+        if total >= SPEED_MAX_BYTES {
+            break;
+        }
+    }
+    // A short download (the file ended, or the gates fired inside the first
+    // second) has no sealed window to report — grade the bytes it did deliver
+    // over the time it took, so a fast link on a small file still gets a
+    // number instead of a failure.
+    if peak == 0 && total > 0 {
+        let elapsed = started.elapsed().max(Duration::from_millis(1));
+        peak = (total as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+    }
+    if peak == 0 {
+        return Err(NativeError::Timeout {
+            step: "speed body",
+            limit: req.max_duration,
+        });
+    }
+    Ok(peak)
+}
+
+/// How many bytes one download may read before it stops, however long that
+/// took: a hard roof so a misconfigured `min_bytes` cannot stream a whole CDN
+/// through one probe. Generous by design — the window gates do the real
+/// stopping, this is the fence behind them.
+const SPEED_MAX_BYTES: u64 = 1 << 30;
+
+/// The body read chunk: 256 KiB, enough that one read fills a meaningful
+/// fraction of a 1-second window even on a fast link (a 1 GiB/s stream
+/// delivers ~1 MiB per read at this size, so the window still samples it).
+const SPEED_READ_CHUNK: usize = 256 * 1024;
+
+/// `Host` header for the speed request (the probe's own law, without the
+/// borrowed struct).
+fn host_header_of(host: &str, port: u16, https: bool) -> String {
+    let default_port = if https { 443 } else { 80 };
+    if port == default_port {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Classify a TARGET-leg TLS failure by the stage that actually failed.
 ///
 /// The engine's record layer reads the tunnel with `read_exact`, so an EOF from
@@ -402,7 +662,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::{ProbeMethod, ProbeRequest, fetch_over};
+    use super::{ProbeMethod, ProbeRequest, SpeedRequest, fetch_over, speed_over};
 
     /// A VLESS+TLS config as JSON — the proto's serde shape, the same one the
     /// other engine tests build.
@@ -860,6 +1120,116 @@ mod tests {
         assert!(
             matches!(err, crate::error::NativeError::Timeout { .. }),
             "{err:?}"
+        );
+        server.abort();
+    }
+
+    /// A body that delivers bytes grades a rate; a short download falls back
+    /// to the bytes it delivered over the time it took, not a zero.
+    #[tokio::test]
+    async fn a_short_download_still_grades_the_bytes_it_delivered() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = vec![0x41u8; 64 * 1024];
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_head(&mut sock).await;
+            let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            sock.write_all(&body).await.unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let req = SpeedRequest {
+            host: "127.0.0.1",
+            port: addr.port(),
+            https: false,
+            path: "/50mb.test",
+            timeout: Duration::from_secs(5),
+            transport_timeout: Duration::from_secs(5),
+            max_duration: Duration::from_secs(5),
+            min_duration: Duration::from_secs(3),
+            min_bytes: 1 << 20,
+        };
+        let rate = speed_over(stream, &req).await.unwrap();
+        // The exact value depends on timing; the assertion is the SIGN — a
+        // delivered body must grade a positive rate, not a failure.
+        assert!(rate > 0, "a delivered body must grade a positive rate");
+        server.await.unwrap();
+    }
+
+    /// A non-2xx answer is a download failure, not a zero rate.
+    #[tokio::test]
+    async fn a_non_2xx_target_fails_the_download() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_head(&mut sock).await;
+            sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let req = SpeedRequest {
+            host: "127.0.0.1",
+            port: addr.port(),
+            https: false,
+            path: "/missing",
+            timeout: Duration::from_secs(5),
+            transport_timeout: Duration::from_secs(5),
+            max_duration: Duration::from_secs(5),
+            min_duration: Duration::from_secs(3),
+            min_bytes: 1 << 20,
+        };
+        let err = speed_over(stream, &req).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::NativeError::Transport(_)),
+            "a 404 must be a transport failure, not a rate: {err}"
+        );
+        server.await.unwrap();
+    }
+
+    /// A body that never arrives: the `max_duration` deadline cuts it short,
+    /// and a zero-byte download is a timeout.
+    #[tokio::test]
+    async fn a_stalled_body_fails_under_max_duration() {
+        use std::time::Instant;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_head(&mut sock).await;
+            // A Content-Length that promises more than it will ever send.
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000000\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let req = SpeedRequest {
+            host: "127.0.0.1",
+            port: addr.port(),
+            https: false,
+            path: "/50mb.test",
+            timeout: Duration::from_secs(5),
+            transport_timeout: Duration::from_secs(5),
+            max_duration: Duration::from_millis(300),
+            min_duration: Duration::from_secs(3),
+            min_bytes: 1 << 20,
+        };
+        let started = Instant::now();
+        let err = speed_over(stream, &req).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::NativeError::Timeout { .. }),
+            "a stalled body must be a timeout: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the download deadline must bound the wait: {:?}",
+            started.elapsed()
         );
         server.abort();
     }

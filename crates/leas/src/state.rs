@@ -26,7 +26,8 @@ use toasty::{Deferred, Json};
 
 use crate::BackendUpdateStatus;
 use crate::ops::{
-    compact, connect, events, ping, profiles, scheduler, settings, subscriptions, updates,
+    compact, connect, events, ping, profiles, scheduler, settings, speed_test, subscriptions,
+    updates,
 };
 use crate::types::{
     AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, FocusedPane, LogLine,
@@ -1140,6 +1141,11 @@ impl AppState {
     }
     pub fn start_speed_test(&mut self, endpoint_id: i64, protocol_id: i64) {
         ping::start_speed_test(self, endpoint_id, protocol_id);
+    }
+    /// Batch download-speed test over one scope of the feed — the
+    /// `Speed Test (Successful)` menu item.
+    pub fn start_speed_test_batch(&mut self, scope: leas_db::profiles_query::PlanScope) {
+        speed_test::start_speed_test_batch(self, scope);
     }
     pub fn start_udp_test(&mut self, endpoint_id: i64, protocol_id: i64) {
         ping::start_udp_test(self, endpoint_id, protocol_id);

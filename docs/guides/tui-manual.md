@@ -68,6 +68,7 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | `Auth`       | 4     | The config's ACCEPTANCE flag: `✓` the server accepted it, `✗` positive rejection evidence (an EOF during the VLESS response-header peel, an auth error, a framing error), `·` the family has no server ack (Trojan, classic-AEAD SS) or the engine cannot serve the row, `?` the ack was possible but was not observed in time (a lazy sing-box server + a slow target). Blank = never observed, which is NOT the same fact as `?`. The flag is read by the probe's own protocol phase — the tunnel's read path reports what it saw — and is NOT a band term: it never changes the row's place in the order (spec D3) |
 | `Real`       | 7     | The real probe's delay `[ 12 ]`, colored as `Fast`; red problem labels `[name]` (DNS unresolved), `[n-a]` (the native engine cannot serve this row — no probe ran), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). `[name]` is suppressed when the row carries a TRANSPORT measurement: the probe dialed the name and the OS resolved it, so the two facts cannot both be true, and the measurement is the fresher one (the probe does not persist the resolution, so the endpoint's address set can be empty while the probe reached it). The cell describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index`, the argmin of the ordering key) — the same link the `ID`, `Fast` and `Auth` cells name, so the cells cannot disagree. Labels survive restarts; the Speed Test `error_ttl_hours` setting clears them. The header's `↑` arrow is the fixed sort (`PageSort::Test`, ascending): sorting is deliberately not user-changeable, to avoid database contention |
 | `Stab`       | 7     | The REPRESENTATIVE link's stability ring as `successes/attempts` (e.g. `14/16`; `—` no samples yet) — the same link the `Real`/`Fast`/`Auth`/`ID` cells describe. Colored by success rate (green ≥80%, yellow ≥50%, red below; dashed = no samples). A stable server keeps its position and a healthy Stab cell even when its latest real ping failed (spec `2026-10-20-stab-alive-design`) |
+| `Speed`      | 7     | The REPRESENTATIVE link's peak download rate in MiB/s (one decimal, e.g. `12.3`) from `Speed Test (Successful)`; blank when never measured. Neutral colour: a speed number says nothing about the link's health — the `Real`/`Fast` cells carry the verdicts. Same representative link as the other cells, so the number cannot disagree with the row's tier |
 | `Out`        | 5     | Exit country flag, same `<flag>-<ISO>` idiom as `Flag`; `—` unknown |
 | `Exit`       | 14    | Exit IP of the active link's persisted real ping (`—` none); survives reruns |
 
@@ -392,6 +393,7 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 │  Real Test (New)                                        │
 │  Real Test (Successful + New)                           │
 │  Real Test (Failed)                                     │
+│  Speed Test (Successful)                                │
 │  Fill Exit IPs (Successful)                            │
 │  Sort by Test                                         │
 │  Remove Bad Servers                                   │
@@ -410,11 +412,11 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 - `?` — open help overlay
 
 The schedulable items enqueue: the six Real/Fast Test variants, the four
-Selected variants, `Fill Exit IPs (Successful)`, `Retry Failed DNS Lookups`, and
-`Compact Duplicate Endpoints`. `Stop Testing` cancels the running task and
-pauses the queue (the Tasks pane's `s`/`r` do the same). `Remove Bad Servers`
-and `Clear All Stats` stay immediate with their `y/n` confirmation and are
-disabled while the scheduler is busy.
+Selected variants, `Speed Test (Successful)`, `Fill Exit IPs (Successful)`,
+`Retry Failed DNS Lookups`, and `Compact Duplicate Endpoints`. `Stop Testing`
+cancels the running task and pauses the queue (the Tasks pane's `s`/`r` do the
+same). `Remove Bad Servers` and `Clear All Stats` stay immediate with their
+`y/n` confirmation and are disabled while the scheduler is busy.
 
 Progress is shown in the status bar (`{Task}: {done}/{total}`) and, with the
 queue, in the Tasks pane.
@@ -804,6 +806,7 @@ appended when updates are available for installed backends.
    - **Fast Test (All Profiles)** — batch transport measurements over every link in the database
    - **Real Test (All Profiles)** — one probe per link over the whole database (a link whose transport failed is retired; rows the native engine cannot serve are marked instead of probed)
    - **Real Test (Successful / New / Successful + New / Failed)** — the same run narrowed to a scope of the feed: endpoints that achieved a real success; endpoints nothing has answered for yet (untested); those two together; or those whose links all failed (including a DNS name that never resolved). The scope reads the endpoint's stored test tier, so it is a filter on the plan, not a different pipeline. A scoped run freezes its endpoint list before the first probe, so an endpoint leaving the scope mid-run is still tested.
+   - **Speed Test (Successful)** — downloads the configured test file through each Successful-band link's OWN native tunnel and stores the peak 1-second-windowed rate in the `Speed` column (MiB/s). No local SOCKS5 hop in the measurement, and no connected core needed. A failure is categorized, marked and purged exactly like a Real Test failure (transport-stage failures carry the `[fast]` marker; typed evidence can earn a purge verdict). Settings > Speed Test owns the URL, concurrency, retries, min duration/bytes and max duration.
    - **Fill Exit IPs (Successful)** — fetches the exit IP for the Successful band's links, on its own rate limiter (the free IP-API tiers publish ~45 requests/minute). It writes the exit IP and the country flag and **never** the real delay — the two are independently-aged facts in one row. It has its own progress bar in the Details pane, labelled `Look`, with the three outcomes counted separately: `N ok, N failed, N retryable` — "the fill finished" is not one number.
    - **Sort by Test** — re-sorts the table by test priority (real successes by delay, then the failure bands)
    - **Remove Bad Servers** — removes profiles with failed tests

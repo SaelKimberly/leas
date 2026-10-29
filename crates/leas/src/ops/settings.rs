@@ -284,7 +284,32 @@ pub async fn build_settings_fields(
                         .error_ttl_hours
                         .map_or_else(String::new, |h| h.to_string()),
                 ),
-                ("geoip_url".into(), state.config.geo.geoip_url.clone()),
+                (
+                    "speed_test_url".into(),
+                    state.config.speed_test.speed_test_url.clone(),
+                ),
+                (
+                    "speed_test_concurrency".into(),
+                    state.config.speed_test.speed_test_concurrency.to_string(),
+                ),
+                (
+                    "speed_test_retries".into(),
+                    state.config.speed_test.speed_test_retries.to_string(),
+                ),
+                (
+                    "speed_test_min_duration".into(),
+                    humantime::format_duration(*state.config.speed_test.speed_test_min_duration)
+                        .to_string(),
+                ),
+                (
+                    "speed_test_min_bytes".into(),
+                    state.config.speed_test.speed_test_min_bytes.to_string(),
+                ),
+                (
+                    "speed_test_max_duration".into(),
+                    humantime::format_duration(*state.config.speed_test.speed_test_max_duration)
+                        .to_string(),
+                ),
                 ("geosite_url".into(), state.config.geo.geosite_url.clone()),
                 (
                     "geo_auto_update".into(),
@@ -511,6 +536,24 @@ fn apply_settings_fields(
             // Empty = never (None); a non-empty field must parse as hours.
             state.config.speed_test.error_ttl_hours =
                 get_opt("error_ttl_hours").and_then(|s| s.parse::<i64>().ok());
+            if !get_str("speed_test_url").is_empty() {
+                state.config.speed_test.speed_test_url = get("speed_test_url");
+            }
+            if let Ok(v) = get_str("speed_test_concurrency").parse::<usize>() {
+                state.config.speed_test.speed_test_concurrency = v;
+            }
+            if let Ok(v) = get_str("speed_test_retries").parse::<u32>() {
+                state.config.speed_test.speed_test_retries = v;
+            }
+            if let Ok(d) = humantime::parse_duration(get_str("speed_test_min_duration")) {
+                *state.config.speed_test.speed_test_min_duration = d;
+            }
+            if let Ok(v) = get_str("speed_test_min_bytes").parse::<u64>() {
+                state.config.speed_test.speed_test_min_bytes = v;
+            }
+            if let Ok(d) = humantime::parse_duration(get_str("speed_test_max_duration")) {
+                *state.config.speed_test.speed_test_max_duration = d;
+            }
             if !get_str("geoip_url").is_empty() {
                 state.config.geo.geoip_url = get("geoip_url");
             }

@@ -14,6 +14,7 @@ pub mod profiles;
 pub mod purge;
 pub mod scheduler;
 pub mod settings;
+pub mod speed_test;
 pub mod stream_import;
 pub mod subscriptions;
 pub mod updates;

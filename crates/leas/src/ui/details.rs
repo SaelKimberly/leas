@@ -235,9 +235,10 @@ fn render_facts(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
             lines.push(field("Auth", auth_label(link.latency.auth), theme));
             lines.push(field(
                 "Speed",
-                &link
-                    .speed_bps
-                    .map_or_else(|| EMPTY.to_string(), |s| format!("{s}bps")),
+                &link.speed_bps.map_or_else(
+                    || EMPTY.to_string(),
+                    |s| format!("{:.1}MiB/s", s as f64 / 8.0 / 1_048_576.0),
+                ),
                 theme,
             ));
             lines.push(field("Stability", &stability(link), theme));

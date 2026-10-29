@@ -30,6 +30,9 @@ pub enum TaskKind {
     SpeedTest,
     /// `UDP Test (Selected)`.
     UdpTest,
+    /// `Speed Test (Successful)`: batch download test over the successful
+    /// scope, a batch shape like `RealTest`, not the single-link `SpeedTest`.
+    SpeedTestBatch,
     /// `Fill Exit IPs (Successful)`.
     FillExitIps,
     /// `Retry Failed DNS Lookups`.
@@ -212,7 +215,8 @@ fn started(state: &AppState, spec: &TaskSpec, testing_before: usize) -> bool {
         TaskKind::FastTest
         | TaskKind::RealTest
         | TaskKind::MultiFastTest
-        | TaskKind::MultiRealTest => state.batch_progress.is_some(),
+        | TaskKind::MultiRealTest
+        | TaskKind::SpeedTestBatch => state.batch_progress.is_some(),
         TaskKind::SpeedTest | TaskKind::UdpTest => {
             // A Selected speed/UDP task with no endpoint cannot start.
             spec.endpoint.is_some()
@@ -276,6 +280,7 @@ fn dispatch(state: &mut AppState, spec: &TaskSpec) {
         TaskKind::Compact => state.compact_duplicate_endpoints(),
         TaskKind::MultiFastTest => state.start_endpoint_batch_ping(),
         TaskKind::MultiRealTest => state.start_endpoint_batch_real_ping(),
+        TaskKind::SpeedTestBatch => state.start_speed_test_batch(spec.scope),
     }
 }
 
@@ -302,6 +307,7 @@ const fn expected_kinds(event: TerminalEvent) -> &'static [TaskKind] {
             TaskKind::FillExitIps,
             TaskKind::MultiFastTest,
             TaskKind::MultiRealTest,
+            TaskKind::SpeedTestBatch,
         ],
         TerminalEvent::CompactFinished => &[TaskKind::Compact],
         TerminalEvent::MaintenanceDone => &[TaskKind::DnsRetry],
@@ -413,6 +419,42 @@ mod tests {
             state.task_queue.len(),
             2,
             "a different scope is a distinct task"
+        );
+    }
+
+    /// `Speed Test (Successful)` is its own batched task: a `SpeedTestBatch`
+    /// is not deduped against the single-link `SpeedTest` (different shape:
+    /// no endpoint), and it is one of the kinds `BatchEnded` may end.
+    #[tokio::test]
+    async fn the_batch_speed_test_is_a_distinct_schedulable_task() {
+        let mut state = sched_state().await;
+        enqueue(
+            &mut state,
+            spec(
+                TaskKind::SpeedTestBatch,
+                PlanScope::Successful,
+                "Speed Test (Successful)",
+            ),
+        );
+        assert_eq!(state.task_queue.len(), 1, "the batch speed test enqueues");
+
+        // The single-link Speed Test is a DIFFERENT identity (it carries an
+        // endpoint), so it must not dedupe against the batch.
+        enqueue(
+            &mut state,
+            selected(TaskKind::SpeedTest, "Speed Test (Selected)"),
+        );
+        assert_eq!(
+            state.task_queue.len(),
+            2,
+            "the Selected variant is a distinct task"
+        );
+
+        // The batch's terminal event is BatchEnded, and its kind must be one
+        // that event may end — otherwise the task would hang the scheduler.
+        assert!(
+            expected_kinds(TerminalEvent::BatchEnded).contains(&TaskKind::SpeedTestBatch),
+            "BatchEnded must be able to end a SpeedTestBatch"
         );
     }
 

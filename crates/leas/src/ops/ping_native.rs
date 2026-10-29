@@ -314,6 +314,124 @@ pub async fn real_ping(
     })
 }
 
+/// Parameters for one native download speed test.
+pub struct NativeSpeedReq<'a> {
+    pub speed_url: &'a str,
+    /// Per-attempt budget for the PROTOCOL stage (handshake + response HEAD).
+    pub timeout: Duration,
+    /// Per-attempt budget for the TRANSPORT stage alone (spec D12).
+    pub transport_timeout: Duration,
+    /// How long the download may run at most.
+    pub max_duration: Duration,
+    /// The stop gate: elapsed time before an early stop is allowed.
+    pub min_duration: Duration,
+    /// The stop gate: received bytes before an early stop is allowed.
+    pub min_bytes: u64,
+    /// Whole-download retries before failure is reported.
+    pub retries: u32,
+}
+
+/// A successful native download speed test: the peak 1-second-windowed bytes
+/// per second plus the same two facts a real probe reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeSpeedResult {
+    /// Peak BYTES per second (the 1-second windowed maximum). The caller
+    /// converts to the row's bits-per-second unit at the boundary.
+    pub peak_bytes_per_sec: u64,
+    /// The TRANSPORT span in ms (the Fast metric, spec D2).
+    pub transport_ms: Option<u64>,
+    /// What the PROTOCOL stage saw of the server's ack (spec D3).
+    pub auth_ack: leas_native::protocol::AuthAck,
+}
+
+/// Run one native download speed test for `endpoint` + the already-loaded
+/// protocol config, retrying the whole download on failure (`retries`).
+///
+/// The failure contract is the real probe's: the transport span survives a
+/// failure, the class comes from the engine's typed error, and only the
+/// transport stage's own failure sets `transport_failed` (spec D12/D1).
+pub async fn speed_ping(
+    endpoint: &Endpoint,
+    addresses: &[std::net::IpAddr],
+    config: &ProtocolConfig,
+    req: &NativeSpeedReq<'_>,
+) -> Result<NativeSpeedResult, ProbeFailure> {
+    let target =
+        parse_probe_url(req.speed_url).map_err(|e| ProbeFailure::local(ProbeClass::Config, e))?;
+    let params = probe_params(endpoint, addresses, config, &target);
+    let attempts = req.retries.max(1);
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..attempts {
+        let params = params.clone();
+        let host = target.host.clone();
+        let path = target.path.clone();
+        let (port, https) = (target.port, target.https);
+        let (timeout, transport_timeout) = (req.timeout, req.transport_timeout);
+        let (max_duration, min_duration, min_bytes) =
+            (req.max_duration, req.min_duration, req.min_bytes);
+        set.spawn(async move {
+            let request = leas_native::probe::SpeedRequest {
+                host: &host,
+                port,
+                https,
+                path: &path,
+                timeout,
+                transport_timeout,
+                max_duration,
+                min_duration,
+                min_bytes,
+            };
+            leas_native::probe::speed_fetch(params, &request)
+                .await
+                .map(|r| NativeSpeedResult {
+                    peak_bytes_per_sec: r.peak_bytes_per_sec,
+                    transport_ms: Some(r.transport_span.as_millis() as u64),
+                    auth_ack: r.auth_ack,
+                })
+                .map_err(|e| {
+                    let mut failure = ProbeFailure::from_engine(e.error());
+                    failure.transport_ms = e.transport_span.map(|s| s.as_millis() as u64);
+                    failure.auth_ack = e.auth_ack;
+                    failure
+                })
+        });
+    }
+    let mut best: Option<NativeSpeedResult> = None;
+    let mut last_error: Option<ProbeFailure> = None;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(result)) => {
+                // The fastest attempt wins: a retry that grades lower cannot
+                // demote a good measurement.
+                if best
+                    .as_ref()
+                    .is_none_or(|b| result.peak_bytes_per_sec > b.peak_bytes_per_sec)
+                {
+                    best = Some(result);
+                }
+            }
+            Ok(Err(e)) => last_error = Some(e),
+            Err(e) => {
+                last_error = Some(ProbeFailure::local(
+                    ProbeClass::Io,
+                    format!("speed test task failed: {e}"),
+                ));
+            }
+        }
+    }
+    best.map_or_else(
+        || {
+            Err(last_error.unwrap_or_else(|| {
+                ProbeFailure::local(
+                    ProbeClass::Other,
+                    "all speed test attempts failed".to_string(),
+                )
+            }))
+        },
+        Ok,
+    )
+}
+
 /// The connect parameters for a row's probe and for its exit-IP fetch.
 ///
 /// Public because the exit-IP fetch is a SEPARATE phase (spec D10/D11) and

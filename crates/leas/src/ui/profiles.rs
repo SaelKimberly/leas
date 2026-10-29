@@ -177,6 +177,10 @@ pub struct DisplayRowData {
     /// row shows. `—` when the ring has no samples.
     stab_str: String,
     stab_style: Style,
+    /// The Speed column: the representative link's peak download rate in
+    /// MiB/s — the SAME link the Test/Stab cells describe.
+    speed_str: String,
+    speed_style: Style,
     outbound_addr: String,
     /// Exit flag cell (D14): `<flag>-<ISO>` or bare `<ISO>`, `—` unknown.
     outbound_flag: String,
@@ -233,8 +237,9 @@ impl DataTableRow for DisplayRowData {
                 8 => (self.auth_str.as_str(), self.auth_style),
                 9 => (self.test_str.as_str(), self.test_style),
                 10 => (self.stab_str.as_str(), self.stab_style),
-                11 => (self.outbound_flag.as_str(), self.row_style),
-                12 => (self.outbound_addr.as_str(), self.address_style),
+                11 => (self.speed_str.as_str(), self.speed_style),
+                12 => (self.outbound_flag.as_str(), self.row_style),
+                13 => (self.outbound_addr.as_str(), self.address_style),
                 _ => ("", self.row_style),
             };
             let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
@@ -919,6 +924,41 @@ fn compute_stab_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) 
     (text, style)
 }
 
+/// The endpoint row's Speed cell: the REPRESENTATIVE link's peak download
+/// rate in MiB/s — the same link the Test/Stab cells describe — `—` when it
+/// was never measured.
+///
+/// Neutral colour: a speed number says nothing about the link's health (a
+/// slow link can be perfectly reliable), so the cell reports the measurement
+/// and lets the Real/Test columns carry the verdicts.
+fn compute_speed_cell(
+    row: &EndpointRow,
+    resolved: bool,
+    theme: &opaline::Theme,
+) -> (String, Style) {
+    let representative = row
+        .representative_link_index(!resolved)
+        .and_then(|i| row.links.get(i));
+    let Some(link) = representative else {
+        return (String::new(), Style::default());
+    };
+    match link.speed_bps {
+        None => (String::new(), Style::default()),
+        Some(0) => ("—".to_string(), ThemeStyles::hint(theme)),
+        Some(bps) => (format_speed_mibps(bps as u64), ThemeStyles::hint(theme)),
+    }
+}
+
+/// The Speed cell's number: MiB/s with one decimal (`12.3`), 5 cells — the
+/// same width the Stab cell uses and the shape v2rayN's grid shows.
+///
+/// The stored unit is BITS per second (the column's name is `speed_bps`), so
+/// the mebibyte conversion divides by 8 first.
+fn format_speed_mibps(bps: u64) -> String {
+    let mib = bps as f64 / 8.0 / 1_048_576.0;
+    format!("{mib:.1}")
+}
+
 /// Row-number cell: a 6-cell right-aligned slot plus a trailing gap cell
 /// (carrying the multi-select `*`) — room for 100000+ profiles without the
 /// number bleeding into the next column.
@@ -1177,6 +1217,7 @@ fn build_display_rows(
         let (fast_str, fast_style) = compute_fast_cell(row, resolved, theme);
         let (auth_str, auth_style) = compute_auth_cell(row, resolved, theme);
         let (stab_str, stab_style) = compute_stab_cell(row, resolved, theme);
+        let (speed_str, speed_style) = compute_speed_cell(row, resolved, theme);
 
         let protocol_info_str = protocol_info_cell(row);
 
@@ -1340,6 +1381,8 @@ fn build_display_rows(
             auth_style,
             stab_str,
             stab_style,
+            speed_str,
+            speed_style,
             outbound_addr,
             outbound_flag,
             // The same `▸`/`▾` chevrons the settings sections use, so the
@@ -1397,7 +1440,7 @@ fn build_display_rows(
 /// measurement and the auth flag are the two facts a row has BEFORE its
 /// verdict, so a reader sees "the server answered in 12 ms, the config was
 /// accepted, the real probe failed" left to right.
-const GRID_COLUMNS: [(usize, &str, u16); 13] = [
+const GRID_COLUMNS: [(usize, &str, u16); 14] = [
     (0, "", 2),         // status glyph + expand chevron in the gap cell
     (1, "ID", 8),       // link id hex
     (2, "Flag", 5),     // inbound flag
@@ -1409,8 +1452,9 @@ const GRID_COLUMNS: [(usize, &str, u16); 13] = [
     (8, "Auth", 4),   // the quad-state success flag (spec D3)
     (9, "Real", 7),   // the real span, or the failure marker
     (10, "Stab", 7),  // representative link's ring, successes/attempts
-    (11, "Out", 5),   // exit flag
-    (12, "Exit", 14), // exit IP
+    (11, "Speed", 7), // representative link's peak download rate
+    (12, "Out", 5),   // exit flag
+    (13, "Exit", 14), // exit IP
 ];
 
 fn render_data_grid(
@@ -1436,10 +1480,10 @@ fn render_data_grid(
     // merged row's two new facts, while `Stab` is a ring the row already
     // showed. Fast drops before Auth because a number is the more useful of
     // the two when the pane is narrow.
-    let logical: &[(usize, &str, u16); 13] = &GRID_COLUMNS;
+    let logical: &[(usize, &str, u16); 14] = &GRID_COLUMNS;
     let mut widths: Vec<u16> = logical.iter().map(|(_, _, w)| *w).collect();
     let inner_w = area.width.saturating_sub(2); // frameless inset
-    for &drop in &[12usize, 11, 5, 10, 8, 7] {
+    for &drop in &[13usize, 12, 5, 10, 8, 7, 11] {
         if widths.iter().sum::<u16>() > inner_w {
             widths[drop] = 0;
         }
@@ -2100,6 +2144,34 @@ mod tests {
         assert_eq!(style, ThemeStyles::test_delay_bad(&theme));
     }
 
+    #[test]
+    fn speed_cell_renders_mibps_from_the_representative_link() {
+        use crate::ops::profiles::test_support::fake_row;
+        use leas_db::models::Latency;
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let mut row = fake_row(1, "1.2.3.4", 2);
+        row.links[0].latency = Latency::default();
+        row.links[1].latency = Latency::real_with_ip(40, None);
+
+        // No measurement yet: blank, not a zero (a zero would read as
+        // measured-and-slow).
+        row.links[1].speed_bps = None;
+        let (text, _) = compute_speed_cell(&row, true, &theme);
+        assert_eq!(text, "", "unmeasured is blank");
+
+        // 10 MiB/s: 10 * 8 * 1_048_576 bits per second.
+        row.links[1].speed_bps = Some(10 * 8 * 1_048_576);
+        let (text, style) = compute_speed_cell(&row, true, &theme);
+        assert_eq!(text, "10.0", "the cell renders MiB/s with one decimal");
+        assert_eq!(style, ThemeStyles::hint(&theme), "the number is neutral");
+
+        // The representative link is the one measured: a sibling's stale
+        // number must not render on the row.
+        row.links[0].speed_bps = Some(8 * 8 * 1_048_576);
+        let (text, _) = compute_speed_cell(&row, true, &theme);
+        assert_eq!(text, "10.0", "the cell reads the representative link only");
+    }
+
     fn sample_panel_row(marker: &str) -> PanelRow {
         PanelRow {
             marker: marker.to_string(),
@@ -2135,6 +2207,8 @@ mod tests {
             auth_style: Style::default(),
             stab_str: String::new(),
             stab_style: Style::default(),
+            speed_str: String::new(),
+            speed_style: Style::default(),
             outbound_addr: String::new(),
             outbound_flag: String::new(),
             expand_prefix: if panel_rows.is_empty() {

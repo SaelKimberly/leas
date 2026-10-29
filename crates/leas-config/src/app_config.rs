@@ -466,6 +466,56 @@ mod tests {
     }
 
     #[test]
+    fn speed_test_download_defaults_and_round_trip() {
+        // Defaults: a 50 MB file (v2rayN's list starts there), 4 parallel
+        // downloads, 2 retries (v2rayN's MaxTryAgainOnFailure), min 3 s /
+        // 1 MiB before an early stop, 15 s hard cap.
+        let original = AppConfig::default();
+        assert_eq!(
+            original.speed_test.speed_test_url,
+            "https://cachefly.cachefly.net/50mb.test"
+        );
+        assert_eq!(original.speed_test.speed_test_concurrency, 4);
+        assert_eq!(original.speed_test.speed_test_retries, 2);
+        assert_eq!(
+            *original.speed_test.speed_test_min_duration,
+            std::time::Duration::from_secs(3)
+        );
+        assert_eq!(original.speed_test.speed_test_min_bytes, 1 << 20);
+        assert_eq!(
+            *original.speed_test.speed_test_max_duration,
+            std::time::Duration::from_secs(15)
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.speed_test.speed_test_url,
+            original.speed_test.speed_test_url
+        );
+        assert_eq!(restored.speed_test.speed_test_concurrency, 4);
+        assert_eq!(restored.speed_test.speed_test_retries, 2);
+
+        // Explicit values round-trip; absent fields fall back to defaults.
+        let json = r#"{"core":{},"gui":{},"inbound":{},"speed_test":{"speed_test_url":"https://example.test/100mb.bin","speed_test_concurrency":2,"speed_test_retries":5,"speed_test_min_duration":"6s","speed_test_min_bytes":2097152,"speed_test_max_duration":"30s"}}"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.speed_test.speed_test_url,
+            "https://example.test/100mb.bin"
+        );
+        assert_eq!(config.speed_test.speed_test_concurrency, 2);
+        assert_eq!(config.speed_test.speed_test_retries, 5);
+        assert_eq!(
+            *config.speed_test.speed_test_min_duration,
+            std::time::Duration::from_secs(6)
+        );
+        assert_eq!(config.speed_test.speed_test_min_bytes, 2 << 20);
+        assert_eq!(
+            *config.speed_test.speed_test_max_duration,
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
     fn normalize_protocol_key_known_pairs() {
         // Each known old Display string → current short form
         let cases = [
@@ -620,6 +670,32 @@ pub struct SpeedTestConfig {
     /// config load and settings save.
     #[serde(default = "default_dns_failure_defer_secs")]
     pub dns_failure_defer_secs: i64,
+    /// The file the batch `Speed Test (Successful)` downloads through each
+    /// successful link's own tunnel. Distinct from `ping_url` on purpose: the
+    /// ping file is a tiny latency probe, this must be large enough to sustain
+    /// a measurable stream (v2rayN's list starts at 50 MB).
+    #[serde(default = "default_speed_test_url")]
+    pub speed_test_url: String,
+    /// Parallel downloads the batch speed test allows. Separate from
+    /// `real_ping_concurrency`: a download holds its slot for seconds, not
+    /// milliseconds, so the real level's knob is the wrong unit.
+    #[serde(default = "default_speed_test_concurrency")]
+    pub speed_test_concurrency: usize,
+    /// Whole-download retries before a speed test reports failure (v2rayN's
+    /// `MaxTryAgainOnFailure = 2`).
+    #[serde(default = "default_speed_test_retries")]
+    pub speed_test_retries: u32,
+    /// The minimum elapsed time before a download may stop early: a window
+    /// shorter than this grades slow-start noise.
+    #[serde(default = "default_speed_test_min_duration")]
+    pub speed_test_min_duration: crate::DurationOrSecs,
+    /// The minimum received bytes before a download may stop early: a fast
+    /// link that finishes a small file has not shown its steady rate.
+    #[serde(default = "default_speed_test_min_bytes")]
+    pub speed_test_min_bytes: u64,
+    /// The hard cap on one download's duration (the 1-second windows' budget).
+    #[serde(default = "default_speed_test_max_duration")]
+    pub speed_test_max_duration: crate::DurationOrSecs,
 }
 
 fn default_ping_url() -> String {
@@ -659,6 +735,31 @@ const fn default_dns_failure_defer_secs() -> i64 {
     15
 }
 
+fn default_speed_test_url() -> String {
+    "https://cachefly.cachefly.net/50mb.test".to_string()
+}
+
+const fn default_speed_test_concurrency() -> usize {
+    4
+}
+
+const fn default_speed_test_retries() -> u32 {
+    2
+}
+
+fn default_speed_test_min_duration() -> crate::DurationOrSecs {
+    crate::DurationOrSecs::from(std::time::Duration::from_secs(3))
+}
+
+const fn default_speed_test_min_bytes() -> u64 {
+    // 1 MiB: a window that delivered less has not left slow start behind.
+    1 << 20
+}
+
+fn default_speed_test_max_duration() -> crate::DurationOrSecs {
+    crate::DurationOrSecs::from(std::time::Duration::from_secs(15))
+}
+
 impl Default for SpeedTestConfig {
     fn default() -> Self {
         Self {
@@ -672,6 +773,12 @@ impl Default for SpeedTestConfig {
             error_ttl_hours: None,
             task_queue_limit: default_task_queue_limit(),
             dns_failure_defer_secs: default_dns_failure_defer_secs(),
+            speed_test_url: default_speed_test_url(),
+            speed_test_concurrency: default_speed_test_concurrency(),
+            speed_test_retries: default_speed_test_retries(),
+            speed_test_min_duration: default_speed_test_min_duration(),
+            speed_test_min_bytes: default_speed_test_min_bytes(),
+            speed_test_max_duration: default_speed_test_max_duration(),
         }
     }
 }
