@@ -17,17 +17,12 @@ severity_threshold = "low"
 
 # Reachable but unactionable from this workspace — deliberately NOT in
 # `ignore`, so they keep showing up in the warning list instead of being
-# hidden. Both are third-party pins, neither is on a path this app drives:
+# hidden. A third-party pin, not on a path this app drives:
 #
-# - lru 0.16.4, RUSTSEC-2026-0253 "unsound: potential use-after-free due to
-#   lack of panic safety in LruCache::pop()". Reached as
-#   turso 0.9.0-pre.2 → turso_core 0.9.0-pre.2 → tantivy 0.26.2 → lru. 0.16.4 is
-#   the newest 0.16.x published and tantivy pins ^0.16.3, so there is no
-#   in-range fix — only a turso/tantivy bump or a `[patch]`. We never call
-#   `LruCache::pop`; the unsoundness requires a panic inside tantivy's cache,
-#   i.e. the FTS index path, which this app never populates. Our own crates use
-#   lru 0.19, so the advisory never touches a type we call. Re-evaluate when
-#   turso or tantivy moves.
+# (The lru 0.16.4 / RUSTSEC-2026-0253 entry that used to live here is gone:
+# it arrived only through turso's `fts` feature → tantivy → lru 0.16, and that
+# feature is no longer enabled — see the turso pin in crates/leas-db/Cargo.toml.)
+#
 # - rustls-pemfile 2.2.0, RUSTSEC-2025-0134 (unmaintained; superseded by
 #   rustls-pki-types' PEM support). Same class as the `rsa` entry above: it
 #   enters only through toasty's optional postgresql driver

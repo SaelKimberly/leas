@@ -19,7 +19,16 @@ categories = ["database"]
 toasty = { workspace = true, features = ["serde", "jiff"] }
 toasty-core = "0.11"
 toasty-sql = "0.11"
-turso = "=0.9.0-pre.2"
+# `default-features = false` + `mimalloc` rather than the default
+# `["mimalloc", "fts"]`: `fts` is the ONLY path to tantivy, and turso's
+# `tantivy ^0.26.2` pin drags `zstd 0.13.3` / `zstd-safe 7.3.0`, which
+# RUSTSEC-2026-0391, -0398 and -0403 fix in zstd 0.14.3 / zstd-safe 8.2.0.
+# tantivy 0.27 (zstd ^0.14, optional) is out of turso's `^0.26.2` range and
+# 0.9.0-pre.2 is turso's newest release, so the upgrade exists upstream but
+# not in this graph. This schema holds no FTS index and never issues an
+# `fts` statement, so the feature buys nothing; `mimalloc` stays explicit
+# because it was default and the allocator choice is deliberate.
+turso = { version = "=0.9.0-pre.2", default-features = false, features = ["mimalloc"] }
 async-trait.workspace = true
 
 # ============ Time ============

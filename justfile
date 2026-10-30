@@ -90,10 +90,10 @@ machete mode='report':
 # — with the breakage fixed in `leas-core/src/log_heed.rs` for heed's new
 # commit-scoped database API). The residual entries are transitive-only,
 # graph-inherent dual-major pins in the generated leas-hakari, e.g. base64
-# 0.22 via dns-stamp-parser/tantivy/tonic, compact_str 0.9 via ratatui-core
-# 0.1.2, hashbrown 0.16 via lru 0.16 (NOT yaml-rust2, which moved to hashlink
-# 0.12.2), nom 7 via cexpr/bindgen (turso_sdk_kit), itertools 0.14 via prost
-# 0.14, lock_api 0.4 via dashmap 6, parking_lot 0.12 via arboard/crossterm/
+# 0.22 via dns-stamp-parser/tonic, compact_str 0.9 via ratatui-core 0.1.2,
+# hashbrown 0.16 via hashlink/rsqlite-vfs (NOT yaml-rust2, which moved to
+# hashlink 0.12.2), nom 7 via cexpr/bindgen (turso_sdk_kit), itertools 0.14 via
+# prost 0.14, lock_api 0.4 via dashmap 6, parking_lot 0.12 via arboard/crossterm/
 # opaline, lru 0.18 via ratatui-core 0.1.2, constant_time_eq 0.4 via blake3,
 # quinn-udp 0.5 via quinn 0.11, rand_core 0.6 via crypto-common 0.1 (turso's
 # aes-gcm 0.10), tower-http 0.6 via reqwest 0.13, syn 2 vs 3, and the
