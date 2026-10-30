@@ -3,6 +3,16 @@
 //! Layering (mirror of the h3 arm + hysteria2 spec §5.2): the QUIC dial
 //! replaces dial + security + upgrade entirely (quinn's rustls is internal).
 //! Salamander packet obfuscation wraps the UDP socket when configured.
+// The send-path `thread_local!` scratch buffer initializer is already a `const`
+// block, but `missing_const_for_thread_local` fires on it anyway — the
+// windows-gnu false positive in clippy#17566. An `allow` on the macro
+// invocation itself is ignored (it produces its own `unused_attributes`
+// warning), so the suppression sits at module level, where it reaches the
+// expansion.
+#![allow(
+    clippy::missing_const_for_thread_local,
+    reason = "false positive on an already-const initializer: clippy#17566"
+)]
 
 use std::io;
 use std::net::SocketAddr;

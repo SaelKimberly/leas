@@ -202,7 +202,7 @@ tower-http = { version = "0.6", default-features = false, features = ["decompres
 uuid = { version = "1", default-features = false, features = ["serde"] }
 winapi = { version = "0.3", default-features = false, features = ["consoleapi", "handleapi", "impl-default", "processenv", "synchapi", "sysinfoapi", "winbase", "winerror", "winuser"] }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 zstd-sys = { version = "2", default-features = false, features = ["experimental"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
@@ -217,7 +217,43 @@ nom = { version = "7" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 uuid = { version = "1", default-features = false, features = ["serde"] }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[target.x86_64-pc-windows-gnu.dependencies]
+aho-corasick = { version = "1" }
+bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
+deranged = { version = "0.5", features = ["serde"] }
+futures-util = { version = "0.3" }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
+ipnet = { version = "2", features = ["serde"] }
+nom = { version = "7" }
+simd-adler32 = { version = "0.3" }
+slab = { version = "0.4" }
+stable_deref_trait = { version = "1" }
+time = { version = "0.3", features = ["serde-well-known"] }
+tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
+tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip", "follow-redirect"] }
+uuid = { version = "1", default-features = false, features = ["serde"] }
+winapi = { version = "0.3", default-features = false, features = ["consoleapi", "handleapi", "impl-default", "processenv", "synchapi", "sysinfoapi", "winbase", "winerror", "winuser"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+zstd-sys = { version = "2", default-features = false, features = ["experimental"] }
+
+[target.x86_64-pc-windows-gnu.build-dependencies]
+aho-corasick = { version = "1" }
+block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
+chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha", "zeroize"] }
+cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
+crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hybrid-array = { version = "0.4", default-features = false, features = ["ctutils", "extra-sizes", "zeroize"] }
+nom = { version = "7" }
+typenum = { version = "1", default-features = false, features = ["const-generics"] }
+uuid = { version = "1", default-features = false, features = ["serde"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 zeroize = { version = "1", features = ["derive"] }
 
 ### END HAKARI SECTION

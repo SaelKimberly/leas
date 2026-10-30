@@ -19,8 +19,8 @@ categories = ["database"]
 toasty = { workspace = true, features = ["serde", "jiff"] }
 toasty-core = "0.11"
 toasty-sql = "0.11"
-turso = "=0.9.0-pre.1"
-async-trait = "0.1.92"
+turso = "=0.9.0-pre.2"
+async-trait.workspace = true
 
 # ============ Time ============
 jiff = { workspace = true }
@@ -42,7 +42,7 @@ uuid.workspace = true
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true
-dashmap = "6.2.1"
+dashmap.workspace = true
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
 [features]

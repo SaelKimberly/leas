@@ -8,7 +8,7 @@ actually proves something. Everything here was measured on 2026-10-13 against
 
 | Need | Why | Notes |
 | --- | --- | --- |
-| `rustup` (or a system Rust ≥ the workspace `rust-version`) | `rust-toolchain.toml` pins the channel, `rustfmt`/`clippy`, and the two targets | `rustup show` installs what the file asks for |
+| `rustup` (or a system Rust ≥ the workspace `rust-version`) | `rust-toolchain.toml` pins the channel, `rustfmt`/`clippy`, and the three targets | `rustup show` installs what the file asks for |
 | a C compiler (`build-essential`, `gcc`, or MSVC's `cl.exe`) | `ring`, `zstd-sys` and `libsqlite3-sys` compile C | verified: a clean build does its C work through `cc`/`cc1` |
 | `git`, `curl`, `tar` | `just plugin-bins` fetches a prebuilt plugin and builds another | optional: only the plugin e2e rows need it |
 | `just` | every documented task is a recipe | `cargo install --locked just` |
@@ -26,7 +26,8 @@ published crate need a protobuf compiler on `PATH`. (Before this change
 
 On Windows the extra prerequisite is **`nasm`** — `ring` assembles its perlasm
 with it. `x86_64-pc-windows-msvc` is the declared target, so no mingw toolchain
-is involved.
+is involved. `x86_64-pc-windows-gnu` is also installed (the local fallback
+where `link.exe` is unavailable), but nothing in CI or the gate builds it.
 
 ## The fast path is opt-in: `just fast <cmd>`
 

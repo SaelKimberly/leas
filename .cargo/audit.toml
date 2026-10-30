@@ -21,7 +21,7 @@ severity_threshold = "low"
 #
 # - lru 0.16.4, RUSTSEC-2026-0253 "unsound: potential use-after-free due to
 #   lack of panic safety in LruCache::pop()". Reached as
-#   turso 0.9.0-pre.1 → turso_core 0.9.0-pre.1 → tantivy 0.26.2 → lru. 0.16.4 is
+#   turso 0.9.0-pre.2 → turso_core 0.9.0-pre.2 → tantivy 0.26.2 → lru. 0.16.4 is
 #   the newest 0.16.x published and tantivy pins ^0.16.3, so there is no
 #   in-range fix — only a turso/tantivy bump or a `[patch]`. We never call
 #   `LruCache::pop`; the unsoundness requires a panic inside tantivy's cache,

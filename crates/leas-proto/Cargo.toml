@@ -48,7 +48,7 @@ toasty.workspace = true
 smallvec.workspace = true
 
 # ============ Public-suffix DNS split (db-rewamp D2/D6) ============
-psl2 = "0.1.35"
+psl2 = "0.1.36"
 bstr = { version = "^1.13.1", default-features = false, features = ["std"] }
 daachorse.workspace = true
 # Small inline string for URL/credential text. `compact_str` replaces the
