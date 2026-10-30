@@ -850,6 +850,23 @@ mod tests {
         let err = fetch(params, &req)
             .await
             .expect_err("a refused transport must fail the probe");
+        // Windows does not refuse a closed port at once: the stack
+        // retransmits SYN (the initial RTO, ~1 s on loopback) before it
+        // surfaces the refuse, so this 300 ms transport budget can expire
+        // while the dial is still inside that SYN-retry budget. Both outcomes
+        // are transport-stage failures under the transport budget.
+        #[cfg(windows)]
+        assert!(
+            !matches!(
+                err.error,
+                NativeError::Timeout {
+                    step: "probe attempt",
+                    ..
+                }
+            ),
+            "a refused dial is a transport-stage failure, not a protocol-stage timeout: {err}"
+        );
+        #[cfg(not(windows))]
         assert!(
             !matches!(err.error, NativeError::Timeout { .. }),
             "a refused dial is a transport failure, not a timeout: {err}"

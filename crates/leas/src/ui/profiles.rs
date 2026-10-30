@@ -2091,9 +2091,9 @@ mod tests {
             labels,
             [
                 "", "ID", "Flag", "Address", "Port", "White", "Protocol", "Fast", "Auth", "Real",
-                "Stab", "Out", "Exit"
+                "Stab", "Speed", "Out", "Exit"
             ],
-            "Fast and Auth sit before Real; Stab immediately after it"
+            "Fast and Auth sit before Real; Stab immediately after it, Speed after Stab"
         );
         let real_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Real");
         let stab_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Stab");
