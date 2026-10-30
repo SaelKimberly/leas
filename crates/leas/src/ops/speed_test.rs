@@ -4,9 +4,10 @@
 //! Modelled on `Fill Exit IPs` (`ping.rs::run_fill_exit_ips`): its own meters,
 //! its own walk of one [`PlanScope`], and `CoreEvent::BatchEnded` as its
 //! terminal event — but where the fill fetches an exit IP, this runs a
-//! streaming download with the SAME failure contract as the real probe
-//! (`ping_native::speed_ping`), so a failed download is categorized, marked
-//! and purged exactly like a failed Real Test.
+//! streaming download (`ping_native::speed_ping`). A failed download is
+//! categorized for the batch histogram ONLY: it never marks or purges a link —
+//! a target the exit cannot reach says nothing about the config, and a slow
+//! exit is not a dead one.
 //!
 //! The download rides the row's OWN native tunnel (dial → security → transport
 //! → protocol), not the local SOCKS5 inbound: no loopback hop in the
@@ -155,6 +156,21 @@ async fn run_speed_batch(params: SpeedBatchParams) {
                 .map(move |link| (link, endpoint.clone(), addresses.clone()))
         })
         .collect();
+    // "Successful" is `rank_proven` (a success anywhere in the last 16 real
+    // samples), so it keeps servers that died since. A download test needs a
+    // CURRENT success: the row must carry no marker and a measured real delay.
+    let planned = plans.len();
+    let plans: Vec<_> = plans
+        .into_iter()
+        .filter(|(link, _, _)| link.error.is_none() && link.latency.real_delay.is_some())
+        .collect();
+    tracing::info!(
+        target: "tui::ops::speed_test",
+        "speed batch: {} of {} planned link(s) currently successful, {} skipped",
+        plans.len(),
+        planned,
+        planned - plans.len(),
+    );
     let total = plans.len() as u32;
     meters.main.total.store(total, Ordering::Relaxed);
     let failed = Arc::new(AtomicU32::new(0));
@@ -219,7 +235,7 @@ async fn run_speed_batch(params: SpeedBatchParams) {
         if parts.is_empty() {
             String::new()
         } else {
-            format!(" failed[{}]", parts.join(" "))
+            format!(" [{}]", parts.join(" "))
         }
     };
     tracing::info!(
@@ -256,16 +272,16 @@ async fn run_one_speed_probe(
     else {
         let outcome = ProbeOutcome::soft_failure("Protocol row not found for speed test");
         let class = outcome.failed_class();
-        settle(tx, writer, link, &outcome, None);
+        settle(tx, writer, link, &outcome);
         return class;
     };
     let config = protocol.config.get().0.clone();
-    // The config-level capability gate: its marker IS the result, exactly as
-    // in the real probe.
+    // The config-level capability gate: nothing was dialled, so the text only
+    // feeds the batch histogram (settle stages nothing for a failure).
     if let Some(reason) = leas_native::capability::support_reason(protocol.proto_kind, &config) {
         let outcome = ProbeOutcome::soft_failure(crate::ops::ping::untestable_marker_text(&reason));
         let class = outcome.failed_class();
-        settle(tx, writer, link, &outcome, None);
+        settle(tx, writer, link, &outcome);
         return class;
     }
     let result = ping_native::speed_ping(
@@ -292,14 +308,12 @@ async fn run_one_speed_probe(
         Err(e) => ProbeOutcome::Failed {
             text: e.text,
             class: e.class,
-            evidence: e.evidence,
             transport_ms: e.transport_ms,
-            transport_failed: e.transport_failed,
             auth_ack: e.auth_ack,
         },
     };
     let class = outcome.failed_class();
-    settle(tx, writer, link, &outcome, protocol.security.fp.as_deref());
+    settle(tx, writer, link, &outcome);
     class
 }
 
@@ -314,9 +328,7 @@ enum ProbeOutcome {
     Failed {
         text: String,
         class: ProbeClass,
-        evidence: Option<leas_native::error::FailureEvidence>,
         transport_ms: Option<u64>,
-        transport_failed: bool,
         auth_ack: leas_native::protocol::AuthAck,
     },
 }
@@ -330,15 +342,13 @@ impl ProbeOutcome {
             Self::Failed { class, .. } => Some(*class),
         }
     }
-    /// A failure that proves nothing (the probe never ran): the marker text
-    /// is what the row shows.
+    /// A failure that proves nothing (the probe never ran); it is counted in
+    /// the batch histogram only.
     fn soft_failure(text: impl Into<String>) -> Self {
         Self::Failed {
             text: text.into(),
             class: ProbeClass::Config,
-            evidence: None,
             transport_ms: None,
-            transport_failed: false,
             auth_ack: leas_native::protocol::AuthAck::NotApplicable,
         }
     }
@@ -348,6 +358,10 @@ impl ProbeOutcome {
 /// `stage_result`/`emit_result` pair performs, with `TestType::SpeedTest` so
 /// `apply_test_result` writes `speed_bps` and clears the verdict on success.
 ///
+/// A FAILED download stages nothing: a speed probe proves the tunnel only when
+/// bytes arrive. The verdict columns belong to the real probe, whose marker
+/// must survive a target that cannot be reached from the exit.
+///
 /// `speed_bps` is the peak 1-second-windowed rate in BITS per second (the
 /// column's unit); the bytes→bits conversion happens once, in
 /// `run_one_speed_probe`, at the engine boundary.
@@ -356,54 +370,36 @@ fn settle(
     writer: &Arc<leas_db::WriteBehind<leas_db::LinkSpec>>,
     link: &leas_db::models::ProfileStats,
     outcome: &ProbeOutcome,
-    // The protocol row's security fingerprint: an approximated fingerprint
-    // suppresses the purge verdict — the same rule the real probe's `purge_for`
-    // applies (a dial on a roster-mapped row proves nothing about the config
-    // the row ASKED for).
-    fp: Option<&str>,
 ) {
-    let (speed_bps, transport_ms, error, purge, marker_kind, auth_ack) = match outcome {
+    let (speed_bps, transport_ms, auth_ack, error) = match outcome {
         ProbeOutcome::Ok {
             speed_bps,
             transport_ms,
             auth_ack,
-        } => (Some(*speed_bps), *transport_ms, None, None, None, *auth_ack),
+        } => (Some(*speed_bps), *transport_ms, *auth_ack, None),
         ProbeOutcome::Failed {
             text,
-            evidence,
             transport_ms,
-            transport_failed,
             auth_ack,
             ..
-        } => (
-            None,
-            *transport_ms,
-            Some(text.clone()),
-            // The purge verdict comes from the typed evidence, exactly as the
-            // real probe's does (`purge_for` in ping.rs). The security
-            // fingerprint is the row's own; a speed probe carries the same
-            // row, so it is read here, not from a second source.
-            evidence.and_then(|ev| crate::ops::purge::reason_for(ev, fp)),
-            // A TRANSPORT-stage failure is the `[fast]` marker even though
-            // this was a download (spec D1's "not measurable" outcome).
-            transport_failed.then_some(leas_db::models::ProfileErr::Fast),
-            *auth_ack,
-        ),
+        } => (None, *transport_ms, *auth_ack, Some(text.clone())),
     };
-    let mut row = link.clone();
-    if let Some(groups) = crate::ops::events::apply_test_result(
-        &mut row,
-        TestType::SpeedTest,
-        None,
-        transport_ms,
-        speed_bps,
-        None,
-        error.as_deref(),
-        purge,
-        marker_kind,
-        Some(auth_ack),
-    ) {
-        writer.stage(&row, groups);
+    if let ProbeOutcome::Ok { .. } = outcome {
+        let mut row = link.clone();
+        if let Some(groups) = crate::ops::events::apply_test_result(
+            &mut row,
+            TestType::SpeedTest,
+            None,
+            transport_ms,
+            speed_bps,
+            None,
+            None,
+            None,
+            None,
+            Some(auth_ack),
+        ) {
+            writer.stage(&row, groups);
+        }
     }
     let endpoint_id = link.endpoint_id.get();
     let _ = tx.try_send(CoreEvent::TestTypeUpdate {
@@ -422,10 +418,73 @@ fn settle(
             speed_bps,
             ip_info: None,
             error,
-            purge,
-            marker_kind,
+            purge: None,
+            marker_kind: None,
             auth_ack: Some(auth_ack),
         },
         "speed_test_result",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A failed download is counted, not persisted: nothing is staged for the
+    /// row (the Alive scope and the rank law read the marker), while the UI
+    /// still hears about the failure through the result event.
+    #[tokio::test]
+    async fn a_failed_download_stages_no_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            leas_db::Database::open(dir.path().join("speed.db"))
+                .await
+                .unwrap(),
+        );
+        let writer: Arc<leas_db::WriteBehind<leas_db::LinkSpec>> =
+            leas_db::WriteBehind::new(db, 8, Duration::from_secs(1));
+        let link = crate::ops::profiles::test_support::fake_row(1, "h.example", 1)
+            .links
+            .remove(0);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let outcome = ProbeOutcome::Failed {
+            text: "timeout on probe attempt (limit 5s)".to_string(),
+            class: ProbeClass::Timeout,
+            transport_ms: Some(90),
+            auth_ack: leas_native::protocol::AuthAck::NotApplicable,
+        };
+        settle(&tx, &writer, &link, &outcome);
+
+        assert!(
+            writer
+                .get(&(
+                    link.protocol_id,
+                    link.endpoint_id,
+                    leas_db::LinkGroups::RESULT
+                ))
+                .is_none(),
+            "a failed download must stage nothing"
+        );
+        assert_eq!(writer.staged_len(), 0);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CoreEvent::TestTypeUpdate {
+                test_type: TestType::SpeedTest,
+                ..
+            })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CoreEvent::SpeedTestResult {
+                error: Some(_),
+                speed_bps: None,
+                ..
+            })
+        ));
+    }
 }

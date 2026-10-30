@@ -383,16 +383,18 @@ pub async fn speed_fetch(
     // ── STAGE 2: PROTOCOL + DOWNLOAD ────────────────────────────────────
     let ctx = crate::context::LinkContext::with_auth_ack(params.clone(), params.target.clone());
     let ack_slot = ctx.ack.clone();
-    let attempt = async move {
-        let tunnel = if params.mux {
+    // `req.timeout` bounds the TUNNEL BUILD only. The download owns its own
+    // deadline (`max_duration`) and its own request-head budget, so a healthy
+    // but slow link is not severed by the real probe's latency budget.
+    let build = async move {
+        if params.mux {
             let mux = crate::chain::finish_chain_mux(&ctx, dialed).await?;
-            crate::mux_session::open_session(mux, &params.target).await?
+            crate::mux_session::open_session(mux, &params.target).await
         } else {
-            crate::chain::finish_chain(&ctx, dialed).await?
-        };
-        speed_over(tunnel, req).await
+            crate::chain::finish_chain(&ctx, dialed).await
+        }
     };
-    let peak = Box::pin(tokio::time::timeout(req.timeout, attempt))
+    let tunnel = Box::pin(tokio::time::timeout(req.timeout, build))
         .await
         .map_err(|_| {
             // Same rule as `fetch`: the transport span rides the failure, and
@@ -411,6 +413,11 @@ pub async fn speed_fetch(
             transport_span: Some(transport_span),
             auth_ack: ack_slot.get(),
         })?;
+    let peak = speed_over(tunnel, req).await.map_err(|error| ProbeError {
+        error,
+        transport_span: Some(transport_span),
+        auth_ack: ack_slot.get(),
+    })?;
     Ok(SpeedResponse {
         peak_bytes_per_sec: peak,
         transport_span,
@@ -442,9 +449,18 @@ pub async fn speed_over<S: crate::Stream + 'static>(
     req: &SpeedRequest<'_>,
 ) -> Result<u64, NativeError> {
     let stream: BoxStream = if req.https {
-        let tls = client::connect(Box::new(io) as BoxStream, &tls_config(req.host))
-            .await
-            .map_err(target_leg_error)?;
+        // The target handshake is PROTOCOL-stage work and sits under the same
+        // budget as its request head; the body remains under `max_duration`.
+        let tls = tokio::time::timeout(
+            req.timeout,
+            client::connect(Box::new(io) as BoxStream, &tls_config(req.host)),
+        )
+        .await
+        .map_err(|_| NativeError::Timeout {
+            step: "speed tls handshake",
+            limit: req.timeout,
+        })?
+        .map_err(target_leg_error)?;
         Box::new(tls)
     } else {
         Box::new(io)
@@ -1248,6 +1264,49 @@ mod tests {
             "the download deadline must bound the wait: {:?}",
             started.elapsed()
         );
+        server.abort();
+    }
+
+    /// The target TLS handshake sits under the protocol budget: before the
+    /// split it had no deadline of its own, and the only bound was the outer
+    /// timeout that also cut the body.
+    #[tokio::test]
+    async fn a_silent_target_handshake_times_out_under_the_protocol_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read the ClientHello, answer nothing.
+            let mut hello = [0u8; 512];
+            let _ = sock.read(&mut hello).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let req = SpeedRequest {
+            host: "127.0.0.1",
+            port: addr.port(),
+            https: true,
+            path: "/50mb.test",
+            timeout: Duration::from_millis(300),
+            transport_timeout: Duration::from_secs(5),
+            max_duration: Duration::from_secs(5),
+            min_duration: Duration::from_secs(3),
+            min_bytes: 1 << 20,
+        };
+        let started = std::time::Instant::now();
+        let err = speed_over(stream, &req).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::NativeError::Timeout {
+                    step: "speed tls handshake",
+                    ..
+                }
+            ),
+            "the target handshake must be bounded: {err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
         server.abort();
     }
 }

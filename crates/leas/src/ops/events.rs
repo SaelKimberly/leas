@@ -803,18 +803,28 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                 && !error.as_deref().is_some_and(|e| {
                                     e.starts_with(crate::ops::ping::UNTESTABLE_PREFIX)
                                 });
-                            if let Some(groups) = apply_test_result(
-                                link,
-                                test_type,
-                                latency_ms,
-                                transport_ms,
-                                speed_bps,
-                                ip_info.as_deref(),
-                                error.as_deref(),
-                                purge,
-                                marker_kind,
-                                auth_ack,
-                            ) {
+                            // A FAILED DOWNLOAD carries no verdict: a speed
+                            // test proves the tunnel only when bytes arrive.
+                            // `speed_test::settle` stages nothing for a failure;
+                            // this is the UI half of the same rule, so the row's
+                            // real-probe marker is neither replaced nor cleared.
+                            let verdict = if test_type == TestType::SpeedTest && error.is_some() {
+                                None
+                            } else {
+                                apply_test_result(
+                                    link,
+                                    test_type,
+                                    latency_ms,
+                                    transport_ms,
+                                    speed_bps,
+                                    ip_info.as_deref(),
+                                    error.as_deref(),
+                                    purge,
+                                    marker_kind,
+                                    auth_ack,
+                                )
+                            };
+                            if let Some(groups) = verdict {
                                 // STABILITY, single pings only. A batch stages
                                 // its own samples (its rows are off-page here),
                                 // so sampling in both would count every batch
@@ -1848,6 +1858,46 @@ mod tests {
             "no evidence, no verdict"
         );
         assert_eq!(link.purge_reason, None);
+    }
+
+    /// A failed speed test is not a link verdict: the row keeps the real
+    /// probe's measurement and gains no marker (the Alive scope counts a
+    /// marker as dead, and a target-side failure proves nothing).
+    #[tokio::test]
+    async fn a_failed_speed_test_leaves_the_links_verdict_alone() {
+        let (mut state, tx) = event_state().await;
+        let mut ep = fake_row(1, "5.5.5.5", 1);
+        let pid = ep.links[0].protocol_id.get();
+        ep.links[0].latency.real_delay = Some(120);
+        ep.links[0].error = None;
+        state.endpoints = vec![ep];
+        state.testing_profiles.insert((1, pid));
+
+        tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 1,
+            protocol_id: pid,
+            test_type: TestType::SpeedTest,
+            transport_ms: Some(90),
+            latency_ms: None,
+            speed_bps: None,
+            ip_info: None,
+            error: Some("timeout on probe attempt (limit 5s)".to_string()),
+            purge: None,
+            marker_kind: None,
+            auth_ack: None,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+
+        let link = state.endpoints[0]
+            .links
+            .iter()
+            .find(|l| l.protocol_id.get() == pid)
+            .expect("link");
+        assert_eq!(link.error, None, "a failed download is not a verdict");
+        assert_eq!(link.latency.real_delay, Some(120), "the measurement stays");
+        assert_eq!(link.speed_bps, None);
     }
 
     /// Multi-protocol endpoint fixture. Protocol ids `[start..start+n]`.
