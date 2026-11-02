@@ -24,9 +24,15 @@ pub const HS_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 pub const HS_CERTIFICATE: u8 = 0x0B;
 pub const HS_CERTIFICATE_VERIFY: u8 = 0x0F;
 pub const HS_FINISHED: u8 = 0x14;
+/// RFC 8446 §4.6.3 `key_update` — the only post-handshake message besides
+/// `NewSessionTicket` that this engine accepts.
+pub const HS_KEY_UPDATE: u8 = 0x18;
 /// RFC 8879 §7.2 `compressed_certificate`, sent in place of `Certificate`
 /// when the client offered `compress_certificate`.
 pub const HS_COMPRESSED_CERTIFICATE: u8 = 0x19;
+/// RFC 8446 §4.4.1 `message_hash`: a synthetic transcript message standing in
+/// for `ClientHello1` after a `HelloRetryRequest` (never sent on the wire).
+pub const HS_MESSAGE_HASH: u8 = 0xFE;
 
 /// Maximum acceptable record payload: 2^14 plaintext plus 272 slack — the
 /// TLS 1.3 `TLSInnerPlaintext` type byte (1), the maximum record padding

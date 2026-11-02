@@ -56,7 +56,7 @@ use leas_tls::verify::WebPkiVerifier;
 const HOST: &str = "tls.peet.ws";
 const PORT: u16 = 443;
 const API_PATH: &str = "/api/all";
-const ALPN: &[&str] = &["h2", "http/1.1"];
+const ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
 /// Locked expected fingerprints of the two kept hand profiles (captured
 /// live against tls.peet.ws with this engine: Chrome 130 on 2026-08-11,
 /// Edge 106 in Task 7/8 — see the task report). Both share the same

@@ -16,7 +16,7 @@
 //! IP caveat: this host's IP is datacenter/VPN, so amiabot's absolute scores
 //! are inflated (~+48 points) regardless of TLS/header fidelity. Compare
 //! profiles relatively and prefer the Cloudflare score. See
-//! `docs/amiabot-roster-report.md`.
+//! `docs/research/amiabot-roster-report.md`.
 //!
 //! Run a single profile:
 //! ```text
@@ -236,7 +236,7 @@ async fn sweep_one(entry: GenEntry) -> Result<Row, Box<dyn std::error::Error + S
     // consume. Strip the extension for the sweep so every kept profile
     // completes the handshake and yields a verdict; the engine still
     // decompresses RFC 8879 certs from servers that do send them. See
-    // `docs/amiabot-roster-report.md` §Limitations.
+    // `docs/research/amiabot-roster-report.md` §Limitations.
     let mut spec = spec;
     spec.extensions
         .retain(|e| !matches!(e, ExtensionSpec::CompressCertificate(_)));

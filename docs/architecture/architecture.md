@@ -743,11 +743,11 @@ serialize — REALITY must agree twice with the same scalar.
   legacy KDFs, QUIC header protection) is inventoried in `docs/reference/crypto-dependencies.md`; both
   crypto crates carry `#![forbid(unsafe_code)]`.
 - `record/` — record framing, `read_record`, `TlsStream<S>`.
-- `handshake/` — client handshake (HRR detection, `ServerVerifier` seam,
+- `handshake/` — client handshake (one HelloRetryRequest retry, plain TLS only; `server_hello.rs` parses ServerHello/HRR, `flight.rs` the encrypted flight; `ServerVerifier` seam,
   multi-record flight reassembly); TLS 1.2 fallback driver in `handshake/tls12.rs`
   reached on a 1.2 ServerHello.
 - `verify/` — `WebPkiVerifier` (roots / CA DER / `insecure` / `pin_sha256`).
-- `reality/` — `HelloProvisioner` + 9-step wire contract, `FixedChrome133`,
+- `reality/` — `HelloProvisioner` + 9-step wire contract, `FixedChrome130Hybrid`,
   auth-key/session-seal/server-auth.
 - `http2/` — minimal h2 layer for the tls.peet.ws grader (not a client).
 

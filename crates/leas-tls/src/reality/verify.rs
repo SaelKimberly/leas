@@ -7,7 +7,7 @@
 //! chain check — a REALITY server is authenticated purely by the HMAC +
 //! Ed25519 pair.
 
-use ring::{digest, hmac, signature};
+use ring::{hmac, signature};
 use subtle::ConstantTimeEq as _;
 
 use crate::error::{Result, TlsError};
@@ -231,14 +231,14 @@ pub fn verify_server(
     cert_der: &[u8],
     cv_message: &[u8],
     auth_key: &[u8; 32],
-    transcript: &[u8],
-    digest_alg: &'static digest::Algorithm,
+    // `Transcript-Hash(ClientHello .. Certificate)`, already hashed by the
+    // key schedule's streaming context (RFC 8446 §4.4.3).
+    transcript_hash: &[u8],
 ) -> Result<()> {
     verify_certificate_hmac(cert_der, auth_key)?;
     let public_key = extract_ed25519_public_key(cert_der)?;
     let signature = extract_certificate_verify_signature(cv_message)?;
-    let transcript_hash = digest::digest(digest_alg, transcript);
-    verify_certificate_verify_signature(&public_key, &signature, transcript_hash.as_ref())
+    verify_certificate_verify_signature(&public_key, &signature, transcript_hash)
 }
 
 // ── DER helpers ────────────────────────────────────────────────────────────
@@ -335,6 +335,7 @@ fn u24(b: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::digest;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     /// Builds a minimal TLS 1.3 `Certificate` message containing one DER
@@ -542,9 +543,9 @@ mod tests {
         let mut cv = vec![0x0f, 0x00, 0x00, 0x44, 0x08, 0x07, 0x00, 0x40];
         cv.extend_from_slice(signature.as_ref());
 
-        verify_server(&cert_der, &cv, &auth_key, transcript, &digest::SHA256).unwrap();
+        verify_server(&cert_der, &cv, &auth_key, &th).unwrap();
 
         // A wrong auth_key fails the whole chain.
-        assert!(verify_server(&cert_der, &cv, &[0x43; 32], transcript, &digest::SHA256).is_err());
+        assert!(verify_server(&cert_der, &cv, &[0x43; 32], &th).is_err());
     }
 }

@@ -328,7 +328,7 @@ pub(crate) async fn drive12<S: AsyncRead + AsyncWrite + Unpin + Send>(
         suite: cs,
         signature_scheme: flight.ske.sigalg,
         signature: &flight.ske.signature,
-        signed_data: &signed_data,
+        signed: crate::handshake::SignedData::Tls12Raw(&signed_data),
     })?;
 
     // 4./5. ECDHE shared secret + the client's public point, per curve.

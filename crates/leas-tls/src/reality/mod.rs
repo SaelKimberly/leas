@@ -12,7 +12,7 @@
 //! 3. `auth_key` = HKDF-SHA256(auth_shared, salt = random[0..20], info b"REALITY").
 //! 4. `SessionId` plaintext 16 B = version(1,8,0) + pad(1) + timestamp u32
 //!    BE + `short_id` (≤8 bytes, zero-padded).
-//! 5. `ClientHello`: Chrome-133 fingerprint, SNI steal target, X25519
+//! 5. `ClientHello`: Chrome 130 + hybrid fingerprint, SNI steal target, X25519
 //!    keyshare, suites 0x1301-03, ALPN h2+http/1.1.
 //! 6. AAD = hello with `SessionId` zeroed; nonce = random[20..32];
 //!    `SessionId` = AES-256-GCM(auth_key, nonce, plaintext, aad).
@@ -43,7 +43,7 @@ use crate::record::stream::TlsStream;
 use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
 
 /// The `ClientHello` ALPN list REALITY always offers.
-const REALITY_ALPN: &[&str] = &["h2", "http/1.1"];
+const REALITY_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
 
 // ── Provisioner contract ───────────────────────────────────────────────────
 
@@ -69,8 +69,9 @@ pub trait HelloProvisioner: Send + Sync {
 pub struct HelloProvisionParams<'a> {
     /// The SNI steal target (the `server_name` extension host).
     pub server_name: &'a str,
-    /// ALPN protocols to offer; `None` uses the spec's own list.
-    pub alpn: Option<&'a [&'a str]>,
+    /// ALPN protocols to offer; `None` uses the spec's own list. Protocol
+    /// names are opaque bytes (RFC 7301 §3.1).
+    pub alpn: Option<&'a [&'a [u8]]>,
     /// The connector's X25519 public key, injected into `key_share`.
     pub x25519_pub: &'a [u8; 32],
     /// The connector's ML-KEM-768 encapsulation key (1184 bytes) when the
@@ -103,7 +104,7 @@ impl ProvisionedHello {
 /// hybrid share; the JA4-driven profile omits it because JA3/JA4 do not
 /// fingerprint key shares. Grafting it back keeps REALITY's post-quantum
 /// path alive after the roster reduction dropped the Chrome-133 preset.
-fn fixed_chrome_spec() -> ClientHelloSpec {
+fn chrome_130_hybrid_spec() -> ClientHelloSpec {
     let mut spec = crate::profiles::hand_selected::chrome_130();
     for ext in &mut spec.extensions {
         match ext {
@@ -119,46 +120,51 @@ fn fixed_chrome_spec() -> ClientHelloSpec {
     spec
 }
 
+/// The fixed spec, built once: both `provision` and `offers_hybrid_key_share`
+/// ask for it on every connect, and it is a pure constant.
+static CHROME_130_HYBRID: std::sync::LazyLock<ClientHelloSpec> =
+    std::sync::LazyLock::new(chrome_130_hybrid_spec);
+
 /// Fixed Chrome-shaped provisioner (first engine; ported from shoes).
 ///
 /// Serves the surviving wire-exact Chrome desktop spec
 /// (`profiles::hand_selected::chrome_130` plus the hybrid key share — see
-/// [`fixed_chrome_spec`]). The Chrome-133 hand profile was dropped in the
+/// [`chrome_130_hybrid_spec`]). The Chrome-133 hand profile was dropped in the
 /// roster reduction.
-pub struct FixedChrome133;
+pub struct FixedChrome130Hybrid;
 
 /// A `HelloProvisioner` shaped by any concrete hello spec: REALITY's
 /// auth payload rides the session-id slot of the given spec.
+///
+/// The spec is resolved ONCE at construction: `Fingerprint::resolve` is a
+/// table walk that also clones the `ClientHelloSpec`, and the provisioner is
+/// asked for both `offers_hybrid_key_share` and `provision` on every connect.
 pub struct SpecProvisioner {
-    spec_source: Box<dyn Fn() -> ClientHelloSpec + Send + Sync>,
+    spec: ClientHelloSpec,
 }
 
 impl SpecProvisioner {
-    /// Shapes the provisioner from a spec-producing closure.
+    /// Shapes the provisioner from a concrete spec.
     #[must_use]
-    pub fn new(spec_source: impl Fn() -> ClientHelloSpec + Send + Sync + 'static) -> Self {
-        Self {
-            spec_source: Box::new(spec_source),
-        }
+    pub const fn new(spec: ClientHelloSpec) -> Self {
+        Self { spec }
     }
 }
 
-impl From<&Fingerprint> for SpecProvisioner {
-    fn from(fp: &Fingerprint) -> Self {
-        // REALITY provisioning needs a concrete hello; unknown identities
-        // panic here by contract (resolve errors are a configuration bug —
-        // validated upstream when the fingerprint was configured).
-        let spec_source = {
-            let fp = fp.clone();
-            move || fp.resolve().expect("fingerprint must resolve").spec
-        };
-        Self::new(spec_source)
+impl TryFrom<&Fingerprint> for SpecProvisioner {
+    type Error = TlsError;
+
+    /// Resolves the identity at construction, so an unresolvable fingerprint
+    /// is a typed `Err` at configuration time — never a panic inside a dial.
+    fn try_from(fp: &Fingerprint) -> core::result::Result<Self, Self::Error> {
+        let resolved = fp.resolve().map_err(|e| TlsError::Spec(e.to_string()))?;
+        Ok(Self::new(resolved.spec))
     }
 }
 
 impl HelloProvisioner for SpecProvisioner {
     fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello> {
-        let mut spec = (self.spec_source)();
+        let mut spec = self.spec.clone();
         spec.session_id = SessionIdSpec::AuthPayload { len: 32 };
         let built = build_hello(
             &spec,
@@ -180,7 +186,7 @@ impl HelloProvisioner for SpecProvisioner {
     }
 
     fn offers_hybrid_key_share(&self) -> bool {
-        (self.spec_source)().extensions.iter().any(|ext| {
+        self.spec.extensions.iter().any(|ext| {
             matches!(
                 ext,
                 ExtensionSpec::KeyShare(groups)
@@ -195,9 +201,13 @@ impl HelloProvisioner for SpecProvisioner {
     }
 }
 
-impl HelloProvisioner for FixedChrome133 {
+impl HelloProvisioner for FixedChrome130Hybrid {
     fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello> {
-        SpecProvisioner::new(fixed_chrome_spec).provision(params)
+        SpecProvisioner::new(CHROME_130_HYBRID.clone()).provision(params)
+    }
+
+    fn offers_hybrid_key_share(&self) -> bool {
+        SpecProvisioner::new(CHROME_130_HYBRID.clone()).offers_hybrid_key_share()
     }
 }
 
@@ -267,13 +277,22 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
     stream: S,
     params: RealityParams<'_>,
 ) -> Result<TlsStream<S>> {
+    // One box per connection, so the shared driver's large future does not
+    // propagate into every caller's stack frame (clippy::large_futures).
+    Box::pin(connect_reality_inner(stream, params)).await
+}
+
+async fn connect_reality_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    params: RealityParams<'_>,
+) -> Result<TlsStream<S>> {
     // 1. Ephemeral X25519 key pair (the ClientHello keyshare). The
     //    connector draws no randomness of its own: the client random inside
     //    the provisioned hello *is* the REALITY random.
     let keypair = X25519KeyPair::generate(params.rng)?;
 
     // 1b. Ephemeral ML-KEM-768 key pair: only when the provisioner's spec
-    //     offers a hybrid key-share entry (the Chrome-133 family does) —
+    //     offers a hybrid key-share entry (the fixed Chrome 130 spec does) —
     //     the encapsulation key then flows into the provisioned key share.
     //     Classical-only profiles skip the ~100 µs keygen entirely.
     let (pq_public, pq_secret) = if params.provisioner.offers_hybrid_key_share() {
@@ -283,7 +302,7 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
         (None, None)
     };
 
-    // 2. Provision the Chrome-133-shaped ClientHello with a zeroed
+    // 2. Provision the fixed Chrome 130 + hybrid ClientHello with a zeroed
     //    AuthPayload slot; the connector's keyshare and rng flow through.
     let mut hello = params.provisioner.provision(&HelloProvisionParams {
         server_name: params.server_name,
@@ -326,12 +345,15 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
         &hello.handshake_bytes,
         hello.session_id(),
         keypair,
-        pq_secret.as_ref(),
+        pq_secret,
         params.server_name,
-        &[],
         ServerAuth::Reality {
             auth_key: &auth_key,
         },
+        // HRR under REALITY is a documented non-goal: the sealed session id is
+        // bound to the FIRST hello, so a retry would need a re-seal this
+        // engine does not define (see `docs/reference/native-core.md`).
+        None,
     )
     .await?;
     match outcome {
@@ -355,6 +377,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::fingerprints::Browser;
     use crate::hello::parse::parse_hello;
     use crate::http2;
     use parking_lot::Mutex;
@@ -370,13 +393,64 @@ mod tests {
         out
     }
 
-    /// The Chrome-133 provisioner lays out a valid `ClientHello` with a
+    /// An unresolvable identity is a typed error at construction, never a
+    /// panic inside a dial (the retired `From<&Fingerprint>` resolved lazily
+    /// with `.expect`).
+    #[test]
+    fn spec_provisioner_refuses_an_unresolvable_fingerprint() {
+        let fp = Fingerprint::new(Browser::Chrome).with_version(200);
+        match SpecProvisioner::try_from(&fp) {
+            Err(TlsError::Spec(_)) => {}
+            Err(other) => panic!("expected a spec error, got {other:?}"),
+            Ok(_) => panic!("chrome v200 has no roster row; try_from must refuse"),
+        }
+    }
+
+    /// The provisioner holds the resolved spec, so the hybrid question and
+    /// the built hello cannot disagree — the invariant that the old
+    /// per-call closure re-resolve could break.
+    #[test]
+    fn spec_provisioner_share_report_matches_its_hello() {
+        let rng = ring::rand::SystemRandom::new();
+        for (version, expected_hybrid) in [(130_u16, false), (143, true)] {
+            let fp = Fingerprint::new(Browser::Chrome).with_version(version);
+            let provisioner = match SpecProvisioner::try_from(&fp) {
+                Ok(p) => p,
+                Err(e) => panic!("chrome v{version} must resolve: {e:?}"),
+            };
+            let (mlkem_pk, _) = Mlkem768::generate_keypair();
+            let hello = provisioner
+                .provision(&HelloProvisionParams {
+                    server_name: "www.microsoft.com",
+                    alpn: Some(REALITY_ALPN),
+                    x25519_pub: &[0xAB; 32],
+                    mlkem768_pub: Some(mlkem_pk.as_bytes()),
+                    rng: &rng,
+                })
+                .unwrap();
+            let parsed = parse_hello(&hello.handshake_bytes).unwrap();
+            let key_share = parsed.extension(0x0033).expect("key_share");
+            let hello_offers_hybrid = key_share
+                .windows(2)
+                .any(|w| w == 0x11EC_u16.to_be_bytes());
+            assert_eq!(
+                provisioner.offers_hybrid_key_share(),
+                hello_offers_hybrid,
+                "chrome v{version}: the report and the hello must agree"
+            );
+            assert_eq!(hello_offers_hybrid, expected_hybrid, "chrome v{version}");
+            assert_eq!(hello.session_id_range.len(), 32);
+        }
+    }
+
+    /// The fixed Chrome 130 + hybrid provisioner lays out a valid
+    /// `ClientHello` with a
     /// 32-byte zeroed `AuthPayload` slot at the reported range.
     #[test]
     fn fixed_chrome133_provisioner_builds_auth_payload_hello() {
         let rng = ring::rand::SystemRandom::new();
         let (mlkem_pk, _) = Mlkem768::generate_keypair();
-        let hello = FixedChrome133
+        let hello = FixedChrome130Hybrid
             .provision(&HelloProvisionParams {
                 server_name: "www.microsoft.com",
                 alpn: Some(REALITY_ALPN),
@@ -398,7 +472,7 @@ mod tests {
         );
         assert_eq!(parsed.session_id, vec![0u8; 32]);
 
-        // Chrome-133 surface: TLS 1.3 suites, X25519 keyshare carrying the
+        // Chrome surface: TLS 1.3 suites, X25519 keyshare carrying the
         // connector's public key, SNI steal target, ALPN h2 + http/1.1.
         for suite in [0x1301u16, 0x1302, 0x1303] {
             assert!(
@@ -449,7 +523,7 @@ mod tests {
     fn fixed_chrome_provisioner_keeps_hybrid_share_and_chrome130_ja4() {
         // The roster reduction dropped the Chrome-133 preset; the fixed
         // provisioner now shapes the surviving chrome_130 spec with the
-        // X25519MLKEM768 key share grafted back (see `fixed_chrome_spec`).
+        // X25519MLKEM768 key share grafted back (see `chrome_130_hybrid_spec`).
         // Assert both halves of that contract: the hello still offers the
         // 1216-byte hybrid share (REALITY's PQ path), and its JA4-relevant
         // wire — cipher set, extension ids, signature-alg order — still
@@ -463,7 +537,7 @@ mod tests {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),
         };
-        let fixed = FixedChrome133
+        let fixed = FixedChrome130Hybrid
             .provision(&HelloProvisionParams {
                 server_name: "www.microsoft.com",
                 alpn: Some(REALITY_ALPN),
@@ -666,7 +740,7 @@ mod tests {
                 server_name: "localhost",
                 public_key: &[0xAB; 32],
                 short_id: &[],
-                provisioner: &FixedChrome133,
+                provisioner: &FixedChrome130Hybrid,
                 rng: &rng,
                 spider: &SpiderConfig::default(),
             },
@@ -947,7 +1021,7 @@ mod tests {
                     server_name: "localhost",
                     public_key: &static_pub,
                     short_id: &[],
-                    provisioner: &FixedChrome133,
+                    provisioner: &FixedChrome130Hybrid,
                     rng: &rng,
                     spider: &SpiderConfig::default(),
                 },

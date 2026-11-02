@@ -237,7 +237,10 @@ pub type TrafficSecrets = (Zeroizing<[u8; MAX_HASH_LEN]>, Zeroizing<[u8; MAX_HAS
 /// Mirrors the `tls-fingerprint` flow: `new` seeds the `EarlySecret`, then
 pub struct KeySchedule {
     suite: CipherSuiteId,
-    transcript: Vec<u8>,
+    /// Streaming transcript hash (RFC 8446 §4.4.1). Checkpoints clone the
+    /// context and finish the clone: ring's `Context` is `Clone` and
+    /// `finish(self)` consumes, so `transcript_hash(&self)` stays O(state).
+    transcript: digest::Context,
 }
 
 /// Maps an `HKDF-Expand-Label` label to its full `tls13 ...` wire form
@@ -256,37 +259,42 @@ fn tls13_label(label: &str) -> Result<&'static [u8]> {
         "c ap traffic" => Ok(b"tls13 c ap traffic"),
         "s ap traffic" => Ok(b"tls13 s ap traffic"),
         "exp master" => Ok(b"tls13 exp master"),
+        "traffic upd" => Ok(b"tls13 traffic upd"),
         _ => Err(TlsError::Crypto("unknown HKDF-Expand-Label label".into())),
     }
 }
 
 impl KeySchedule {
     /// A fresh schedule for `suite` with an empty transcript.
+    ///
+    /// Not `const`: `ring::digest::Context::new` is not a const fn (this is
+    /// the only reason the previous `Vec`-backed constructor could be).
     #[must_use]
-    pub const fn new(suite: CipherSuiteId) -> Self {
+    pub fn new(suite: CipherSuiteId) -> Self {
         Self {
             suite,
-            transcript: Vec::new(),
+            transcript: digest::Context::new(suite.digest()),
         }
     }
 
     /// Appends one handshake message to the transcript.
     pub fn add_transcript(&mut self, hs_msg: &[u8]) {
-        self.transcript.extend_from_slice(hs_msg);
+        self.transcript.update(hs_msg);
     }
 
-    /// Transcript-Hash of everything added so far: stack return, no `Vec`.
+    /// Transcript-Hash of everything added so far: stack return, no buffer.
     /// Only `hash[..len]` is meaningful (see [`transcript_digest`]).
+    ///
+    /// The context is CLONED and the clone finished — `finish` consumes, and
+    /// the schedule keeps appending messages after every checkpoint.
     #[must_use]
     pub fn transcript_hash(&self) -> ([u8; MAX_HASH_LEN], usize) {
-        transcript_digest(self.suite, &self.transcript)
-    }
-
-    /// The raw accumulated transcript (handshake messages in wire order),
-    /// for verifiers that hash it themselves.
-    #[must_use]
-    pub fn transcript_bytes(&self) -> &[u8] {
-        &self.transcript
+        let digest = self.transcript.clone().finish();
+        let bytes = digest.as_ref();
+        let mut out = [0u8; MAX_HASH_LEN];
+        let len = bytes.len().min(MAX_HASH_LEN);
+        out[..len].copy_from_slice(&bytes[..len]);
+        (out, len)
     }
 
     /// HKDF-Extract(salt, ikm) → PRK bytes.
@@ -451,6 +459,16 @@ impl KeySchedule {
         let c = self.derive_secret(master, "c ap traffic")?;
         let s = self.derive_secret(master, "s ap traffic")?;
         Ok((c, s))
+    }
+
+    /// `KeyUpdate`: the next generation of a traffic secret =
+    /// `HKDF-Expand-Label(secret, "traffic upd", "", hash_len)` (RFC 8446
+    /// §7.2). Only `secret[..hash_len]` is valid.
+    pub fn update_traffic_secret(
+        &self,
+        secret: &[u8],
+    ) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
+        self.hkdf_expand_label_stack(secret, "traffic upd", &[], self.suite.hash_len())
     }
 
     /// `Finished` key = `HKDF-Expand-Label(traffic_secret, "finished", "",

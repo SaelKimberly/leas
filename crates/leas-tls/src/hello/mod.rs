@@ -21,8 +21,9 @@ pub use crate::SecureRandom;
 /// Runtime inputs for a single `ClientHello` build.
 pub struct BuildParams<'a> {
     pub server_name: &'a str,
-    /// `None` → use the spec's ALPN list.
-    pub alpn: Option<&'a [&'a str]>,
+    /// `None` → use the spec's ALPN list. Protocol names are opaque bytes
+    /// (RFC 7301 §3.1) — no UTF-8 requirement.
+    pub alpn: Option<&'a [&'a [u8]]>,
     pub x25519_pub: &'a [u8; 32],
     /// ML-KEM-768 encapsulation key (1184 bytes) for a hybrid key-share
     /// entry; required iff the spec's `key_share` contains one.
@@ -60,7 +61,100 @@ impl BuiltHello {
 /// the target.
 const PADDING_TARGET: usize = 512;
 
-/// Builds a `ClientHello` handshake message and record from a spec.
+/// Records every byte a [`build_hello`] call draws, so the exact same
+/// `ClientHello` shape can be rebuilt.
+///
+/// RFC 8446 §4.1.2 allows `ClientHello2` to differ from `ClientHello1` only in
+/// `key_share`, `cookie`, `early_data` and padding — but the client random, the
+/// GREASE values (including one draw per further placeholder), the ECH grease
+/// and the `Random32` session id all come from the RNG. Replaying the recorded
+/// draw stream is what keeps those bytes identical across a retry.
+pub struct RecordingRng<'a> {
+    inner: &'a dyn SecureRandom,
+    log: std::sync::Mutex<Vec<u8>>,
+}
+
+impl<'a> RecordingRng<'a> {
+    /// Wraps `inner`, recording every byte it hands out.
+    #[must_use]
+    pub fn new(inner: &'a dyn SecureRandom) -> Self {
+        Self {
+            inner,
+            log: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The bytes drawn so far, in draw order.
+    #[must_use]
+    pub fn recorded(&self) -> Vec<u8> {
+        self.log.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+}
+
+impl SecureRandom for RecordingRng<'_> {
+    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified> {
+        self.inner.fill(dest)?;
+        if let Ok(mut log) = self.log.lock() {
+            log.extend_from_slice(dest);
+        }
+        Ok(())
+    }
+}
+
+/// Replays a [`RecordingRng`] draw stream.
+///
+/// A request for more bytes than were recorded is a HARD FAILURE (the `fill`
+/// returns `Err`), never fresh randomness: silently drawing it would emit a
+/// different hello, which is exactly the fingerprint drift the replay exists to
+/// prevent. [`ReplayRng::check`] then names the divergence for the caller.
+pub struct ReplayRng {
+    log: Vec<u8>,
+    cursor: std::sync::atomic::AtomicUsize,
+    diverged: std::sync::atomic::AtomicBool,
+}
+
+impl ReplayRng {
+    /// Replays `log` from the start.
+    #[must_use]
+    pub const fn new(log: Vec<u8>) -> Self {
+        Self {
+            log,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+            diverged: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// `Err` when the rebuild asked for more randomness than the recording
+    /// holds — the two hellos are not the same shape and must not be sent.
+    pub fn check(&self) -> Result<(), TlsError> {
+        if self.diverged.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(TlsError::Handshake(
+                "hello replay diverged: ClientHello2 needs randomness the recording does not cover"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SecureRandom for ReplayRng {
+    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified> {
+        use std::sync::atomic::Ordering;
+        let start = self.cursor.load(Ordering::Relaxed);
+        let end = start.saturating_add(dest.len());
+        let Some(chunk) = self.log.get(start..end) else {
+            // Fail closed: the build aborts instead of emitting a hello the
+            // recording does not cover.
+            self.diverged.store(true, Ordering::Relaxed);
+            dest.fill(0);
+            return Err(ring::error::Unspecified);
+        };
+        dest.copy_from_slice(chunk);
+        self.cursor.store(end, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<BuiltHello, TlsError> {
     // GREASE pairing (Chrome family): the first placeholder in each of
     // {cipher_suites, supported_groups, supported_versions, key_share} is
@@ -190,8 +284,8 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
         match ext {
             ExtensionSpec::Alpn(_) => {
                 match params.alpn {
-                    // The override encodes straight from `&[&str]` — no
-                    // `Vec<String>` staging.
+                    // The override encodes straight from `&[&[u8]]` — no
+                    // `Vec<String>` staging, no encoding check.
                     Some(protos) => encode_alpn_override_into(protos, &mut ext_bytes)?,
                     None => ext.encode_body_into(&rt, &mut ext_bytes)?,
                 }
@@ -418,7 +512,10 @@ fn draw_grease_distinct(
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
+    use rstest::rstest;
+
     use super::{BuildParams, SecureRandom, build_hello, to_record};
+    use crate::error::TlsError;
     use crate::hello::parse::parse_hello;
     use crate::spec::grease::GREASE_PLACEHOLDER;
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
@@ -493,7 +590,7 @@ mod tests {
             &spec,
             &BuildParams {
                 server_name: "tls.peet.ws",
-                alpn: Some(&["h2", "http/1.1"]),
+                alpn: Some(&[b"h2", b"http/1.1"]),
                 x25519_pub: &[0xAB; 32],
                 mlkem768_pub: None,
                 rng: &rng,
@@ -623,7 +720,7 @@ mod tests {
             &spec,
             &BuildParams {
                 server_name: "tls.peet.ws",
-                alpn: Some(&["h2", "http/1.1"]),
+                alpn: Some(&[b"h2", b"http/1.1"]),
                 x25519_pub: &[0xAB; 32],
                 mlkem768_pub: None,
                 rng: &rng,
@@ -721,7 +818,7 @@ mod tests {
             session_id: SessionIdSpec::Random32,
             extensions: vec![ExtensionSpec::Alpn(vec!["spec-only".into()])],
         };
-        let build = |alpn: Option<&[&str]>| {
+        let build = |alpn: Option<&[&[u8]]>| {
             let rng = FixedRandom {
                 bytes: vec![0x42; 64],
                 pos: AtomicUsize::new(0),
@@ -740,7 +837,7 @@ mod tests {
         };
 
         // Some(...) replaces the spec's ALPN list.
-        let overridden = build(Some(&["h2"]));
+        let overridden = build(Some(&[b"h2"]));
         let parsed = parse_hello(&overridden.handshake_bytes).unwrap();
         let alpn = parsed.extension(0x0010).expect("alpn");
         assert!(alpn.windows(2).any(|w| w == b"h2".as_slice()));
@@ -751,6 +848,81 @@ mod tests {
         let parsed = parse_hello(&spec_alpn.handshake_bytes).unwrap();
         let alpn = parsed.extension(0x0010).expect("alpn");
         assert!(alpn.windows(9).any(|w| w == b"spec-only".as_slice()));
+    }
+
+    /// RFC 7301 §3.1 puts no encoding on a protocol name: the override path
+    /// must carry opaque bytes verbatim and impose no UTF-8 requirement.
+    #[rstest]
+    #[case::text(
+        &[b"h2" as &[u8], b"http/1.1"],
+        &[0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1']
+    )]
+    #[case::opaque(&[b"\xff\x00" as &[u8]], &[0x00, 0x03, 0x02, 0xff, 0x00])]
+    fn alpn_override_encodes_opaque_protocol_bytes(
+        #[case] protos: &[&[u8]],
+        #[case] expected_body: &[u8],
+    ) {
+        let spec = ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Empty,
+            extensions: vec![ExtensionSpec::Alpn(vec!["spec-only".into()])],
+        };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
+        let built = build_hello(
+            &spec,
+            &BuildParams {
+                server_name: "example.com",
+                alpn: Some(protos),
+                x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+        )
+        .unwrap();
+        let parsed = parse_hello(&built.handshake_bytes).unwrap();
+        assert_eq!(
+            parsed.extension(0x0010).expect("alpn"),
+            expected_body,
+            "the ALPN body is the list length plus length-prefixed raw bytes"
+        );
+    }
+
+    /// The only length the format cannot express is a protocol name over
+    /// 255 bytes (one-byte prefix, RFC 7301 §3.1).
+    #[test]
+    fn alpn_override_rejects_overlong_protocol() {
+        let spec = ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Empty,
+            extensions: vec![ExtensionSpec::Alpn(vec!["spec-only".into()])],
+        };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
+        let long = [0u8; 256];
+        let result = build_hello(
+            &spec,
+            &BuildParams {
+                server_name: "example.com",
+                alpn: Some(&[long.as_slice()]),
+                x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+        );
+        match result {
+            Err(TlsError::Spec(_)) => {}
+            Err(other) => panic!("expected a spec error, got {other:?}"),
+            Ok(_) => panic!("expected a spec error, got a built hello"),
+        }
     }
 
     #[test]
@@ -839,7 +1011,7 @@ mod tests {
     fn params_fixed(rng: &FixedRandom) -> BuildParams<'_> {
         BuildParams {
             server_name: "tls.peet.ws",
-            alpn: Some(&["h2", "http/1.1"]),
+            alpn: Some(&[b"h2", b"http/1.1"]),
             x25519_pub: &[0xAB; 32],
             mlkem768_pub: None,
             rng,

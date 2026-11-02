@@ -29,7 +29,7 @@ pub struct NativeConnectParams {
     pub resolved_ip: Option<SocketAddr>,
     /// REALITY provisioner for the security phase: which fingerprint shapes
     /// the `ClientHello`. Defaults to
-    /// [`HelloProvisionerChoice::FixedChrome133`].
+    /// [`HelloProvisionerChoice::FixedChrome130Hybrid`].
     pub reality_provisioner: HelloProvisionerChoice,
     /// UDP packet mode: `None` = the TCP path (default; [`crate::connect`]);
     /// `Some(mode)` selects the VLESS UDP datagram tunnel ([`crate::connect_udp`],
@@ -68,7 +68,7 @@ impl NativeConnectParams {
             server,
             target,
             resolved_ip: None,
-            reality_provisioner: HelloProvisionerChoice::FixedChrome133,
+            reality_provisioner: HelloProvisionerChoice::FixedChrome130Hybrid,
             udp: None,
             // **Derived here, once.** The mux decision is the row's RESOLVED
             // plugin mux (`PluginSpec::mux_active`: the resolved value, never the

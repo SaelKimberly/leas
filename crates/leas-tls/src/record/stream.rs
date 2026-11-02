@@ -6,10 +6,30 @@
 //! the same decryption (`strip_padding`) and framing (`make_app_data_record`)
 //! logic is implemented as a poll-based stream: buffered plaintext on read
 //! (handles TLS record fragmentation), 16 KiB plaintext split and
-//! partial-write buffering on write. Post-handshake `NewSessionTicket`
-//! records (encrypted handshake content, message type 0x04) are consumed and
-//! dropped;
-//! any other inner handshake message is a protocol error (no renegotiation).
+//! partial-write buffering on write.
+//!
+//! # Post-handshake policy (TLS 1.3)
+//!
+//! A record may carry SEVERAL handshake messages (RFC 8446 §5.1); every one is
+//! walked, not just the first.
+//!
+//! - `NewSessionTicket` (0x04) is consumed and DISCARDED: resumption is not
+//!   implemented, so the ticket has no consumer and is never replayed.
+//! - `KeyUpdate` (0x18) rotates the read key (RFC 8446 §4.6.3) and, when the
+//!   peer set `request_update`, queues a reciprocal `update_not_requested`
+//!   acknowledgement on the write side. `poll_write` also sends one
+//!   proactively at the per-key record limit (RFC 8446 §5.5) — the AEAD
+//!   bounds would otherwise be reached after ~24 GB under one key.
+//! - Any other inner handshake message is a protocol error: neither version
+//!   allows renegotiation. A handshake message split ACROSS records is also an
+//!   error (the engine reassembles only during the handshake flight).
+//! - Alerts: `close_notify` is a clean EOF; every other alert ends the stream
+//!   with `ConnectionReset`. TLS 1.2 rejects a `KeyUpdate` outright (it does
+//!   not exist there, RFC 5246 §7.4.1).
+//!
+//! Direct mode (`set_read_direct`/`set_write_direct`, used by the Vision
+//! splice) bypasses this entire policy: the record layer is not parsed at all,
+//! so post-handshake messages are the tunnel's problem, not ours.
 
 use std::io;
 use std::ops::Range;
@@ -18,13 +38,37 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::crypto::AeadKey;
+use zeroize::Zeroizing;
+
+use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, MAX_HASH_LEN};
 use crate::error::{Result, TlsError};
+
+/// RFC 8446 §5.5 per-key record limits, kept well inside the published bounds
+/// so a `KeyUpdate` happens before the AEAD's limits are reached (the
+/// `KeyUpdate` itself is sealed at `seq == limit`, so one generation may seal
+/// `limit + 1` records — still inside the bounds below).
+const fn record_limit(suite: CipherSuiteId) -> u64 {
+    match suite {
+        // AES-GCM's confidentiality limit is 2^24.5 ≈ 23.7M records; 2^24.
+        CipherSuiteId::Aes128GcmSha256 | CipherSuiteId::Aes256GcmSha384 => 1 << 24,
+        // ChaCha20-Poly1305's RFC bound is a BYTE limit (2^62 bytes ⇒ 2^48
+        // full-size records), so this record cap is a conservative margin, not
+        // the bound itself.
+        CipherSuiteId::Chacha20Poly1305Sha256 => 1 << 25,
+    }
+}
+
+/// Whether a direction that has sealed `seq` records must rekey before the
+/// next one (RFC 8446 §5.5).
+const fn should_update(seq: u64, suite: CipherSuiteId) -> bool {
+    seq >= record_limit(suite)
+}
 
 /// TLS record content types (RFC 8446 §5.1).
 use super::{
     AEAD_TAG_LEN, CONTENT_ALERT, CONTENT_APPLICATION_DATA, CONTENT_CHANGE_CIPHER_SPEC,
-    CONTENT_HANDSHAKE, HS_NEW_SESSION_TICKET, MAX_RECORD_PAYLOAD, aead_aad, aead_aad_12,
+    CONTENT_HANDSHAKE, HS_KEY_UPDATE, HS_NEW_SESSION_TICKET, MAX_RECORD_PAYLOAD, aead_aad,
+    aead_aad_12,
 };
 
 /// Maximum plaintext bytes per TLS 1.3 record: 2^14 (RFC 8446 §5.2).
@@ -95,6 +139,57 @@ fn advance_seq(seq: &mut u64) -> io::Result<u64> {
         )
     })?;
     Ok(current)
+}
+
+/// TLS 1.3 application traffic secrets, kept ONLY so `KeyUpdate` can derive
+/// the next generation (RFC 8446 §7.2, §4.6.3).
+///
+/// Zeroized on drop: every later generation is derived from these, so a live
+/// `TlsStream` holds the client's and server's current application secrets.
+/// Deliberately NOT `Clone` — two copies would fork the key-update stream and
+/// silently desynchronise from the peer.
+pub struct AppSecrets {
+    suite: CipherSuiteId,
+    client: Zeroizing<[u8; MAX_HASH_LEN]>,
+    server: Zeroizing<[u8; MAX_HASH_LEN]>,
+}
+
+impl AppSecrets {
+    /// Copies the two application traffic secrets (`hash_len` bytes each;
+    /// the tail of the arrays is zero padding and never used).
+    #[must_use]
+    pub fn new(suite: CipherSuiteId, client: &[u8], server: &[u8]) -> Self {
+        let hash_len = suite.hash_len();
+        let mut out = Self {
+            suite,
+            client: Zeroizing::new([0u8; MAX_HASH_LEN]),
+            server: Zeroizing::new([0u8; MAX_HASH_LEN]),
+        };
+        out.client[..hash_len.min(client.len())].copy_from_slice(&client[..hash_len.min(client.len())]);
+        out.server[..hash_len.min(server.len())].copy_from_slice(&server[..hash_len.min(server.len())]);
+        out
+    }
+
+    /// Advances one direction's secret (`server = true` for the read side) and
+    /// returns the AEAD key for the new generation.
+    fn advance(&mut self, server: bool) -> std::result::Result<AeadKey, TlsError> {
+        let hash_len = self.suite.hash_len();
+        let schedule = KeySchedule::new(self.suite);
+        let secret = if server {
+            &mut self.server
+        } else {
+            &mut self.client
+        };
+        let next = schedule.update_traffic_secret(&secret[..hash_len])?;
+        *secret = next;
+        AeadKey::new(self.suite, &secret[..hash_len])
+    }
+
+    /// The suite these secrets belong to.
+    #[must_use]
+    pub const fn suite(&self) -> CipherSuiteId {
+        self.suite
+    }
 }
 
 /// The record-protection cipher for a connection direction.
@@ -245,6 +340,11 @@ pub struct TlsStream<S> {
     /// `ServerHello` — the key schedule consumed `pq || classical` shared
     /// material. `false` = classical-only key exchange.
     negotiated_hybrid: bool,
+    /// Application traffic secrets, kept only for `KeyUpdate` (TLS 1.3).
+    secrets: Option<AppSecrets>,
+    /// The protocol the server selected in `EncryptedExtensions`
+    /// (RFC 7301), if it offered ALPN.
+    negotiated_alpn: Option<Vec<u8>>,
 }
 
 /// Incremental state of reading one TLS record off the wire. The bytes live
@@ -276,6 +376,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
             write_direct: false,
             read_direct: false,
             negotiated_hybrid: false,
+            secrets: None,
+            negotiated_alpn: None,
         }
     }
 
@@ -310,6 +412,116 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
     /// transport buffer are preserved for the direct reader.
     pub const fn set_read_direct(&mut self) {
         self.read_direct = true;
+    }
+
+    /// Whether the write side has reached its per-key record limit and must
+    /// send a `KeyUpdate` before sealing more application data.
+    const fn needs_key_update(&self) -> bool {
+        match (&self.secrets, &self.keys.write) {
+            (Some(secrets), RecordCipher::Tls13(_)) => {
+                should_update(self.keys.write_seq, secrets.suite())
+            }
+            _ => false,
+        }
+    }
+
+    /// The ALPN protocol the server selected (`None` when neither side sent
+    /// the extension). Opaque bytes — RFC 7301 §3.1 puts no encoding on them.
+    #[must_use]
+    pub fn negotiated_alpn(&self) -> Option<&[u8]> {
+        self.negotiated_alpn.as_deref()
+    }
+
+    /// Record the negotiated ALPN (handshake-driver internal).
+    pub(crate) fn set_negotiated_alpn(&mut self, alpn: Option<Vec<u8>>) {
+        self.negotiated_alpn = alpn;
+    }
+
+    /// Install the application traffic secrets that `KeyUpdate` derives the
+    /// next generation from (TLS 1.3 only; set by the handshake driver).
+    pub(crate) fn set_app_secrets(&mut self, secrets: AppSecrets) {
+        self.secrets = Some(secrets);
+    }
+
+    /// RFC 8446 §4.6.3: rotate the READ key to the next generation, and — when
+    /// the peer asked for a reciprocal update — queue our own `KeyUpdate` with
+    /// `update_not_requested`.
+    ///
+    /// The acknowledgement rides the normal write buffer, so it is flushed by
+    /// the next `write`/`flush`/`shutdown`. A tunnel always writes; a
+    /// read-only peer sees the ACK at its next flush rather than instantly.
+    fn apply_key_update(&mut self, request_update: bool) -> io::Result<()> {
+        if !self.keys.read.is_tls13() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "KeyUpdate in a TLS 1.2 session is illegal (RFC 5246 §7.4.1)",
+            ));
+        }
+        let Some(secrets) = self.secrets.as_mut() else {
+            return Err(io::Error::other(
+                "KeyUpdate received but no application secrets were installed",
+            ));
+        };
+        let next = secrets.advance(true).map_err(to_io_error)?;
+        // Old key and its counter go together: a rotated key with a stale
+        // sequence number is a nonce-reuse bug.
+        self.keys.read = RecordCipher::Tls13(next);
+        self.keys.read_seq = 0;
+        if request_update {
+            self.queue_key_update(false)?;
+        }
+        Ok(())
+    }
+
+    /// Frame and seal a `KeyUpdate` with the CURRENT write key, appended to
+    /// the pending output after anything already buffered.
+    fn queue_key_update(&mut self, request_update: bool) -> io::Result<()> {
+        let msg = [HS_KEY_UPDATE, 0x00, 0x00, 0x01, u8::from(request_update)];
+        let AppKeys {
+            write, write_seq, ..
+        } = &mut self.keys;
+        let RecordCipher::Tls13(key) = &*write else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "KeyUpdate in a TLS 1.2 session is illegal",
+            ));
+        };
+        let seq = *write_seq;
+        let start = self.pending.len();
+        self.pending
+            .extend_from_slice(&[CONTENT_APPLICATION_DATA, 0x03, 0x03, 0, 0]);
+        self.pending.extend_from_slice(&msg);
+        self.pending.push(CONTENT_HANDSHAKE);
+        // The record length counts the plaintext plus the AEAD tag, and must
+        // be written BEFORE the seal (the tag is appended by it).
+        let record_len = self.pending.len() - start - RECORD_HEADER_LEN + AEAD_TAG_LEN;
+        let len = u16::try_from(record_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "KeyUpdate record too long")
+        })?;
+        self.pending[start + 3..start + RECORD_HEADER_LEN].copy_from_slice(&len.to_be_bytes());
+        key.seal_in_place(
+            seq,
+            &aead_aad(record_len),
+            &mut self.pending,
+            start + RECORD_HEADER_LEN,
+        )
+        .map_err(to_io_error)?;
+        *write_seq = seq + 1;
+        Ok(())
+    }
+
+    /// Rotate the WRITE key to the next generation (after our own
+    /// `KeyUpdate` has been sealed with the previous one).
+    fn rotate_write(&mut self) -> io::Result<()> {
+        let Some(secrets) = self.secrets.as_mut() else {
+            return Err(io::Error::other(
+                "cannot rotate a write key without application secrets",
+            ));
+        };
+        let next = secrets.advance(false).map_err(to_io_error)?;
+        self.keys.write = RecordCipher::Tls13(next);
+        self.keys.write_seq = 0;
+        Ok(())
     }
 
     /// Read the next complete raw record off `inner` into `self.rec_buf`.
@@ -463,7 +675,9 @@ fn process_record_13(key: &AeadKey, seq: &mut u64, buf: &mut [u8]) -> io::Result
     match inner_type {
         CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(0..content_len)),
         CONTENT_ALERT => alert_to_record(content),
-        CONTENT_HANDSHAKE => post_handshake_message(content),
+        CONTENT_HANDSHAKE => Ok(DecryptedRecord::PostHandshake(post_handshake_messages(
+            content, true,
+        )?)),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unexpected inner TLS content type {other:#04x}"),
@@ -510,7 +724,10 @@ fn process_record_12(
     match content_type {
         CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(plain)),
         CONTENT_ALERT => alert_to_record(&buf[plain]),
-        CONTENT_HANDSHAKE => post_handshake_message(&buf[plain]),
+        CONTENT_HANDSHAKE => Ok(DecryptedRecord::PostHandshake(post_handshake_messages(
+            &buf[plain],
+            false,
+        )?)),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unexpected TLS content type {other:#04x}"),
@@ -532,20 +749,86 @@ fn alert_to_record(body: &[u8]) -> io::Result<DecryptedRecord> {
     ))
 }
 
-/// Classify an authenticated handshake record seen after the handshake:
-/// only `NewSessionTicket` is legal (no renegotiation in either version).
-fn post_handshake_message(body: &[u8]) -> io::Result<DecryptedRecord> {
-    match body.first() {
-        Some(&HS_NEW_SESSION_TICKET) => Ok(DecryptedRecord::Skip),
-        Some(&msg_type) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected handshake message type {msg_type} after handshake"),
-        )),
-        None => Err(io::Error::new(
+/// One authenticated post-handshake message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostHandshake {
+    /// Consumed and dropped (resumption is not implemented).
+    NewSessionTicket,
+    /// RFC 8446 §4.6.3.
+    KeyUpdate { request_update: bool },
+}
+
+/// Classify EVERY handshake message in an authenticated post-handshake record.
+///
+/// RFC 8446 §5.1 lets a peer coalesce several messages into one record, so
+/// stopping at `body[0]` would silently drop a `KeyUpdate` that followed a
+/// `NewSessionTicket` — and the peer's next record would then fail to
+/// authenticate (a key desync, not a clean protocol error). Message framing is
+/// therefore walked in full; a record that ends mid-message is an error (the
+/// engine reassembles only during the handshake flight) and an unknown type is
+/// fatal (no renegotiation in either version).
+fn post_handshake_messages(body: &[u8], tls13: bool) -> io::Result<Vec<PostHandshake>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < body.len() {
+        let Some(header) = body.get(pos..pos + 4) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "post-handshake message is fragmented across records",
+            ));
+        };
+        let msg_type = header[0];
+        let len = usize::from(header[1]) << 16 | usize::from(header[2]) << 8 | usize::from(header[3]);
+        let Some(message) = body.get(pos + 4..pos + 4 + len) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "post-handshake message is fragmented across records",
+            ));
+        };
+        pos += 4 + len;
+        match msg_type {
+            HS_NEW_SESSION_TICKET => out.push(PostHandshake::NewSessionTicket),
+            HS_KEY_UPDATE => {
+                if !tls13 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "KeyUpdate in a TLS 1.2 session is illegal (RFC 5246 §7.4.1)",
+                    ));
+                }
+                // type(1) || length(3) || request_update(1)
+                let request_update = match message {
+                    [0] => false,
+                    [1] => true,
+                    [_] => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "KeyUpdate request_update must be 0 or 1",
+                        ));
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "malformed KeyUpdate message (RFC 8446 §4.6.3)",
+                        ));
+                    }
+                };
+                out.push(PostHandshake::KeyUpdate { request_update });
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected handshake message type {other} after handshake"),
+                ));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "empty handshake record during application data",
-        )),
+        ));
     }
+    Ok(out)
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
@@ -616,8 +899,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
                     this.closed = true;
                     return Poll::Ready(Ok(()));
                 }
-                // NewSessionTicket: consumed, nothing to deliver — read on.
-                Ok(DecryptedRecord::Skip) => {}
+                Ok(DecryptedRecord::PostHandshake(messages)) => {
+                    for message in messages {
+                        match message {
+                            // Consumed and dropped: no resumption in this engine.
+                            PostHandshake::NewSessionTicket => {}
+                            PostHandshake::KeyUpdate { request_update } => {
+                                this.apply_key_update(request_update)?;
+                            }
+                        }
+                    }
+                }
                 Err(e) => return Poll::Ready(Err(e)),
             }
         }
@@ -644,6 +936,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
         }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
+        }
+        // RFC 8446 §5.5: rekey before the per-key record limit. The KeyUpdate
+        // itself is sealed with the CURRENT key, then the write key rotates —
+        // subsequent records use the new generation, in order.
+        if this.needs_key_update() {
+            if let Err(e) = this.queue_key_update(true).and_then(|()| this.rotate_write()) {
+                return Poll::Ready(Err(e));
+            }
+            match this.flush_pending(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
         }
         // Split at 2^14 plaintext bytes (RFC 8446 §5.2); the inner content
         // type byte rides at the end of the TLSInnerPlaintext (TLS 1.3).
@@ -759,8 +1064,8 @@ enum DecryptedRecord {
     Data(Range<usize>),
     /// `close_notify` — subsequent reads are EOF.
     CloseNotify,
-    /// Record consumed with nothing to deliver (`NewSessionTicket`).
-    Skip,
+    /// Every post-handshake message the record carried, in wire order.
+    PostHandshake(Vec<PostHandshake>),
 }
 
 /// Remove TLS 1.3 record padding and extract the inner content type (port of
@@ -981,6 +1286,187 @@ mod tests {
         let mut buf = [0u8; 8];
         let err = reader.read(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    fn key_update_msg(request_update: bool) -> Vec<u8> {
+        vec![HS_KEY_UPDATE, 0x00, 0x00, 0x01, u8::from(request_update)]
+    }
+
+    /// The TLS 1.3 secret generations for one direction (SHA-256 suite →
+    /// `hash_len` = 32), plus the AEAD key each one yields.
+    fn generations(suite: CipherSuiteId, secret: &[u8; 32]) -> (AeadKey, AeadKey) {
+        let hash_len = suite.hash_len();
+        let schedule = KeySchedule::new(suite);
+        let first = AeadKey::new(suite, secret).unwrap();
+        let next = schedule.update_traffic_secret(secret).unwrap();
+        let second = AeadKey::new(suite, &next[..hash_len]).unwrap();
+        (first, second)
+    }
+
+    /// RFC 8446 §4.6.3: a peer `KeyUpdate` rotates the READ key, and the
+    /// application data that follows is sealed with the next generation — so
+    /// this only passes if the rotation happened.
+    #[rstest::rstest]
+    #[case::not_requested(false)]
+    #[case::requested(true)]
+    #[tokio::test]
+    async fn key_update_rotates_the_read_key(#[case] request_update: bool) {
+        let suite = CipherSuiteId::Aes128GcmSha256;
+        let server_ts = [0x33u8; 32];
+        let client_ts = [0x22u8; 32];
+        let (first, second) = generations(suite, &server_ts);
+
+        let keys = AppKeys::tls13(first.clone_key(), first.clone_key());
+        let update = raw_record(
+            &keys,
+            0,
+            CONTENT_HANDSHAKE,
+            &key_update_msg(request_update),
+        );
+        let next_keys = AppKeys::tls13(second.clone_key(), second);
+        let data = raw_record(&next_keys, 0, CONTENT_APPLICATION_DATA, b"after-update");
+
+        let (a, b) = duplex(4096);
+        tokio::spawn(async move {
+            let mut b = b;
+            b.write_all(&update).await.unwrap();
+            b.write_all(&data).await.unwrap();
+        });
+        let mut reader = TlsStream::new(a, keys);
+        reader.set_app_secrets(AppSecrets::new(suite, &client_ts, &server_ts));
+        let mut buf = [0u8; 12];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"after-update");
+
+        // The ACK policy: queued iff the peer asked for an update, and it
+        // always says `update_not_requested` so the exchange terminates.
+        if request_update {
+            let mut rec = reader.pending.clone();
+            assert!(!rec.is_empty(), "a requested update must be acknowledged");
+            assert_eq!(rec[0], CONTENT_APPLICATION_DATA);
+            let body = &mut rec[RECORD_HEADER_LEN..];
+            let aad = aead_aad(body.len());
+            let n = first
+                .clone_key()
+                .open_in_place(0, &aad, body)
+                .expect("the ACK is sealed with the pre-update write key");
+            assert_eq!(
+                &body[..n],
+                &[HS_KEY_UPDATE, 0x00, 0x00, 0x01, 0x00, CONTENT_HANDSHAKE],
+                "the ACK carries request_update = 0"
+            );
+        } else {
+            assert!(
+                reader.pending.is_empty(),
+                "a KeyUpdate that requested nothing must not be acknowledged"
+            );
+        }
+    }
+
+    /// RFC 8446 §4.6.3: `KeyUpdate.request_update` is 1 bit, and RFC 8446
+    /// §5.1 lets a record carry several handshake messages — every one must be
+    /// walked, or a `KeyUpdate` coalesced behind a `NewSessionTicket` is
+    /// silently dropped and the next record fails to authenticate.
+    #[rstest::rstest]
+    #[case::zero(&[HS_KEY_UPDATE, 0, 0, 1, 0], Ok(vec![PostHandshake::KeyUpdate { request_update: false }]))]
+    #[case::one(&[HS_KEY_UPDATE, 0, 0, 1, 1], Ok(vec![PostHandshake::KeyUpdate { request_update: true }]))]
+    #[case::bad_value(&[HS_KEY_UPDATE, 0, 0, 1, 2], Err(()))]
+    #[case::wrong_length(&[HS_KEY_UPDATE, 0, 0, 2, 0, 0], Err(()))]
+    #[case::nst_only(&[HS_NEW_SESSION_TICKET, 0, 0, 1, 0], Ok(vec![PostHandshake::NewSessionTicket]))]
+    #[case::nst_then_key_update(
+        &[HS_NEW_SESSION_TICKET, 0, 0, 1, 0, HS_KEY_UPDATE, 0, 0, 1, 1],
+        Ok(vec![PostHandshake::NewSessionTicket, PostHandshake::KeyUpdate { request_update: true }])
+    )]
+    #[case::unknown_type(&[0x42, 0, 0, 0], Err(()))]
+    #[case::fragmented(&[HS_KEY_UPDATE, 0, 0, 1], Err(()))]
+    fn post_handshake_messages_are_all_walked(
+        #[case] body: &[u8],
+        #[case] expected: std::result::Result<Vec<PostHandshake>, ()>,
+    ) {
+        match (post_handshake_messages(body, true), expected) {
+            (Ok(got), Ok(want)) => assert_eq!(got, want),
+            (Err(_), Err(())) => {}
+            (got, want) => panic!("expected {want:?}, got {got:?}"),
+        }
+    }
+
+    /// A `KeyUpdate` does not exist in TLS 1.2 (RFC 5246 §7.4.1): the same
+    /// bytes must be rejected on that version's path.
+    #[test]
+    fn tls12_rejects_a_key_update() {
+        let body = [HS_KEY_UPDATE, 0, 0, 1, 1];
+        assert!(post_handshake_messages(&body, true).is_ok());
+        assert!(
+            post_handshake_messages(&body, false).is_err(),
+            "TLS 1.2 has no KeyUpdate"
+        );
+    }
+
+    /// RFC 8446 §5.5: the rekey happens AT the per-key limit, not after it.
+    #[rstest::rstest]
+    #[case::aes_under(CipherSuiteId::Aes128GcmSha256, (1 << 24) - 1, false)]
+    #[case::aes_at(CipherSuiteId::Aes128GcmSha256, 1 << 24, true)]
+    #[case::aes_over(CipherSuiteId::Aes128GcmSha256, (1 << 24) + 1, true)]
+    #[case::chacha_at(CipherSuiteId::Chacha20Poly1305Sha256, 1 << 25, true)]
+    #[case::sha384_at(CipherSuiteId::Aes256GcmSha384, 1 << 24, true)]
+    fn should_update_at_the_record_limit(
+        #[case] suite: CipherSuiteId,
+        #[case] seq: u64,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(should_update(seq, suite), expected);
+    }
+
+    /// The write path sends a `KeyUpdate` sealed with the OLD key, then seals
+    /// application data with the next generation — the peer's two records must
+    /// decode under exactly those keys.
+    #[tokio::test]
+    async fn write_side_rekeys_at_the_record_limit() {
+        let suite = CipherSuiteId::Aes128GcmSha256;
+        let client_ts = [0x22u8; 32];
+        let server_ts = [0x33u8; 32];
+        let (first, second) = generations(suite, &client_ts);
+
+        let (a, mut b) = duplex(8192);
+        let mut writer = TlsStream::new(
+            a,
+            AppKeys::tls13(
+                AeadKey::new(suite, &[0x44; 32]).unwrap(),
+                first.clone_key(),
+            ),
+        );
+        writer.set_app_secrets(AppSecrets::new(suite, &client_ts, &server_ts));
+        let limit = record_limit(suite);
+        writer.keys.write_seq = limit;
+        writer.write_all(b"hi").await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(writer.keys.write_seq, 1, "the counter restarts after the rekey");
+
+        let mut wire = vec![0u8; 4096];
+        let n = b.read(&mut wire).await.unwrap();
+        let wire = &mut wire[..n];
+
+        let first_len = usize::from(u16::from_be_bytes([wire[3], wire[4]])) + RECORD_HEADER_LEN;
+        let (ku_record, data_record) = wire.split_at_mut(first_len);
+        let ku_body = &mut ku_record[RECORD_HEADER_LEN..];
+        let aad = aead_aad(ku_body.len());
+        let n = first
+            .clone_key()
+            .open_in_place(limit, &aad, ku_body)
+            .expect("the KeyUpdate is sealed with the pre-rekey key at the old seq");
+        assert_eq!(
+            &ku_body[..n],
+            &[HS_KEY_UPDATE, 0x00, 0x00, 0x01, 0x01, CONTENT_HANDSHAKE],
+            "we request an update from the peer"
+        );
+
+        let data_body = &mut data_record[RECORD_HEADER_LEN..];
+        let aad = aead_aad(data_body.len());
+        let n = second
+            .clone_key()
+            .open_in_place(0, &aad, data_body)
+            .expect("application data uses the next generation at seq 0");
+        assert_eq!(&data_body[..n], &[b'h', b'i', CONTENT_APPLICATION_DATA]);
     }
 
     #[tokio::test]

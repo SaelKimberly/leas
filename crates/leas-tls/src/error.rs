@@ -38,6 +38,10 @@ pub enum TlsError {
     NotImplemented { feature: String },
     #[error("server sent HelloRetryRequest; retry is not supported")]
     HelloRetryRequest,
+    /// A `HelloRetryRequest` asked for something this engine cannot answer
+    /// (an unimplemented key-exchange group), so no retry is possible.
+    #[error("HelloRetryRequest cannot be answered: {0}")]
+    HelloRetryRequestUnsupported(String),
     /// REALITY was expected but the server flight was not REALITY-authenticated
     /// — a real certificate (transparent proxy / possible MITM or redirection).
     #[error("REALITY: received real certificate (potential MITM or redirection)")]

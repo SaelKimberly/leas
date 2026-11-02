@@ -62,6 +62,7 @@ const fn extension_codepoint(ext: &crate::spec::ExtensionSpec) -> u16 {
         E::Padding => 0x0015,
         E::Grease => 0x0A0A,
         E::EchGrease => 0xFE0D,
+        E::Cookie(_) => 0x002C,
         E::Raw { ty, .. } => *ty,
     }
 }

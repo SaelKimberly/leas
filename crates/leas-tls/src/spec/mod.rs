@@ -129,10 +129,27 @@ pub enum ExtensionSpec {
     /// Firefox/Safari/Chrome-family profile carries it; omitting it would
     /// change the JA4 extension set.
     EchGrease,
+    /// `cookie` (RFC 8446 §4.2.2): the opaque cookie a `HelloRetryRequest`
+    /// handed out, echoed verbatim in `ClientHello2`.
+    Cookie(Vec<u8>),
     Raw {
         ty: u16,
         data: Vec<u8>,
     },
+}
+
+impl KeyShareGroup {
+    /// Wire group id (RFC 8446 §4.2.7 / draft-ietf-tls-ecdhe-mlkem).
+    #[must_use]
+    pub const fn wire_id(&self) -> u16 {
+        match self {
+            Self::Grease => crate::spec::grease::GREASE_PLACEHOLDER,
+            Self::X25519 => 0x001D,
+            Self::X25519Mlkem768 => 0x11EC,
+            Self::Secp256r1Mlkem768 => 0x11EB,
+            Self::Secp384r1Mlkem1024 => 0x11ED,
+        }
+    }
 }
 
 /// One key-share entry in the `key_share` extension.
@@ -401,6 +418,21 @@ impl ExtensionSpec {
             Self::EchGrease => {
                 encode_ech_grease_into(&rt.ech, out)?;
             }
+            Self::Cookie(cookie) => {
+                // RFC 8446 §4.2.2: `cookie<1..2^16-1>` — a u16 byte length
+                // then the opaque bytes the server handed out.
+                if cookie.is_empty() {
+                    return Err(TlsError::Spec(
+                        "cookie extension must carry at least one byte (RFC 8446 §4.2.2)"
+                            .to_string(),
+                    ));
+                }
+                let len = u16::try_from(cookie.len())
+                    .map_err(|_| TlsError::Spec("cookie exceeds u16 length".to_string()))?;
+                write_ext_header(out, 0x002C, 2 + cookie.len())?;
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(cookie);
+            }
             Self::Raw { ty, data } => {
                 write_ext_header(out, *ty, data.len())?;
                 out.extend_from_slice(data);
@@ -498,12 +530,13 @@ pub(crate) fn encode_supported_versions_into(
 }
 
 /// Length of ALPN entries (RFC 7301): per entry, a u8 BE length plus the
-/// raw protocol bytes. Generic over `String`/`&str` so the hello builder
-/// encodes a `&[&str]` override with no `Vec<String>` staging.
-fn alpn_entries_len<S: AsRef<str>>(protos: &[S]) -> Result<usize, TlsError> {
+/// raw protocol bytes. Generic over `String`/`&str`/`&[u8]` so the hello
+/// builder encodes an opaque-byte override (RFC 7301 §3.1 puts no encoding
+/// on a protocol name) with no `Vec<String>` staging.
+fn alpn_entries_len<S: AsRef<[u8]>>(protos: &[S]) -> Result<usize, TlsError> {
     let mut len = 0usize;
     for proto in protos {
-        let bytes = proto.as_ref().as_bytes();
+        let bytes = proto.as_ref();
         if bytes.len() > 255 {
             return Err(TlsError::Spec(
                 "alpn protocol exceeds 255 bytes".to_string(),
@@ -515,9 +548,9 @@ fn alpn_entries_len<S: AsRef<str>>(protos: &[S]) -> Result<usize, TlsError> {
 }
 
 /// Writes ALPN entries (no list-length prefix) into `out`.
-fn write_alpn_entries<S: AsRef<str>>(protos: &[S], out: &mut Vec<u8>) -> Result<(), TlsError> {
+fn write_alpn_entries<S: AsRef<[u8]>>(protos: &[S], out: &mut Vec<u8>) -> Result<(), TlsError> {
     for proto in protos {
-        let bytes = proto.as_ref().as_bytes();
+        let bytes = proto.as_ref();
         let len = u8::try_from(bytes.len())
             .map_err(|_| TlsError::Spec("alpn protocol exceeds 255 bytes".to_string()))?;
         out.push(len);
@@ -555,10 +588,10 @@ fn write_alps_entries<S: AsRef<str>>(protos: &[S], out: &mut Vec<u8>) -> Result<
     Ok(())
 }
 
-/// Encodes an ALPN extension from a `&[&str]` override list (no `Vec<String>`
-/// staging): the hello builder's `params.alpn` path.
-pub(crate) fn encode_alpn_override_into(
-    protos: &[&str],
+/// Encodes an ALPN extension from an opaque-byte override list (no
+/// `Vec<String>` staging): the hello builder's `params.alpn` path.
+pub(crate) fn encode_alpn_override_into<S: AsRef<[u8]>>(
+    protos: &[S],
     out: &mut Vec<u8>,
 ) -> Result<(), TlsError> {
     let entries_len = alpn_entries_len(protos)?;

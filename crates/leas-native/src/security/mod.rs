@@ -21,7 +21,7 @@ use leas_tls::reality::{HelloProvisioner, SpecProvisioner, SpiderConfig};
 use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
-use crate::security::reality::{FixedChrome133, HelloProvisionerChoice};
+use crate::security::reality::{FixedChrome130Hybrid, HelloProvisionerChoice};
 
 /// Wrap the transport stream according to the profile's security config.
 ///
@@ -91,17 +91,28 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 .ok_or_else(|| NativeError::Config("reality config missing pbk".into()))?;
             let provisioner: Arc<dyn HelloProvisioner> = match &ctx.params.reality_provisioner {
                 HelloProvisionerChoice::Custom(p) => p.clone(),
-                HelloProvisionerChoice::FixedChrome133 => {
+                HelloProvisionerChoice::FixedChrome130Hybrid => {
                     match fingerprint::resolve_fingerprint(opts.fp.as_deref()).0 {
-                        Some(id) => Arc::new(SpecProvisioner::from(&fingerprint::profile_for(id)?)),
+                        // `profile_for` validates the id against the roster, so
+                        // a resolve failure here is a CONFIG defect (a row that
+                        // cannot dial as written), never a server verdict.
+                        Some(id) => Arc::new(
+                            SpecProvisioner::try_from(&fingerprint::profile_for(id)?).map_err(
+                                |e| {
+                                    NativeError::Config(format!(
+                                        "fingerprint {id:?} does not resolve: {e}"
+                                    ))
+                                },
+                            )?,
+                        ),
                         // No fingerprint requested (absent, `""` or `unsafe`), or
                         // an id with no roster row: the fixed provisioner shapes
                         // the surviving wire-exact chrome_130 spec (the
                         // Chrome-133 hand profile was dropped in the roster
                         // reduction). Byte-equivalent to the previous
                         // chrome_133-fingerprint default modulo the dropped
-                        // profile's keyshare shape — see `fixed_chrome_spec`.
-                        None => Arc::new(FixedChrome133),
+                        // profile's keyshare shape — see `chrome_130_hybrid_spec`.
+                        None => Arc::new(FixedChrome130Hybrid),
                     }
                 }
             };

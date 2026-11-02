@@ -73,7 +73,7 @@ fn fixture_bytes() -> Vec<u8> {
         &spec,
         &BuildParams {
             server_name: "example.com",
-            alpn: Some(&["h2", "http/1.1"]),
+            alpn: Some(&[b"h2", b"http/1.1"]),
             x25519_pub: &[0xAB; 32],
             mlkem768_pub: None,
             rng: &rng,

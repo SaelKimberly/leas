@@ -26,7 +26,7 @@ pub enum TlsMode {
     /// REALITY: fingerprint-shaped hello + sealed session id + HMAC/Ed25519
     /// server auth; Spider-X fallback on auth failure.
     Reality {
-        /// `SpecProvisioner::from(&Fingerprint)` for a browser shape, or any
+        /// `SpecProvisioner::try_from(&Fingerprint)` for a browser shape, or any
         /// custom `HelloProvisioner`.
         provisioner: Arc<dyn HelloProvisioner>,
         /// The server's static X25519 public key (decoded `pbk`).
@@ -118,21 +118,12 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
                 }
                 _ => resolved.spec,
             };
-            let alpn: Option<Vec<&str>> = config
+            // ALPN protocol names are opaque bytes (RFC 7301 §3.1) — the
+            // config already carries them that way, so no encoding check.
+            let alpn: Option<Vec<&[u8]>> = config
                 .alpn
                 .as_ref()
-                .map(|list| {
-                    list.iter()
-                        .map(|p| {
-                            std::str::from_utf8(p).map_err(|e| {
-                                crate::error::TlsError::Handshake(format!(
-                                    "invalid ALPN bytes: {e}"
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<&str>>>()
-                })
-                .transpose()?;
+                .map(|list| list.iter().map(Vec::as_slice).collect());
             let tls = handshake::connect(
                 stream,
                 HandshakeParams {
@@ -292,9 +283,10 @@ mod tests {
         let addr = spawn_recording_tls_server(recorded.clone());
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let config = TlsConfig::reality(
-            Arc::new(SpecProvisioner::from(
-                &Fingerprint::new(Browser::Chrome).with_version(130),
-            )),
+            Arc::new(
+                SpecProvisioner::try_from(&Fingerprint::new(Browser::Chrome).with_version(130))
+                    .expect("chrome 130 resolves"),
+            ),
             [0xAB; 32],
             vec![],
             SpiderConfig::default(),
@@ -307,25 +299,41 @@ mod tests {
         );
     }
 
-    /// The ALPN override's UTF-8 validation must reject non-UTF-8 protocol
-    /// bytes before any I/O happens.
+    /// RFC 7301 §3.1: a protocol name is an opaque byte string, so a
+    /// non-UTF-8 ALPN entry must reach the wire verbatim instead of being
+    /// rejected at connect time.
     #[tokio::test]
-    async fn plain_mode_rejects_invalid_alpn_bytes() {
-        let (client, _server) = tokio::io::duplex(64);
+    async fn plain_mode_carries_opaque_alpn_bytes_to_the_wire() {
+        let (client, mut server) = tokio::io::duplex(8192);
         let config = TlsConfig {
             mode: TlsMode::Plain {
                 fingerprint: None,
                 verifier: insecure_verifier(),
             },
             server_name: "localhost".to_string(),
-            alpn: Some(vec![vec![0xFF]]),
+            alpn: Some(vec![vec![0xFF, 0x00]]),
             curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
         };
-        let result = connect(client, &config).await;
+        let handshake = tokio::spawn(async move { connect(client, &config).await });
+
+        let mut buf = vec![0u8; 8192];
+        let n = server.read(&mut buf).await.unwrap();
+        drop(server);
+        let outcome = handshake.await.expect("the connect task must not panic");
         assert!(
-            matches!(result, Err(TlsError::Handshake(_))),
-            "non-UTF-8 ALPN bytes must be rejected before the handshake"
+            n > 5,
+            "the client must have written a ClientHello record, got {n} bytes \
+             (connect ok: {})",
+            outcome.is_ok()
+        );
+
+        // Record header (5) then the ClientHello handshake message.
+        let hello = crate::hello::parse::parse_hello(&buf[5..n]).expect("parse ClientHello");
+        assert_eq!(
+            hello.extension(0x0010).expect("alpn"),
+            &[0x00, 0x03, 0x02, 0xFF, 0x00],
+            "the opaque protocol bytes must be framed as list_len || len || bytes"
         );
     }
 }

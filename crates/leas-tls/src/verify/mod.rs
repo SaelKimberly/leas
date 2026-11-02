@@ -27,7 +27,7 @@ use rustls_pki_types::{CertificateDer, ServerName, TrustAnchor, UnixTime};
 use webpki::{EndEntityCert, KeyUsage};
 
 use crate::error::{Result, TlsError};
-use crate::handshake::{ServerVerifier, TlsVersion, VerifyContext};
+use crate::handshake::{ServerVerifier, SignedData, TlsVersion, VerifyContext};
 
 /// RFC 8446 §4.4.3 server context label, NUL-terminated. The signed message
 /// is `64*0x20 || SERVER_CV_CONTEXT || transcript_hash` — the literal 64
@@ -176,12 +176,15 @@ impl ServerVerifier for WebPkiVerifier {
 /// TLS 1.3 (RFC 8446 §4.4.3): the signed message is
 /// `64*0x20 || "TLS 1.3, server CertificateVerify\x00" || Transcript-Hash(transcript)`
 /// where `transcript` = `ClientHello .. Certificate` (the `CertificateVerify`
-/// message itself is excluded). The context's `signed_data` carries this
-/// transcript prefix.
+/// message itself is excluded). The context's
+/// [`SignedData::Tls13Hash`](crate::handshake::SignedData::Tls13Hash) carries
+/// this transcript's HASH (already computed by the key schedule).
 ///
 /// TLS 1.2 (RFC 5246 §7.4.3, RFC 4492 §5.4): the signed message is the raw
 /// `client_random || server_random || ServerECDHParams` — no hash prefix,
-/// no context string. The context's `signed_data` carries these bytes.
+/// no context string. The context's
+/// [`SignedData::Tls12Raw`](crate::handshake::SignedData::Tls12Raw) carries
+/// these bytes.
 fn verify_certificate_verify(
     end_entity: &EndEntityCert<'_>,
     ctx: &VerifyContext<'_>,
@@ -195,13 +198,17 @@ fn verify_certificate_verify(
     match ctx.version {
         TlsVersion::Tls13 => {
             let algorithm = tls13_algorithm(ctx.signature_scheme)?;
-            let transcript_hash = ring::digest::digest(ctx.suite.digest(), ctx.signed_data);
+            let SignedData::Tls13Hash(transcript_hash) = ctx.signed else {
+                return Err(TlsError::Verify(
+                    "TLS 1.3 verification received non-hash signed data".to_string(),
+                ));
+            };
             // Stack-signed content: `64 spaces || SERVER_CV_CONTEXT ||
             // transcript_hash`, sized to the SHA-384 max.
             let mut signed = [0u8; 64 + 34 + 48];
             signed[..64].fill(0x20);
             signed[64..64 + SERVER_CV_CONTEXT.len()].copy_from_slice(SERVER_CV_CONTEXT);
-            let th = transcript_hash.as_ref();
+            let th = transcript_hash;
             if th.len() > 48 {
                 return Err(TlsError::Verify(
                     "transcript hash exceeds SHA-384 length".to_string(),
@@ -222,7 +229,12 @@ fn verify_certificate_verify(
             // `tls12_algorithms`.
             let mut last = None;
             for algorithm in tls12_algorithms(ctx.signature_scheme)? {
-                match end_entity.verify_signature(*algorithm, ctx.signed_data, signature) {
+                let SignedData::Tls12Raw(signed_data) = ctx.signed else {
+                    return Err(TlsError::Verify(
+                        "TLS 1.2 verification received a transcript hash".to_string(),
+                    ));
+                };
+                match end_entity.verify_signature(*algorithm, signed_data, signature) {
                     Ok(()) => return Ok(()),
                     Err(e) => last = Some(e),
                 }
@@ -320,6 +332,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{WebPkiVerifier, verify_certificate_verify};
+    use crate::handshake::SignedData;
     use crate::crypto::CipherSuiteId;
     use crate::error::{Result, TlsError};
     use crate::handshake::{HandshakeParams, ServerVerifier, TlsVersion, VerifyContext, connect};
@@ -458,7 +471,7 @@ mod tests {
             HandshakeParams {
                 spec: &test_spec(),
                 server_name,
-                alpn: Some(&["http/1.1"]),
+                alpn: Some(&[b"http/1.1"]),
                 verifier,
                 rng: &rng,
             },
@@ -650,7 +663,7 @@ mod tests {
             suite: CipherSuiteId::Aes128GcmSha256,
             signature_scheme: 0x0403,
             signature: &body[4..],
-            signed_data: transcript,
+            signed: SignedData::Tls13Hash(&transcript_hash),
         };
 
         let verifier = WebPkiVerifier::from_roots(Vec::new()).with_pin(pin);
@@ -683,7 +696,7 @@ mod tests {
             suite: CipherSuiteId::Aes128GcmSha256,
             signature_scheme: 0x1234,
             signature: &[],
-            signed_data: &[],
+            signed: SignedData::Tls13Hash(&[]),
         };
         let err = verify_certificate_verify(&ee, &ctx).unwrap_err();
         assert!(matches!(err, TlsError::Verify(_)), "got: {err}");

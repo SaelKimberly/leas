@@ -94,7 +94,7 @@ mod tests {
     use crate::crypto::mlkem::Mlkem768;
     use crate::hello::parse::parse_hello;
     use crate::reality::auth::{decrypt_session_id, derive_auth_key};
-    use crate::reality::{FixedChrome133, HelloProvisionParams, HelloProvisioner};
+    use crate::reality::{FixedChrome130Hybrid, HelloProvisionParams, HelloProvisioner};
 
     /// Decodes a hex string into bytes (test helper).
     fn decode_hex(s: &str) -> Vec<u8> {
@@ -168,10 +168,10 @@ mod tests {
         let plaintext = build_session_id_plaintext(timestamp, &short_id).unwrap();
 
         // A hello built with AuthPayload (slot zeroed) via the provisioner.
-        let mut hello = FixedChrome133
+        let mut hello = FixedChrome130Hybrid
             .provision(&HelloProvisionParams {
                 server_name: "www.microsoft.com",
-                alpn: Some(&["h2", "http/1.1"]),
+                alpn: Some(&[b"h2", b"http/1.1"]),
                 x25519_pub: &keypair.public_key(),
                 mlkem768_pub: Some(mlkem_pk.as_bytes()),
                 rng: &rng,
@@ -216,10 +216,10 @@ mod tests {
     fn extract_client_random_from_provisioned_hello() {
         let rng = ring::rand::SystemRandom::new();
         let (mlkem_pk, _) = Mlkem768::generate_keypair();
-        let hello = FixedChrome133
+        let hello = FixedChrome130Hybrid
             .provision(&HelloProvisionParams {
                 server_name: "www.microsoft.com",
-                alpn: Some(&["h2", "http/1.1"]),
+                alpn: Some(&[b"h2", b"http/1.1"]),
                 x25519_pub: &[0xAB; 32],
                 mlkem768_pub: Some(mlkem_pk.as_bytes()),
                 rng: &rng,

@@ -3,7 +3,7 @@
 //!
 //! `wrap()` routes `TlsConfig::Reality` here: this module decodes the
 //! REALITY opts (`pbk`/`sid`) from the link's security config, selects the
-//! `HelloProvisioner` (default: [`FixedChrome133`], or a caller-supplied
+//! `HelloProvisioner` (default: [`FixedChrome130Hybrid`], or a caller-supplied
 //! custom provisioner via `NativeConnectParams::reality_provisioner`), and
 //! the full client handshake — fingerprint-shaped `ClientHello` with a
 //! sealed `SessionId`, X25519 auth key, HMAC/Ed25519 server auth — runs in
@@ -15,20 +15,20 @@ use base64::Engine as _;
 
 use crate::error::NativeError;
 
-pub use leas_tls::reality::{FixedChrome133, HelloProvisioner, SpecProvisioner, SpiderConfig};
+pub use leas_tls::reality::{FixedChrome130Hybrid, HelloProvisioner, SpecProvisioner, SpiderConfig};
 
 /// Chosen provisioner for a REALITY connect.
 #[derive(Clone, Default)]
 pub enum HelloProvisionerChoice {
     #[default]
-    FixedChrome133,
+    FixedChrome130Hybrid,
     Custom(Arc<dyn HelloProvisioner>),
 }
 
 impl std::fmt::Debug for HelloProvisionerChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::FixedChrome133 => f.write_str("FixedChrome133"),
+            Self::FixedChrome130Hybrid => f.write_str("FixedChrome130Hybrid"),
             // `dyn HelloProvisioner` is deliberately not `Debug`; the
             // concrete provisioner is observable through the type itself.
             Self::Custom(_) => f.write_str("Custom(..)"),
@@ -131,8 +131,8 @@ mod tests {
     }
 
     #[test]
-    fn provisioner_choice_defaults_to_fixed_chrome133() {
+    fn provisioner_choice_defaults_to_fixed_chrome130_hybrid() {
         let choice = HelloProvisionerChoice::default();
-        assert_eq!(format!("{choice:?}"), "FixedChrome133");
+        assert_eq!(format!("{choice:?}"), "FixedChrome130Hybrid");
     }
 }
