@@ -235,7 +235,11 @@ impl RetrySupport<'_> {
     pub(crate) fn rebuild(
         &self,
         hrr: &HrrData,
-    ) -> Result<(crate::hello::BuiltHello, Option<X25519KeyPair>, Option<MlkemSecretKey>)> {
+    ) -> Result<(
+        crate::hello::BuiltHello,
+        Option<X25519KeyPair>,
+        Option<MlkemSecretKey>,
+    )> {
         let group = match hrr.selected_group {
             None => None,
             Some(wire) => Some(keyshare_group_for(wire).ok_or_else(|| {
@@ -375,8 +379,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
                 if first_hello.is_some() {
                     return Err(TlsError::Handshake(
-                        "server sent a second HelloRetryRequest; RFC 8446 §4.1.4 allows one"
-                            .into(),
+                        "server sent a second HelloRetryRequest; RFC 8446 §4.1.4 allows one".into(),
                     ));
                 }
                 let (rebuilt, new_keypair, new_sk) = retry.rebuild(&hrr)?;
@@ -412,8 +415,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 return Err(TlsError::RealityFallback);
             }
             ServerAuth::Verifier(verifier) => {
-                let client_random: [u8; 32] =
-                    current_hello[6..38].try_into().expect("32 bytes");
+                let client_random: [u8; 32] = current_hello[6..38].try_into().expect("32 bytes");
                 let pre_buffer = server_hello.pre_buffer.clone();
                 return tls12::drive12(
                     stream,
@@ -437,18 +439,19 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // IKM is `mlkem_shared || classical_shared` — Go's
     // handshake_client_tls13 appends the ECDH secret AFTER the ML-KEM
     // shared secret (`sharedKey = append(mlkemShared, sharedKey...)`).
-    let shared: Zeroizing<Vec<u8>> = match (mlkem_sk.as_ref(), server_hello.mlkem_ciphertext.as_ref()) {
-        (Some(sk), Some(ct)) => {
-            // The ciphertext was validated at parse; decapsulate it
-            // directly — no second copy through a temp `Vec`.
-            let pq_shared = Mlkem768::decapsulate(sk, ct);
-            let mut combined = Zeroizing::new(Vec::with_capacity(classical_shared.len() + 32));
-            combined.extend_from_slice(pq_shared.as_bytes());
-            combined.extend_from_slice(classical_shared.as_slice());
-            combined
-        }
-        _ => Zeroizing::new(classical_shared.to_vec()),
-    };
+    let shared: Zeroizing<Vec<u8>> =
+        match (mlkem_sk.as_ref(), server_hello.mlkem_ciphertext.as_ref()) {
+            (Some(sk), Some(ct)) => {
+                // The ciphertext was validated at parse; decapsulate it
+                // directly — no second copy through a temp `Vec`.
+                let pq_shared = Mlkem768::decapsulate(sk, ct);
+                let mut combined = Zeroizing::new(Vec::with_capacity(classical_shared.len() + 32));
+                combined.extend_from_slice(pq_shared.as_bytes());
+                combined.extend_from_slice(classical_shared.as_slice());
+                combined
+            }
+            _ => Zeroizing::new(classical_shared.to_vec()),
+        };
 
     let hash_len = server_hello.suite.hash_len();
     let mut ks = KeySchedule::new(server_hello.suite);
@@ -1135,14 +1138,14 @@ mod tests {
     use super::{
         AEAD_TAG_LEN, AcceptAll, CONTENT_APPLICATION_DATA, HRR_RANDOM, HS_CERTIFICATE,
         HS_CERTIFICATE_VERIFY, HS_COMPRESSED_CERTIFICATE, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED,
-        HS_MESSAGE_HASH, HS_SERVER_HELLO, HandshakeParams, TlsVersion, connect, decompress_bounded,
-        decompress_certificate_message, ensure_offered_sigalg, make_hs_msg,
-        parse_certificate_message, parse_certificate_verify, parse_encrypted_extensions,
-        ParsedReply, ParsedServerHello, parse_server_hello, read_server_hs_messages,
+        HS_MESSAGE_HASH, HS_SERVER_HELLO, HandshakeParams, ParsedReply, ParsedServerHello,
+        TlsVersion, connect, decompress_bounded, decompress_certificate_message,
+        ensure_offered_sigalg, make_hs_msg, parse_certificate_message, parse_certificate_verify,
+        parse_encrypted_extensions, parse_server_hello, read_server_hs_messages,
     };
-    use crate::hello::parse::parse_hello;
     use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
+    use crate::hello::parse::parse_hello;
     use crate::hello::{BuildParams, build_hello};
     use crate::record::{CONTENT_HANDSHAKE, aead_aad};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
@@ -1212,7 +1215,10 @@ mod tests {
             },
         )
         .expect("build hello");
-        assert_eq!(super::compressed_algorithms(&hello.handshake_bytes), expected);
+        assert_eq!(
+            super::compressed_algorithms(&hello.handshake_bytes),
+            expected
+        );
     }
 
     /// RFC 8446 §4.4.1: after a retry the transcript starts with the synthetic
@@ -1507,7 +1513,9 @@ mod tests {
                 assert_eq!(hrr.selected_group, Some(0x11EC));
                 assert_eq!(hrr.cookie.as_deref(), Some(b"c00k13".as_slice()));
             }
-            Ok(ParsedReply::Hello(_)) => panic!("an HRR magic random must not parse as a ServerHello"),
+            Ok(ParsedReply::Hello(_)) => {
+                panic!("an HRR magic random must not parse as a ServerHello")
+            }
             Err(e) => panic!("a hint-bearing HRR must parse: {e:?}"),
         }
     }
@@ -1663,7 +1671,9 @@ mod tests {
         // cookie echoed verbatim, length-prefixed.
         assert_eq!(
             hello2.extension(0x002c).expect("cookie"),
-            &[0x00, 0x0A, b's', b'r', b'v', b'-', b'c', b'o', b'o', b'k', b'i', b'e']
+            &[
+                0x00, 0x0A, b's', b'r', b'v', b'-', b'c', b'o', b'o', b'k', b'i', b'e'
+            ]
         );
 
         // Everything else is byte-identical (fingerprint fidelity), except
@@ -1701,7 +1711,10 @@ mod tests {
         // A hybrid share is ~1.2 KB, so the 512-byte record target is
         // unreachable and the padding extension is correctly omitted.
         assert!(ch2.len() + 5 > 512, "the hybrid share grows the hello");
-        assert!(hello2.extension(0x0015).is_none(), "no padding if it cannot fit");
+        assert!(
+            hello2.extension(0x0015).is_none(),
+            "no padding if it cannot fit"
+        );
     }
 
     /// The `key_share` group ids of a built `ClientHello`, in wire order.
@@ -1759,11 +1772,9 @@ mod tests {
             .unwrap();
         // Nothing more may arrive: the client aborts instead of retrying.
         let mut hdr = [0u8; 5];
-        let trailing = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            server.read(&mut hdr),
-        )
-        .await;
+        let trailing =
+            tokio::time::timeout(std::time::Duration::from_millis(200), server.read(&mut hdr))
+                .await;
         assert!(
             matches!(trailing, Ok(Ok(0)) | Err(_)),
             "the client must not send ClientHello2, got {trailing:?}"
@@ -2232,7 +2243,9 @@ mod tests {
         two.extend_from_slice(&0x002bu16.to_be_bytes());
         two.extend_from_slice(&[0x00, 0x03, 0x02, 0x03, 0x04]);
         two.extend_from_slice(&0x0010u16.to_be_bytes());
-        two.extend_from_slice(&[0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1']);
+        two.extend_from_slice(&[
+            0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1',
+        ]);
         let mut two_body = Vec::new();
         two_body.extend_from_slice(&u16::try_from(two.len()).unwrap().to_be_bytes());
         two_body.extend_from_slice(&two);

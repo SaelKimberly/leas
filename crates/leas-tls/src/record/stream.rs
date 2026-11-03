@@ -165,8 +165,10 @@ impl AppSecrets {
             client: Zeroizing::new([0u8; MAX_HASH_LEN]),
             server: Zeroizing::new([0u8; MAX_HASH_LEN]),
         };
-        out.client[..hash_len.min(client.len())].copy_from_slice(&client[..hash_len.min(client.len())]);
-        out.server[..hash_len.min(server.len())].copy_from_slice(&server[..hash_len.min(server.len())]);
+        out.client[..hash_len.min(client.len())]
+            .copy_from_slice(&client[..hash_len.min(client.len())]);
+        out.server[..hash_len.min(server.len())]
+            .copy_from_slice(&server[..hash_len.min(server.len())]);
         out
     }
 
@@ -495,9 +497,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
         // The record length counts the plaintext plus the AEAD tag, and must
         // be written BEFORE the seal (the tag is appended by it).
         let record_len = self.pending.len() - start - RECORD_HEADER_LEN + AEAD_TAG_LEN;
-        let len = u16::try_from(record_len).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "KeyUpdate record too long")
-        })?;
+        let len = u16::try_from(record_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "KeyUpdate record too long"))?;
         self.pending[start + 3..start + RECORD_HEADER_LEN].copy_from_slice(&len.to_be_bytes());
         key.seal_in_place(
             seq,
@@ -778,7 +779,8 @@ fn post_handshake_messages(body: &[u8], tls13: bool) -> io::Result<Vec<PostHands
             ));
         };
         let msg_type = header[0];
-        let len = usize::from(header[1]) << 16 | usize::from(header[2]) << 8 | usize::from(header[3]);
+        let len =
+            usize::from(header[1]) << 16 | usize::from(header[2]) << 8 | usize::from(header[3]);
         let Some(message) = body.get(pos + 4..pos + 4 + len) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -941,7 +943,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
         // itself is sealed with the CURRENT key, then the write key rotates —
         // subsequent records use the new generation, in order.
         if this.needs_key_update() {
-            if let Err(e) = this.queue_key_update(true).and_then(|()| this.rotate_write()) {
+            if let Err(e) = this
+                .queue_key_update(true)
+                .and_then(|()| this.rotate_write())
+            {
                 return Poll::Ready(Err(e));
             }
             match this.flush_pending(cx) {
@@ -1317,12 +1322,7 @@ mod tests {
         let (first, second) = generations(suite, &server_ts);
 
         let keys = AppKeys::tls13(first.clone_key(), first.clone_key());
-        let update = raw_record(
-            &keys,
-            0,
-            CONTENT_HANDSHAKE,
-            &key_update_msg(request_update),
-        );
+        let update = raw_record(&keys, 0, CONTENT_HANDSHAKE, &key_update_msg(request_update));
         let next_keys = AppKeys::tls13(second.clone_key(), second);
         let data = raw_record(&next_keys, 0, CONTENT_APPLICATION_DATA, b"after-update");
 
@@ -1430,17 +1430,17 @@ mod tests {
         let (a, mut b) = duplex(8192);
         let mut writer = TlsStream::new(
             a,
-            AppKeys::tls13(
-                AeadKey::new(suite, &[0x44; 32]).unwrap(),
-                first.clone_key(),
-            ),
+            AppKeys::tls13(AeadKey::new(suite, &[0x44; 32]).unwrap(), first.clone_key()),
         );
         writer.set_app_secrets(AppSecrets::new(suite, &client_ts, &server_ts));
         let limit = record_limit(suite);
         writer.keys.write_seq = limit;
         writer.write_all(b"hi").await.unwrap();
         writer.flush().await.unwrap();
-        assert_eq!(writer.keys.write_seq, 1, "the counter restarts after the rekey");
+        assert_eq!(
+            writer.keys.write_seq, 1,
+            "the counter restarts after the rekey"
+        );
 
         let mut wire = vec![0u8; 4096];
         let n = b.read(&mut wire).await.unwrap();

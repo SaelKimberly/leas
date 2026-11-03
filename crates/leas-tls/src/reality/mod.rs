@@ -430,9 +430,7 @@ mod tests {
                 .unwrap();
             let parsed = parse_hello(&hello.handshake_bytes).unwrap();
             let key_share = parsed.extension(0x0033).expect("key_share");
-            let hello_offers_hybrid = key_share
-                .windows(2)
-                .any(|w| w == 0x11EC_u16.to_be_bytes());
+            let hello_offers_hybrid = key_share.windows(2).any(|w| w == 0x11EC_u16.to_be_bytes());
             assert_eq!(
                 provisioner.offers_hybrid_key_share(),
                 hello_offers_hybrid,

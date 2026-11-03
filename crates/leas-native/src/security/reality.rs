@@ -15,7 +15,9 @@ use base64::Engine as _;
 
 use crate::error::NativeError;
 
-pub use leas_tls::reality::{FixedChrome130Hybrid, HelloProvisioner, SpecProvisioner, SpiderConfig};
+pub use leas_tls::reality::{
+    FixedChrome130Hybrid, HelloProvisioner, SpecProvisioner, SpiderConfig,
+};
 
 /// Chosen provisioner for a REALITY connect.
 #[derive(Clone, Default)]

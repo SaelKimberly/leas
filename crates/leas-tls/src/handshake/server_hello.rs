@@ -1,7 +1,7 @@
 //! `ServerHello` / `HelloRetryRequest` parsing and record reading.
 
 use super::{
-    AsyncRead, CONTENT_HANDSHAKE, Ciphertext, CipherSuiteId, HS_SERVER_HELLO, ParsedReply, Result,
+    AsyncRead, CONTENT_HANDSHAKE, CipherSuiteId, Ciphertext, HS_SERVER_HELLO, ParsedReply, Result,
     Tls12Suite, TlsError, TlsVersion, parse_handshake_messages, parse_server_hello, skip_ccs,
 };
 
@@ -69,10 +69,7 @@ pub enum ServerReply {
 
 /// Read and parse the `ServerHello` record, skipping CCS records. The
 /// server must echo the offered legacy session id (RFC 8446 §4.1.3).
-pub async fn read_server_hello<S>(
-    stream: &mut S,
-    offered_session_id: &[u8],
-) -> Result<ServerReply>
+pub async fn read_server_hello<S>(stream: &mut S, offered_session_id: &[u8]) -> Result<ServerReply>
 where
     S: AsyncRead + Unpin,
 {

@@ -464,10 +464,7 @@ impl KeySchedule {
     /// `KeyUpdate`: the next generation of a traffic secret =
     /// `HKDF-Expand-Label(secret, "traffic upd", "", hash_len)` (RFC 8446
     /// §7.2). Only `secret[..hash_len]` is valid.
-    pub fn update_traffic_secret(
-        &self,
-        secret: &[u8],
-    ) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
+    pub fn update_traffic_secret(&self, secret: &[u8]) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
         self.hkdf_expand_label_stack(secret, "traffic upd", &[], self.suite.hash_len())
     }
 

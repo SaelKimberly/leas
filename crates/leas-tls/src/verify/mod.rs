@@ -332,9 +332,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{WebPkiVerifier, verify_certificate_verify};
-    use crate::handshake::SignedData;
     use crate::crypto::CipherSuiteId;
     use crate::error::{Result, TlsError};
+    use crate::handshake::SignedData;
     use crate::handshake::{HandshakeParams, ServerVerifier, TlsVersion, VerifyContext, connect};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
     use rcgen::PublicKeyData;
