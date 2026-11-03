@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, hash_map::Entry};
+
+use rapidhash::{HashMapExt as _, HashSetExt as _, RapidHashMap, RapidHashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -1098,7 +1100,7 @@ pub(crate) struct BatchShared {
     fast_dedup: Mutex<FastDedupInner>,
     /// Links whose fast probe failed for a hard unreachability reason: their
     /// real half is not probed (the probe cannot pass where the dial did not).
-    hard_fast: Mutex<HashSet<(ProtocolId, EndpointId)>>,
+    hard_fast: Mutex<RapidHashSet<(ProtocolId, EndpointId)>>,
     /// The delay the fast level measured, per link, for as long as the batch
     /// runs.
     ///
@@ -1107,7 +1109,7 @@ pub(crate) struct BatchShared {
     /// `latency = None` and wipe the measurement the same batch had just taken
     /// (160 of 218 real failures lost their fast delay on 2026-09-15). This is
     /// the one field that must be composed back in.
-    fast_latency: Mutex<HashMap<(ProtocolId, EndpointId), i32>>,
+    fast_latency: Mutex<RapidHashMap<(ProtocolId, EndpointId), i32>>,
     /// The batch's counters (see [`BatchCounters`]).
     counters: BatchCounters,
     /// Wall-clock marks of the two levels, in ms since `started`. The spans
@@ -1119,7 +1121,7 @@ pub(crate) struct BatchShared {
     started_ms: AtomicU32,
     ended_ms: AtomicU32,
     // ── real-level endpoint dedup: endpoints whose real ping succeeded ─
-    completed_endpoints: Mutex<HashSet<i64>>,
+    completed_endpoints: Mutex<RapidHashSet<i64>>,
     /// The group's SIBLINGS, held until the group's first protocol's verdict
     /// lands (spec D15/T3.1).
     ///
@@ -1132,12 +1134,12 @@ pub(crate) struct BatchShared {
     /// real-success rate is 0.03%–1.7%, so a 74k-endpoint run holds tens of
     /// ids) and a membership test must be exact — a false positive would
     /// silently drop a working config.
-    deferred_siblings: Mutex<HashMap<i64, Vec<ProfileStats>>>,
+    deferred_siblings: Mutex<RapidHashMap<i64, Vec<ProfileStats>>>,
     /// DNS resolution requests already emitted by this batch. The plan walk
     /// dispatches pages sequentially, but the set belongs to the batch: a DNS
     /// endpoint can span page boundaries while its first request is still
     /// queued or in flight.
-    resolve_requested: Mutex<HashSet<i64>>,
+    resolve_requested: Mutex<RapidHashSet<i64>>,
 }
 
 /// Per-batch counters, folded into ONE summary line at the end (per-result
@@ -1193,8 +1195,8 @@ impl Half {
 }
 
 struct FastDedupInner {
-    cache: HashMap<(String, u16), ProbeOutcome>,
-    in_flight: HashMap<(String, u16), Arc<Notify>>,
+    cache: RapidHashMap<(String, u16), ProbeOutcome>,
+    in_flight: RapidHashMap<(String, u16), Arc<Notify>>,
 }
 
 /// Parameters for one batch run. Built by the entry points from `AppState`;
@@ -1276,18 +1278,18 @@ impl BatchShared {
             tasks: Mutex::new(Vec::new()),
             rate_main: Mutex::new((Instant::now(), 0)),
             fast_dedup: Mutex::new(FastDedupInner {
-                cache: HashMap::new(),
-                in_flight: HashMap::new(),
+                cache: RapidHashMap::new(),
+                in_flight: RapidHashMap::new(),
             }),
-            hard_fast: Mutex::new(HashSet::new()),
-            fast_latency: Mutex::new(HashMap::new()),
+            hard_fast: Mutex::new(RapidHashSet::new()),
+            fast_latency: Mutex::new(RapidHashMap::new()),
             counters: BatchCounters::default(),
             plan_ms: AtomicU32::new(0),
             started_ms: AtomicU32::new(0),
             ended_ms: AtomicU32::new(0),
-            completed_endpoints: Mutex::new(HashSet::new()),
-            deferred_siblings: Mutex::new(HashMap::new()),
-            resolve_requested: Mutex::new(HashSet::new()),
+            completed_endpoints: Mutex::new(RapidHashSet::new()),
+            deferred_siblings: Mutex::new(RapidHashMap::new()),
+            resolve_requested: Mutex::new(RapidHashSet::new()),
         }
     }
 
@@ -1972,11 +1974,11 @@ impl BatchShared {
     async fn dispatch_page(self: &Arc<Self>, links: Vec<PlanLink>) {
         // The group's siblings, held back until the first protocol's verdict
         // lands. Keyed by endpoint id: the group is the endpoint's links.
-        let mut deferred_siblings: HashMap<i64, Vec<ProfileStats>> = HashMap::new();
+        let mut deferred_siblings: RapidHashMap<i64, Vec<ProfileStats>> = RapidHashMap::new();
         // The endpoint ids whose first protocol has already been dispatched in
         // this page. The group is contiguous, so the SECOND link of an
         // endpoint is a sibling, not a new group.
-        let mut group_seen: HashSet<i64> = HashSet::new();
+        let mut group_seen: RapidHashSet<i64> = RapidHashSet::new();
         // One resolution request per DNS endpoint for the whole batch. The
         // handler's TTL gate makes a completed repeat cheap, but a request
         // waiting on the resolver semaphore is invisible to that gate.
@@ -2097,7 +2099,7 @@ impl BatchShared {
     }
 
     /// Hold a page's deferred siblings until their group's verdict lands.
-    fn hold_siblings(&self, siblings: HashMap<i64, Vec<ProfileStats>>) {
+    fn hold_siblings(&self, siblings: RapidHashMap<i64, Vec<ProfileStats>>) {
         if siblings.is_empty() {
             return;
         }
@@ -3607,10 +3609,10 @@ mod tests {
         dns_mark_on_real: Mutex<Option<(Arc<TaskScheduler>, EndpointId)>>,
         /// Per-address fast outcome, for the tests that need a mixed batch
         /// (an unreachable link next to a reachable one).
-        fast_by_addr: Mutex<std::collections::HashMap<String, ProbeOutcome>>,
+        fast_by_addr: Mutex<rapidhash::RapidHashMap<String, ProbeOutcome>>,
         /// Per-address fast delay, for the tests that need a deterministic
         /// fast-settle order (the real half is dispatched from that settle).
-        fast_delay_by_addr: Mutex<std::collections::HashMap<String, Duration>>,
+        fast_delay_by_addr: Mutex<rapidhash::RapidHashMap<String, Duration>>,
         /// Endpoint ids in the order their real probe STARTED.
         real_endpoint_order: Mutex<Vec<i64>>,
         /// When set, the real outcome is chosen by the CALL INDEX instead of
@@ -3639,8 +3641,8 @@ mod tests {
                 real_gate: Mutex::new(None),
                 dns_mark_on_fast: Mutex::new(None),
                 dns_mark_on_real: Mutex::new(None),
-                fast_by_addr: Mutex::new(std::collections::HashMap::new()),
-                fast_delay_by_addr: Mutex::new(std::collections::HashMap::new()),
+                fast_by_addr: Mutex::new(rapidhash::RapidHashMap::new()),
+                fast_delay_by_addr: Mutex::new(rapidhash::RapidHashMap::new()),
                 real_endpoint_order: Mutex::new(Vec::new()),
                 real_by_call: Mutex::new(None),
             }

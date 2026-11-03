@@ -45,7 +45,9 @@ use crate::models_toasty::{
 };
 use crate::weight::ConfigWeight;
 use crate::{Database, DatabaseError, Result, retry_on_busy};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use rapidhash::{HashMapExt as _, RapidHashMap, RapidHashSet};
 
 /// What one merge did, for the actions-log audit entry (the only record —
 /// the command applies directly and there is no undo).
@@ -197,7 +199,7 @@ async fn merge_links(
     weight_of: &(dyn Fn(i64) -> ConfigWeight + Send + Sync),
 ) -> Result<MergeReport> {
     let now = crate::models_toasty::now_epoch();
-    let mut survivor_links: HashMap<i64, &ProfileStats> = HashMap::new();
+    let mut survivor_links: RapidHashMap<i64, &ProfileStats> = RapidHashMap::new();
     let mut absorbed_links: Vec<&ProfileStats> = Vec::new();
     for link in links {
         if link.endpoint_id == survivor {
@@ -341,7 +343,7 @@ async fn merge_addresses(
     absorbed: EndpointId,
     addresses: &HashMap<EndpointId, Vec<(std::net::IpAddr, Option<String>)>>,
 ) -> Result<()> {
-    let have: HashSet<Vec<u8>> = addresses
+    let have: RapidHashSet<Vec<u8>> = addresses
         .get(&survivor)
         .map(|ips| {
             ips.iter()

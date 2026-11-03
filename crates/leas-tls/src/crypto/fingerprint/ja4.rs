@@ -102,13 +102,7 @@ fn sha12(payload: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(payload.as_bytes());
     let digest = hasher.finalize();
-    let mut out = String::with_capacity(12);
-    for b in &digest[..6] {
-        use core::fmt::Write as _;
-        out.write_fmt(format_args!("{b:02x}"))
-            .expect("string write");
-    }
-    out
+    hex::encode(&digest[..6])
 }
 
 #[cfg(test)]

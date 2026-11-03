@@ -28,6 +28,7 @@ block-buffer = { version = "0.12", default-features = false, features = ["zeroiz
 bytemuck = { version = "1", default-features = false, features = ["derive"] }
 chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
+compact_str = { version = "0.10", features = ["serde"] }
 crc32fast = { version = "1" }
 criterion = { version = "0.8", features = ["async_tokio"] }
 crossbeam-epoch = { version = "0.9" }
@@ -240,6 +241,7 @@ ignored = [
     "cc",
     "chacha20",
     "cipher",
+    "compact_str",
     "crc32fast",
     "criterion",
     "crossbeam-epoch",

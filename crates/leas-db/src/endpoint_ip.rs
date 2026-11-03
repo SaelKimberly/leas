@@ -33,6 +33,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::error::Result;
 use crate::models_toasty::{EndpointId, EndpointIp};
+use indexmap::IndexMap;
+use rapidhash::fast::RandomState as RapidState;
+use smallvec::SmallVec;
 use toasty_core::stmt::Value;
 
 /// Family byte of an IPv4 key: every IPv4 address sorts before every IPv6.
@@ -42,10 +45,19 @@ const FAMILY_V6: u8 = 6;
 /// Longest key: the family byte plus 16 address octets.
 const MAX_KEY_LEN: usize = 17;
 
+/// One packed address key, inline: every key is ≤ [`MAX_KEY_LEN`] bytes.
+type IpKey = SmallVec<[u8; MAX_KEY_LEN]>;
+
 /// The sortable key of an address. Byte order is address order, IPv4 first.
 #[must_use]
 pub fn key_of(ip: IpAddr) -> Vec<u8> {
-    let mut out = Vec::with_capacity(MAX_KEY_LEN);
+    key_of_inline(ip).to_vec()
+}
+
+/// [`key_of`] without the heap: every key is ≤ [`MAX_KEY_LEN`] bytes, so the
+/// bulk writers (which build one key per row) keep it inline.
+fn key_of_inline(ip: IpAddr) -> IpKey {
+    let mut out = SmallVec::new();
     match ip {
         IpAddr::V4(v4) => {
             out.push(FAMILY_V4);
@@ -172,16 +184,13 @@ pub async fn insert_literals_bulk(
     }
     // Dedup by (endpoint, key): the PK is the pair, and a duplicated literal
     // must not be a constraint violation.
-    let mut seen: std::collections::HashSet<(i64, Vec<u8>)> =
-        std::collections::HashSet::with_capacity(rows.len());
-    let mut pairs: Vec<(i64, Vec<u8>)> = Vec::with_capacity(rows.len());
+    let mut seen: IndexMap<(i64, IpKey), (), RapidState> =
+        IndexMap::with_capacity_and_hasher(rows.len(), RapidState::default());
     for (id, ip) in rows {
-        let key = key_of(*ip);
-        if seen.insert((id.get(), key.clone())) {
-            pairs.push((id.get(), key));
-        }
+        seen.insert((id.get(), key_of_inline(*ip)), ());
     }
-    for chunk in pairs.chunks(LITERAL_BULK_ROWS) {
+    let entries: Vec<(i64, IpKey)> = seen.into_keys().collect();
+    for chunk in entries.chunks(LITERAL_BULK_ROWS) {
         let mut sql = String::with_capacity(chunk.len() * 48 + 96);
         sql.push_str("INSERT INTO \"endpoint_ip\" (\"endpoint_id\", \"ip_key\") VALUES ");
         for (i, (id, key)) in chunk.iter().enumerate() {
@@ -203,12 +212,7 @@ const LITERAL_BULK_ROWS: usize = 400;
 
 /// Lowercase hex of a key, for a `x'…'` blob literal.
 fn hex_lit(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    hex::encode(bytes)
 }
 
 /// The persisted countries of `ids`, keyed by endpoint and address key.
@@ -282,7 +286,6 @@ pub(crate) async fn set_countries_bulk(
     conn: &mut impl toasty::Executor,
     rows: &[(EndpointId, IpAddr, String)],
 ) -> Result<()> {
-    use std::collections::hash_map::Entry;
     use std::fmt::Write as _;
     if rows.is_empty() {
         return Ok(());
@@ -295,25 +298,19 @@ pub(crate) async fn set_countries_bulk(
     // endpoint — so this branch is not reachable FROM the geo drain today, and it
     // exists to keep the ordering contract explicit rather than to be exercised.
     // First-seen order is preserved so the statement's row order is stable.
-    let mut slot: std::collections::HashMap<(i64, Vec<u8>), usize> =
-        std::collections::HashMap::with_capacity(rows.len());
-    let mut pairs: Vec<(i64, Vec<u8>, &str)> = Vec::with_capacity(rows.len());
+    let mut pairs: IndexMap<(i64, IpKey), &str, RapidState> =
+        IndexMap::with_capacity_and_hasher(rows.len(), RapidState::default());
     for (id, ip, iso) in rows {
-        let key = key_of(*ip);
-        match slot.entry((id.get(), key.clone())) {
-            Entry::Occupied(e) => pairs[*e.get()].2 = iso.as_str(),
-            Entry::Vacant(e) => {
-                e.insert(pairs.len());
-                pairs.push((id.get(), key, iso.as_str()));
-            }
-        }
+        // Last occurrence wins; `IndexMap` keeps the first-seen row position.
+        pairs.insert((id.get(), key_of_inline(*ip)), iso.as_str());
     }
-    for chunk in pairs.chunks(LITERAL_BULK_ROWS) {
+    let entries: Vec<((i64, IpKey), &str)> = pairs.into_iter().collect();
+    for chunk in entries.chunks(LITERAL_BULK_ROWS) {
         let mut sql = String::with_capacity(chunk.len() * 64 + 160);
         sql.push_str(
             "INSERT INTO \"endpoint_ip\" (\"endpoint_id\", \"ip_key\", \"country\") VALUES ",
         );
-        for (i, (id, key, iso)) in chunk.iter().enumerate() {
+        for (i, ((id, key), iso)) in chunk.iter().enumerate() {
             if i > 0 {
                 sql.push(',');
             }

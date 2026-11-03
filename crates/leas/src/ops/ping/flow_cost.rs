@@ -27,6 +27,7 @@
 //! feed file.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

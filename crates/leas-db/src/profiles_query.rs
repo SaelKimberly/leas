@@ -17,7 +17,6 @@
 //! re-derives that law: an index-driven scan of 200 rows replaced a
 //! `ROW_NUMBER()` window that cost ~975 ms per page on the reference feed.
 
-use std::collections::HashMap;
 use std::net::IpAddr;
 
 use crate::Database;
@@ -27,6 +26,7 @@ use crate::models_toasty::{
     ProtocolId, PurgatoryView, PurgeReason, Security, TrafficStats, Transport,
 };
 use leas_proto::proto_spec::{ProtocolKind, SecurityType, TransportType};
+use rapidhash::{HashMapExt as _, RapidHashMap};
 use toasty::Deferred;
 use toasty::schema::Load;
 use toasty_core::stmt::{Value, ValueRecord};
@@ -1308,9 +1308,9 @@ impl Database {
             sql.exec(&mut conn).await?
         };
 
-        let mut endpoints: HashMap<EndpointId, (Endpoint, Vec<IpAddr>)> = HashMap::new();
-        let mut links: HashMap<EndpointId, Vec<ProfileStats>> = HashMap::new();
-        let mut protocols: HashMap<ProtocolId, Protocol> = HashMap::new();
+        let mut endpoints: RapidHashMap<EndpointId, (Endpoint, Vec<IpAddr>)> = RapidHashMap::new();
+        let mut links: RapidHashMap<EndpointId, Vec<ProfileStats>> = RapidHashMap::new();
+        let mut protocols: RapidHashMap<ProtocolId, Protocol> = RapidHashMap::new();
         for row in &rows {
             let mut p = Projection::new(row)?;
             let (endpoint, resolved_ips) = decode_projected_endpoint(&mut p)?;

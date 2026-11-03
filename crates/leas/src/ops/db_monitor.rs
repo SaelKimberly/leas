@@ -12,8 +12,9 @@
 //!
 //! See `docs/aegis/specs/2026-09-24-db-query-monitoring-design.md`.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+
+use rapidhash::RapidHashMap;
 
 /// Bucket key for statements not enclosed by a named `Database`-method span.
 pub const UNATTRIBUTED: &str = "unattributed";
@@ -97,27 +98,27 @@ impl MethodStat {
 /// The per-method aggregation registry.
 #[derive(Debug, Default)]
 pub struct Registry {
-    methods: HashMap<String, MethodStat>,
+    methods: RapidHashMap<&'static str, MethodStat>,
 }
 
 impl Registry {
     /// Fold one `toasty::query` event into `method`'s bucket.
     pub fn fold_query(
         &mut self,
-        method: &str,
+        method: &'static str,
         duration_ms: f64,
         is_err: bool,
         statement: Option<&str>,
     ) {
         self.methods
-            .entry(method.to_owned())
+            .entry(method)
             .or_default()
             .record_query(duration_ms, is_err, statement);
     }
 
     /// Fold a method's completion: one invocation plus its final retry count.
-    pub fn fold_close(&mut self, method: &str, retries: u64) {
-        let stat = self.methods.entry(method.to_owned()).or_default();
+    pub fn fold_close(&mut self, method: &'static str, retries: u64) {
+        let stat = self.methods.entry(method).or_default();
         stat.invocations += 1;
         stat.retries += retries;
     }
@@ -125,7 +126,11 @@ impl Registry {
     /// Ranked dump lines, hottest method (by p99) first, capped to `top_n`.
     #[must_use]
     pub fn ranked(&self, top_n: usize) -> Vec<String> {
-        let mut rows: Vec<(&String, &MethodStat)> = self.methods.iter().collect();
+        let mut rows: Vec<(&'static str, &MethodStat)> = self
+            .methods
+            .iter()
+            .map(|(method, stat)| (*method, stat))
+            .collect();
         rows.sort_by(|a, b| b.1.percentile(99.0).total_cmp(&a.1.percentile(99.0)));
 
         let mut out = Vec::with_capacity(rows.len().min(top_n) + 1);
@@ -186,7 +191,7 @@ impl DbMonitor {
 
     pub fn fold_query(
         &self,
-        method: &str,
+        method: &'static str,
         duration_ms: f64,
         is_err: bool,
         statement: Option<&str>,
@@ -196,7 +201,7 @@ impl DbMonitor {
         }
     }
 
-    pub fn fold_close(&self, method: &str, retries: u64) {
+    pub fn fold_close(&self, method: &'static str, retries: u64) {
         if let Ok(mut reg) = self.0.lock() {
             reg.fold_close(method, retries);
         }
@@ -368,7 +373,7 @@ where
         let mut v = QueryVisitor::default();
         event.record(&mut v);
 
-        let method: &str = ctx
+        let method: &'static str = ctx
             .event_scope(event)
             .and_then(|mut scope| {
                 scope.find_map(|s| s.extensions().get::<MethodSpan>().map(|m| m.name))

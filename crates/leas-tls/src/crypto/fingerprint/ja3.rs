@@ -141,15 +141,9 @@ pub fn ja3_string(f: &Ja3Fields) -> String {
 /// The JA3 hash: md5 hex of [`ja3_string`].
 #[must_use]
 pub fn ja3_hash(f: &Ja3Fields) -> String {
-    use std::fmt::Write as _;
     let mut hasher = Md5::new();
     hasher.update(ja3_string(f).as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        let _ = write!(hex, "{b:02x}");
-    }
-    hex
+    hex::encode(hasher.finalize())
 }
 
 fn join_hex(values: &[u16]) -> String {

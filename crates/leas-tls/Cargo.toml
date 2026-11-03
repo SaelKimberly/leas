@@ -46,6 +46,8 @@ serde_json.workspace = true
 serde.workspace = true
 # errors
 thiserror.workspace = true
+# JA3/JA4 fingerprint digests
+hex.workspace = true
 # ML-KEM-768 (FIPS 203) — RustCrypto, pure Rust. Replaces liboqs/`oqs`, whose
 # vendored build required CMake, bindgen/libclang and a C/C++ toolchain — the
 # declared Windows target (`x86_64-pc-windows-msvc`, ADR 0013) cannot assume

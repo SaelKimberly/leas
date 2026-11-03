@@ -11,6 +11,7 @@
 use std::borrow::Cow;
 
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
+use memchr::{memchr, memmem};
 
 /// Protocol identified by the sniffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,19 +219,19 @@ fn probe_tls(bytes: &[u8]) -> Option<SniffResult<'_>> {
 /// matched case-insensitively with the value trimmed.
 fn probe_http(bytes: &[u8]) -> Option<SniffResult<'_>> {
     // Find end of request line.
-    let line_end = bytes.iter().position(|&b| b == b'\n')?;
+    let line_end = memchr(b'\n', bytes)?;
     let line = &bytes[..line_end];
     // Response line starts "HTTP/" — not a request.
     if line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"HTTP/") {
         return None;
     }
     // Method token: alphabetic chars then a space.
-    let sp = line.iter().position(|&b| b == b' ')?;
+    let sp = memchr(b' ', line)?;
     if sp == 0 || !line[..sp].iter().all(u8::is_ascii_alphabetic) {
         return None;
     }
     // Full header block must be present within the slice.
-    let _ = bytes.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let _ = memmem::find(bytes, b"\r\n\r\n")?;
 
     // Scan header lines for `host:` (case-insensitive name match). The
     // scan stops at the blank line that ends the header block: lines in
@@ -238,7 +239,7 @@ fn probe_http(bytes: &[u8]) -> Option<SniffResult<'_>> {
     // "host: attacker.com" cannot be mistaken for a header.
     let mut rest = &bytes[line_end + 1..];
     while !rest.is_empty() {
-        let Some(nl) = rest.iter().position(|&b| b == b'\n') else {
+        let Some(nl) = memchr(b'\n', rest) else {
             break;
         };
         let line = rest[..nl].strip_suffix(b"\r").unwrap_or(&rest[..nl]);
@@ -247,7 +248,7 @@ fn probe_http(bytes: &[u8]) -> Option<SniffResult<'_>> {
             // Blank line: end of headers; host not found in the block.
             break;
         }
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
+        let Some(colon) = memchr(b':', line) else {
             continue;
         };
         if !line[..colon].eq_ignore_ascii_case(b"host") {

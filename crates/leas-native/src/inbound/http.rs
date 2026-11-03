@@ -72,7 +72,7 @@ pub struct HttpInboundConfig {
     /// bind; a non-loopback bind without credentials warns at bind time.
     pub auth: Option<(String, String)>,
     /// Inbound tag reported to the router (`ConnMeta.inbound_tag`).
-    pub inbound_tag: String,
+    pub inbound_tag: Arc<str>,
     /// Compiled routing engine.
     pub engine: Arc<Engine>,
     /// Tagged outbounds the router may select.
@@ -91,7 +91,7 @@ impl HttpInboundConfig {
         Self {
             listen,
             auth: None,
-            inbound_tag: DEFAULT_HTTP_INBOUND_TAG.to_owned(),
+            inbound_tag: Arc::from(DEFAULT_HTTP_INBOUND_TAG),
             engine,
             outbounds,
             trace: None,

@@ -107,12 +107,12 @@ impl ConfigWeight {
     /// integers), so the literal is what the write path needs.
     #[must_use]
     pub fn sql_literal(self) -> String {
-        use std::fmt::Write as _;
-        let mut literal = String::with_capacity(19);
+        let mut digits = [0u8; 16];
+        hex::encode_to_slice(self.to_be_bytes(), &mut digits)
+            .expect("an 8-byte key always encodes to 16 hex digits");
+        let mut literal = String::with_capacity(3 + digits.len());
         literal.push_str("x'");
-        for byte in self.to_be_bytes() {
-            let _ = write!(literal, "{byte:02x}");
-        }
+        literal.push_str(std::str::from_utf8(&digits).expect("hex digits are ASCII"));
         literal.push('\'');
         literal
     }

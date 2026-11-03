@@ -1,12 +1,13 @@
 //! Compiled domain matchers and CIDR prefix sets.
 
-use crate::addr::{Cidr, prefix_match};
+use crate::addr::Cidr;
 use crate::error::RouteError;
 use daachorse::DoubleArrayAhoCorasick;
+use memchr::memchr;
+use rapidhash::RapidHashSet;
 use regex::RegexSet;
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr};
 
 /// Uncompiled set of domain matching rules.
 #[derive(Debug, Clone, Default)]
@@ -29,8 +30,8 @@ pub fn empty_spec() -> DomainRulesSpec {
 
 /// Compiled domain matcher: exact set, suffix set, keyword automaton, regex set.
 pub struct CompiledDomain {
-    exact: HashSet<String>,
-    suffix: HashSet<String>,
+    exact: RapidHashSet<String>,
+    suffix: RapidHashSet<String>,
     // Boxed: daachorse's automaton is 168 bytes inline (vs aho-corasick's
     // 24-byte internal box), which alone pushed `ItemMatcher::Domain` over the
     // `large_size_differences_between_variants` gate.
@@ -53,10 +54,11 @@ impl CompiledDomain {
     pub fn build(spec: &DomainRulesSpec) -> Result<Self, RouteError> {
         let lower_all = |xs: &[String]| xs.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>();
         let exact = lower_all(&spec.exact).into_iter().collect();
-        // Suffix entries are stored dot-prefixed so `ends_with` enforces the
-        // label boundary ("a.foo.com" hits ".foo.com"; "xfoo.com" does not).
-        // Leading dots on the input are trimmed; empty entries are rejected.
-        let mut suffix = HashSet::new();
+        // Suffix entries are stored dot-prefixed: a small set scans them with
+        // `ends_with` (the boundary check is the leading dot itself), and a
+        // large set looks each dot-prefixed host tail up directly. Leading
+        // dots on the input are trimmed; empty entries are rejected.
+        let mut suffix = RapidHashSet::default();
         for s in lower_all(&spec.suffix) {
             let s = s.trim_start_matches('.');
             if s.is_empty() {
@@ -112,13 +114,26 @@ impl CompiledDomain {
         if !self.exact.is_empty() && self.exact.contains(host) {
             return true;
         }
-        if self.suffix.iter().any(|s| host.ends_with(s.as_str())) {
+        if !self.suffix.is_empty() && self.suffix_matches(host) {
             return true;
         }
         if self.has_keywords && self.keywords.find_iter(host).next().is_some() {
             return true;
         }
         self.has_regexes && self.regexes.is_match(host)
+    }
+
+    /// Whether `host` hits any suffix entry.
+    ///
+    /// A small set is cheaper to scan with `ends_with` than to hash a
+    /// label per entry; the label walk pays off once the set is large.
+    #[inline]
+    fn suffix_matches(&self, host: &str) -> bool {
+        const SCAN_MAX: usize = 8;
+        if self.suffix.len() <= SCAN_MAX {
+            return self.suffix.iter().any(|s| host.ends_with(s.as_str()));
+        }
+        suffix_hit(&self.suffix, host)
     }
 
     /// Whether no rule is registered.
@@ -128,15 +143,42 @@ impl CompiledDomain {
     }
 }
 
-/// Correctness-first CIDR prefix storage; radix/prefix trie explicitly deferred.
+/// Whether any stored suffix matches `host`, for a suffix set too large to
+/// scan.
+///
+/// Entries are dot-prefixed, so every dot in the host starts a slice that IS
+/// the candidate key: `a.b.foo.com` probes `.b.foo.com`, `.foo.com`, `.com`.
+/// No allocation, O(dots) probes. The full host is never a candidate, so a
+/// suffix never matches the bare host. A trailing dot leaves the last slice
+/// as `.`-terminated (`.foo.com.`), which cannot equal `.foo.com`.
+fn suffix_hit(suffix: &RapidHashSet<String>, host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = memchr(b'.', &bytes[from..]) {
+        let at = from + pos;
+        if at + 1 < bytes.len() && suffix.contains(&host[at..]) {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// Inclusive host-order ranges per family; membership is one binary search.
+///
+/// A CIDR set is a *union*: normalising every prefix to its `[first, last]`
+/// range at build time and merging the overlaps makes `contains` a single
+/// `partition_point` over ≤N disjoint ranges, with no per-candidate mask
+/// compare. The old linear `prefix_match` form is kept in [`Cidr::contains`]
+/// for single-block checks.
 #[derive(Debug, Clone, Default)]
 pub struct CidrSetBuilder {
-    v4: Vec<(Ipv4Addr /* masked */, u8 /* bits */)>,
-    v6: Vec<(Ipv6Addr, u8)>,
+    v4: Vec<(u32, u32)>,
+    v6: Vec<(u128, u128)>,
 }
 
 impl CidrSetBuilder {
-    /// Adds a CIDR block to the set; the network address is masked to `bits`.
+    /// Adds a CIDR block to the set.
     ///
     /// # Errors
     /// Returns [`RouteError::Parse`] when `c.bits` exceeds the address
@@ -155,42 +197,40 @@ impl CidrSetBuilder {
             });
         }
         match c.addr {
-            IpAddr::V4(a) => self.v4.push((mask_v4(a, c.bits), c.bits)),
-            IpAddr::V6(a) => self.v6.push((mask_v6(a, c.bits), c.bits)),
+            IpAddr::V4(a) => self.v4.push(v4_range(a.octets(), c.bits)),
+            IpAddr::V6(a) => self.v6.push(v6_range(a.octets(), c.bits)),
         }
         Ok(())
     }
 
-    /// Builds the [`CidrSet`].
+    /// Builds the [`CidrSet`], merging overlapping ranges.
     #[must_use]
     pub fn build(self) -> CidrSet {
-        CidrSet {
-            v4: self.v4,
-            v6: self.v6,
-        }
+        CidrSet::new(self.v4, self.v6)
     }
 }
 
 /// The built read-only set of prefixes.
 #[derive(Debug, Clone, Default)]
 pub struct CidrSet {
-    v4: Vec<(Ipv4Addr /* masked */, u8 /* bits */)>,
-    v6: Vec<(Ipv6Addr, u8)>,
+    v4: Vec<(u32, u32)>,
+    v6: Vec<(u128, u128)>,
 }
 
 impl CidrSet {
-    /// Linear scan over stored prefixes matching `ip`'s family plus bits compare.
+    fn new(mut v4: Vec<(u32, u32)>, mut v6: Vec<(u128, u128)>) -> Self {
+        merge_ranges(&mut v4);
+        merge_ranges(&mut v6);
+        Self { v4, v6 }
+    }
+
+    /// Whether `ip` falls inside any stored prefix: one binary search over
+    /// the merged ranges of its family.
     #[must_use]
     pub fn contains(&self, ip: &IpAddr) -> bool {
         match *ip {
-            IpAddr::V4(b) => self
-                .v4
-                .iter()
-                .any(|(a, bits)| prefix_match(&a.octets(), &b.octets(), *bits)),
-            IpAddr::V6(b) => self
-                .v6
-                .iter()
-                .any(|(a, bits)| prefix_match(&a.octets(), &b.octets(), *bits)),
+            IpAddr::V4(b) => contains_range(&self.v4, u32::from_be_bytes(b.octets())),
+            IpAddr::V6(b) => contains_range(&self.v6, u128::from_be_bytes(b.octets())),
         }
     }
 
@@ -203,51 +243,63 @@ impl CidrSet {
     /// RFC1918 + CGNAT + loopback + link-local + ULA prefixes.
     #[must_use]
     pub fn private_set() -> Self {
-        // All entries below are already exact network addresses for their bits.
-        Self {
-            v4: vec![
-                (Ipv4Addr::new(10, 0, 0, 0), 8),
-                (Ipv4Addr::new(172, 16, 0, 0), 12),
-                (Ipv4Addr::new(192, 168, 0, 0), 16),
-                (Ipv4Addr::new(100, 64, 0, 0), 10),
-                (Ipv4Addr::new(127, 0, 0, 0), 8),
-                (Ipv4Addr::new(169, 254, 0, 0), 16),
+        Self::new(
+            vec![
+                v4_range([10, 0, 0, 0], 8),
+                v4_range([172, 16, 0, 0], 12),
+                v4_range([192, 168, 0, 0], 16),
+                v4_range([100, 64, 0, 0], 10),
+                v4_range([127, 0, 0, 0], 8),
+                v4_range([169, 254, 0, 0], 16),
             ],
-            v6: vec![
-                (Ipv6Addr::LOCALHOST, 128),
-                (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
-                (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
+            vec![
+                v6_range(Ipv6Addr::LOCALHOST.octets(), 128),
+                v6_range(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0).octets(), 10),
+                v6_range(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0).octets(), 7),
             ],
-        }
+        )
     }
 }
 
-/// Masks an octet array down to its network address for `bits`.
-fn mask_octets<const N: usize>(octets: [u8; N], bits: u8) -> [u8; N] {
-    let mut m = [0u8; N];
-    for (i, byte) in octets.iter().enumerate() {
-        let shift = i * 8;
-        if shift >= bits as usize {
-            break;
+/// The inclusive host-order range a v4 prefix covers.
+///
+/// `checked_shr` encodes both edges: `/0` leaves the whole space (`MAX >> 0`)
+/// and `/32` covers exactly the address (`MAX >> 32` overflows → `0`).
+fn v4_range(addr: [u8; 4], bits: u8) -> (u32, u32) {
+    let inv = u32::MAX.checked_shr(u32::from(bits)).unwrap_or(0);
+    let start = u32::from_be_bytes(addr) & !inv;
+    (start, start | inv)
+}
+
+/// The inclusive host-order range a v6 prefix covers (see [`v4_range`]).
+fn v6_range(addr: [u8; 16], bits: u8) -> (u128, u128) {
+    let inv = u128::MAX.checked_shr(u32::from(bits)).unwrap_or(0);
+    let start = u128::from_be_bytes(addr) & !inv;
+    (start, start | inv)
+}
+
+/// Sorts by start and merges overlapping ranges (adjacent ranges need no
+/// merge: `partition_point` still finds the one that contains the key).
+fn merge_ranges<T: Ord + Copy>(ranges: &mut Vec<(T, T)>) {
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut merged: Vec<(T, T)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.drain(..) {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            }
+            _ => merged.push((start, end)),
         }
-        let nb = (bits as usize - shift).min(8);
-        m[i] = byte
-            & match nb {
-                8 => u8::MAX,
-                _ => !(u8::MAX >> nb),
-            };
     }
-    m
+    *ranges = merged;
 }
 
-/// Masks an IPv4 address down to its network address for `bits`.
-fn mask_v4(a: Ipv4Addr, bits: u8) -> Ipv4Addr {
-    Ipv4Addr::from(mask_octets(a.octets(), bits))
-}
-
-/// Masks an IPv6 address down to its network address for `bits`.
-fn mask_v6(a: Ipv6Addr, bits: u8) -> Ipv6Addr {
-    Ipv6Addr::from(mask_octets(a.octets(), bits))
+/// Membership over merged, start-sorted ranges.
+fn contains_range<T: Ord + Copy>(ranges: &[(T, T)], key: T) -> bool {
+    let idx = ranges.partition_point(|range| range.0 <= key);
+    idx > 0 && key <= ranges[idx - 1].1
 }
 
 #[cfg(test)]
@@ -283,6 +335,72 @@ mod tests {
             }),
             Err(RouteError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn suffix_matches_only_parent_labels() {
+        let m = CompiledDomain::build(&DomainRulesSpec {
+            suffix: vec!["foo.com".into()],
+            ..empty_spec()
+        })
+        .unwrap();
+        // A suffix is a PARENT: the bare host does not match itself.
+        assert!(!m.matches_domain("foo.com"));
+        assert!(m.matches_domain("a.foo.com"));
+        assert!(m.matches_domain("a.b.foo.com"));
+        // A label that merely ends with the same bytes is not a match.
+        assert!(!m.matches_domain("xfoo.com"));
+        assert!(!m.matches_domain("a.xfoo.com"));
+        assert!(!m.matches_domain("foo.com.evil.test"));
+    }
+
+    #[test]
+    fn suffix_walk_over_a_large_set_keeps_label_boundaries() {
+        let mut suffix: Vec<String> = (0..16).map(|i| format!("cdn{i}.example.net")).collect();
+        suffix.push("foo.com".into());
+        let m = CompiledDomain::build(&DomainRulesSpec {
+            suffix,
+            ..empty_spec()
+        })
+        .unwrap();
+        assert!(m.matches_domain("a.b.foo.com"));
+        assert!(!m.matches_domain("foo.com"));
+        assert!(!m.matches_domain("xfoo.com"));
+        // Trailing dot: `.foo.com` is not the tail of `a.foo.com.`.
+        assert!(!m.matches_domain("a.foo.com."));
+        assert!(m.matches_domain("a.cdn3.example.net"));
+        assert!(!m.matches_domain("cdn3.example.net"));
+    }
+
+    #[test]
+    fn cidrset_merges_overlaps_and_edges() {
+        let mut b = CidrSetBuilder::default();
+        for c in [
+            "10.0.0.0/8",
+            "10.1.0.0/16", // nested inside 10/8
+            "192.168.0.0/16",
+            "192.168.0.0/16", // duplicate
+            "0.0.0.0/0",      // every v4 address
+        ] {
+            b.insert(Cidr::parse(c).unwrap()).unwrap();
+        }
+        b.insert(Cidr::parse("2001:db8::/32").unwrap()).unwrap();
+        b.insert(Cidr::parse("2001:db8:1::/48").unwrap()).unwrap();
+        let s = b.build();
+        // The /0 subsumes every v4 range, including ones never inserted.
+        assert!(s.contains(&"8.8.8.8".parse().unwrap()));
+        assert!(s.contains(&"10.2.0.1".parse().unwrap()));
+        assert!(s.contains(&"192.168.5.5".parse().unwrap()));
+        // v6 stays family-separated and nested prefixes still match.
+        assert!(s.contains(&"2001:db8:1::1".parse().unwrap()));
+        assert!(!s.contains(&"2001:db9::1".parse().unwrap()));
+
+        // A /32 matches exactly its address; a neighbouring one does not.
+        let mut host = CidrSetBuilder::default();
+        host.insert(Cidr::parse("203.0.113.7/32").unwrap()).unwrap();
+        let host = host.build();
+        assert!(host.contains(&"203.0.113.7".parse().unwrap()));
+        assert!(!host.contains(&"203.0.113.8".parse().unwrap()));
     }
 
     #[test]

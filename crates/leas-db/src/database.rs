@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
@@ -15,6 +14,7 @@ use crate::models_toasty::{
     TrafficStats, now_epoch,
 };
 use crate::retry_on_busy;
+use rapidhash::{HashMapExt as _, RapidHashMap};
 
 // ── Database handle ─────────────────────────────────────────────────────
 
@@ -1047,7 +1047,7 @@ impl Database {
         }
 
         // Page order, not id order: the caller's sequence IS the display order.
-        let mut by_id: HashMap<EndpointId, EndpointRow> =
+        let mut by_id: RapidHashMap<EndpointId, EndpointRow> =
             rows.into_iter().map(|row| (row.endpoint.id, row)).collect();
         Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
     }
@@ -1091,10 +1091,10 @@ impl Database {
                 .exec(conn)
                 .await?
         };
-        let protocol_by_id: HashMap<ProtocolId, Protocol> =
+        let protocol_by_id: RapidHashMap<ProtocolId, Protocol> =
             protocols.into_iter().map(|p| (p.id, p)).collect();
 
-        let mut by_endpoint: HashMap<EndpointId, Vec<ProfileStats>> = HashMap::new();
+        let mut by_endpoint: RapidHashMap<EndpointId, Vec<ProfileStats>> = RapidHashMap::new();
         for link in links {
             by_endpoint.entry(link.endpoint_id).or_default().push(link);
         }
@@ -1508,7 +1508,7 @@ impl Database {
     pub async fn endpoint_resolutions(
         &self,
         ids: &[EndpointId],
-    ) -> Result<HashMap<EndpointId, Vec<ResolvedAddress>>> {
+    ) -> Result<std::collections::HashMap<EndpointId, Vec<ResolvedAddress>>> {
         let mut conn = self.conn().await?;
         crate::endpoint_ip::load_resolved(&mut conn, ids).await
     }

@@ -19,7 +19,8 @@
 //! Both spec hooks therefore take `&mut impl toasty::Executor` and never open a
 //! transaction of their own.
 
-use std::collections::HashMap;
+use indexmap::IndexMap;
+use rapidhash::fast::RandomState as RapidState;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -597,24 +598,22 @@ impl CacheSpec for CountrySpec {
     }
 
     fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Patch>> {
-        let mut latest: HashMap<Self::Key, CountryRow> = HashMap::new();
-        let mut order: Vec<Self::Key> = Vec::new();
+        // `IndexMap::insert` keeps an existing key's first-seen position and
+        // replaces its value — exactly the old map+order pair, minus the
+        // parallel Vec.
+        let mut latest: IndexMap<Self::Key, CountryRow, RapidState> = IndexMap::default();
         for row in rows {
-            let key = row.endpoint_id;
-            if latest.insert(key, row).is_none() {
-                order.push(key);
-            }
+            latest.insert(row.endpoint_id, row);
         }
-        order
+        latest
             .into_iter()
-            .filter_map(|key| {
-                let row = latest.remove(&key)?;
+            .map(|(key, row)| {
                 let patch = CountryPatch {
                     endpoint_id: row.endpoint_id,
                     ip: row.ip,
                     iso: row.iso,
                 };
-                Some(Coalesced { key, patch })
+                Coalesced { key, patch }
             })
             .collect()
     }
@@ -902,60 +901,51 @@ impl CacheSpec for LinkSpec {
     /// rows it replaced would have contributed.
     fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Patch>> {
         use crate::LinkGroups;
-        let mut order: Vec<(
-            crate::models_toasty::ProtocolId,
-            crate::models_toasty::EndpointId,
-        )> = Vec::new();
-        let mut merged: HashMap<
+        // Insertion order IS the statement's row order; `IndexMap` carries it
+        // without the parallel key Vec the map+order pair needed.
+        let mut merged: IndexMap<
             (
                 crate::models_toasty::ProtocolId,
                 crate::models_toasty::EndpointId,
             ),
-            (crate::LinkGroups, crate::models_toasty::ProfileStats),
-        > = HashMap::new();
+            (LinkGroups, crate::models_toasty::ProfileStats),
+            RapidState,
+        > = IndexMap::default();
         for row in rows {
             let link_key = (row.link.protocol_id, row.link.endpoint_id);
-            match merged.entry(link_key) {
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    let (groups, base) = slot.get_mut();
-                    for flag in [
-                        LinkGroups::RESULT,
-                        LinkGroups::PURGE,
-                        LinkGroups::TRAFFIC,
-                        LinkGroups::STAB,
-                    ] {
-                        if row.groups.contains(flag) {
-                            merge_group(base, flag, &row.link);
-                        }
+            if let Some((groups, base)) = merged.get_mut(&link_key) {
+                for flag in [
+                    LinkGroups::RESULT,
+                    LinkGroups::PURGE,
+                    LinkGroups::TRAFFIC,
+                    LinkGroups::STAB,
+                ] {
+                    if row.groups.contains(flag) {
+                        merge_group(base, flag, &row.link);
                     }
-                    *groups = groups.union(row.groups);
                 }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    let mut link = row.link.clone();
-                    for flag in [
-                        LinkGroups::RESULT,
-                        LinkGroups::PURGE,
-                        LinkGroups::TRAFFIC,
-                        LinkGroups::STAB,
-                    ] {
-                        if row.groups.contains(flag) {
-                            merge_group(&mut link, flag, &row.link);
-                        }
-                    }
-                    order.push(link_key);
-                    slot.insert((row.groups, link));
+                *groups = groups.union(row.groups);
+                continue;
+            }
+            let mut link = row.link.clone();
+            for flag in [
+                LinkGroups::RESULT,
+                LinkGroups::PURGE,
+                LinkGroups::TRAFFIC,
+                LinkGroups::STAB,
+            ] {
+                if row.groups.contains(flag) {
+                    merge_group(&mut link, flag, &row.link);
                 }
             }
+            merged.insert(link_key, (row.groups, link));
         }
 
-        order
+        merged
             .into_iter()
-            .filter_map(|link_key| {
-                let (groups, link) = merged.remove(&link_key)?;
-                Some(Coalesced {
-                    key: (link_key.0, link_key.1, groups),
-                    patch: crate::LinkPatch { link, groups },
-                })
+            .map(|(link_key, (groups, link))| Coalesced {
+                key: (link_key.0, link_key.1, groups),
+                patch: crate::LinkPatch { link, groups },
             })
             .collect()
     }

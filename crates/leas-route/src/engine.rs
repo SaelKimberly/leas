@@ -7,6 +7,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use rapidhash::RapidHashSet;
 
 use bytes::Bytes;
 
@@ -27,7 +28,7 @@ pub struct ConnMeta {
     /// Transport-protocol bit mask of the connection.
     pub network: NetworkMask,
     /// Tag of the inbound the connection arrived on.
-    pub inbound_tag: Option<String>,
+    pub inbound_tag: Option<Arc<str>>,
     /// Peer address on the source side, when known.
     pub source: Option<SocketAddr>,
     /// Pre-resolved source IPs.
@@ -40,7 +41,7 @@ pub struct ConnMeta {
     pub sniffed: Option<SniffedProtocol>,
     /// SNI host carried on the wire, stashed by the sniff-enrichment pass
     /// (`decide_async`); the sync path only reads it.
-    pub sni_host: Option<String>,
+    pub sni_host: Option<compact_str::CompactString>,
     /// Filled by the `IfNonMatch` pass or pre-seeded by the caller.
     pub resolved_host_ips: Vec<IpAddr>,
 }
@@ -91,7 +92,7 @@ enum ItemMatcher {
     SourcePorts(Vec<PortRange>),
     Network(NetworkMask),
     Protocol(SniffedProtocol),
-    InboundTag(std::collections::HashSet<String>),
+    InboundTag(RapidHashSet<Arc<str>>),
     /// Inert until `ConnMeta` gains an outbound-tag field (Task 12).
     OutboundTag,
 }
@@ -437,8 +438,9 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
     // Protocol item in any rule means declared intent to look at payload.
     // The probe result borrows `meta.payload_prefix`, so it is reduced to
     // owned (protocol, host) fields before `meta` is mutated — the SNI is
-    // stashed by value (one alloc) because a `ConnMeta` cannot hold a
-    // borrow of its own payload buffer.
+    // stashed by value because a `ConnMeta` cannot hold a borrow of its own
+    // payload buffer. `CompactString` keeps the common short SNI inline; only
+    // a name past 24 bytes reaches the heap.
     let sniff_outcome = if engine.needs_sniff() && meta.sniffed.is_none() {
         meta.payload_prefix
             .as_deref()
@@ -452,7 +454,9 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
                     .then(|| {
                         (
                             result.protocol,
-                            result.host.map(std::borrow::Cow::into_owned),
+                            result
+                                .host
+                                .map(|h| compact_str::CompactString::new(h.as_ref())),
                         )
                     })
             })
@@ -578,7 +582,9 @@ fn compile_item(item: crate::ir::MatchItem, idx: usize) -> Result<ItemMatcher, R
         }
         M::Network(mask) => ItemMatcher::Network(mask),
         M::Protocol(p) => ItemMatcher::Protocol(p),
-        M::InboundTag { tags } => ItemMatcher::InboundTag(tags.into_iter().collect()),
+        M::InboundTag { tags } => {
+            ItemMatcher::InboundTag(tags.into_iter().map(Arc::from).collect())
+        }
         M::OutboundTag { .. } => ItemMatcher::OutboundTag,
     })
 }
@@ -1068,10 +1074,10 @@ mod tests {
         };
         let e = Engine::build(rs(vec![(ib, route("in"))])).unwrap();
         let mut tagged = meta("h", 1, NetworkMask::TCP);
-        tagged.inbound_tag = Some("proxy-in".to_owned());
+        tagged.inbound_tag = Some(Arc::from("proxy-in"));
         assert!(e.decide(&tagged).is_routed_to("in"));
         let mut wrong = meta("h", 1, NetworkMask::TCP);
-        wrong.inbound_tag = Some("other".to_owned());
+        wrong.inbound_tag = Some(Arc::from("other"));
         assert!(!e.decide(&wrong).is_routed_to("in"));
 
         // No ConnMeta.outbound_tag field exists yet; the item never matches.

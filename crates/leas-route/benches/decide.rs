@@ -33,6 +33,8 @@ const HIT_CIDR: &str = "203.0.113.0/24";
 const HIT_TAG: &str = "hit";
 /// Fallthrough tag, and therefore the `miss` rows' expected outcome.
 const DEFAULT_TAG: &str = "direct";
+/// Suffix-set cardinality for the scale row.
+const SUFFIX_SCAN: usize = 1024;
 
 const fn domain_item(suffix: Vec<String>, keywords: Vec<String>) -> MatchItem {
     MatchItem::Domain {
@@ -176,7 +178,78 @@ fn criterion_benches(c: &mut Criterion) {
             });
         }
     }
+    // Scale rows: the per-item cardinality the linear scan was questioned
+    // at. The hit is always the LAST entry, so the cost is worst case for
+    // both the CIDR set and the suffix set.
+    for n in [64_usize, 256] {
+        let engine = Engine::build(cidr_scale_set(n)).expect("bench rule set compiles");
+        let input = meta("203.0.113.7", 443);
+        assert_eq!(
+            engine.decide(&input),
+            Decision::Route {
+                tag: HIT_TAG.into(),
+                override_addr: None,
+            },
+            "decide/cidr_scan_{n} must reach the hit route"
+        );
+        group.bench_function(format!("cidr_scan/{n}"), |b| {
+            b.iter(|| engine.decide(black_box(&input)));
+        });
+    }
+    let engine = Engine::build(suffix_scale_set(SUFFIX_SCAN)).expect("bench rule set compiles");
+    let input = meta("assets.hit.example.org", 443);
+    assert_eq!(
+        engine.decide(&input),
+        Decision::Route {
+            tag: HIT_TAG.into(),
+            override_addr: None,
+        },
+        "decide/suffix_scan must reach the hit route"
+    );
+    group.bench_function(format!("suffix_scan/{SUFFIX_SCAN}"), |b| {
+        b.iter(|| engine.decide(black_box(&input)));
+    });
     group.finish();
+}
+
+fn cidr_scale_set(n: usize) -> RuleSet {
+    let mut cidrs: Vec<Cidr> = (0..n - 1)
+        .map(|i| Cidr::parse(&format!("198.{}.{}.0/24", 18 + i / 256, i % 256)).expect("cidr"))
+        .collect();
+    cidrs.push(Cidr::parse(HIT_CIDR).expect("hit cidr"));
+    RuleSet {
+        rules: vec![Rule {
+            name: Some("cidr-scale".to_owned()),
+            cond: Cond::All(vec![MatchItem::IpCidr {
+                cidrs,
+                private: false,
+                geo_country: Vec::new(),
+            }]),
+            action: route(HIT_TAG),
+        }],
+        default: DefaultRoute::Route {
+            tag: DEFAULT_TAG.to_owned(),
+        },
+        resolve_strategy: ResolveStrategy::AsIs,
+        probes: Vec::new(),
+    }
+}
+
+fn suffix_scale_set(n: usize) -> RuleSet {
+    let mut suffix: Vec<String> = (0..n - 1).map(|i| format!("cdn{i}.example.net")).collect();
+    suffix.push(HIT_SUFFIX.to_owned());
+    RuleSet {
+        rules: vec![Rule {
+            name: Some("suffix-scale".to_owned()),
+            cond: Cond::All(vec![domain_item(suffix, Vec::new())]),
+            action: route(HIT_TAG),
+        }],
+        default: DefaultRoute::Route {
+            tag: DEFAULT_TAG.to_owned(),
+        },
+        resolve_strategy: ResolveStrategy::AsIs,
+        probes: Vec::new(),
+    }
 }
 
 criterion_group!(benches, criterion_benches);

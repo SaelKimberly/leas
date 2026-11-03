@@ -24,11 +24,11 @@ fn meta(target: &str, port: u16) -> ConnMeta {
         network: NetworkMask::TCP,
         inbound_tag: None,
         source: None,
-        source_resolved_ips: vec![],
+        source_resolved_ips: Vec::new(),
         payload_prefix: None,
         sniffed: None,
         sni_host: None,
-        resolved_host_ips: vec![],
+        resolved_host_ips: Vec::new(),
     }
 }
 

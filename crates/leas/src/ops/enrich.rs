@@ -368,7 +368,7 @@ fn bump_resolve_progress() {
 /// `endpoint_info` entry, a `profile_stats` refresh) even though the query is
 /// per-host. Sharing the query without fanning the answer would leave the
 /// siblings `[name]` forever — the regression this replaces.
-static LOOKUP_WAITERS: std::sync::LazyLock<dashmap::DashMap<String, Vec<i64>>> =
+static LOOKUP_WAITERS: std::sync::LazyLock<dashmap::DashMap<String, smallvec::SmallVec<[i64; 4]>>> =
     std::sync::LazyLock::new(dashmap::DashMap::new);
 
 /// The key a host is deduplicated under: case-insensitive, trailing dot
@@ -437,7 +437,7 @@ pub fn spawn_dns_resolve_host(
         return;
     }
     if let Some(key) = &key {
-        LOOKUP_WAITERS.insert(key.clone(), vec![endpoint_id]);
+        LOOKUP_WAITERS.insert(key.clone(), smallvec::smallvec![endpoint_id]);
     }
     let waiters_key = key;
 
@@ -648,10 +648,10 @@ pub fn spawn_dns_resolve_host(
 /// one endpoint — so it serves only `fallback`, its own id. Without that
 /// fallback those lookups would emit no event at all and would leave a
 /// permanent in-flight marker, deferring their links forever.
-fn take_waiters(key: Option<&String>, fallback: i64) -> Vec<i64> {
+fn take_waiters(key: Option<&String>, fallback: i64) -> smallvec::SmallVec<[i64; 4]> {
     key.and_then(|k| LOOKUP_WAITERS.remove(k).map(|(_, ids)| ids))
         .filter(|ids| !ids.is_empty())
-        .unwrap_or_else(|| vec![fallback])
+        .unwrap_or_else(|| smallvec::smallvec![fallback])
 }
 
 /// Release the waiters a lookup will never answer (the runtime shut down

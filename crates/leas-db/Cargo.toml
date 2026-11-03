@@ -48,6 +48,13 @@ tracing.workspace = true
 
 # ============ Text / Search / Hash ============
 uuid.workspace = true
+# blob literal (`x'…'`) hex for the bulk upsert statements
+hex.workspace = true
+# insertion-ordered dedup maps in the write-behind/bulk writers
+indexmap = "2.14.2"
+rapidhash.workspace = true
+# inline (≤17-byte) packed address keys in the bulk writers
+smallvec.workspace = true
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true

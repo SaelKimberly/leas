@@ -18,6 +18,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use base64::Engine as _;
+use memchr::memmem;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::BoxStream;
@@ -115,7 +116,7 @@ impl HttpObfs {
 
 /// The index just past the first `\r\n\r\n`, if present.
 fn find_head_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|w| w == b"\r\n\r\n")
+    memmem::find(bytes, b"\r\n\r\n")
 }
 
 impl AsyncRead for HttpObfs {

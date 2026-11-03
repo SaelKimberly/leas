@@ -111,6 +111,8 @@ compact_str.workspace = true
 smallvec.workspace = true
 # host-table lookups on the UDP hot path (spec D13)
 rapidhash.workspace = true
+# SIMD byte search for HTTP/obfs head boundaries and Vision reshape
+memchr.workspace = true
 
 # observability (debug diagnostics in transports)
 tracing.workspace = true

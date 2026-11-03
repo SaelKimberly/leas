@@ -82,6 +82,9 @@ smallvec = { version = "1.16.4", default-features = false, features = ["const_ne
 # toasty's dependency graph; this promotes it to a direct edge.
 compact_str = "0.10.0"
 
+# hex: SQL blob literals (db), JA3/JA4 fingerprints (tls), weight literals (proto).
+hex = "0.4.3"
+
 # ============ Hashing ============
 rapidhash = { version = "4.5.1", features = ["std", "unsafe"] }
 

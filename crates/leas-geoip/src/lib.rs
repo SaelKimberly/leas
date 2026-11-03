@@ -34,9 +34,10 @@ pub struct GeoIp {
     init_lock: tokio::sync::Mutex<()>,
     fetch: Arc<Fetcher>,
     /// Per-IP decode cache (misses cached too), bounded at 1024 entries: a
-    /// repeated IP costs a lock + `Arc` clones, never another mmdb walk or
-    /// string decode; distinct-IP churn evicts cold entries.
-    cache: Mutex<lru::LruCache<IpAddr, Option<Arc<Location>>>>,
+    /// repeated IP is a sharded concurrent lookup plus `Arc` clones, never
+    /// another mmdb walk or string decode. `moka` evicts by admission
+    /// (`TinyLFU`), so churn cannot flush the hot set the way strict LRU can.
+    cache: moka::sync::Cache<IpAddr, Option<Arc<Location>>>,
     /// Cross-lookup latch for a persistently-unopenable artifact. Without it
     /// every cache-missing lookup deletes + re-downloads the database, since a
     /// failed heal latches nothing (finding f5).
@@ -71,9 +72,7 @@ impl GeoIp {
             reader: tokio::sync::OnceCell::new(),
             init_lock: tokio::sync::Mutex::new(()),
             fetch: Arc::new(fetcher),
-            cache: Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(1024).expect("cache cap is nonzero"),
-            )),
+            cache: moka::sync::Cache::builder().max_capacity(1024).build(),
             heal_latch: Mutex::new(HealLatch::default()),
         }
     }
@@ -82,13 +81,7 @@ impl GeoIp {
         // Cache-first: the common repeat lookup never touches the reader.
         // (Lock scoped to this block: the guard must drop before the awaits
         // below, and a guard in an `if let` scrutinee trips clippy.)
-        let hit = {
-            let mut cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.get(&ip).cloned()
-        };
+        let hit = self.cache.get(&ip);
         if let Some(hit) = hit {
             return Ok(hit.map(|loc| Location {
                 // Refcount bumps — no re-decode, no string copies.
@@ -131,11 +124,8 @@ impl GeoIp {
             }))
         })
         .await??;
-        let _ = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(ip, result.as_ref().map(|loc| Arc::new(loc.clone())));
+        self.cache
+            .insert(ip, result.as_ref().map(|loc| Arc::new(loc.clone())));
         Ok(result)
     }
 

@@ -33,8 +33,9 @@ anyhow.workspace = true
 tracing.workspace = true
 
 # ============ Bounded caches ============
-# Memory-diet Task 6 (B-slice gate): per-IP location micro-cache LRU bound.
-lru.workspace = true
+# Per-IP location micro-cache. `sync` is opt-in on moka; hickory-resolver
+# (already in this graph) compiles only its future half.
+moka = { version = "0.12.16", features = ["sync"] }
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
 [lints]

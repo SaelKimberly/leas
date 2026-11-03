@@ -27,6 +27,8 @@ serde_with = { version = "^3.24.0", default-features = false, features = ["macro
 url = { workspace = true }
 urlencoding.workspace = true
 base64.workspace = true
+# rank-key SQL blob literals
+hex.workspace = true
 
 # ============ Error Handling ============
 thiserror = { workspace = true }

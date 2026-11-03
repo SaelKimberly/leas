@@ -91,7 +91,7 @@ pub struct Socks5InboundConfig {
     /// RFC 1929 username/password; `None` = no-auth.
     pub auth: Option<(String, String)>,
     /// Inbound tag reported to the router (`ConnMeta.inbound_tag`).
-    pub inbound_tag: String,
+    pub inbound_tag: Arc<str>,
     /// Compiled routing engine.
     pub engine: Arc<Engine>,
     /// Tagged outbounds the router may select.
@@ -114,7 +114,7 @@ impl Socks5InboundConfig {
         Self {
             listen,
             auth: None,
-            inbound_tag: DEFAULT_INBOUND_TAG.to_owned(),
+            inbound_tag: Arc::from(DEFAULT_INBOUND_TAG),
             engine,
             outbounds,
             udp: true,
@@ -739,7 +739,7 @@ async fn shutdown_signal(rx: Option<&mut watch::Receiver<bool>>) {
 /// leg owns resolution so the relay loop never waits on DNS.
 struct ProxyDatagram {
     dest: TargetAddr,
-    payload: Vec<u8>,
+    payload: bytes::Bytes,
 }
 
 /// A spawned task aborted when this handle drops.
@@ -926,8 +926,10 @@ impl UdpRelay {
         // Route this datagram's destination. The sniffer needs the WHOLE
         // payload: a QUIC Initial is padded to ≥1200 bytes and the QUIC arm
         // rejects a truncated packet, so a prefix could never decrypt one.
-        // The copy is skipped entirely when no rule sniffs.
-        let payload_prefix = self
+        // The copy is skipped entirely when no rule sniffs; when it is made,
+        // the downstream consumer shares it (refcount) instead of copying a
+        // second time for its own ownership.
+        let owned_payload = self
             .config
             .engine
             .needs_sniff()
@@ -938,7 +940,7 @@ impl UdpRelay {
             inbound_tag: Some(self.config.inbound_tag.clone()),
             source: self.source,
             source_resolved_ips: Vec::new(),
-            payload_prefix,
+            payload_prefix: owned_payload.clone(),
             sniffed: None,
             sni_host: None,
             resolved_host_ips: Vec::new(),
@@ -982,11 +984,12 @@ impl UdpRelay {
             OutboundKind::Block => self.drop_datagram(Some(&host), payload.len()),
             OutboundKind::Direct => {
                 self.note_conn(&host);
-                self.forward_direct(dest, payload, &host).await;
+                self.forward_direct(dest, payload, owned_payload.as_ref(), &host)
+                    .await;
             }
             OutboundKind::Proxy(proxy) => {
                 self.note_conn(&host);
-                self.forward_proxy(&tag, proxy, dest, payload, &host);
+                self.forward_proxy(&tag, proxy, dest, payload, owned_payload.as_ref(), &host);
             }
         }
     }
@@ -998,7 +1001,13 @@ impl UdpRelay {
     /// stall the other flows on this association — and that task receives BOTH
     /// family sockets, so an `AAAA`-only name is reachable (guessing the
     /// family before the lookup would drop every v6 answer).
-    async fn forward_direct(&mut self, dest: TargetAddr, payload: &[u8], host: &str) {
+    async fn forward_direct(
+        &mut self,
+        dest: TargetAddr,
+        payload: &[u8],
+        owned_payload: Option<&bytes::Bytes>,
+        host: &str,
+    ) {
         self.ensure_direct_sockets().await;
         match dest.host {
             Host::Ip(ip) => {
@@ -1044,7 +1053,10 @@ impl UdpRelay {
                 // family sockets (guessing the family before the lookup would
                 // drop every `AAAA`-only answer).
                 let cache = Arc::clone(&self.dns_cache);
-                let payload = payload.to_vec();
+                let payload = owned_payload.map_or_else(
+                    || bytes::Bytes::copy_from_slice(payload),
+                    bytes::Bytes::clone,
+                );
                 let len = payload.len();
                 let port = dest.port;
                 let v4 = self.out_v4.clone();
@@ -1165,6 +1177,7 @@ impl UdpRelay {
         proxy: &ProxyOutbound,
         dest: TargetAddr,
         payload: &[u8],
+        owned_payload: Option<&bytes::Bytes>,
         host: &str,
     ) {
         if let Some(leg) = &self.proxy
@@ -1221,7 +1234,10 @@ impl UdpRelay {
             .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
         let datagram = ProxyDatagram {
             dest,
-            payload: payload.to_vec(),
+            payload: owned_payload.map_or_else(
+                || bytes::Bytes::copy_from_slice(payload),
+                bytes::Bytes::clone,
+            ),
         };
         match leg.queue.try_send(datagram) {
             // `up` counts a datagram accepted into the leg, matching spec §6.

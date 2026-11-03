@@ -23,6 +23,8 @@ use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use bytes::{Buf, BytesMut};
+use memchr::memmem;
+use smallvec::{SmallVec, smallvec};
 
 use crate::protocol::vless::stream::VlessClientStream;
 
@@ -252,10 +254,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
     fn pad_chunk(&mut self, chunk: &[u8]) -> (usize, bool) {
         // Reshape chunks >= 8171 at the last 0x17 0x03 0x03 boundary
         // (ReshapeMultiBuffer, spec §4.3) so each piece keeps the frame cap.
-        let pieces: Vec<&[u8]> = if chunk.len() >= MAX_FRAME - FRAME_OVERHEAD {
+        let pieces: SmallVec<[&[u8]; 4]> = if chunk.len() >= MAX_FRAME - FRAME_OVERHEAD {
             reshape(chunk)
         } else {
-            vec![chunk]
+            smallvec![chunk]
         };
         let long_padding = self.filter.is_tls;
         for (i, piece) in pieces.iter().enumerate() {
@@ -878,14 +880,11 @@ impl TlsFilter {
 /// The split repeats — our chunks can span several frames (e.g. a full
 /// 16 KiB inner TLS record), so a single split would not guarantee the cap;
 /// the reassembled byte stream is unchanged either way.
-fn reshape(chunk: &[u8]) -> Vec<&[u8]> {
-    let mut pieces = Vec::new();
+fn reshape(chunk: &[u8]) -> SmallVec<[&[u8]; 4]> {
+    let mut pieces = SmallVec::new();
     let mut rest = chunk;
     while rest.len() >= MAX_FRAME - FRAME_OVERHEAD {
-        let index = rest
-            .windows(TLS_APP_DATA_START.len())
-            .rposition(|w| w == TLS_APP_DATA_START)
-            .unwrap_or(usize::MAX);
+        let index = memmem::rfind(rest, &TLS_APP_DATA_START).unwrap_or(usize::MAX);
         let index = if (21..=MAX_FRAME - FRAME_OVERHEAD).contains(&index) {
             index
         } else {

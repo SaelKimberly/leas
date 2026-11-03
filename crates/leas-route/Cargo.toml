@@ -20,7 +20,11 @@ thiserror.workspace = true
 
 # ============ Text / Search / Hash ============
 daachorse.workspace = true
+memchr.workspace = true
 regex = "1.13.1"
+# hot-path maps and the sniffed SNI (the telemetry pattern)
+rapidhash.workspace = true
+compact_str.workspace = true
 parking_lot.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
