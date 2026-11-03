@@ -901,8 +901,8 @@ impl CacheSpec for LinkSpec {
     /// rows it replaced would have contributed.
     fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Patch>> {
         use crate::LinkGroups;
-        // Insertion order IS the statement's row order; `IndexMap` carries it
-        // without the parallel key Vec the map+order pair needed.
+        // First-seen order IS the statement's row order; `IndexMap` carries
+        // it without the parallel key Vec the map+order pair needed.
         let mut merged: IndexMap<
             (
                 crate::models_toasty::ProtocolId,

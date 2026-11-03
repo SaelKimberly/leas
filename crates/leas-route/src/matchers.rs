@@ -30,6 +30,11 @@ pub fn empty_spec() -> DomainRulesSpec {
 
 /// Compiled domain matcher: exact set, suffix set, keyword automaton, regex set.
 pub struct CompiledDomain {
+    // `rapidhash`'s `fast` state seeds itself from process entropy (minimal,
+    // not zero, DoS resistance). The keys are config-built hostnames; the
+    // attacker can only choose the probed host, never the stored set, so the
+    // per-process random seed is the accepted trade — same boundary as the
+    // telemetry maps.
     exact: RapidHashSet<String>,
     suffix: RapidHashSet<String>,
     // Boxed: daachorse's automaton is 168 bytes inline (vs aho-corasick's
@@ -127,6 +132,8 @@ impl CompiledDomain {
     ///
     /// A small set is cheaper to scan with `ends_with` than to hash a
     /// label per entry; the label walk pays off once the set is large.
+    /// `SCAN_MAX` sits between the two bench shapes: the `rules_{8,64}`
+    /// fillers carry 2 suffixes (linear) and `suffix_scan/1024` walks.
     #[inline]
     fn suffix_matches(&self, host: &str) -> bool {
         const SCAN_MAX: usize = 8;
@@ -370,6 +377,23 @@ mod tests {
         assert!(!m.matches_domain("a.foo.com."));
         assert!(m.matches_domain("a.cdn3.example.net"));
         assert!(!m.matches_domain("cdn3.example.net"));
+    }
+
+    #[test]
+    fn suffix_walk_handles_non_ascii_labels() {
+        let mut suffix: Vec<String> = (0..16).map(|i| format!("cdn{i}.example.net")).collect();
+        suffix.push("例え.テスト".into());
+        let m = CompiledDomain::build(&DomainRulesSpec {
+            suffix,
+            ..empty_spec()
+        })
+        .unwrap();
+        // Full-Unicode lowercasing feeds the label walk; the dot is ASCII, so
+        // the slice starts on a char boundary.
+        assert!(m.matches_domain("WWW.例え.テスト"));
+        assert!(m.matches_domain("café.例え.テスト"));
+        assert!(!m.matches_domain("例え.テスト"));
+        assert!(!m.matches_domain("café.example.net"));
     }
 
     #[test]

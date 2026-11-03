@@ -114,7 +114,7 @@ impl HttpObfs {
     }
 }
 
-/// The index just past the first `\r\n\r\n`, if present.
+/// The index of the first `\r\n\r\n`, if present (the caller adds 4).
 fn find_head_end(bytes: &[u8]) -> Option<usize> {
     memmem::find(bytes, b"\r\n\r\n")
 }

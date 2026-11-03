@@ -290,12 +290,18 @@ impl Visit for QueryVisitor {
     }
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "db.statement" {
+            // Still one String per attributed event: the visitor cannot hold
+            // the event's borrow, and the text is needed only if this sample
+            // becomes the slowest. The fold's method KEY is the alloc that
+            // went away; this copy is pre-existing and bounded by the event
+            // rate of a local SQLite handle.
             self.statement = Some(value.to_owned());
         }
     }
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         // toasty records `db.statement` and `error` through `field::display`,
-        // which arrives here as `format_args!` (the bare Display string).
+        // which arrives here as `format_args!` (the bare Display string);
+        // the statement copy is the same per-event capture as `record_str`.
         match field.name() {
             "db.statement" => self.statement = Some(format!("{value:?}")),
             "error" => self.is_err = true,

@@ -27,6 +27,8 @@
 //! feed file.
 #![allow(dead_code)]
 
+// The lab keeps std `HashMap` on purpose: its rows A/B the *key type*
+// (String vs Arc<str> vs prehashed) against a fixed SipHash control.
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -236,6 +238,7 @@ fn flow_cost_sizes() {
         ("ProbeOutcome", size_of::<ProbeOutcome>()),
         ("ProtocolConfig", size_of::<ProtocolConfig>()),
         ("LinkPatch", size_of::<leas_db::LinkPatch>()),
+        ("ConnMeta", size_of::<leas_route::ConnMeta>()),
     ] {
         println!("{name:<56} {size:>6}");
     }
