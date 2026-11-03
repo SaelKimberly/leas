@@ -66,6 +66,12 @@ chrono = { version = "0.4.45" }
 humantime.workspace = true
 url.workspace = true
 parking_lot.workspace = true
+# Sniffer pane: inline host keys and the allocation-free snapshot row list
+# (spec 2026-11-03-sniffer-pane D13)
+compact_str.workspace = true
+smallvec.workspace = true
+# per-host rate lookup between samples
+rapidhash.workspace = true
 # Memory-diet Task 6 (B-slice gate): the ONLY new-dep allowance. `lru` is
 # already in Cargo.lock (toasty's transitive dep), so no new CRATE enters the
 # tree — direct edges only for the TUI's bounded caches. The VERSION is ours:

@@ -33,11 +33,12 @@ use tokio::sync::watch;
 
 use super::outbound::{self, Outbound, OutboundKind};
 use super::{
-    DEFAULT_HTTP_INBOUND_TAG, TraceCtx, absorb_accept_error, net_to_target, target_to_net,
-    traced_relay, warn_if_open_relay,
+    DEFAULT_HTTP_INBOUND_TAG, TraceCtx, absorb_accept_error, dest_str, net_to_target,
+    target_to_net, traced_relay, warn_if_open_relay,
 };
 use crate::addr::TargetAddr;
 use crate::error::{NativeError, timeouts};
+use crate::telemetry::{TraceFailReason, UNKNOWN_HOST};
 
 /// Upper bound on the CONNECT request head (request line + headers).
 /// CONNECT heads are tiny; anything larger is a slowloris / abuse.
@@ -227,12 +228,21 @@ pub(super) async fn handle_conn(
         read_request(&mut reader, config.auth.as_ref()),
     )
     .await
-    .map_err(|_| NativeError::Timeout {
-        step: "http request",
-        limit: timeouts::PROTOCOL,
-    })? {
-        Ok(request) => request,
-        Err(refusal) => {
+    {
+        Err(_) => {
+            trace_failure(&config, UNKNOWN_HOST, TraceFailReason::Malformed);
+            return Err(NativeError::Timeout {
+                step: "http request",
+                limit: timeouts::PROTOCOL,
+            });
+        }
+        Ok(Ok(request)) => request,
+        Ok(Err(refusal)) => {
+            let reason = match refusal {
+                Refusal::AuthRequired => TraceFailReason::Auth,
+                _ => TraceFailReason::Malformed,
+            };
+            trace_failure(&config, UNKNOWN_HOST, reason);
             // Best effort: a client that hung up mid-head cannot be told, and
             // that is its own fault, not a server failure.
             if let Err(error) = write_refusal(reader.into_inner(), refusal).await {
@@ -245,6 +255,13 @@ pub(super) async fn handle_conn(
     handle_connect(&config, reader.into_inner(), peer, request).await
 }
 
+/// Report a pre-relay refusal when the inbound is traced.
+fn trace_failure(config: &HttpInboundConfig, dest: &str, reason: TraceFailReason) {
+    if let Some(trace) = &config.trace {
+        trace.failed(dest, reason);
+    }
+}
+
 /// Handle a routed CONNECT: route the destination, dial the outbound, relay.
 async fn handle_connect(
     config: &HttpInboundConfig,
@@ -253,6 +270,7 @@ async fn handle_connect(
     request: ConnectRequest,
 ) -> Result<(), NativeError> {
     let ConnectRequest { target, pending } = request;
+    let dest = dest_str(&target);
 
     // Route the destination.
     let mut meta = ConnMeta {
@@ -272,10 +290,14 @@ async fn handle_connect(
         Decision::Route { tag, override_addr } => {
             let Some(outbound) = config.outbounds.iter().find(|o| o.tag.as_str() == &*tag) else {
                 tracing::warn!(%tag, "http inbound: routing decision named an unknown outbound");
+                trace_failure(config, &dest, TraceFailReason::NoOutbound);
                 return write_refusal(&mut conn, Refusal::BadGateway).await;
             };
             match &outbound.kind {
-                OutboundKind::Block => write_refusal(&mut conn, Refusal::Blocked).await,
+                OutboundKind::Block => {
+                    trace_failure(config, &dest, TraceFailReason::Blocked);
+                    write_refusal(&mut conn, Refusal::Blocked).await
+                }
                 kind => {
                     let target = override_addr.map(|a| net_to_target(&a)).unwrap_or(target);
                     let mut upstream = match outbound::dial(kind, &target).await {
@@ -287,6 +309,7 @@ async fn handle_connect(
                                 %error,
                                 "http inbound: outbound dial failed"
                             );
+                            trace_failure(config, &dest, TraceFailReason::Dial);
                             return write_refusal(&mut conn, Refusal::BadGateway).await;
                         }
                     };
@@ -311,6 +334,9 @@ async fn handle_connect(
         Decision::Reject { .. } | Decision::HijackDns => {
             if matches!(decision, Decision::HijackDns) {
                 tracing::warn!("http inbound: HijackDns decision is not implemented; rejecting");
+                trace_failure(config, &dest, TraceFailReason::HijackDns);
+            } else {
+                trace_failure(config, &dest, TraceFailReason::Rejected);
             }
             write_refusal(&mut conn, Refusal::Blocked).await
         }

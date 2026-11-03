@@ -19,8 +19,8 @@ and starts the other.
 The window is two framed panes, a shell-level log row, and a status bar:
 
 ```
-┌ 1: [Profiles]  Logs ────────────────────────────────────┐
-│ …table or log viewer…                                    │
+┌ 1: [Profiles]  Sniffer  Logs ───────────────────────────┐
+│ …table, per-host traffic, or log viewer…                 │
 ├ 2: Details  Metrics  [Tasks] ────────────────────────────┤
 │ …server facts + DB aggregates / metrics / job queue…      │
 └ live log tail ───────────────────────────────────────────┘
@@ -30,7 +30,8 @@ The window is two framed panes, a shell-level log row, and a status bar:
 - Each pane carries an inline tab bar in its border title: pane index (`1:`/`2:`)
   accent-bold, the active tab bracketed and accent-bold (`[Profiles]`), inactive
   tabs plain. Focused pane draws an accent border, the other a muted one.
-- **Pane 1 tabs**: `Profiles` (endpoint table) and `Logs` (live core log viewer).
+- **Pane 1 tabs**: `Profiles` (endpoint table), `Sniffer` (per-host traffic for
+  the native session), and `Logs` (live core log viewer).
 - **Pane 2 tabs**: `Details` (the selected server's static facts + the DB's
   aggregate status), `Metrics` (connection status + traffic + native-core
   connection ring + core system stats, one scrollable view), and `Tasks` (the
@@ -220,6 +221,38 @@ selection moves the Values pane with it.
 **Updates form** — shows current version and latest available version for each
 backend. `C` triggers a version check, `D` triggers download for all available
 updates. `Esc` returns to menu.
+
+---
+
+### Sniffer (pane 1 tab)
+
+Per-host traffic for the **in-process native core**, fed by a 1 s snapshot of
+the session's accounting (spec `2026-11-03-sniffer-pane-design.md`). With a
+subprocess core (xray-core / sing-box) or no connection, the tab shows:
+
+```
+No native session — per-host traffic requires the native core
+```
+
+Layout, top to bottom:
+
+1. **Rates** — `↓ x/s  ↑ y/s` for the last second.
+2. **Summary** — `hosts N · failed N · dropped N datagrams (bytes)`; "dropped"
+   counts undelivered UDP payloads (malformed, blocked, queue-full, unresolvable
+   destination, carrier refusal), while "failed" counts refused or failed TCP
+   legs.
+3. **Two mirrored sparklines** — down grows downward from the top line, up grows
+   upward from the bottom line, over the last 60 s. Both share one scale, so the
+   two directions are comparable; a non-zero sample is never invisible.
+4. **Host table** — `host · ↓ · ↑ · conns · failed`, sorted by total bytes
+   descending. A host is the destination **as the client sent it** (domain or IP
+   literal, no port): a proxied domain keeps its domain because the remote proxy
+   resolves it.
+
+Bytes only — the pane has no bits/packets selector: TCP has no packet boundary,
+so a packet count would mean different things per row. Totals are session-only
+and in memory: disconnect freezes the table, connecting again clears it. Keys:
+`↑`/`↓` scroll, `PgUp`/`PgDn` page, `Home`/`End` jump to the first/last host.
 
 ---
 

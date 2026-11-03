@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod native_activity;
 pub mod profiles;
 pub mod settings;
+pub mod sniffer;
 pub mod status_bar;
 pub mod tasks;
 pub mod theme;
@@ -936,6 +937,26 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         return;
     }
 
+    // Sniffer tab: the host table's scroll keys (mirrors Native Activity).
+    if matches!(state.pane1_tab, crate::Pane1Tab::Sniffer)
+        && matches!(state.focused_pane, crate::FocusedPane::Pane1)
+        && matches!(state.mode, crate::AppMode::List)
+    {
+        let is_sniffer_key = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+        ) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_sniffer_key {
+            sniffer::handle_key(state, key);
+            return;
+        }
+    }
+
     // Logs tab: route logs-specific keys (scroll, filter, copy, selection)
     if matches!(state.pane1_tab, crate::Pane1Tab::Logs)
         && matches!(state.focused_pane, crate::FocusedPane::Pane1)
@@ -1406,6 +1427,7 @@ fn render_base(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState)
 fn render_pane1(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     match state.pane1_tab {
         crate::Pane1Tab::Profiles => profiles::render(frame, area, state),
+        crate::Pane1Tab::Sniffer => sniffer::render(frame, area, state),
         crate::Pane1Tab::Logs => logs::render_inner(frame, area, state),
     }
 }
@@ -1674,6 +1696,10 @@ fn render(frame: &mut Frame, state: &AppState) {
             "Profiles",
             matches!(state.pane1_tab, crate::Pane1Tab::Profiles),
         ),
+        (
+            "Sniffer",
+            matches!(state.pane1_tab, crate::Pane1Tab::Sniffer),
+        ),
         ("Logs", matches!(state.pane1_tab, crate::Pane1Tab::Logs)),
     ];
     let p1_border = if pane1_focused {
@@ -1792,6 +1818,15 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("[ / ]", "Cycle the focused pane's tabs"),
                     (",", "Open Settings popup"),
                     ("Ctrl+D", "Disconnect"),
+                    ("?", "Toggle this help"),
+                    ("q / Ctrl+C", "Quit"),
+                ],
+                crate::Pane1Tab::Sniffer => vec![
+                    ("↑↓", "Scroll hosts"),
+                    ("PgUp / PgDn", "Page up/down"),
+                    ("Home / End", "Jump to first/last host"),
+                    ("[ / ]", "Cycle the focused pane's tabs"),
+                    ("Tab / Shift+Tab", "Switch pane focus (1 / 2 jump)"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
                 ],

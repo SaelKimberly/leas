@@ -32,7 +32,7 @@ use crate::ops::{
 use crate::types::{
     AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, FocusedPane, LogLine,
     NativeActivityLog, Pane1Tab, Pane2Tab, SectionList, SettingsSearch, SettingsSection,
-    SplitRightPane,
+    SnifferState, SplitRightPane,
 };
 
 /// The scope an [`AggregateCache`] was computed for.
@@ -154,6 +154,8 @@ pub struct AppState {
     pub system_stats: Option<grpc_client::SysStats>,
     /// Session-only native-core trace log for the Native Activity tab.
     pub native_activity: NativeActivityLog,
+    /// Session-only per-host traffic for the Sniffer tab.
+    pub sniffer: SnifferState,
     /// Cached log entries for the Logs tab, newest at end.
     pub log_cache: VecDeque<LogLine>,
     /// Whether there may be older entries in the DB to load.
@@ -767,6 +769,7 @@ impl AppState {
             confirmation: None,
             updating_groups: HashSet::new(),
             native_activity: NativeActivityLog::new(2000),
+            sniffer: SnifferState::default(),
             system_stats: None,
             testing_profiles: HashSet::new(),
             testing_details: HashMap::new(),
@@ -1021,7 +1024,9 @@ impl AppState {
     /// session has not recorded.
     pub fn reset_native_activity(&mut self) {
         self.native_activity.reset();
+        self.sniffer.reset();
         crate::ui::native_activity::reset_scroll();
+        crate::ui::sniffer::reset_scroll();
     }
     /// Resolve which core a profile row should use, considering (in order):
     ///   1. Per-pair override (`link.core_type` — resolved at parse time)

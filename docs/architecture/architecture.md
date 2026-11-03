@@ -75,6 +75,7 @@ pub struct AppState {
     pub connecting: bool,
     pub system_stats: Option<grpc_client::SysStats>,
     pub native_activity: NativeActivityLog, // session-scoped native trace ring (2000 rows)
+    pub sniffer: SnifferState, // session-scoped per-host accounting (1 s snapshots, 60-sample rate ring)
     pub log_cache: VecDeque<LogLine>,
     pub log_has_older: bool,
     pub log_seek_home: bool,
@@ -223,6 +224,7 @@ Methods previously in `lib.rs` extracted to `ops/` modules:
 - `settings.rs` — Split-pane settings panel. Left: collapsible tree (SPLIT_SETTINGS_TREE) navigating by SettingsSection. Right: Form (SplitRightPane::Form), UpdateForm, GroupList, or GroupForm. 14 sections: Core, GUI, Protocol Core, Inbound, Routing Rules, DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates, Speed Test, Logging, Subscriptions. Ctrl+W switches focus between tree and form panels. Routes/DNS persist to DB; all others to AppConfig JSON. Replaced per-section SettingsMode variants with unified Split { tree, focus, right } architecture. Subscription-group management lives here (`g` from Profiles jumps to the Subscriptions section).
 - `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs, v toggles validation/subscription logs)
 - `native_activity.rs` — Native Activity tab (`Tab::NativeActivity`): session totals plus one line per traced native-core connection from `AppState.native_activity`. Window-then-format render (only the visible slice of the ring is turned into `Line`s), scroll offset in a module-level atomic clamped to the ring length every frame, `reset_scroll()` on each new native session; Up/Down/PageUp/PageDown/Home/End only.
+- `sniffer.rs` — pane-1 `Sniffer` tab: per-host traffic for the native session from `AppState.sniffer` (1 s `CoreEvent::SnifferSample` snapshots). Two header lines (rates, summary), two MIRRORED 60 s sparklines on a shared scale (down grows downward, up upward; custom half-block renderer — no widget draws both directions), then the host table `host · ↓ · ↑ · conns · failed` sorted by total. Table scroll offset is a module-level atomic; Up/Down/PageUp/PageDown/Home/End only; empty state when the core is not native.
 - `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
 - `theme.rs` — ThemeStyles struct with static methods returning Style from a &Palette (container_border, container_title, hint, warning, error, success, tab_selected, etc.)
 - `palette_bridge.rs` — Maps ratatui-themes ThemePalette (10 colors) to ratatui-cheese Palette (11 roles)

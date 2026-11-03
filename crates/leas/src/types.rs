@@ -138,6 +138,11 @@ impl NativeActivityLog {
                     self.fail_count += 1;
                 }
             }
+            // A leg refused before the relay never became a ring row; the
+            // session failure counter still sees it.
+            TraceEvent::Failed(_) => {
+                self.fail_count += 1;
+            }
         }
         while self.entries.len() > self.cap {
             let dropped = self.entries.pop_front();
@@ -178,27 +183,121 @@ impl NativeActivityLog {
     }
 }
 
-/// Top pane's tabs (spec D2): the table and the log viewer.
+/// Top pane's tabs (spec D2): the table, the per-host sniffer, the log viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane1Tab {
     Profiles,
+    Sniffer,
     Logs,
 }
 
 impl Pane1Tab {
-    pub const ALL: &'static [Self] = &[Self::Profiles, Self::Logs];
+    pub const ALL: &'static [Self] = &[Self::Profiles, Self::Sniffer, Self::Logs];
 
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
-            Self::Profiles => Self::Logs,
+            Self::Profiles => Self::Sniffer,
+            Self::Sniffer => Self::Logs,
             Self::Logs => Self::Profiles,
         }
     }
 
     #[must_use]
     pub const fn prev(self) -> Self {
-        self.next()
+        match self {
+            Self::Profiles => Self::Logs,
+            Self::Sniffer => Self::Profiles,
+            Self::Logs => Self::Sniffer,
+        }
+    }
+}
+
+/// Sparkline history length: 60 one-second samples.
+pub const RATE_SAMPLES: usize = 60;
+
+/// One second of session-wide traffic, for the mirrored sparklines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateSample {
+    /// Remote → client bytes in this second.
+    pub down: u64,
+    /// Client → remote bytes in this second.
+    pub up: u64,
+}
+
+/// Session-only state behind the `Sniffer` tab (spec 2026-11-03, D5/D7).
+///
+/// The snapshot is cumulative; this keeps the previous total to turn each
+/// 1 s sample into a rate. Cleared on a new native session and frozen on
+/// disconnect (no samples arrive).
+#[derive(Debug)]
+pub struct SnifferState {
+    /// Latest per-host snapshot, already sorted by total bytes.
+    pub latest: Option<leas_native::telemetry::SnifferSnapshot>,
+    /// Ring of 1 s rates, oldest overwritten first.
+    pub samples: [RateSample; RATE_SAMPLES],
+    /// Next write slot in `samples`.
+    head: usize,
+    /// Samples written, capped at [`RATE_SAMPLES`].
+    pub filled: usize,
+    /// Cumulative session totals at the previous sample.
+    prev_total: (u64, u64),
+}
+
+impl Default for SnifferState {
+    fn default() -> Self {
+        Self {
+            latest: None,
+            samples: [RateSample::default(); RATE_SAMPLES],
+            head: 0,
+            filled: 0,
+            prev_total: (0, 0),
+        }
+    }
+}
+
+impl SnifferState {
+    /// Ingest one snapshot and push the rate it implies.
+    pub fn record(&mut self, snapshot: leas_native::telemetry::SnifferSnapshot) {
+        let total = snapshot.hosts.iter().fold((0u64, 0u64), |(down, up), row| {
+            (down.saturating_add(row.down), up.saturating_add(row.up))
+        });
+        let sample = RateSample {
+            down: total.0.saturating_sub(self.prev_total.0),
+            up: total.1.saturating_sub(self.prev_total.1),
+        };
+        self.prev_total = total;
+        self.samples[self.head] = sample;
+        self.head = (self.head + 1) % RATE_SAMPLES;
+        self.filled = (self.filled + 1).min(RATE_SAMPLES);
+        self.latest = Some(snapshot);
+    }
+
+    /// The most recent second's rates.
+    #[must_use]
+    pub fn rates(&self) -> RateSample {
+        if self.filled == 0 {
+            return RateSample::default();
+        }
+        self.samples[(self.head + RATE_SAMPLES - 1) % RATE_SAMPLES]
+    }
+
+    /// Oldest sample first, newest last.
+    pub fn samples_iter(&self) -> impl Iterator<Item = &RateSample> {
+        let start = if self.filled == RATE_SAMPLES {
+            self.head
+        } else {
+            0
+        };
+        self.samples[start..]
+            .iter()
+            .chain(self.samples[..start].iter())
+            .take(self.filled)
+    }
+
+    /// Drop the session's data (a new native session started).
+    pub fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -508,6 +607,10 @@ pub enum CoreEvent {
     SysStatsUpdate(grpc_client::SysStats),
     /// A per-connection trace event from the in-process native core.
     NativeTrace(TraceEvent),
+    /// One per-host accounting snapshot from the in-process native core
+    /// (emitted once a second for the Sniffer pane). Boxed: the inline
+    /// `SmallVec` would otherwise dominate every `CoreEvent`.
+    SnifferSample(Box<leas_native::telemetry::SnifferSnapshot>),
     /// A log line from the core process stderr.
     LogLine {
         level: String,
@@ -787,4 +890,70 @@ pub struct FillMeters {
     /// The links whose fetch failed in a way another attempt could fix (a
     /// transport error, a timeout).
     pub retry: Arc<PhaseMeters>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leas_native::telemetry::{HostStat, SnifferSnapshot};
+    use smallvec::SmallVec;
+
+    fn snapshot_with(rows: &[(&str, u64, u64)]) -> SnifferSnapshot {
+        SnifferSnapshot {
+            hosts: rows
+                .iter()
+                .map(|(host, up, down)| HostStat {
+                    host: compact_str::CompactString::new(*host),
+                    up: *up,
+                    down: *down,
+                    conns: 1,
+                    failed: 0,
+                })
+                .collect::<SmallVec<[HostStat; 16]>>(),
+            ..SnifferSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn rates_are_the_delta_between_consecutive_snapshots() {
+        let mut state = SnifferState::default();
+        state.record(snapshot_with(&[("a.example", 10, 100)]));
+        state.record(snapshot_with(&[("a.example", 30, 180)]));
+        assert_eq!(state.rates(), RateSample { down: 80, up: 20 });
+    }
+
+    #[test]
+    fn the_sample_ring_keeps_sixty_oldest_first() {
+        let mut state = SnifferState::default();
+        // Cumulative totals whose per-second deltas are 10, 20, 30, …
+        for i in 1..=RATE_SAMPLES as u64 + 5 {
+            let total = 5 * i * (i + 1);
+            state.record(snapshot_with(&[("a.example", total, 0)]));
+        }
+        assert_eq!(state.filled, RATE_SAMPLES);
+        let samples: Vec<_> = state.samples_iter().copied().collect();
+        assert_eq!(samples.len(), RATE_SAMPLES);
+        // The first five were evicted; the oldest survivor is sample 6.
+        assert_eq!(samples[0].up, 60);
+        assert_eq!(samples[RATE_SAMPLES - 1].up, 650);
+    }
+
+    #[test]
+    fn reset_clears_totals_and_history() {
+        let mut state = SnifferState::default();
+        state.record(snapshot_with(&[("a.example", 10, 0)]));
+        state.reset();
+        assert!(state.latest.is_none());
+        assert_eq!(state.filled, 0);
+        assert_eq!(state.rates(), RateSample::default());
+    }
+
+    #[test]
+    fn tabs_cycle_through_the_sniffer() {
+        assert_eq!(Pane1Tab::Profiles.next(), Pane1Tab::Sniffer);
+        assert_eq!(Pane1Tab::Sniffer.next(), Pane1Tab::Logs);
+        assert_eq!(Pane1Tab::Logs.next(), Pane1Tab::Profiles);
+        assert_eq!(Pane1Tab::Profiles.prev(), Pane1Tab::Logs);
+        assert_eq!(Pane1Tab::ALL.len(), 3);
+    }
 }

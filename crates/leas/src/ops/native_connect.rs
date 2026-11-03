@@ -25,6 +25,8 @@ use crate::types::CoreEvent;
 
 /// Stats poll cadence (same as the xray gRPC poller).
 const STATS_INTERVAL_SECS: u64 = 3;
+/// Per-host snapshot cadence for the Sniffer pane (spec D10).
+const SNIFFER_INTERVAL_SECS: u64 = 1;
 /// Sys stats every Nth tick (~9 s, same as the xray poller).
 const SYS_EVERY_TICKS: u8 = 3;
 /// Telemetry channel depth (memory-diet Task 2): 16 events per queue — drops
@@ -103,6 +105,9 @@ pub async fn run_native_session(
     let session_start = std::time::Instant::now();
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(STATS_INTERVAL_SECS));
     ticker.tick().await;
+    let mut sniffer_ticker =
+        tokio::time::interval(std::time::Duration::from_secs(SNIFFER_INTERVAL_SECS));
+    sniffer_ticker.tick().await;
     let mut sys_tick_counter = 0u8;
     loop {
         tokio::select! {
@@ -126,6 +131,13 @@ pub async fn run_native_session(
                     Some(NativeEvent::Traffic { .. }) => {}
                     None => break,
                 }
+            }
+            _ = sniffer_ticker.tick() => {
+                try_send_or_warn(
+                    tx,
+                    CoreEvent::SnifferSample(Box::new(telemetry.snapshot())),
+                    "sniffer_sample",
+                );
             }
             _ = ticker.tick() => {
                 let (up, down) = telemetry.drain_traffic();

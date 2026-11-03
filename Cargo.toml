@@ -77,6 +77,10 @@ urlencoding = "2.1.3"
 daachorse = "5.1.0"
 memchr = "2.8.3"
 smallvec = { version = "1.16.4", default-features = false, features = ["const_new"] }
+# Inline host keys / per-host accounting without an allocation for the common
+# short hostname (spec 2026-11-03-sniffer-pane D13). Already in the lock via
+# toasty's dependency graph; this promotes it to a direct edge.
+compact_str = "0.10.0"
 
 # ============ Hashing ============
 rapidhash = { version = "4.5.1", features = ["std", "unsafe"] }

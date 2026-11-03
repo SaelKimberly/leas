@@ -35,6 +35,14 @@ use std::{
     time::Instant,
 };
 
+use compact_str::CompactString;
+// Host/open/pending maps use rapidhash's FAST hasher (AVALANCHE/PROTECTED off,
+// so only minimal HashDoS resistance). Host keys are attacker-influenced — any
+// local client can name arbitrary domains — but the listener is
+// loopback-trusted and the table is capped at 1000 rows; the per-datagram
+// lookup wins are worth that accepted trade.
+use rapidhash::RapidHashMap;
+use smallvec::SmallVec;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::mpsc,
@@ -107,6 +115,56 @@ pub enum TraceEvent {
     Opened(TraceOpened),
     /// A leg finished (ok or failed).
     Closed(TraceClosed),
+    /// A leg was refused before it could reach a relay (no bytes, no close).
+    Failed(TraceFailed),
+}
+
+/// Why a leg never reached the relay. Rendered by the Sniffer pane and
+/// aggregated per host, so the set is closed rather than free-form text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TraceFailReason {
+    /// Method/credential negotiation failed.
+    Auth,
+    /// The request head never parsed.
+    Malformed,
+    /// Routing chose a `Block` outbound.
+    Blocked,
+    /// Routing rejected the destination.
+    Rejected,
+    /// Routing asked for DNS interception, which this inbound does not do.
+    HijackDns,
+    /// The routing decision named a tag with no outbound.
+    NoOutbound,
+    /// The outbound dial failed.
+    Dial,
+}
+
+impl TraceFailReason {
+    /// Stable short label for logs and the Sniffer summary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Malformed => "malformed",
+            Self::Blocked => "blocked",
+            Self::Rejected => "rejected",
+            Self::HijackDns => "hijack-dns",
+            Self::NoOutbound => "no-outbound",
+            Self::Dial => "dial",
+        }
+    }
+}
+
+/// A leg refused before the relay: no byte totals exist for it.
+#[derive(Debug, Clone)]
+pub struct TraceFailed {
+    /// Inbound leg kind that refused it.
+    pub kind: TraceKind,
+    /// Destination host as sent; [`UNKNOWN_HOST`] when no target parsed.
+    pub host: CompactString,
+    /// Why it was refused.
+    pub reason: TraceFailReason,
 }
 
 /// The single native → TUI event feed.
@@ -132,6 +190,68 @@ pub enum NativeEvent {
     Trace(TraceEvent),
 }
 
+/// Placeholder host for a failure that never yielded a destination.
+pub const UNKNOWN_HOST: &str = "(unknown)";
+
+/// Hosts kept in the session table; the least recently active is evicted
+/// past this. Bounds a browser session that keeps naming new hosts.
+const HOST_TABLE_CAP: usize = 1000;
+
+/// One host's session totals, as the Sniffer pane consumes them.
+#[derive(Debug, Clone)]
+pub struct HostStat {
+    /// Host as the client sent it (domain or IP literal), port stripped.
+    pub host: CompactString,
+    /// Client → remote bytes.
+    pub up: u64,
+    /// Remote → client bytes.
+    pub down: u64,
+    /// Accepted legs plus UDP associations that touched this host.
+    pub conns: u64,
+    /// Refused or failed legs attributed to this host.
+    pub failed: u64,
+}
+
+/// One session's per-host accounting, sorted by total bytes descending.
+#[derive(Debug, Clone, Default)]
+pub struct SnifferSnapshot {
+    /// Per-host rows; inline up to 16 hosts.
+    pub hosts: SmallVec<[HostStat; 16]>,
+    /// Undelivered UDP payload bytes.
+    pub dropped_bytes: u64,
+    /// Undelivered UDP datagrams.
+    pub dropped_datagrams: u64,
+    /// Every pre-relay refusal and failed leg this session.
+    pub failed: u64,
+}
+
+/// Per-host cumulative totals; the map key is the host.
+#[derive(Debug, Default)]
+struct HostRow {
+    up: u64,
+    down: u64,
+    conns: u64,
+    failed: u64,
+    last_seq: u64,
+}
+
+/// A relayed leg whose bytes are still in flight (folded into [`HostRow`] on
+/// close, so a leg is either open or folded — never both).
+#[derive(Debug)]
+struct OpenLeg {
+    host: CompactString,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+}
+
+/// Strip the port from a traced destination (`host:port`, `[v6]:port`).
+fn host_of(dest: &str) -> &str {
+    if let Some(rest) = dest.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(host, _)| host);
+    }
+    dest.rsplit_once(':').map_or(dest, |(host, _)| host)
+}
+
 /// Telemetry sink: one sender per event class plus shared traffic atomics.
 ///
 /// Cheap to clone and to call from connection tasks: every emit is a
@@ -145,6 +265,17 @@ pub struct Telemetry {
     down: Arc<AtomicU64>,
     dropped_logs: Arc<AtomicU64>,
     dropped_traces: Arc<AtomicU64>,
+    /// Per-host session totals, keyed by the host as sent (no port).
+    hosts: Arc<parking_lot::Mutex<RapidHashMap<CompactString, HostRow>>>,
+    /// Legs whose bytes have not been folded into `hosts` yet.
+    open: Arc<parking_lot::Mutex<RapidHashMap<u64, OpenLeg>>>,
+    /// Host recorded by [`Telemetry::opened`] before its atomics exist.
+    pending: Arc<parking_lot::Mutex<RapidHashMap<u64, CompactString>>>,
+    /// Monotonic activity counter for LRU eviction (cheaper than `Instant`).
+    seq: Arc<AtomicU64>,
+    dropped_bytes: Arc<AtomicU64>,
+    dropped_datagrams: Arc<AtomicU64>,
+    failed_total: Arc<AtomicU64>,
 }
 
 impl Telemetry {
@@ -165,6 +296,13 @@ impl Telemetry {
                 down: Arc::new(AtomicU64::new(0)),
                 dropped_logs: Arc::new(AtomicU64::new(0)),
                 dropped_traces: Arc::new(AtomicU64::new(0)),
+                hosts: Arc::new(parking_lot::Mutex::new(RapidHashMap::default())),
+                open: Arc::new(parking_lot::Mutex::new(RapidHashMap::default())),
+                pending: Arc::new(parking_lot::Mutex::new(RapidHashMap::default())),
+                seq: Arc::new(AtomicU64::new(0)),
+                dropped_bytes: Arc::new(AtomicU64::new(0)),
+                dropped_datagrams: Arc::new(AtomicU64::new(0)),
+                failed_total: Arc::new(AtomicU64::new(0)),
             },
             NativeEvents {
                 logs: logs_rx,
@@ -200,13 +338,17 @@ impl Telemetry {
         security: TraceSecurity,
     ) -> u64 {
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let dest: Arc<str> = dest.into();
+        self.pending
+            .lock()
+            .insert(conn_id, CompactString::new(host_of(&dest)));
         Self::emit(
             &self.traces,
             &self.dropped_traces,
             NativeEvent::Trace(TraceEvent::Opened(TraceOpened {
                 conn_id,
                 kind,
-                dest: dest.into(),
+                dest,
                 protocol: protocol.into(),
                 transport: transport.into(),
                 security,
@@ -225,6 +367,7 @@ impl Telemetry {
         duration_ms: u64,
         error: Option<String>,
     ) {
+        self.fold_leg(conn_id, up_bytes, down_bytes);
         Self::emit(
             &self.traces,
             &self.dropped_traces,
@@ -245,6 +388,20 @@ impl Telemetry {
     /// (an inbound shutdown, a cancelled task) — see [`TraceGuard`].
     #[must_use]
     pub fn guard(&self, conn_id: u64, up: Arc<AtomicU64>, down: Arc<AtomicU64>) -> TraceGuard {
+        let host = self
+            .pending
+            .lock()
+            .remove(&conn_id)
+            .unwrap_or_else(|| CompactString::new(UNKNOWN_HOST));
+        self.with_host(&host, |row| row.conns = row.conns.saturating_add(1));
+        self.open.lock().insert(
+            conn_id,
+            OpenLeg {
+                host,
+                up: Arc::clone(&up),
+                down: Arc::clone(&down),
+            },
+        );
         TraceGuard {
             telemetry: self.clone(),
             conn_id,
@@ -252,6 +409,157 @@ impl Telemetry {
             down,
             started: Instant::now(),
             emitted: false,
+        }
+    }
+
+    /// Account one refused leg and emit [`TraceEvent::Failed`].
+    ///
+    /// `dest` is the destination as the client sent it; the port is stripped
+    /// like every other host key. Bytes are never touched.
+    pub fn failed(&self, kind: TraceKind, dest: &str, reason: TraceFailReason) {
+        let host = host_of(dest);
+        self.with_host(host, |row| row.failed = row.failed.saturating_add(1));
+        self.failed_total.fetch_add(1, Ordering::Relaxed);
+        Self::emit(
+            &self.traces,
+            &self.dropped_traces,
+            NativeEvent::Trace(TraceEvent::Failed(TraceFailed {
+                kind,
+                host: CompactString::new(host),
+                reason,
+            })),
+        );
+    }
+
+    /// Fold one finished leg into its host row and drop it from the open map.
+    ///
+    /// The ledger is the only source of a leg's host, so a `Closed` for an id
+    /// that was never opened (a dropped `Opened`, a test) folds nothing.
+    fn fold_leg(&self, conn_id: u64, up: u64, down: u64) {
+        let host = {
+            let mut open = self.open.lock();
+            match open.remove(&conn_id) {
+                Some(leg) => Some(leg.host),
+                None => self.pending.lock().remove(&conn_id),
+            }
+        };
+        if let Some(host) = host {
+            self.with_host(&host, |row| {
+                row.up = row.up.saturating_add(up);
+                row.down = row.down.saturating_add(down);
+            });
+        }
+    }
+
+    /// Run `f` with the row for `host`, creating it (and evicting the least
+    /// recently active past [`HOST_TABLE_CAP`]) on first sight.
+    fn with_host(&self, host: &str, f: impl FnOnce(&mut HostRow)) {
+        let mut table = self.hosts.lock();
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(row) = table.get_mut(host) {
+            row.last_seq = seq;
+            f(row);
+            return;
+        }
+        if table.len() >= HOST_TABLE_CAP
+            && let Some(oldest) = table
+                .iter()
+                .min_by_key(|(_, row)| row.last_seq)
+                .map(|(host, _)| host.clone())
+        {
+            table.remove(&oldest);
+        }
+        let mut row = HostRow {
+            last_seq: seq,
+            ..HostRow::default()
+        };
+        f(&mut row);
+        table.insert(CompactString::new(host), row);
+    }
+
+    /// Account one forwarded UDP datagram (client → destination).
+    pub fn udp_sent(&self, host: &str, bytes: u64) {
+        self.with_host(host, |row| row.up = row.up.saturating_add(bytes));
+    }
+
+    /// Account one delivered UDP reply (destination → client).
+    pub fn udp_received(&self, host: &str, bytes: u64) {
+        self.with_host(host, |row| row.down = row.down.saturating_add(bytes));
+    }
+
+    /// Count one dropped datagram; `host` is `None` when the destination never
+    /// parsed. Drop bytes are session-global, not per-host (spec §6).
+    pub fn udp_dropped(&self, _host: Option<&str>, bytes: u64) {
+        self.dropped_datagrams.fetch_add(1, Ordering::Relaxed);
+        self.dropped_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record that one UDP association exchanged traffic with `host`.
+    pub fn udp_conn(&self, host: &str) {
+        self.with_host(host, |row| row.conns = row.conns.saturating_add(1));
+    }
+
+    /// Snapshot the session's per-host accounting for the Sniffer pane.
+    ///
+    /// Closed totals live in the table; still-open legs contribute their live
+    /// atomics here, so a long transfer moves before it ends. Sorting is by
+    /// total bytes descending, host ascending on ties.
+    #[must_use]
+    pub fn snapshot(&self) -> SnifferSnapshot {
+        let mut hosts: SmallVec<[HostStat; 16]> = self
+            .hosts
+            .lock()
+            .iter()
+            .map(|(host, row)| HostStat {
+                host: host.clone(),
+                up: row.up,
+                down: row.down,
+                conns: row.conns,
+                failed: row.failed,
+            })
+            .collect();
+
+        // Sum each open host once (a browser keeps many legs on one host).
+        let mut live: SmallVec<[(CompactString, u64, u64); 16]> = SmallVec::new();
+        for leg in self.open.lock().values() {
+            let (up, down) = (
+                leg.up.load(Ordering::Relaxed),
+                leg.down.load(Ordering::Relaxed),
+            );
+            if let Some(slot) = live.iter_mut().find(|(host, _, _)| *host == leg.host) {
+                slot.1 = slot.1.saturating_add(up);
+                slot.2 = slot.2.saturating_add(down);
+            } else {
+                live.push((leg.host.clone(), up, down));
+            }
+        }
+        for (host, up, down) in live {
+            match hosts.iter_mut().find(|row| row.host == host) {
+                Some(row) => {
+                    row.up = row.up.saturating_add(up);
+                    row.down = row.down.saturating_add(down);
+                }
+                None => hosts.push(HostStat {
+                    host,
+                    up,
+                    down,
+                    conns: 0,
+                    failed: 0,
+                }),
+            }
+        }
+
+        hosts.sort_unstable_by(|a, b| {
+            (b.up + b.down)
+                .cmp(&(a.up + a.down))
+                .then_with(|| a.host.cmp(&b.host))
+        });
+
+        SnifferSnapshot {
+            hosts,
+            dropped_bytes: self.dropped_bytes.load(Ordering::Relaxed),
+            dropped_datagrams: self.dropped_datagrams.load(Ordering::Relaxed),
+            failed: self.failed_total.load(Ordering::Relaxed),
         }
     }
 
@@ -603,6 +911,7 @@ mod tests {
                     assert_eq!(c.error.as_deref(), Some("dial failed"));
                     kinds.push("closed-err");
                 }
+                NativeEvent::Trace(TraceEvent::Failed(_)) => kinds.push("failed?"),
                 NativeEvent::Traffic { .. } => kinds.push("traffic?"),
             }
         }
@@ -629,18 +938,97 @@ mod tests {
     }
 
     #[test]
-    fn drain_traffic_read_and_reset() {
-        let (tel, _rx) = Telemetry::new(4);
-        assert_eq!(tel.drain_traffic(), (0, 0));
+    fn snapshot_sums_open_legs_and_does_not_double_count_after_close() {
+        let (telemetry, _events) = Telemetry::new(16);
+        let id = telemetry.opened(
+            TraceKind::Tcp,
+            "example.com:443",
+            "vless",
+            "tcp",
+            TraceSecurity::Tls,
+        );
+        let up = Arc::new(AtomicU64::new(0));
+        let down = Arc::new(AtomicU64::new(0));
+        let mut guard = telemetry.guard(id, Arc::clone(&up), Arc::clone(&down));
 
-        tel.add_traffic(100, 200);
-        tel.add_traffic(50, 25);
-        assert_eq!(tel.drain_traffic(), (150, 225));
+        up.fetch_add(100, Ordering::Relaxed);
+        down.fetch_add(250, Ordering::Relaxed);
+        let live = telemetry.snapshot();
+        assert_eq!(live.hosts.len(), 1);
+        assert_eq!(
+            (
+                live.hosts[0].host.as_str(),
+                live.hosts[0].up,
+                live.hosts[0].down
+            ),
+            ("example.com", 100, 250)
+        );
 
-        // Reset sticks: second drain is empty until new traffic arrives.
-        assert_eq!(tel.drain_traffic(), (0, 0));
-        tel.add_traffic(0, 7);
-        assert_eq!(tel.drain_traffic(), (0, 7));
+        guard.finish(None);
+        let closed = telemetry.snapshot();
+        assert_eq!(
+            (closed.hosts[0].up, closed.hosts[0].down),
+            (100, 250),
+            "fold must not double count"
+        );
+        assert_eq!(closed.hosts[0].conns, 1);
+    }
+
+    #[test]
+    fn one_row_per_host_across_ports_and_kinds() {
+        let (telemetry, _events) = Telemetry::new(16);
+        for dest in ["example.com:443", "example.com:8443", "[2001:db8::1]:53"] {
+            let id = telemetry.opened(TraceKind::Tcp, dest, "vless", "tcp", TraceSecurity::Plain);
+            telemetry
+                .guard(
+                    id,
+                    Arc::new(AtomicU64::new(10)),
+                    Arc::new(AtomicU64::new(1)),
+                )
+                .finish(None);
+        }
+        let snap = telemetry.snapshot();
+        assert_eq!(snap.hosts.len(), 2, "ports merge, families do not");
+        assert!(snap.hosts.iter().any(|h| h.host == "2001:db8::1"));
+    }
+
+    #[test]
+    fn snapshot_sorts_by_total_desc_and_keeps_the_inline_buffer() {
+        let (telemetry, _events) = Telemetry::new(16);
+        for (dest, bytes) in [("a.example", 1_u64), ("b.example", 5)] {
+            telemetry.udp_sent(dest, bytes);
+        }
+        let snap = telemetry.snapshot();
+        assert_eq!(snap.hosts[0].host, "b.example");
+        assert!(!snap.hosts.spilled(), "<=16 hosts must stay inline");
+    }
+
+    #[test]
+    fn udp_bytes_and_drops_land_in_the_table() {
+        let (telemetry, _events) = Telemetry::new(16);
+        telemetry.udp_sent("dns.example", 40);
+        telemetry.udp_received("dns.example", 120);
+        telemetry.udp_dropped(Some("dns.example"), 40);
+        telemetry.udp_dropped(None, 7);
+        let snap = telemetry.snapshot();
+        let row = snap
+            .hosts
+            .iter()
+            .find(|h| h.host == "dns.example")
+            .expect("row");
+        assert_eq!((row.up, row.down), (40, 120));
+        assert_eq!((snap.dropped_datagrams, snap.dropped_bytes), (2, 47));
+    }
+
+    #[test]
+    fn the_host_table_evicts_the_least_recently_active_past_the_cap() {
+        let (telemetry, _events) = Telemetry::new(16);
+        for i in 0..=HOST_TABLE_CAP {
+            telemetry.udp_sent(&format!("h{i}.example"), 1);
+        }
+        let snap = telemetry.snapshot();
+        assert_eq!(snap.hosts.len(), HOST_TABLE_CAP);
+        assert!(snap.hosts.iter().all(|h| h.host != "h0.example"));
     }
 
     #[test]

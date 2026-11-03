@@ -281,6 +281,9 @@ fn build_hints(state: &AppState) -> String {
                             .to_string()
                     }
                 }
+                (crate::FocusedPane::Pane1, crate::Pane1Tab::Sniffer) => {
+                    " [↑↓] Scroll  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit ".to_string()
+                }
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Logs) => {
                     // The tab's own keys are the scroll keys (documented in its
                     // manual section); the hints name what else is live here.

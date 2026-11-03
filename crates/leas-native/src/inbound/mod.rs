@@ -20,14 +20,17 @@ pub mod outbound;
 pub mod socks5;
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 
+use compact_str::CompactString;
 use leas_route::engine::decide_async;
 use leas_route::ir::NetworkMask;
 use leas_route::{ConnMeta, Decision, Engine, NetAddr, NetHost};
+use smallvec::SmallVec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
@@ -35,7 +38,9 @@ use tokio::sync::{mpsc, watch};
 use crate::BoxStream;
 use crate::addr::{Host, TargetAddr};
 use crate::error::{NativeError, timeouts};
-use crate::telemetry::{Counted, Telemetry, TraceGuard, TraceKind, TraceSecurity};
+use crate::telemetry::{
+    Counted, Telemetry, TraceFailReason, TraceGuard, TraceKind, TraceSecurity, UNKNOWN_HOST,
+};
 
 pub use http::{HttpInbound, HttpInboundConfig};
 pub use mixed::MixedInbound;
@@ -69,6 +74,13 @@ pub struct TraceCtx {
     pub transport: Arc<str>,
     /// Outbound security layer.
     pub security: TraceSecurity,
+}
+
+impl TraceCtx {
+    /// Report a leg refused before it could reach a relay.
+    pub fn failed(&self, dest: &str, reason: TraceFailReason) {
+        self.telemetry.failed(self.kind, dest, reason);
+    }
 }
 
 /// Configuration for a [`Socks5Inbound`].
@@ -294,23 +306,43 @@ pub(super) async fn handle_conn(
     .await;
     match negotiated {
         Err(_) => {
+            if let Some(trace) = &config.trace {
+                trace.failed(UNKNOWN_HOST, TraceFailReason::Auth);
+            }
             return Err(NativeError::Timeout {
                 step: "socks5 negotiate",
                 limit: timeouts::PROTOCOL,
             });
         }
-        Ok(Err(error)) => return Err(error.into()),
+        Ok(Err(error)) => {
+            if let Some(trace) = &config.trace {
+                trace.failed(UNKNOWN_HOST, TraceFailReason::Auth);
+            }
+            return Err(error.into());
+        }
         Ok(Ok(())) => {}
     }
 
     // Request.
-    let request = tokio::time::timeout(timeouts::PROTOCOL, socks5::read_request(&mut conn))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "socks5 request",
-            limit: timeouts::PROTOCOL,
-        })?
-        .map_err(NativeError::from)?;
+    let request =
+        match tokio::time::timeout(timeouts::PROTOCOL, socks5::read_request(&mut conn)).await {
+            Err(_) => {
+                if let Some(trace) = &config.trace {
+                    trace.failed(UNKNOWN_HOST, TraceFailReason::Malformed);
+                }
+                return Err(NativeError::Timeout {
+                    step: "socks5 request",
+                    limit: timeouts::PROTOCOL,
+                });
+            }
+            Ok(Err(error)) => {
+                if let Some(trace) = &config.trace {
+                    trace.failed(UNKNOWN_HOST, TraceFailReason::Malformed);
+                }
+                return Err(error.into());
+            }
+            Ok(Ok(request)) => request,
+        };
 
     match request.cmd {
         socks5::Command::Connect => handle_connect(&config, conn, peer, request).await,
@@ -337,6 +369,12 @@ async fn handle_connect(
     request: socks5::Socks5Request,
 ) -> Result<(), NativeError> {
     // Route the destination.
+    let dest = dest_str(&request.target);
+    let fail = |reason: TraceFailReason| {
+        if let Some(trace) = &config.trace {
+            trace.failed(&dest, reason);
+        }
+    };
     let mut meta = ConnMeta {
         target: target_to_net(&request.target),
         network: NetworkMask::TCP,
@@ -354,12 +392,14 @@ async fn handle_connect(
         Decision::Route { tag, override_addr } => {
             let Some(outbound) = config.outbounds.iter().find(|o| o.tag.as_str() == &*tag) else {
                 tracing::warn!(%tag, "socks5 inbound: routing decision named an unknown outbound");
+                fail(TraceFailReason::NoOutbound);
                 socks5::write_reply(&mut conn, socks5::ReplyCode::GeneralFailure, &BIND_ZERO)
                     .await?;
                 return Ok(());
             };
             match &outbound.kind {
                 OutboundKind::Block => {
+                    fail(TraceFailReason::Blocked);
                     socks5::write_reply(
                         &mut conn,
                         socks5::ReplyCode::ConnectionNotAllowed,
@@ -381,6 +421,7 @@ async fn handle_connect(
                                 %error,
                                 "socks5 inbound: outbound dial failed"
                             );
+                            fail(TraceFailReason::Dial);
                             socks5::write_reply(&mut conn, reply_for(&error), &BIND_ZERO).await?;
                             return Ok(());
                         }
@@ -395,6 +436,7 @@ async fn handle_connect(
             }
         }
         Decision::Reject { .. } => {
+            fail(TraceFailReason::Rejected);
             socks5::write_reply(
                 &mut conn,
                 socks5::ReplyCode::ConnectionNotAllowed,
@@ -407,6 +449,7 @@ async fn handle_connect(
             // The inbound has no built-in DNS interceptor; refuse explicitly
             // (explicit absence beats silent fallthrough).
             tracing::warn!("socks5 inbound: HijackDns decision is not implemented; rejecting");
+            fail(TraceFailReason::HijackDns);
             socks5::write_reply(
                 &mut conn,
                 socks5::ReplyCode::ConnectionNotAllowed,
@@ -475,6 +518,22 @@ async fn traced_relay(
     }
     guard.finish(result.as_ref().err().map(ToString::to_string));
     result
+}
+
+/// Host key for telemetry: no port, no brackets. `CompactString` keeps an
+/// IPv4 literal or a short name inline (no heap per datagram).
+fn host_key(host: &Host) -> CompactString {
+    match host {
+        Host::Ip(ip) => ip_key(*ip),
+        Host::Domain(domain) => CompactString::new(domain),
+    }
+}
+
+/// The same key for an address seen on the wire (a reply's source).
+fn ip_key(ip: IpAddr) -> CompactString {
+    let mut out = CompactString::new("");
+    let _ = write!(out, "{ip}");
+    out
 }
 
 /// `host:port` display form for trace rows (IPv6 literals bracketed).
@@ -577,6 +636,7 @@ async fn run_udp_relay(
         proxy_retry_at: None,
         bind_retry_at: None,
         hijack_warned: false,
+        seen: SmallVec::new(),
     };
 
     let mut client_buf = vec![0u8; 64 * 1024];
@@ -746,9 +806,31 @@ struct UdpRelay {
     /// Earliest instant a failed upstream socket bind may be retried.
     bind_retry_at: Option<Instant>,
     hijack_warned: bool,
+    /// Hosts this association already counted in `conns` (inline, no hashing).
+    seen: SmallVec<[CompactString; 4]>,
 }
 
 impl UdpRelay {
+    /// Report one datagram this association could not deliver.
+    fn drop_datagram(&self, host: Option<&str>, bytes: usize) {
+        if let Some(trace) = &self.config.trace {
+            trace
+                .telemetry
+                .udp_dropped(host, u64::try_from(bytes).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// Count this host once per association — the Sniffer `conns` column.
+    fn note_conn(&mut self, host: &str) {
+        if self.seen.iter().any(|seen| seen == host) {
+            return;
+        }
+        self.seen.push(CompactString::new(host));
+        if let Some(trace) = &self.config.trace {
+            trace.telemetry.udp_conn(host);
+        }
+    }
+
     /// Decide whether a datagram source may drive this association.
     ///
     /// The first datagram from the control connection's peer address pins the
@@ -802,6 +884,11 @@ impl UdpRelay {
         write_reply(&mut self.reply_buf, src, &buf[..len]);
         match self.client_udp.send_to(&self.reply_buf, source).await {
             Ok(_) => {
+                if let Some(trace) = &self.config.trace {
+                    trace
+                        .telemetry
+                        .udp_received(&ip_key(src.ip()), u64::try_from(len).unwrap_or(u64::MAX));
+                }
                 // Grow-only buffer would pin the association's high-water mark
                 // forever; drop oversized capacity back once drained.
                 if self.reply_buf.capacity() > 16384 {
@@ -826,11 +913,13 @@ impl UdpRelay {
             Ok(parsed) => parsed,
             Err(error) => {
                 tracing::debug!(%error, "socks5 inbound: malformed udp datagram dropped");
+                self.drop_datagram(None, datagram.len());
                 return;
             }
         };
         if frag != 0 {
             tracing::trace!(frag, "socks5 inbound: dropping fragmented datagram");
+            self.drop_datagram(None, datagram.len());
             return;
         }
 
@@ -856,10 +945,12 @@ impl UdpRelay {
         };
         let decision = decide_async(&self.config.engine, &mut meta).await;
 
+        let requested = host_key(&target.host);
         let (tag, override_addr) = match decision {
             Decision::Route { tag, override_addr } => (tag, override_addr),
             Decision::Reject { .. } => {
                 tracing::debug!("socks5 inbound: udp datagram rejected");
+                self.drop_datagram(Some(&requested), payload.len());
                 return;
             }
             Decision::HijackDns => {
@@ -870,6 +961,7 @@ impl UdpRelay {
                          (no built-in DNS interceptor)"
                     );
                 }
+                self.drop_datagram(Some(&requested), payload.len());
                 return;
             }
         };
@@ -880,14 +972,22 @@ impl UdpRelay {
         let config = Arc::clone(&self.config);
         let Some(outbound) = config.outbounds.iter().find(|o| o.tag.as_str() == &*tag) else {
             tracing::debug!(%tag, "socks5 inbound: udp decision named an unknown outbound");
+            self.drop_datagram(Some(&requested), payload.len());
             return;
         };
         let dest = override_addr.map(|a| net_to_target(&a)).unwrap_or(target);
+        let host = host_key(&dest.host);
 
         match &outbound.kind {
-            OutboundKind::Block => {}
-            OutboundKind::Direct => self.forward_direct(dest, payload).await,
-            OutboundKind::Proxy(proxy) => self.forward_proxy(&tag, proxy, dest, payload),
+            OutboundKind::Block => self.drop_datagram(Some(&host), payload.len()),
+            OutboundKind::Direct => {
+                self.note_conn(&host);
+                self.forward_direct(dest, payload, &host).await;
+            }
+            OutboundKind::Proxy(proxy) => {
+                self.note_conn(&host);
+                self.forward_proxy(&tag, proxy, dest, payload, &host);
+            }
         }
     }
 
@@ -898,17 +998,22 @@ impl UdpRelay {
     /// stall the other flows on this association — and that task receives BOTH
     /// family sockets, so an `AAAA`-only name is reachable (guessing the
     /// family before the lookup would drop every v6 answer).
-    async fn forward_direct(&mut self, dest: TargetAddr, payload: &[u8]) {
+    async fn forward_direct(&mut self, dest: TargetAddr, payload: &[u8], host: &str) {
         self.ensure_direct_sockets().await;
         match dest.host {
             Host::Ip(ip) => {
                 let addr = SocketAddr::new(ip, dest.port);
                 let Some(socket) = self.socket_for(addr) else {
                     tracing::debug!(%addr, "socks5 inbound: no upstream socket for family");
+                    self.drop_datagram(Some(host), payload.len());
                     return;
                 };
-                if let Err(error) = socket.send_to(payload, addr).await {
-                    tracing::debug!(%error, %addr, "socks5 inbound: direct udp send dropped");
+                match socket.send_to(payload, addr).await {
+                    Ok(_) => self.sent(host, payload.len()),
+                    Err(error) => {
+                        tracing::debug!(%error, %addr, "socks5 inbound: direct udp send dropped");
+                        self.drop_datagram(Some(host), payload.len());
+                    }
                 }
             }
             Host::Domain(domain) => {
@@ -918,10 +1023,19 @@ impl UdpRelay {
                 if let Some(addr) = cached_domain(&self.dns_cache, &domain, dest.port) {
                     let Some(socket) = self.socket_for(addr) else {
                         tracing::debug!(%addr, "socks5 inbound: no upstream socket for family");
+                        self.drop_datagram(Some(host), payload.len());
                         return;
                     };
-                    if let Err(error) = socket.send_to(payload, addr).await {
-                        tracing::debug!(%error, %addr, "socks5 inbound: direct udp send dropped");
+                    match socket.send_to(payload, addr).await {
+                        Ok(_) => self.sent(host, payload.len()),
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                %addr,
+                                "socks5 inbound: direct udp send dropped"
+                            );
+                            self.drop_datagram(Some(host), payload.len());
+                        }
                     }
                     return;
                 }
@@ -931,24 +1045,65 @@ impl UdpRelay {
                 // drop every `AAAA`-only answer).
                 let cache = Arc::clone(&self.dns_cache);
                 let payload = payload.to_vec();
+                let len = payload.len();
                 let port = dest.port;
                 let v4 = self.out_v4.clone();
                 let v6 = self.out_v6.clone();
+                let trace = self.config.trace.clone();
+                let host = CompactString::new(host);
                 tokio::spawn(async move {
                     let Some(addr) = resolve_domain(&cache, &domain, port).await else {
                         tracing::debug!(%domain, "socks5 inbound: direct udp dest unresolvable");
+                        if let Some(trace) = &trace {
+                            trace
+                                .telemetry
+                                .udp_dropped(Some(&host), u64::try_from(len).unwrap_or(u64::MAX));
+                        }
                         return;
                     };
                     let socket = if addr.is_ipv4() { v4 } else { v6 };
                     let Some(socket) = socket else {
                         tracing::debug!(%addr, "socks5 inbound: no upstream socket for family");
+                        if let Some(trace) = &trace {
+                            trace
+                                .telemetry
+                                .udp_dropped(Some(&host), u64::try_from(len).unwrap_or(u64::MAX));
+                        }
                         return;
                     };
-                    if let Err(error) = socket.send_to(&payload, addr).await {
-                        tracing::debug!(%error, %addr, "socks5 inbound: direct udp send dropped");
+                    match socket.send_to(&payload, addr).await {
+                        Ok(_) => {
+                            if let Some(trace) = &trace {
+                                trace
+                                    .telemetry
+                                    .udp_sent(&host, u64::try_from(len).unwrap_or(u64::MAX));
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                %addr,
+                                "socks5 inbound: direct udp send dropped"
+                            );
+                            if let Some(trace) = &trace {
+                                trace.telemetry.udp_dropped(
+                                    Some(&host),
+                                    u64::try_from(len).unwrap_or(u64::MAX),
+                                );
+                            }
+                        }
                     }
                 });
             }
+        }
+    }
+
+    /// Account one datagram accepted onto the wire.
+    fn sent(&self, host: &str, bytes: usize) {
+        if let Some(trace) = &self.config.trace {
+            trace
+                .telemetry
+                .udp_sent(host, u64::try_from(bytes).unwrap_or(u64::MAX));
         }
     }
 
@@ -1010,6 +1165,7 @@ impl UdpRelay {
         proxy: &ProxyOutbound,
         dest: TargetAddr,
         payload: &[u8],
+        host: &str,
     ) {
         if let Some(leg) = &self.proxy
             && leg.tag != tag
@@ -1019,13 +1175,16 @@ impl UdpRelay {
                 leg = %leg.tag,
                 "socks5 inbound: one udp association carries one proxy tunnel; dropping"
             );
+            self.drop_datagram(Some(host), payload.len());
             return;
         }
         if self.proxy.is_none() {
             if self.proxy_retry_at.is_some_and(|at| Instant::now() < at) {
+                self.drop_datagram(Some(host), payload.len());
                 return;
             }
             let Some(source) = self.source else {
+                self.drop_datagram(Some(host), payload.len());
                 return;
             };
             let (queue, rx) = mpsc::channel(PROXY_QUEUE_DEPTH);
@@ -1037,6 +1196,7 @@ impl UdpRelay {
                 source,
                 Arc::clone(&self.dns_cache),
                 Arc::clone(&queued_bytes),
+                self.config.trace.clone(),
                 rx,
             )));
             self.proxy = Some(ProxyLeg {
@@ -1054,6 +1214,7 @@ impl UdpRelay {
         let len = payload.len();
         if leg.queued_bytes.load(std::sync::atomic::Ordering::Relaxed) + len > PROXY_QUEUE_BYTES {
             tracing::debug!("socks5 inbound: proxy udp byte cap reached; dropping datagram");
+            self.drop_datagram(Some(host), len);
             return;
         }
         leg.queued_bytes
@@ -1063,15 +1224,22 @@ impl UdpRelay {
             payload: payload.to_vec(),
         };
         match leg.queue.try_send(datagram) {
-            Ok(()) => {}
+            // `up` counts a datagram accepted into the leg, matching spec §6.
+            // A later carrier refusal is also counted as dropped, so a lost
+            // datagram can appear in both slices — the drop slice is a failure
+            // signal, not a conservation equation.
+            Ok(()) => self.sent(host, len),
             Err(mpsc::error::TrySendError::Full(dropped)) => {
                 leg.queued_bytes
                     .fetch_sub(dropped.payload.len(), std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!("socks5 inbound: proxy udp queue full; dropping datagram");
+                self.drop_datagram(Some(host), len);
             }
             Err(mpsc::error::TrySendError::Closed(dropped)) => {
                 leg.queued_bytes
                     .fetch_sub(dropped.payload.len(), std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!("socks5 inbound: proxy udp queue full; dropping datagram");
+                self.drop_datagram(Some(host), len);
                 // The leg ended (tunnel open failed, or the tunnel closed).
                 // Clear it so a later datagram re-opens, bounded by the
                 // backoff — a transient proxy failure must not blackhole the
@@ -1096,6 +1264,7 @@ async fn run_proxy_leg(
     source: SocketAddr,
     dns_cache: Arc<DnsCache>,
     queued_bytes: Arc<AtomicUsize>,
+    trace: Option<TraceCtx>,
     mut queue: mpsc::Receiver<ProxyDatagram>,
 ) {
     let params = outbound::proxy_params(&proxy, &session_target);
@@ -1123,6 +1292,7 @@ async fn run_proxy_leg(
     // `AbortOnDrop`: the reader parks in `recv()` and would NOT wake when the
     // relay drops the queue, so a detached handle leaks a task plus a tunnel
     // per proxy association — including when THIS task is itself aborted.
+    let reply_trace = trace.clone();
     let _replies = AbortOnDrop(tokio::spawn(async move {
         // One framing buffer for the leg, like the direct path's.
         let mut packet = Vec::new();
@@ -1136,12 +1306,24 @@ async fn run_proxy_leg(
                             "socks5 inbound: proxy reply has no address and the session \
                              destination did not resolve; dropping"
                         );
+                        if let Some(trace) = &reply_trace {
+                            trace.telemetry.udp_dropped(
+                                None,
+                                u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                            );
+                        }
                         continue;
                     };
                     write_reply(&mut packet, src, &payload);
                     if let Err(error) = client_udp.send_to(&packet, source).await {
                         tracing::debug!(%error, "socks5 inbound: proxy reply to client failed");
                         return;
+                    }
+                    if let Some(trace) = &reply_trace {
+                        trace.telemetry.udp_received(
+                            &ip_key(src.ip()),
+                            u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                        );
                     }
                 }
                 Ok(None) => {
@@ -1160,6 +1342,8 @@ async fn run_proxy_leg(
         // Release this datagram's budget first: the bytes are now owned by
         // this task, not the queue.
         queued_bytes.fetch_sub(datagram.payload.len(), std::sync::atomic::Ordering::Relaxed);
+        let len = u64::try_from(datagram.payload.len()).unwrap_or(u64::MAX);
+        let host = host_key(&datagram.dest.host);
         // The session destination needs no address on the wire — and no DNS:
         // comparing targets short-circuits the common single-destination case.
         // Every carrier accepts `None`; only a DIFFERENT destination needs an
@@ -1170,6 +1354,9 @@ async fn run_proxy_leg(
         } else {
             let Some(addr) = resolve_cached(&dns_cache, &datagram.dest).await else {
                 tracing::debug!(?datagram.dest, "socks5 inbound: proxy udp dest unresolvable");
+                if let Some(trace) = &trace {
+                    trace.telemetry.udp_dropped(Some(&host), len);
+                }
                 continue;
             };
             Some(addr)
@@ -1181,9 +1368,15 @@ async fn run_proxy_leg(
                     %error,
                     "socks5 inbound: proxy carrier refuses this per-packet destination; dropping"
                 );
+                if let Some(trace) = &trace {
+                    trace.telemetry.udp_dropped(Some(&host), len);
+                }
             }
             Err(error) => {
                 tracing::debug!(%error, "socks5 inbound: proxy udp send failed");
+                if let Some(trace) = &trace {
+                    trace.telemetry.udp_dropped(Some(&host), len);
+                }
                 break;
             }
         }

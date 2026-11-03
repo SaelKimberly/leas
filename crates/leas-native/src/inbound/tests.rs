@@ -1280,3 +1280,118 @@ async fn shutdown_ends_a_live_udp_association() {
     drop(control);
     handle.abort();
 }
+
+/// A leg refused before the relay is a counted failure, not silent traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_connect_emits_a_failure_trace_and_no_traffic() {
+    use crate::telemetry::{
+        NativeEvent, Telemetry, TraceEvent, TraceFailReason, TraceKind, TraceSecurity,
+    };
+
+    let (telemetry, mut events) = Telemetry::new(64);
+    let mut config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("block")),
+        vec![Outbound {
+            tag: "block".into(),
+            kind: OutboundKind::Block,
+        }],
+    );
+    config.trace = Some(super::TraceCtx {
+        telemetry: telemetry.clone(),
+        kind: TraceKind::Tcp,
+        protocol: "vless".into(),
+        transport: "tcp".into(),
+        security: TraceSecurity::Plain,
+    });
+    let (addr, handle) = spawn_inbound(config).await;
+
+    let target = TargetAddr::new(Host::Domain("blocked.example".into()), 443);
+    let ClientResult::Connected { code, .. } = client_connect(addr, None, &target).await else {
+        panic!("expected a reply");
+    };
+    assert_eq!(code, 0x02, "ConnectionNotAllowed");
+
+    let failed = loop {
+        match events.recv().await.expect("event") {
+            NativeEvent::Trace(TraceEvent::Failed(failed)) => break failed,
+            NativeEvent::Trace(_) | NativeEvent::Log { .. } | NativeEvent::Traffic { .. } => {}
+        }
+    };
+    assert_eq!(failed.reason, TraceFailReason::Blocked);
+    assert_eq!(failed.host, "blocked.example");
+
+    let snap = telemetry.snapshot();
+    assert_eq!(snap.failed, 1);
+    assert_eq!(
+        snap.hosts.iter().map(|h| h.up + h.down).sum::<u64>(),
+        0,
+        "a refusal carries no bytes"
+    );
+
+    handle.abort();
+}
+
+/// UDP bytes are attributed to the destination host, one conn per association.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_datagrams_are_accounted_per_host_and_one_conn_per_association() {
+    use crate::telemetry::{Telemetry, TraceKind, TraceSecurity};
+
+    let echo_a = spawn_udp_echo().await;
+    let echo_b = spawn_udp_echo().await;
+    let (telemetry, _events) = Telemetry::new(64);
+    let mut config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".into(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    config.trace = Some(super::TraceCtx {
+        telemetry: telemetry.clone(),
+        kind: TraceKind::UdpAssoc,
+        protocol: "vless".into(),
+        transport: "tcp".into(),
+        security: TraceSecurity::Plain,
+    });
+    let (addr, handle) = spawn_inbound(config).await;
+    let (stream, reply) = udp_associate(addr).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client udp");
+
+    for (echo, payload) in [(echo_a, b"to-a".as_slice()), (echo_b, b"to-b".as_slice())] {
+        let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+        client
+            .send_to(&udp_datagram(&target, 0, payload), reply)
+            .await
+            .expect("send datagram");
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("echo reply timed out")
+            .expect("recv reply");
+        assert!(socks5::parse_udp_request(&buf[..n]).is_ok());
+    }
+
+    // The reply accounting runs after `send_to` on the relay task, so the
+    // down count can land a moment after the client observes the datagram.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let row = loop {
+        let snap = telemetry.snapshot();
+        if let Some(row) = snap.hosts.iter().find(|h| h.host == "127.0.0.1")
+            && row.down > 0
+        {
+            break row.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "UDP accounting never appeared: {snap:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(row.conns, 1, "one association, two ports: one conn");
+    assert_eq!(row.up, 8, "both client payloads counted");
+    assert!(row.down > 0, "reply bytes counted");
+    drop(stream);
+    handle.abort();
+}

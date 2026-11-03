@@ -105,6 +105,13 @@ thiserror.workspace = true
 # infallible sync locks (project rule rs-parking-lot; workspace already uses 0.12)
 parking_lot.workspace = true
 
+# per-host accounting: inline host keys + allocation-free snapshots
+# (spec 2026-11-03-sniffer-pane D13)
+compact_str.workspace = true
+smallvec.workspace = true
+# host-table lookups on the UDP hot path (spec D13)
+rapidhash.workspace = true
+
 # observability (debug diagnostics in transports)
 tracing.workspace = true
 

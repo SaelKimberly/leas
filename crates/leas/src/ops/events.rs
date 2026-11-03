@@ -528,6 +528,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     break;
                 }
             }
+            CoreEvent::SnifferSample(snapshot) => state.sniffer.record(*snapshot),
             CoreEvent::Route(ev) => {
                 let line = render_route_event(&ev);
                 state.log_cache.push_back(line);

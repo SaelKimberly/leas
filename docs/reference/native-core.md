@@ -212,6 +212,43 @@ hellos are OS-independent within a family). See `docs/reference/tls-fingerprint-
 | `shape.rs` | `ConnectShape`: uniform vs divergent connect paths |
 | `e2e/` (feature `native-e2e`) | case/config/core/harness/variant — real-core scenarios (incl. the Shadowsocks server-config builders: xray `settings.method/password` + a widened `network` for the UDP rows, sing-box top-level `method`/`password`, and the xray-only TLS-row gate) |
 
+### Telemetry contract (`telemetry.rs`)
+
+`Telemetry` is the native → TUI feed, cloned into every connection task. It has
+three surfaces:
+
+- **Logs** — `NativeEvent::Log`; a full queue drops the line and counts it.
+- **Traces** — `TraceEvent::{Opened, Closed, Failed}` on their own queue, so a
+  log burst cannot evict a leg's open/close pair. `Opened` carries the
+  destination as the client sent it (`host:port`), `Closed` the leg's bytes,
+  duration and error, and `Failed` a refusal that never reached a relay
+  (`TraceFailReason`: `auth`, `malformed`, `blocked`, `rejected`,
+  `hijack-dns`, `no-outbound`, `dial`). A failure touches no byte total.
+- **Traffic** — shared atomics drained every 3 s into `CoreEvent::StatsUpdate`.
+
+Per-host accounting (spec `2026-11-03-sniffer-pane-design`):
+
+- The host key is the destination **as sent**, port stripped, no local DNS
+  (`example.com` and `1.1.1.1` are separate rows; IPv6 literals lose their
+  brackets). The table is capped at 1000 hosts, least-recently-active evicted.
+- A relayed TCP leg registers its existing byte atomics in an open-leg map and
+  folds them into the host row on close — a leg is either open or folded, never
+  both. `conns` counts accepted legs.
+- UDP accounting is per datagram: `udp_sent` / `udp_received` add payload bytes
+  to the destination/source host (one map lookup each, no allocation for an
+  inline key), `udp_conn` counts an association once per host it touches, and
+  `udp_dropped` counts undelivered payloads (malformed, blocked, rejected,
+  hijack-dns, queue cap/full, unresolvable destination, carrier refusal, send
+  error) as session-global counters. A datagram accepted into a proxy leg and
+  lost upstream is counted in both `up` and the drop counters by design — the
+  drop slice is a failure signal, not a conservation equation.
+- `Telemetry::snapshot()` merges folded rows with still-open legs and sorts by
+  total bytes descending; `SnifferSnapshot.hosts` is a `SmallVec` (inline up to
+  16 hosts) of `HostStat { host, up, down, conns, failed }`. The native session
+  emits a snapshot every second as `CoreEvent::SnifferSample`.
+- Accounting is session-only and in memory: no table, no persistence, no
+  coverage for subprocess cores.
+
 ### leas-tls (`crates/leas-tls/src/`)
 
 | Module | Responsibility |
