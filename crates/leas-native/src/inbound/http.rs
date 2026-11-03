@@ -215,7 +215,7 @@ impl HttpInbound {
 }
 
 /// One connection: read the CONNECT head, route, dial, relay.
-async fn handle_conn(
+pub(super) async fn handle_conn(
     config: Arc<HttpInboundConfig>,
     conn: TcpStream,
     peer: SocketAddr,

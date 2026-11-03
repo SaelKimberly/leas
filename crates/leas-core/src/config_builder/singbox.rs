@@ -3,7 +3,10 @@ use leas_proto::proto_spec::{CoreType, InjectOptions, InjectToCoreConf};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{BuildError, BuildParams, build_hosts_map, endpoint_essentials, protocol_config};
+use super::{
+    BuildError, BuildParams, build_hosts_map, effective_inbound_tags, endpoint_essentials,
+    protocol_config,
+};
 
 // ── Sing-box JSON config structs ──────────────────────────────────
 
@@ -110,19 +113,35 @@ impl SingBoxConfigBuilder {
 /// the experimental (v2ray/clash API) block. `build` fills in the outbounds
 /// afterwards.
 fn skeleton(params: &BuildParams, routing: &[RoutingRule], dns: &DnsSetting) -> SingBoxConfig {
+    // A configured mixed port supersedes the SOCKS inbound: one listener
+    // serves SOCKS5 and HTTP CONNECT, selected by the first byte.
+    let inbounds = params.mixed_port.map_or_else(
+        || {
+            vec![SingBoxInbound {
+                type_: "socks",
+                tag: "socks-in".to_string(),
+                listen: params.listen.clone(),
+                listen_port: params.socks_port,
+                sniff: params.sniffing,
+            }]
+        },
+        |mixed_port| {
+            vec![SingBoxInbound {
+                type_: "mixed",
+                tag: "mixed-in".to_string(),
+                listen: params.listen.clone(),
+                listen_port: mixed_port,
+                sniff: params.sniffing,
+            }]
+        },
+    );
     SingBoxConfig {
         log: SingBoxLogConfig {
             level: params.log_level.clone(),
         },
-        inbounds: vec![SingBoxInbound {
-            type_: "socks",
-            tag: "socks-in".to_string(),
-            listen: params.listen.clone(),
-            listen_port: params.socks_port,
-            sniff: params.sniffing,
-        }],
+        inbounds,
         outbounds: vec![],
-        route: build_routing(routing),
+        route: build_routing(routing, params.mixed_port.is_some()),
         dns: build_dns(dns),
         experimental: Some(ExperimentalConfig {
             v2ray_api: params.v2ray_api_enabled.then(|| V2RayApi {
@@ -185,7 +204,7 @@ fn build_block_outbound() -> Value {
 
 // ── Routing ──────────────────────────────────────────────────────────
 
-fn build_routing(rules: &[RoutingRule]) -> RouteConfig {
+fn build_routing(rules: &[RoutingRule], mixed: bool) -> RouteConfig {
     let json_rules: Vec<Value> = rules
         .iter()
         .filter_map(|r| {
@@ -211,7 +230,7 @@ fn build_routing(rules: &[RoutingRule]) -> RouteConfig {
                 rule["ip_cidr"] = json!(r.ips);
             }
             if !r.inbound_tags.is_empty() {
-                rule["inbound"] = json!(r.inbound_tags);
+                rule["inbound"] = json!(effective_inbound_tags(&r.inbound_tags, mixed));
             }
             if !r.ports.is_empty() {
                 rule["port"] = json!(r.ports);
@@ -566,6 +585,19 @@ mod tests {
     }
 
     #[test]
+    fn singbox_mixed_inbound() {
+        let (mut params, rules, dns) = super::super::tests::default_params();
+        params.mixed_port = Some(10810);
+        let config = skeleton(&params, &rules, &dns);
+        let json = serde_json::to_value(&config).unwrap();
+        let inbounds = json["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 1, "mixed supersedes the socks inbound");
+        assert_eq!(inbounds[0]["type"], "mixed");
+        assert_eq!(inbounds[0]["tag"], "mixed-in");
+        assert_eq!(inbounds[0]["listen_port"], 10810);
+    }
+
+    #[test]
     fn singbox_clash_api_config() {
         let (mut params, rules, dns) = super::super::tests::default_params();
         params.clash_api_enabled = true;
@@ -583,7 +615,7 @@ mod tests {
     #[test]
     fn singbox_route_config() {
         let rules = vec![domain_rule()];
-        let route = build_routing(&rules);
+        let route = build_routing(&rules, false);
         let json = serde_json::to_value(&route).unwrap();
         assert_eq!(json["rules"].as_array().unwrap().len(), 1);
         assert_eq!(json["rules"][0]["domain"][0], "example.com");
@@ -612,7 +644,7 @@ mod tests {
             rule_set_url: None,
             sort_order: None,
         };
-        let routing = build_routing(&[rule]);
+        let routing = build_routing(&[rule], false);
         assert_eq!(routing.rules.len(), 0);
     }
 
@@ -637,7 +669,7 @@ mod tests {
             rule_set_url: None,
             sort_order: None,
         };
-        let routing = build_routing(&[rule]);
+        let routing = build_routing(&[rule], false);
         let rule_json = &routing.rules[0];
         assert_eq!(rule_json["domain_matcher"], "linear");
         assert_eq!(rule_json["protocol"], json!(["http", "tls"]));
@@ -667,7 +699,7 @@ mod tests {
             rule_set_url: None,
             sort_order: None,
         };
-        let routing = build_routing(&[rule]);
+        let routing = build_routing(&[rule], false);
         assert_eq!(routing.rules.len(), 0);
     }
 

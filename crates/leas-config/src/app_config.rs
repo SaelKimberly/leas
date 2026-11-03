@@ -204,6 +204,17 @@ impl Default for InboundConfig {
     }
 }
 
+impl InboundConfig {
+    /// SOCKS-facing local listener port: a configured `mixed_port` supersedes
+    /// `socks_port`. `http_port` is NOT a fallback — an HTTP-only listener does
+    /// not speak SOCKS5, so readiness probes and SOCKS-based speed/UDP tests
+    /// must never target it. The native session (always mixed) listens here too.
+    #[must_use]
+    pub fn local_port(&self) -> u16 {
+        self.mixed_port.unwrap_or(self.socks_port)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TunConfig {
     #[serde(default)]
@@ -404,6 +415,20 @@ fn import_budget_overrides_round_trip_and_zero_disables() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_port_prefers_mixed_then_socks() {
+        let mut inbound = InboundConfig::default();
+        assert_eq!(inbound.local_port(), 10808, "socks port is the fallback");
+        inbound.http_port = Some(10809);
+        assert_eq!(
+            inbound.local_port(),
+            10808,
+            "http_port never speaks SOCKS5, so it is not a fallback"
+        );
+        inbound.mixed_port = Some(10810);
+        assert_eq!(inbound.local_port(), 10810, "mixed beats socks");
+    }
 
     #[test]
     fn default_config_round_trips() {

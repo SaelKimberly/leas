@@ -15,6 +15,7 @@
 //! interceptor) and refuses TCP connections with `0x02`.
 
 pub mod http;
+pub mod mixed;
 pub mod outbound;
 pub mod socks5;
 
@@ -37,6 +38,7 @@ use crate::error::{NativeError, timeouts};
 use crate::telemetry::{Counted, Telemetry, TraceGuard, TraceKind, TraceSecurity};
 
 pub use http::{HttpInbound, HttpInboundConfig};
+pub use mixed::MixedInbound;
 pub use outbound::{Outbound, OutboundKind, ProxyOutbound};
 /// Inbound tag reported to the router when [`HttpInboundConfig`] doesn't
 /// override it.
@@ -279,7 +281,7 @@ fn warn_if_open_relay(listener: &TcpListener, has_auth: bool, who: &str) {
 }
 
 /// One connection: negotiate, then dispatch by command.
-async fn handle_conn(
+pub(super) async fn handle_conn(
     config: Arc<Socks5InboundConfig>,
     mut conn: TcpStream,
     peer: SocketAddr,

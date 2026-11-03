@@ -24,12 +24,37 @@ pub struct BuildParams {
     pub log_level: String,
     pub socks_port: u16,
     pub http_port: Option<u16>,
+    pub mixed_port: Option<u16>,
     pub clash_api_port: Option<u16>,
     pub listen: String,
     pub sniffing: bool,
     pub skip_cert_verify: bool,
     pub mux: Option<serde_json::Value>,
     pub clash_mixin: Option<serde_json::Value>,
+}
+
+impl BuildParams {
+    /// SOCKS-facing local listener port: `mixed_port` supersedes `socks_port`.
+    /// `http_port` is NOT a fallback — an HTTP-only listener does not speak
+    /// SOCKS5, so the readiness probe must never target it.
+    ///
+    /// Mirrors `leas_config::InboundConfig::local_port`.
+    #[must_use]
+    pub fn local_port(&self) -> u16 {
+        self.mixed_port.unwrap_or(self.socks_port)
+    }
+}
+
+/// Remap persisted inbound-tag rule selectors onto the mixed inbound when it
+/// supersedes the legacy listeners. Without this, a rule scoped to `socks-in`
+/// (or `http-in`) would silently stop matching once `mixed_port` is enabled.
+pub(super) fn effective_inbound_tags(tags: &[String], mixed: bool) -> Vec<&str> {
+    tags.iter()
+        .map(|tag| match tag.as_str() {
+            "socks-in" | "http-in" if mixed => "mixed-in",
+            other => other,
+        })
+        .collect()
 }
 
 /// The profile's shadowsocks method string when the protocol is
@@ -287,6 +312,7 @@ mod tests {
             log_level: "warning".to_string(),
             socks_port: 10808,
             http_port: None,
+            mixed_port: None,
             listen: "127.0.0.1".to_string(),
             sniffing: false,
             clash_api_port: None,
@@ -307,6 +333,37 @@ mod tests {
             cache_ttl_secs: None,
         };
         (params, rules, dns)
+    }
+
+    #[test]
+    fn local_port_prefers_mixed_then_socks() {
+        let (mut params, _, _) = default_params();
+        assert_eq!(params.local_port(), 10808, "socks port is the fallback");
+        params.http_port = Some(10809);
+        assert_eq!(
+            params.local_port(),
+            10808,
+            "http_port never speaks SOCKS5, so it is not a fallback"
+        );
+        params.mixed_port = Some(10810);
+        assert_eq!(params.local_port(), 10810, "mixed beats socks");
+    }
+
+    #[test]
+    fn mixed_inbound_remaps_legacy_rule_tags() {
+        let tags = vec![
+            "socks-in".to_owned(),
+            "http-in".to_owned(),
+            "custom-in".to_owned(),
+        ];
+        assert_eq!(
+            effective_inbound_tags(&tags, true),
+            ["mixed-in", "mixed-in", "custom-in"]
+        );
+        assert_eq!(
+            effective_inbound_tags(&tags, false),
+            ["socks-in", "http-in", "custom-in"]
+        );
     }
 
     pub(super) fn ss_config(method: &str) -> ProtocolConfig {

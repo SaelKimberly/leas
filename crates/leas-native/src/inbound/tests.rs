@@ -11,8 +11,9 @@ use leas_route::{Engine, NetAddr, NetHost};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use super::http::HttpInboundConfig;
 use super::outbound::OutboundKind;
-use super::{Outbound, Socks5Inbound, Socks5InboundConfig};
+use super::{MixedInbound, Outbound, Socks5Inbound, Socks5InboundConfig};
 use crate::addr::{Host, TargetAddr};
 
 // Helpers
@@ -54,6 +55,20 @@ fn block_domain(domain: &str) -> Rule {
 
 async fn spawn_inbound(config: Socks5InboundConfig) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let inbound = Socks5Inbound::bind(config).await.expect("bind inbound");
+    let addr = inbound.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        let _ = inbound.serve().await;
+    });
+    (addr, handle)
+}
+
+async fn spawn_mixed(
+    socks: Socks5InboundConfig,
+    http: HttpInboundConfig,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let inbound = MixedInbound::bind(socks, http)
+        .await
+        .expect("bind mixed inbound");
     let addr = inbound.local_addr().expect("local addr");
     let handle = tokio::spawn(async move {
         let _ = inbound.serve().await;
@@ -219,6 +234,69 @@ async fn direct_relay_echoes() {
     let mut buf = [0u8; 12];
     stream.read_exact(&mut buf).await.expect("read echo");
     assert_eq!(&buf, b"hello socks5");
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_port_serves_socks5_and_http_connect() {
+    let echo = spawn_echo().await;
+    let engine = engine(Vec::new(), route_default("direct"));
+    let outbounds = vec![Outbound {
+        tag: "direct".into(),
+        kind: OutboundKind::Direct,
+    }];
+    let socks = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine.clone(),
+        outbounds.clone(),
+    );
+    let http = HttpInboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine,
+        outbounds,
+    );
+    let (addr, handle) = spawn_mixed(socks, http).await;
+
+    // SOCKS5 leg.
+    let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+    let ClientResult::Connected { code, mut stream } = client_connect(addr, None, &target).await
+    else {
+        panic!("expected CONNECT success");
+    };
+    assert_eq!(code, 0x00, "socks reply code");
+    stream.write_all(b"socks").await.expect("write socks");
+    let mut socks_echo = [0u8; 5];
+    stream
+        .read_exact(&mut socks_echo)
+        .await
+        .expect("read socks echo");
+    assert_eq!(&socks_echo, b"socks");
+
+    // HTTP CONNECT leg on the SAME listener.
+    let mut client = TcpStream::connect(addr).await.expect("connect inbound");
+    client
+        .write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", echo.port()).as_bytes())
+        .await
+        .expect("write CONNECT");
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).await.expect("read head");
+        head.push(byte[0]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 200"),
+        "expected 200, got: {}",
+        String::from_utf8_lossy(&head)
+    );
+    client.write_all(b"http").await.expect("write http");
+    let mut http_echo = [0u8; 4];
+    client
+        .read_exact(&mut http_echo)
+        .await
+        .expect("read http echo");
+    assert_eq!(&http_echo, b"http");
 
     handle.abort();
 }

@@ -14,6 +14,7 @@ The invariants a change must respect. Detail lives in the sibling `reference/` p
 - **Protocol-core auto-resolution.** TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → sing-box; everything else → xray-core. Shadowsocks/2022 is cipher-aware (`XRAY_SS_METHODS`/`SINGBOX_SS_METHODS`): legacy ciphers → sing-box. A forced core that cannot build the cipher fails at build time.
 - **One core at a time.** Only one backend runs per session — including the in-process server, whose listeners live in this process. Teardown windows: `PREV_SESSION_TEARDOWN` (5 s), `DISCONNECT_TEARDOWN` (3 s).
 - **Native capability gate fails closed.** `capability::supported(kind, config)` decides whether native may serve a row; a refusal is a *result* (`UNTESTABLE_PREFIX` marker), never a silent downgrade.
+- **The local inbound is one mixed listener.** The native session always binds a single SOCKS5 + HTTP CONNECT port (`inbound/mixed.rs`, first byte selects the protocol), never separate socks/http listeners. Subprocess builders honor the same model: a configured `mixed_port` supersedes `socks_port`/`http_port`, and the SOCKS-facing effective port is `mixed_port ?? socks_port` (an HTTP-only listener never speaks SOCKS5). Persisted rule selectors `socks-in`/`http-in` are remapped to `mixed-in` in both builders.
 
 ## Ordering & the Profiles page
 

@@ -49,8 +49,10 @@ User decisions (2026-09-03):
    Auto" mechanism is superseded.)
 3. Observability = parity counters + realtime per-connection trace + dedicated
    "Native activity" screen.
-4. Native honors both `socks_port` and `http_port` inbounds. Routing rules /
-   sniffing / TUN are out of v1 (warn, connection still works via proxy-all).
+4. The native session is ALWAYS mixed: one SOCKS5 + HTTP CONNECT listener, no
+   separate socks or http listener. A configured `mixed_port` is that listener
+   (older configs fall back to `socks_port`); routing rules / sniffing / TUN
+   are out of v1 (warn, connection still works via proxy-all).
 
 ## Current seams (evidence)
 
@@ -67,10 +69,12 @@ User decisions (2026-09-03):
   link therefore stores `Xray` and `resolved_core` (`ops/profiles.rs:256`) always
   honors it first. "Auto" exists only in the core-facing enum and config defaults.
 - Connect flow (`crates/leas/src/ops/connect.rs:37`): builds `BuildParams`
-  (socks_port, http_port, sniffing, mux JSON, clash_mixin, log_level) →
-  `ConfigBuilder::build` → typed `BackendConfig{Xray|SingBox}` → `find_binary` →
-  `RealCoreManager::start` (writes JSON, spawns `run -c {0}`, log lines via
-  `log_tx`) → TCP port probe on `socks_port` → `CoreEvent::Connected(core_type)` →
+  (socks_port, http_port, mixed_port, sniffing, mux JSON, clash_mixin,
+  log_level) → `ConfigBuilder::build` → typed `BackendConfig{Xray|SingBox}` →
+  `find_binary` → `RealCoreManager::start` (writes JSON, spawns `run -c {0}`,
+  log lines via `log_tx`) → TCP port probe on the effective local port
+  (`mixed_port ?? socks_port`; `http_port` never speaks SOCKS5) →
+  `CoreEvent::Connected(core_type)` →
   core-type branch: xray = gRPC `StatsProvider` 3 s poll; sing-box = Clash HTTP
   `/traffic` stream → both emit `CoreEvent::StatsUpdate` deltas →
   `apply_stats_delta` accumulates onto `ProfileStats.traffic` (today/total, day
@@ -221,16 +225,19 @@ dependency on leas-core (avoids dragging tonic/heed/LMDB into native; native
 already wraps the proto types). Owns one "session" = the connected profile:
 
 ```
-NativeCoreServer::start(params: ServerParams, events: mpsc::Sender<NativeEvent>) -> JoinHandle-ish
-ServerParams {
-    socks_port, http_port: Option<u16>, listen: IpAddr,
-    route: proxy-all (v1),        // engine default → Proxy outbound
-    outbound: NativeConnectParams // from the loaded Protocol row (config + endpoint essentials)
+NativeCoreServer::start(cfg: ServerConfig) -> Result<NativeCoreServer, NativeError>
+ServerConfig {
+    listen: SocketAddr,           // params.listen + params.local_port() (mixed ?? socks)
+    proxy: ProxyOutbound,         // from the loaded Protocol row
+    telemetry: Telemetry,         // event sink; queues logs/traces/traffic
+    udp: bool,                    // UDP ASSOCIATE on the mixed listener
 }
 ```
 
-- Binds the SOCKS5 inbound (existing) on `socks_port` and an HTTP CONNECT
-  inbound on `http_port` when set (`inbound/http.rs`). **CONNECT-only v1:**
+- Binds exactly ONE mixed inbound (`inbound/mixed.rs`; first byte `0x05` =
+  SOCKS5, everything else = HTTP CONNECT) on the effective local port; the
+  native session never opens separate socks or http listeners. **CONNECT-only
+  v1:**
   absolute-form requests are not forwarded (`501 Not Implemented`); a CONNECT
   without `host:port` is `400`, a head over 16 KiB (`MAX_HEAD_BYTES`) is `431`,
   a Block/Reject routing decision is `403`, an unknown outbound tag or a failed
@@ -294,8 +301,9 @@ enum TraceEvent {
   native re-exports what the server needs).
 - `connect.rs`: branch on `resolve_runtime_core` — native path skips
   `ConfigBuilder`/`find_binary`/`RealCoreManager` entirely; starts
-  `NativeCoreServer` with the loaded protocol config + params, probes
-  `socks_port` readiness the same way, emits `Connected(Native)` on bind.
+  `NativeCoreServer` on `params.local_port()` (`mixed_port ?? socks_port`),
+  then emits `Connected(Native)` once the mixed listener binds (`start()`
+  returns after the bind, so no readiness probe runs).
   The existing xray/sing-box arms are untouched.
 - Disconnect: same stop-channel shape; abort task, drop server, flush pending
   traffic deltas (existing `drain_pending_stats_updates`).
@@ -378,8 +386,8 @@ enum TraceEvent {
 1. `leas-native`: `capability` predicate + unit tests (incl. pq-enc false).
 2. `leas-native`: `telemetry` module (counters, trace events, wrappers).
 3. `leas-native`: HTTP CONNECT inbound + tests.
-4. `leas-native`: `NativeCoreServer` (socks + http inbounds, proxy-all,
-   telemetry feed, graceful stop) + hermetic tier-1 tests.
+4. `leas-native`: `NativeCoreServer` (one mixed SOCKS5 + HTTP CONNECT inbound,
+   proxy-all, telemetry feed, graceful stop) + hermetic tier-1 tests.
 5. ~~Proto: `CoreType::Auto` variant; parse-time stamping stores Auto; forms
    surface Auto~~ — **SUPERSEDED** (§1): the proto enum keeps
    `{Xray, SingBox}`, stamping is unchanged, and no form gains a new entry.
@@ -397,7 +405,8 @@ enum TraceEvent {
    ("in-process — no binary").
 10. TUI: `NativeActivity` tab + ring buffer + `docs/guides/tui-manual.md`.
 11. e2e: native-session rows through the TUI harness (connect → traffic →
-    disconnect; http inbound; trace events flow), plus existing suite green.
+    disconnect; mixed inbound (SOCKS5 + HTTP CONNECT); trace events flow), plus
+    existing suite green.
 12. Docs: AGENTS.md decision entries + docs/reference/native-core.md status flip.
 
 ## Verification
@@ -405,13 +414,16 @@ enum TraceEvent {
 - `cargo test -p leas-native --features native-e2e --lib` (tier 1 hermetic).
 - Tier-3 e2e rows for the six protocol kinds (the 2026-09-03 four-protocol
   contract, now 176 tests = 170 green + 6 documented ignored) +
-  new server-mode loopback rows (socks + http inbounds, telemetry events).
+  new server-mode loopback rows (mixed inbound: SOCKS5 + HTTP CONNECT legs,
+  telemetry events).
 - `cargo test` workspace + `just quality-gate code`.
 - Manual: run TUI, import links for the six kinds (vless, vmess, trojan,
   hysteria2, shadowsocks, shadowsocks-2022), connect → native
   (no core selection needed: the stamp is `xray` and the connect-time gate
   picks native); Statistics shows live traffic; NativeActivity shows per-conn
-  rows; kill network mid-connection → Failed events; http_port proxy works;
+  rows; kill network mid-connection → Failed events; SOCKS5 and HTTP CONNECT
+  both work on the effective port (mixed listener), including with `mixed_port`
+  set;
   `protocol_core_overrides` xray entry → subprocess path unchanged; pq-enc
   vless → downgrade warn.
 - Architecture review of the CoreType/resolution surface (Aegis gate).

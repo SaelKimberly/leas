@@ -408,6 +408,7 @@ pub struct BuildParams {
     log_level: String,
     socks_port: u16,
     http_port: Option<u16>,
+    mixed_port: Option<u16>,
     listen: String,
     sniffing: bool,
 }
@@ -628,13 +629,15 @@ and returns the next.
   carrier's `recv` spans several awaits, so racing it in a `select!` would drop
   a partial frame and desynchronise the tunnel. VLESS XUDP refuses to split
   (its datagrams ride a shared mux tunnel, not a stream).
-- `inbound/` — the local server side: `Socks5Inbound` (`inbound/socks5.rs`) and
-  `HttpInbound` (`inbound/http.rs`), both `accept → leas-route Engine`
+- `inbound/` — the local server side: `Socks5Inbound` (`inbound/socks5.rs`),
+  `HttpInbound` (`inbound/http.rs`), and `MixedInbound` (`inbound/mixed.rs` —
+  one listener for both, first byte selects the protocol; the native session
+  uses this one), all `accept → leas-route Engine`
   (`decide_async`) `→ tagged Outbound` (Direct / Block / Proxy, the proxy
   reusing `crate::connect`). Shared in `inbound/mod.rs`: `TraceCtx` (telemetry
   sink + the per-leg protocol/transport/security labels), `traced_relay`,
   `warn_if_open_relay`, `absorb_accept_error`, and the
-  `shutdown: Option<watch::Receiver<bool>>` both configs carry — once the sender
+  `shutdown: Option<watch::Receiver<bool>>` the inbound configs carry — once the sender
   marks shutdown the accept loop stops and in-flight connections abort.
   - SOCKS5: TCP CONNECT plus UDP ASSOCIATE (`Socks5InboundConfig::udp`, default
     on): one relay task per association routes EVERY datagram through the engine
@@ -675,16 +678,17 @@ and returns the next.
   transport match is a POSITIVE, wildcard-free match: a new `TransportConfig`
   variant breaks it at compile time instead of inheriting `true`.
 - `server/` — `NativeCoreServer`, the in-process equivalent of a spawned core.
-  `ServerConfig { socks, http: Option<SocketAddr>, proxy: ProxyOutbound,
-  telemetry, udp }`; `start()` compiles a proxy-all engine (no rules,
-  `DefaultRoute::Route { tag: "proxy" }`), binds the SOCKS5 listener plus the
-  optional HTTP one, and spawns their accept loops. Teardown is cooperative
-  through one `watch` channel: `stop()` fires the signal every listener and
-  in-flight connection selects on (closing live sockets exactly like killing a
-  subprocess would); `shutdown()` additionally awaits the accept loops and is the
-  ONLY teardown that guarantees the ports are free when it returns; `Drop`
-  signals and aborts the loops but cannot await them. Neither inbound
-  authenticates a client, so a non-loopback bind warns once at `start`.
+  `ServerConfig { listen, proxy: ProxyOutbound, telemetry, udp }`; `start()`
+  compiles a proxy-all engine (no rules, `DefaultRoute::Route { tag: "proxy" }`),
+  binds ONE mixed (SOCKS5 + HTTP CONNECT) listener, and spawns its accept loop.
+  The native session is always mixed: there are no separate socks/http
+  listeners. Teardown is cooperative through one `watch` channel: `stop()` fires
+  the signal every listener and in-flight connection selects on (closing live
+  sockets exactly like killing a subprocess would); `shutdown()` additionally
+  awaits the accept loops and is the ONLY teardown that guarantees the ports are
+  free when it returns; `Drop` signals and aborts the loops but cannot await
+  them. Neither protocol face authenticates a client, so a non-loopback bind
+  warns once at `start`.
 - `telemetry.rs` — the event seam to the TUI. `Telemetry::new(cap)` returns the
   sink plus `NativeEvents`, with SEPARATE bounded log and trace queues (a log
   burst can never starve trace rows; `recv` takes traces first). `NativeEvent` is

@@ -215,6 +215,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     let param_log_level = state.config.core.log_level.clone();
     let param_socks_port = state.config.inbound.socks_port;
     let param_http_port = state.config.inbound.http_port;
+    let param_mixed_port = state.config.inbound.mixed_port;
     let param_listen = state.config.inbound.listen.clone();
     let param_sniffing = state.config.inbound.sniffing;
     let param_clash_api_port = state.config.clash_api_port;
@@ -380,6 +381,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             log_level: param_log_level,
             socks_port: param_socks_port,
             http_port: param_http_port,
+            mixed_port: param_mixed_port,
             listen: param_listen,
             sniffing: param_sniffing,
             clash_api_port: param_clash_api_port,
@@ -468,7 +470,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         }
 
         // 3b. Readiness probe: wait for the core's proxy port to open
-        let proxy_port = params.socks_port;
+        let proxy_port = params.local_port();
         if proxy_port > 0 {
             let probe_start = std::time::Instant::now();
             loop {

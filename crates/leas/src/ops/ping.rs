@@ -480,7 +480,7 @@ pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64
     state.testing_profiles.insert((endpoint_id, protocol_id));
     state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
     let proxy_addr = state.config.inbound.listen.clone();
-    let proxy_port = state.config.inbound.socks_port;
+    let proxy_port = state.config.inbound.local_port();
     let test_url = "http://cachefly.cachefly.net/1mb.test".to_string();
     let min_dur = std::time::Duration::from_secs(3);
     let max_dur = std::time::Duration::from_secs(10);
@@ -539,7 +539,7 @@ pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
     state.testing_profiles.insert((endpoint_id, protocol_id));
     state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
     let proxy_addr = state.config.inbound.listen.clone();
-    let proxy_port = state.config.inbound.socks_port;
+    let proxy_port = state.config.inbound.local_port();
 
     tokio::spawn(async move {
         let Ok(_permit) = SINGLE_TEST_SEMAPHORE.acquire().await else {

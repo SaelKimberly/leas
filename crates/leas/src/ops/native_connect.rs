@@ -54,7 +54,10 @@ pub async fn run_native_session(
     }
     let config = protocol.config.get().0.clone();
 
-    let socks_addr: SocketAddr = match format!("{}:{}", params.listen, params.socks_port).parse() {
+    // The native session always speaks mixed (SOCKS5 + HTTP CONNECT on one
+    // port), on the same effective port the builders and readiness probe use.
+    let listen_port = params.local_port();
+    let listen_addr: SocketAddr = match format!("{}:{listen_port}", params.listen).parse() {
         Ok(addr) => addr,
         Err(e) => {
             try_send_or_warn(
@@ -65,20 +68,6 @@ pub async fn run_native_session(
             return;
         }
     };
-    let http_addr: Option<SocketAddr> = match params.http_port {
-        Some(port) => match format!("{}:{port}", params.listen).parse() {
-            Ok(addr) => Some(addr),
-            Err(e) => {
-                try_send_or_warn(
-                    tx,
-                    CoreEvent::Error(format!("Invalid native HTTP listen address: {e}")),
-                    "native_http_listen_invalid",
-                );
-                return;
-            }
-        },
-        None => None,
-    };
 
     let proxy = ProxyOutbound {
         protocol: config,
@@ -87,32 +76,25 @@ pub async fn run_native_session(
         resolved_ip: None,
     };
     let (telemetry, mut events_rx) = Telemetry::new(TELEMETRY_CAP);
-    let server = match NativeCoreServer::start(ServerConfig::new(
-        socks_addr,
-        http_addr,
-        proxy,
-        telemetry.clone(),
-    ))
-    .await
-    {
-        Ok(server) => server,
-        Err(e) => {
-            try_send_or_warn(
-                tx,
-                CoreEvent::Error(format!("Failed to start native core: {e}")),
-                "native_start_error",
-            );
-            return;
-        }
-    };
+    let server =
+        match NativeCoreServer::start(ServerConfig::new(listen_addr, proxy, telemetry.clone()))
+            .await
+        {
+            Ok(server) => server,
+            Err(e) => {
+                try_send_or_warn(
+                    tx,
+                    CoreEvent::Error(format!("Failed to start native core: {e}")),
+                    "native_start_error",
+                );
+                return;
+            }
+        };
 
     telemetry.log(
         "info",
         "leas_native::server",
-        format!(
-            "listening socks5={} http={http_addr:?}",
-            server.socks_addr()
-        ),
+        format!("listening mixed={}", server.listen_addr()),
     );
     try_send_or_warn(tx, CoreEvent::Connected(CoreType::Native), "connected");
 

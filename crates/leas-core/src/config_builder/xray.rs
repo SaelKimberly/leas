@@ -3,7 +3,10 @@ use leas_proto::proto_spec::{CoreType, InjectOptions, InjectToCoreConf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{BuildError, BuildParams, build_hosts_map, endpoint_essentials, protocol_config};
+use super::{
+    BuildError, BuildParams, build_hosts_map, effective_inbound_tags, endpoint_essentials,
+    protocol_config,
+};
 
 // ── Xray JSON config structs ────────────────────────────────────────
 
@@ -157,7 +160,11 @@ fn skeleton(params: &BuildParams, routing: &[RoutingRule], dns: &DnsSetting) -> 
         },
         inbounds: build_inbounds(params),
         outbounds: vec![],
-        routing: build_routing(routing, params.v2ray_api_enabled),
+        routing: build_routing(
+            routing,
+            params.v2ray_api_enabled,
+            params.mixed_port.is_some(),
+        ),
         dns: build_dns(dns),
         stats,
         api,
@@ -168,31 +175,56 @@ fn skeleton(params: &BuildParams, routing: &[RoutingRule], dns: &DnsSetting) -> 
 // ── Inbound construction ─────────────────────────────────────────────
 
 fn build_inbounds(params: &BuildParams) -> Vec<Inbound> {
-    let mut inbounds = vec![Inbound {
-        listen: params.listen.clone(),
-        port: params.socks_port,
-        protocol: "socks",
-        settings: json!({
-            "auth": "noauth",
-            "udp": true,
-            "ip": "127.0.0.1"
-        }),
-        sniffing: json!({
-            "enabled": params.sniffing,
-            "destOverride": ["http", "tls", "quic"]
-        }),
-        tag: "socks-in".to_string(),
-    }];
+    let mut inbounds = Vec::new();
 
-    if let Some(http_port) = params.http_port {
+    // A configured mixed port SUPERSEDES the SOCKS and HTTP inbounds: one
+    // listener serves both protocols, so emitting the separate ones would
+    // reopen the very ports the user collapsed (and collide when equal).
+    if let Some(mixed_port) = params.mixed_port {
+        // xray-core's `mixed` inbound is the SOCKS server with an HTTP front
+        // end: the first byte selects SOCKS5 or HTTP CONNECT.
         inbounds.push(Inbound {
             listen: params.listen.clone(),
-            port: http_port,
-            protocol: "http",
-            settings: json!({}),
-            sniffing: json!({}),
-            tag: "http-in".to_string(),
+            port: mixed_port,
+            protocol: "mixed",
+            settings: json!({
+                "auth": "noauth",
+                "udp": true,
+                "ip": "127.0.0.1"
+            }),
+            sniffing: json!({
+                "enabled": params.sniffing,
+                "destOverride": ["http", "tls", "quic"]
+            }),
+            tag: "mixed-in".to_string(),
         });
+    } else {
+        inbounds.push(Inbound {
+            listen: params.listen.clone(),
+            port: params.socks_port,
+            protocol: "socks",
+            settings: json!({
+                "auth": "noauth",
+                "udp": true,
+                "ip": "127.0.0.1"
+            }),
+            sniffing: json!({
+                "enabled": params.sniffing,
+                "destOverride": ["http", "tls", "quic"]
+            }),
+            tag: "socks-in".to_string(),
+        });
+
+        if let Some(http_port) = params.http_port {
+            inbounds.push(Inbound {
+                listen: params.listen.clone(),
+                port: http_port,
+                protocol: "http",
+                settings: json!({}),
+                sniffing: json!({}),
+                tag: "http-in".to_string(),
+            });
+        }
     }
 
     // API inbound for gRPC Commander — only when stats/api enabled
@@ -264,7 +296,7 @@ fn build_block_outbound() -> Outbound {
 
 // ── Routing ──────────────────────────────────────────────────────────
 
-fn build_routing(rules: &[RoutingRule], v2ray_api_enabled: bool) -> RoutingConfig {
+fn build_routing(rules: &[RoutingRule], v2ray_api_enabled: bool, mixed: bool) -> RoutingConfig {
     let mut json_rules: Vec<Value> = Vec::new();
     // Only add API routing rule when v2ray_api is enabled.
     // When disabled (e.g. real ping temp core), no "api" inbound/outbound exist.
@@ -296,7 +328,7 @@ fn build_routing(rules: &[RoutingRule], v2ray_api_enabled: bool) -> RoutingConfi
             rule["ip"] = json!(r.ips);
         }
         if !r.inbound_tags.is_empty() {
-            rule["inboundTag"] = json!(r.inbound_tags);
+            rule["inboundTag"] = json!(effective_inbound_tags(&r.inbound_tags, mixed));
         }
         if !r.ports.is_empty() {
             rule["port"] = json!(r.ports);
@@ -637,9 +669,34 @@ mod tests {
     }
 
     #[test]
+    fn xray_inbounds_with_mixed() {
+        let (mut params, _, _) = super::super::tests::default_params();
+        params.http_port = Some(10809);
+        params.mixed_port = Some(10810);
+        let json = serde_json::to_value(build_inbounds(&params)).unwrap();
+        let inbounds = json.as_array().unwrap();
+        assert_eq!(
+            inbounds.len(),
+            2,
+            "mixed supersedes socks + http; API stays"
+        );
+        let mixed = &inbounds[0];
+        assert_eq!(mixed["protocol"], "mixed");
+        assert_eq!(mixed["port"], 10810);
+        assert_eq!(mixed["settings"]["udp"], true);
+        assert_eq!(inbounds[1]["protocol"], "dokodemo-door");
+        assert!(
+            inbounds
+                .iter()
+                .all(|inbound| inbound["tag"] != "socks-in" && inbound["tag"] != "http-in"),
+            "no separate socks/http inbound when mixed is set"
+        );
+    }
+
+    #[test]
     fn xray_routing_with_domain_rule() {
         let rules = vec![domain_rule()];
-        let routing = build_routing(&rules, true);
+        let routing = build_routing(&rules, true, false);
         let json_rules = &routing.rules;
         // First rule is the mandatory API routing rule
         assert_eq!(json_rules.len(), 2);
@@ -673,7 +730,7 @@ mod tests {
             rule_set_url: None,
             sort_order: None,
         };
-        let routing = build_routing(&[rule], false);
+        let routing = build_routing(&[rule], false, false);
         assert_eq!(routing.rules.len(), 0);
     }
 
@@ -698,7 +755,7 @@ mod tests {
             rule_set_url: None,
             sort_order: None,
         };
-        let routing = build_routing(&[rule], false);
+        let routing = build_routing(&[rule], false, false);
         let rule_json = &routing.rules[0];
         assert_eq!(rule_json["domainMatcher"], "linear");
         assert_eq!(rule_json["protocol"], json!(["http", "tls"]));
@@ -727,7 +784,7 @@ mod tests {
             rule_set_url: None,
             sort_order: None,
         };
-        let routing = build_routing(&[rule], false);
+        let routing = build_routing(&[rule], false, false);
         assert_eq!(routing.rules.len(), 1);
         assert_eq!(routing.rules[0]["sourcePort"], json!([8080]));
         assert_eq!(routing.rules[0]["outboundTag"], "direct");
