@@ -55,6 +55,61 @@ pub struct AggregateCache {
     pub key: AggregateKey,
 }
 
+/// The local SOCKS5 endpoint of the live tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl ProxyEndpoint {
+    /// The address this process dials when the inbound listens on a wildcard.
+    #[must_use]
+    pub fn from_inbound(listen: &str, port: u16) -> Self {
+        let host = match listen {
+            "0.0.0.0" => "127.0.0.1",
+            "::" | "[::]" => "::1",
+            other => other,
+        };
+        Self {
+            host: host.to_owned(),
+            port,
+        }
+    }
+
+    /// `SOCKS5h` URL: DNS is performed by the running core, so domain routing
+    /// rules match the subscription source's hostname.
+    #[must_use]
+    pub fn socks5h_url(&self) -> String {
+        if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("socks5h://[{}]:{}", self.host, self.port)
+        } else {
+            format!("socks5h://{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// The endpoint of the currently live tunnel; `None` while disconnected.
+#[derive(Debug, Default)]
+pub struct LiveProxy {
+    inner: parking_lot::Mutex<Option<ProxyEndpoint>>,
+}
+
+impl LiveProxy {
+    pub fn set(&self, endpoint: ProxyEndpoint) {
+        *self.inner.lock() = Some(endpoint);
+    }
+
+    pub fn clear(&self) {
+        *self.inner.lock() = None;
+    }
+
+    #[must_use]
+    pub fn get(&self) -> Option<ProxyEndpoint> {
+        self.inner.lock().clone()
+    }
+}
+
 /// Global UI/connection state.
 #[allow(
     clippy::struct_excessive_bools,
@@ -150,6 +205,8 @@ pub struct AppState {
     pub search_query: String,
     pub search_focused: bool,
     pub connected_core: Option<CoreType>,
+    /// Local SOCKS5 endpoint of the live tunnel; subscription fetches ride it.
+    pub live_proxy: Arc<LiveProxy>,
     pub connecting: bool,
     pub system_stats: Option<grpc_client::SysStats>,
     /// Session-only native-core trace log for the Native Activity tab.
@@ -756,6 +813,7 @@ impl AppState {
             log_has_older: false,
             log_seek_home: false,
             connected_core: None,
+            live_proxy: Arc::new(LiveProxy::default()),
             connecting: false,
             connection_error: None,
             core_event_rx: Some(core_rx),
@@ -1327,6 +1385,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::security_embed;
+    use super::{LiveProxy, ProxyEndpoint};
     use leas_native::security::fingerprint::resolve_fingerprint;
     use leas_proto::proto_spec::{
         Hysteria2Config, ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts,
@@ -1476,5 +1535,36 @@ mod tests {
                  label and the purge rule disagree about the same link"
             );
         }
+    }
+
+    #[test]
+    fn proxy_endpoint_normalizes_wildcards_for_socks5h() {
+        assert_eq!(
+            ProxyEndpoint::from_inbound("0.0.0.0", 10808).socks5h_url(),
+            "socks5h://127.0.0.1:10808"
+        );
+        assert_eq!(
+            ProxyEndpoint::from_inbound("::", 10808).socks5h_url(),
+            "socks5h://[::1]:10808"
+        );
+        assert_eq!(
+            ProxyEndpoint::from_inbound("[::]", 10808).socks5h_url(),
+            "socks5h://[::1]:10808"
+        );
+        assert_eq!(
+            ProxyEndpoint::from_inbound("127.0.0.1", 10808).socks5h_url(),
+            "socks5h://127.0.0.1:10808"
+        );
+    }
+
+    #[test]
+    fn live_proxy_holds_only_the_current_endpoint() {
+        let live = LiveProxy::default();
+        assert_eq!(live.get(), None);
+        let endpoint = ProxyEndpoint::from_inbound("127.0.0.1", 10808);
+        live.set(endpoint.clone());
+        assert_eq!(live.get(), Some(endpoint));
+        live.clear();
+        assert_eq!(live.get(), None);
     }
 }

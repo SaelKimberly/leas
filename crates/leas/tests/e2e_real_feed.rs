@@ -35,6 +35,7 @@ async fn streaming_import_real_feed_completes() {
         None,
         &validation,
         leas_config::app_config::ImportConfig::default(),
+        None,
     )
     .await;
     let t_all = t0.elapsed();

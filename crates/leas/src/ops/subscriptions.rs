@@ -7,10 +7,13 @@ use std::time::Duration;
 use dashmap::DashSet;
 use leas_config::import_export::{ValidationSettings, ValidationSummary};
 use leas_db::Database;
-use leas_db::models::{Group, GroupStatus};
+use leas_db::models::{Group, GroupStatus, RoutingRule};
+use leas_route::ir::{DefaultRoute, NetworkMask, ResolveStrategy, RuleSet, SniffedProtocol};
+use leas_route::{ConnMeta, Decision, Engine, NetAddr, NetHost};
 
 use crate::AppState;
 use crate::ops::stream_import::ImportOutcome;
+use crate::state::{LiveProxy, ProxyEndpoint};
 
 use crate::types::{CoreEvent, SplitRightPane};
 use crate::{get_field, try_send_or_warn};
@@ -248,6 +251,123 @@ fn import_in_flight(group_id: &str) -> bool {
     IN_FLIGHT_IMPORTS.contains(group_id)
 }
 
+/// Where one subscription source fetch may go.
+#[derive(Debug, PartialEq, Eq)]
+enum FetchRoute {
+    Direct,
+    Tunnel(ProxyEndpoint),
+    Refused(String),
+}
+
+/// Decide whether the source host may be fetched directly, must ride the live
+/// tunnel, or is refused by the configured routing rules.
+///
+/// Rules are consulted only while a live tunnel exists. Domain/IP-literal,
+/// port, network and protocol items apply; hostnames are not pre-resolved, so
+/// an IP-CIDR-only rule matches an IP-literal URL only.
+fn plan_http_route(url: &str, live: Option<ProxyEndpoint>, rules: &[RoutingRule]) -> FetchRoute {
+    let Some(live) = live else {
+        return FetchRoute::Direct;
+    };
+    if rules.is_empty() {
+        return FetchRoute::Tunnel(live);
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return FetchRoute::Refused("invalid subscription URL".to_owned());
+    };
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return FetchRoute::Refused(format!("unsupported subscription URL scheme `{scheme}`"));
+    }
+    let Some(host) = parsed.host_str() else {
+        return FetchRoute::Refused("subscription URL has no host".to_owned());
+    };
+    let Some(port) = parsed.port_or_known_default() else {
+        return FetchRoute::Refused(format!(
+            "subscription URL has no port for scheme `{scheme}`"
+        ));
+    };
+
+    let mut compiled = Vec::new();
+    for (index, row) in rules.iter().enumerate() {
+        match crate::route_compile::rule_from_row(row, index) {
+            Ok(rule) => compiled.push(rule),
+            Err(error) => tracing::warn!(
+                target: "tui::ops::subscriptions",
+                "routing rule {index} is not usable for source routing: {error}"
+            ),
+        }
+    }
+    let ruleset = RuleSet {
+        rules: compiled,
+        default: DefaultRoute::Route {
+            tag: "proxy".to_owned(),
+        },
+        resolve_strategy: ResolveStrategy::AsIs,
+        probes: Vec::new(),
+    };
+    let engine = match Engine::build(ruleset) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::error!(
+                target: "tui::ops::subscriptions",
+                "routing rules failed to compile for source routing; using the live tunnel: {error}"
+            );
+            return FetchRoute::Tunnel(live);
+        }
+    };
+    let https = scheme == "https";
+    let meta = ConnMeta {
+        target: NetAddr {
+            host: NetHost::new(host),
+            port,
+        },
+        network: NetworkMask::TCP,
+        inbound_tag: None,
+        source: None,
+        source_resolved_ips: Vec::new(),
+        payload_prefix: None,
+        sniffed: Some(if https {
+            SniffedProtocol::Tls
+        } else {
+            SniffedProtocol::Http
+        }),
+        sni_host: None,
+        resolved_host_ips: Vec::new(),
+    };
+    match engine.decide(&meta) {
+        Decision::Route { tag, override_addr } => {
+            if override_addr.is_some() {
+                tracing::warn!(
+                    target: "tui::ops::subscriptions",
+                    "routing rule rewrites the source address; the rewrite is ignored for subscription fetches"
+                );
+            }
+            if tag.as_ref().eq_ignore_ascii_case("direct") {
+                FetchRoute::Direct
+            } else if tag.as_ref().eq_ignore_ascii_case("block")
+                || tag.as_ref().eq_ignore_ascii_case("reject")
+            {
+                FetchRoute::Refused(format!(
+                    "routing rule blocks the subscription source host {host}:{port} (outbound tag `{tag}`)"
+                ))
+            } else {
+                tracing::debug!(
+                    target: "tui::ops::subscriptions",
+                    "routing tag `{tag}` has no source-fetch equivalent; using the live tunnel"
+                );
+                FetchRoute::Tunnel(live)
+            }
+        }
+        Decision::Reject { .. } => FetchRoute::Refused(format!(
+            "routing rule rejects the subscription source host {host}:{port}"
+        )),
+        Decision::HijackDns => FetchRoute::Refused(format!(
+            "routing rule diverts the subscription source host {host}:{port} to DNS"
+        )),
+    }
+}
+
 pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     if state.updating_groups.contains(group_id) {
         return;
@@ -275,12 +395,13 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     let tx = state.core_event_tx.clone();
     let user_agent = group.user_agent.unwrap_or_else(|| "leas/0.1".into());
     let db = state.db.clone();
+    let live_proxy = state.live_proxy.clone();
     let validation: ValidationSettings = state.config.parsing.clone().into();
     // The feed ceilings are configuration, not constants baked into the import
     // path (`specs/2026-10-02-import-budget-design.md`).
     let budget = state.config.import;
     tokio::spawn(async move {
-        update_one_group(url, user_agent, gid, db, validation, budget, tx).await;
+        update_one_group(url, user_agent, gid, db, validation, budget, live_proxy, tx).await;
     });
 }
 
@@ -298,8 +419,10 @@ async fn update_one_group(
     // The feed ceilings are configuration, not constants baked into the import
     // path (`specs/2026-10-02-import-budget-design.md`).
     import_budget: leas_config::app_config::ImportConfig,
+    live_proxy: Arc<LiveProxy>,
     tx: Option<tokio::sync::mpsc::Sender<CoreEvent>>,
 ) {
+    let live = live_proxy.get();
     let Some(flight) = InFlightGuard::acquire(&gid) else {
         // Another path (the auto-update loop) already fetches this group. It
         // delivers its own `SubscriptionsUpdated`, which clears this group's
@@ -320,6 +443,7 @@ async fn update_one_group(
             db,
             validation,
             import_budget,
+            live,
             &flight,
         ),
     )
@@ -363,6 +487,7 @@ async fn do_update_subscription(
     db: Arc<Database>,
     validation: ValidationSettings,
     budget: leas_config::app_config::ImportConfig,
+    live: Option<ProxyEndpoint>,
     _flight: &InFlightGuard,
 ) -> (String, usize, ValidationSummary, Option<String>) {
     // Warn on HTTP (non-HTTPS) subscription URLs
@@ -372,15 +497,66 @@ async fn do_update_subscription(
             "Subscription URL uses HTTP, traffic is not encrypted"
         );
     }
-    let outcome = crate::ops::stream_import::import_http_subscription(
-        &url,
-        &user_agent,
-        &db,
-        Some(&group_id),
-        &validation,
-        budget,
-    )
-    .await;
+    let rules = if live.is_some() {
+        match db.get_all_routing_rules().await {
+            Ok(rules) => rules,
+            Err(error) => {
+                tracing::warn!(
+                    target: "tui::ops::subscriptions",
+                    "routing rules unavailable; sending the subscription fetch through the live tunnel: {error}"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let outcome = match plan_http_route(&url, live, &rules) {
+        FetchRoute::Direct => {
+            tracing::info!(
+                target: "tui::ops::subscriptions",
+                "subscription fetch routed direct"
+            );
+            crate::ops::stream_import::import_http_subscription(
+                &url,
+                &user_agent,
+                &db,
+                Some(&group_id),
+                &validation,
+                budget,
+                None,
+            )
+            .await
+        }
+        FetchRoute::Tunnel(proxy) => {
+            tracing::info!(
+                target: "tui::ops::subscriptions",
+                "subscription fetch routed through live tunnel {}:{}",
+                proxy.host,
+                proxy.port
+            );
+            crate::ops::stream_import::import_http_subscription(
+                &url,
+                &user_agent,
+                &db,
+                Some(&group_id),
+                &validation,
+                budget,
+                Some(&proxy),
+            )
+            .await
+        }
+        FetchRoute::Refused(reason) => {
+            tracing::warn!(
+                target: "tui::ops::subscriptions",
+                "subscription fetch refused: {reason}"
+            );
+            ImportOutcome {
+                ended_early: Some(reason),
+                ..ImportOutcome::default()
+            }
+        }
+    };
     // `links` counts only what was STORED. A run that dropped a batch, or hit a
     // budget, stored less than it parsed — so "succeeded" is only true for a
     // clean run, and the reason travels in the same line rather than only in the
@@ -600,6 +776,7 @@ pub fn update_all_subscriptions(state: &mut AppState) {
 
     let tx = state.core_event_tx.clone();
     let db = state.db.clone();
+    let live_proxy = state.live_proxy.clone();
     let validation: ValidationSettings = state.config.parsing.clone().into();
     let budget = state.config.import;
     for (gid, _url, _ua) in &groups {
@@ -615,6 +792,7 @@ pub fn update_all_subscriptions(state: &mut AppState) {
                 db.clone(),
                 validation.clone(),
                 budget,
+                live_proxy.clone(),
                 tx.clone(),
             )
             .await;
@@ -628,6 +806,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
         return;
     };
     let db = state.db.clone();
+    let live_proxy = state.live_proxy.clone();
     let validation: ValidationSettings = state.config.parsing.clone().into();
     let shutdown = state.shutdown_token.clone();
     tokio::spawn(async move {
@@ -678,6 +857,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
                     db.clone(),
                     validation.clone(),
                     leas_config::app_config::ImportConfig::default(),
+                    live_proxy.get(),
                     &flight,
                 )
                 .await;
@@ -704,6 +884,90 @@ pub fn spawn_auto_update(state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RouteKind {
+        Direct,
+        Tunnel,
+        Refused,
+    }
+
+    fn route_rule(domains: &[&str], outbound: &str) -> RoutingRule {
+        RoutingRule {
+            id: format!("rule-{outbound}"),
+            group_id: None,
+            r#type: 0,
+            domain_matcher: None,
+            domains: domains.iter().map(|domain| (*domain).to_owned()).collect(),
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: Vec::new(),
+            network: None,
+            protocols: Vec::new(),
+            domain_strategy: None,
+            outbound_tag: Some(outbound.to_owned()),
+            balancer_tag: None,
+            rule_set_file: None,
+            rule_set_url: None,
+            sort_order: Some(0),
+        }
+    }
+
+    fn protocol_rule(outbound: &str, protocol: &str) -> RoutingRule {
+        let mut rule = route_rule(&[], outbound);
+        rule.protocols = vec![protocol.to_owned()];
+        rule
+    }
+
+    fn route_kind(route: &FetchRoute) -> RouteKind {
+        match route {
+            FetchRoute::Direct => RouteKind::Direct,
+            FetchRoute::Tunnel(_) => RouteKind::Tunnel,
+            FetchRoute::Refused(_) => RouteKind::Refused,
+        }
+    }
+
+    #[rstest]
+    #[case::no_live_ignores_rules(false, vec![route_rule(&["example.com"], "block")], "https://example.com/feed", RouteKind::Direct)]
+    #[case::live_no_rules(true, vec![], "https://example.com/feed", RouteKind::Tunnel)]
+    #[case::live_direct_domain(true, vec![route_rule(&["example.com"], "direct")], "https://sub.example.com/feed", RouteKind::Direct)]
+    #[case::live_unmatched_domain(true, vec![route_rule(&["example.com"], "direct")], "https://other.test/feed", RouteKind::Tunnel)]
+    #[case::live_block_domain(true, vec![route_rule(&["example.com"], "block")], "https://sub.example.com/feed", RouteKind::Refused)]
+    #[case::live_custom_tag(true, vec![route_rule(&["example.com"], "custom")], "https://example.com/feed", RouteKind::Tunnel)]
+    #[case::live_tls_protocol_https(true, vec![protocol_rule("direct", "tls")], "https://example.com/feed", RouteKind::Direct)]
+    #[case::live_tls_protocol_http(true, vec![protocol_rule("direct", "tls")], "http://example.com/feed", RouteKind::Tunnel)]
+    fn plan_http_route_cases(
+        #[case] live: bool,
+        #[case] rules: Vec<RoutingRule>,
+        #[case] url: &str,
+        #[case] expected: RouteKind,
+    ) {
+        let endpoint = ProxyEndpoint::from_inbound("127.0.0.1", 10808);
+        let route = plan_http_route(url, live.then(|| endpoint.clone()), &rules);
+        assert_eq!(route_kind(&route), expected);
+        if expected == RouteKind::Tunnel {
+            assert!(
+                matches!(&route, FetchRoute::Tunnel(actual) if *actual == endpoint),
+                "a tunnel route must carry the live endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn block_route_names_the_source_host() {
+        let endpoint = ProxyEndpoint::from_inbound("127.0.0.1", 10808);
+        let route = plan_http_route(
+            "https://sub.example.com/feed",
+            Some(endpoint),
+            &[route_rule(&["example.com"], "block")],
+        );
+        let FetchRoute::Refused(message) = route else {
+            panic!("a block rule must refuse the fetch");
+        };
+        assert!(message.contains("example.com"), "{message}");
+    }
 
     fn valid_vmess_url(host: &str) -> String {
         let qr = serde_json::json!({

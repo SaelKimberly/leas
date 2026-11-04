@@ -704,6 +704,7 @@ pub fn disconnect(state: &mut AppState) {
         }));
     }
     state.connected_core = None;
+    state.live_proxy.clear();
     state.connected_protocol_id = None;
     state.connecting = false;
     // Session state: drop the error marker and the actions-log traffic

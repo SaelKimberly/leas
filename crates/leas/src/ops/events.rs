@@ -10,6 +10,7 @@ use leas_db::models::{
 
 use crate::AppState;
 use crate::ops::profiles::endpoint_dns_unresolved;
+use crate::state::ProxyEndpoint;
 use crate::types::{AppMode, CoreEvent, SettingsMode, SplitRightPane};
 
 /// Format a profile ID as a URL-like hex identifier.
@@ -435,6 +436,19 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     state.reset_native_activity();
                 }
                 state.connected_core = Some(core_type);
+                let port = state.config.inbound.local_port();
+                if port == 0 {
+                    state.live_proxy.clear();
+                    tracing::warn!(
+                        target: "tui::ops::events",
+                        "live tunnel has no local SOCKS port; subscription fetches stay direct"
+                    );
+                } else {
+                    state.live_proxy.set(ProxyEndpoint::from_inbound(
+                        &state.config.inbound.listen,
+                        port,
+                    ));
+                }
                 state.connecting = false;
                 state.connection_error = None;
                 state.log_trace("info", "core::process", &format!("Connected [{core_type}]"));
@@ -451,6 +465,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     // rows, and the call no-ops when none are open.
                     state.native_activity.close_out_open();
                     state.connected_core = None;
+                    state.live_proxy.clear();
                     state.connected_protocol_id = None;
                     // Session over: the actions-log traffic segment must not
                     // keep showing the last session's deltas.
@@ -463,6 +478,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 state.connection_error = Some(err.clone());
                 state.connecting = false;
                 state.connected_core = None;
+                state.live_proxy.clear();
                 state.log_trace(
                     "error",
                     "core::process",

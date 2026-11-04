@@ -11,6 +11,8 @@ use std::time::Duration;
 use leas_config::import_export::{ValidationSettings, ValidationSummary};
 use leas_db::Database;
 
+use crate::state::ProxyEndpoint;
+
 use std::future::Future;
 use std::pin::Pin;
 
@@ -629,6 +631,10 @@ async fn flush_import(
 /// HTTP convenience: fetch a subscription URL and stream it through
 /// [`run_streaming_import`]. Equivalent to the old buffered path but never
 /// holds the whole body in memory.
+///
+/// `proxy` is the live tunnel's `SOCKS5h` endpoint. When present, DNS is
+/// delegated to the running core so domain routing rules match the source
+/// hostname.
 pub async fn import_http_subscription(
     url: &str,
     user_agent: &str,
@@ -636,17 +642,29 @@ pub async fn import_http_subscription(
     group_id: Option<&str>,
     validation: &ValidationSettings,
     budget: leas_config::app_config::ImportConfig,
+    proxy: Option<&ProxyEndpoint>,
 ) -> ImportOutcome {
     // Two budgets, never one total deadline: the total deadline used to cover
     // the whole body AND the consumer's persist work between reads, so a
     // large feed was killed mid-stream and looked like a clean run.
-    let client = match reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent(user_agent)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
-        .redirect(leas_core::updater::safe_redirect_policy(false))
-        .build()
-    {
+        .redirect(leas_core::updater::safe_redirect_policy(false));
+    if let Some(proxy) = proxy {
+        let proxy_url = proxy.socks5h_url();
+        match reqwest::Proxy::all(&proxy_url) {
+            Ok(configured) => builder = builder.proxy(configured),
+            Err(e) => {
+                return ImportOutcome {
+                    ended_early: Some(format!("SOCKS5 proxy setup failed for {proxy_url}: {e}")),
+                    ..ImportOutcome::default()
+                };
+            }
+        }
+    }
+    let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(target: "tui::ops::subscriptions", "HTTP client build failed: {e}");
@@ -682,6 +700,8 @@ pub async fn import_http_subscription(
 mod tests {
     use super::*;
     use leas_config::import_export::ValidationSettings;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn valid_vmess_url(host: &str) -> String {
         let qr = serde_json::json!({
@@ -692,6 +712,91 @@ mod tests {
         });
         let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
         format!("vmess://{b64}")
+    }
+
+    #[tokio::test]
+    async fn subscription_http_via_socks5h() {
+        leas_core::ensure_tls_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+        let proxy = ProxyEndpoint {
+            host: "127.0.0.1".to_owned(),
+            port: listener.local_addr().expect("proxy addr").port(),
+        };
+        let body = valid_vmess_url("1.2.3.4");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("proxy accept");
+            let mut greeting = [0u8; 2];
+            stream.read_exact(&mut greeting).await.expect("greeting");
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0u8; usize::from(greeting[1])];
+            stream.read_exact(&mut methods).await.expect("methods");
+            stream.write_all(&[5, 0]).await.expect("auth reply");
+
+            let mut request = [0u8; 4];
+            stream.read_exact(&mut request).await.expect("request head");
+            assert_eq!(request, [5, 1, 0, 3], "CONNECT by domain name");
+            let mut domain_len = [0u8; 1];
+            stream
+                .read_exact(&mut domain_len)
+                .await
+                .expect("domain length");
+            let mut domain = vec![0u8; usize::from(domain_len[0])];
+            stream.read_exact(&mut domain).await.expect("domain");
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await.expect("port");
+            assert_eq!(String::from_utf8(domain).unwrap(), "subscription.invalid");
+            assert_eq!(u16::from_be_bytes(port), 80);
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .expect("connect reply");
+
+            let mut http = Vec::new();
+            while !http.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.expect("http request");
+                http.push(byte[0]);
+                assert!(http.len() < 8192, "HTTP request head too large");
+            }
+            let http = String::from_utf8_lossy(&http);
+            assert!(http.starts_with("GET /feed HTTP/1.1"), "{http}");
+            assert!(
+                http.to_ascii_lowercase()
+                    .contains("host: subscription.invalid"),
+                "{http}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("http response");
+            stream.shutdown().await.expect("proxy shutdown");
+        });
+
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            import_http_subscription(
+                "http://subscription.invalid/feed",
+                "leas-test",
+                &db,
+                None,
+                &ValidationSettings::default(),
+                leas_config::app_config::ImportConfig::default(),
+                Some(&proxy),
+            ),
+        )
+        .await
+        .expect("import timed out");
+        assert_eq!(outcome.links, 1);
+        assert!(outcome.ended_early.is_none(), "{:?}", outcome.ended_early);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("proxy task timed out")
+            .expect("proxy task panicked");
     }
 
     /// Source that replays pre-split byte chunks, then optionally fails.

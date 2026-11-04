@@ -35,7 +35,7 @@ serde_json.workspace = true
 
 # ============ Networking ============
 reqwest.workspace = true
-reqwest.features = ["gzip"]
+reqwest.features = ["gzip", "socks"]
 bytes.workspace = true
 # rustls ring: process-level CryptoProvider::install_default() at startup
 # (main.rs install_tls_provider) — reqwest 0.13 rustls-no-provider requires it.
