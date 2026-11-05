@@ -262,6 +262,18 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The HTTP/2 + navigation-header profile that matches this identity, so
+    /// the HTTP layer never disagrees with the TLS hello about the browser.
+    #[must_use]
+    pub fn http2_profile(&self) -> crate::http2_profile::Http2Profile {
+        let fp = &self.fingerprint;
+        crate::http2_profile::Http2Profile::for_identity(
+            fp.browser,
+            fp.os.unwrap_or(crate::fingerprints::Os::Windows),
+            fp.device.unwrap_or(crate::fingerprints::Device::Desktop),
+        )
+    }
+
     /// The full JA4 of this resolved hello (computed, not looked up).
     #[must_use]
     pub fn ja4(&self) -> String {
@@ -697,8 +709,13 @@ mod tests {
 
     #[test]
     fn in_catalog_evidence_marks_generated_rows_live() {
-        // Hand-transcribed hellos (chrome_130, edge_106) were captured
-        // outside the observed corpus: their JA4s are NOT catalog evidence.
+        // `in_catalog` must agree with the corpus lookup for the JA4 the row
+        // actually produces. It used to be asserted as `false` for the two
+        // hand rows because the crate hashed with the peet variant (padding
+        // excluded) while the corpus keeps padding; under the FoxIO default
+        // the hand hellos hash onto the corpus value and the flag is
+        // truthfully `true`. The invariant worth pinning is the agreement, not
+        // a constant.
         for fp in [
             Fingerprint::new(Browser::Chrome)
                 .with_version(130)
@@ -708,7 +725,15 @@ mod tests {
                 .with_os(Os::Windows),
         ] {
             let r = fp.resolve().unwrap();
-            assert!(!r.in_catalog(), "{} must not be catalog evidence", r.name);
+            let expected =
+                super::super::catalog::contains(r.fingerprint.browser.name(), None, &r.ja4());
+            assert_eq!(
+                r.in_catalog(),
+                expected,
+                "{}: in_catalog must match the corpus lookup for {}",
+                r.name,
+                r.ja4()
+            );
         }
         // Kept generated rows ARE catalog observations (manifest-derived).
         let generated_row = Fingerprint::new(Browser::Firefox)

@@ -171,22 +171,11 @@ fn chrome_sec_ch_ua(major: u16) -> String {
 /// HTTP/2 SETTINGS for a browser family: `(initial_stream_window_size,
 /// initial_connection_window_size, max_header_list_size)`.
 ///
-/// Transcribed from impit: chrome (and every Chromium-family build) uses
-/// `6_291_456 / 15_663_105 / 262_144`; firefox `131_072 / 12_517_377`;
-/// safari (iOS) `2_097_152 / 10_485_760`. impit leaves `max_header_list`
-/// unset for firefox/safari; the sweep pins `262_144` (hyper's h2 default
-/// cap) uniformly.
+/// Delegates to the engine's single table ([`leas_tls::Http2Profile`]) so the
+/// sweep, the grader and the REALITY spider cannot drift apart.
 #[must_use]
 pub const fn h2_settings(browser: Browser) -> (u32, u32, u32) {
-    match browser {
-        Browser::Firefox => (131_072, 12_517_377, 262_144),
-        Browser::Safari => (2_097_152, 10_485_760, 262_144),
-        Browser::Chrome
-        | Browser::Edge
-        | Browser::Brave
-        | Browser::Opera
-        | Browser::SamsungInternet => (6_291_456, 15_663_105, 262_144),
-    }
+    leas_tls::Http2Profile::for_browser(browser).settings()
 }
 
 /// Chromium-family `User-Agent` product token (the version slot).

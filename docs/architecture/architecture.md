@@ -731,10 +731,22 @@ serialize — REALITY must agree twice with the same scalar.
   = 2 wire-exact profiles (`chrome_130`, `edge_106`); generated tier
   (`generated/`, emitted by `gen_specs.py --emit`) = 69 JA4-faithful entries —
   the deterministic `select_roster` kept subset of the 1825-entry ja4db manifest.
-- `hello/` — `build_hello`/`to_record` (GREASE pairing, 512-byte record
-  padding), `parse_hello`.
+  The generator carries an **era axis** (`PQ_ERA`): the hybrid key share is
+  offered only where the browser major shipped it (Chromium `>= 131`), so a
+  Chrome-93 row no longer advertises a 2024 algorithm. GREASE is emitted for the
+  Chromium families only, and era gating filters what the family template lists —
+  it never adds a group.
+- `hello/` — `build_hello`/`to_record` (GREASE pairing — one `grease_a` across
+  the extension-body slots, a separate `grease_b` for standalone extensions,
+  distinct draws within a namespace with a hard error instead of a duplicate;
+  512-byte record padding), `build_hello_ordered` (family/era-scoped
+  extension-order permutation for Chromium `>= 108`; padding and
+  `pre_shared_key` stay last), `parse_hello`.
 - `crypto/` — TLS 1.3 key schedule (RFC 8448-verified) + TLS 1.2 key block, AEAD record keys
-  (IV XOR seq), `X25519KeyPair`, JA3/JA4 codecs, and ML-KEM-768 (`mlkem.rs`, RustCrypto
+  (IV XOR seq), `X25519KeyPair`, JA3/JA4 codecs (`Ja4Variant::Foxio` is the
+  default — padding stays in `hash2`, sig-algs GREASE-filtered, A-part derived
+  from `supported_versions`/SNI; `Ja4Variant::PeetWs` reproduces the older
+  tls.peet.ws rendering), and ML-KEM-768 (`mlkem.rs`, RustCrypto
   `ml-kem`, FIPS 203 — liboqs was removed 2026-09-18 because its vendored build added CMake +
   a C/C++ toolchain; the seed→ek bytes are pinned by a KAT captured before the swap). Every
   secret-producing entry point returns
@@ -754,7 +766,13 @@ serialize — REALITY must agree twice with the same scalar.
   reached on a 1.2 ServerHello.
 - `verify/` — `WebPkiVerifier` (roots / CA DER / `insecure` / `pin_sha256`).
 - `reality/` — `HelloProvisioner` + 9-step wire contract, `FixedChrome130Hybrid`,
-  auth-key/session-seal/server-auth.
+  `RandomEligible` (uniform pick over the REALITY-eligible roster — TLS 1.3 AEAD,
+  32-byte session id, real X25519 share; PQ is not required), auth-key/session-seal/server-auth.
+  The session-id transform is fingerprint-neutral (JA4-proven) and the fallback
+  spider's UA family follows the same identity.
+- `http2_profile/` — `Http2Profile`: one SETTINGS + navigation-header table per
+  browser family, so the TLS hello, the h2 layer and the REALITY spider cannot
+  name different browsers.
 - `http2/` — minimal h2 layer for the tls.peet.ws grader (not a client).
 
 Tier-2 verification: `examples/grader.rs` + ignored `tests/tls_peet_ws.rs`

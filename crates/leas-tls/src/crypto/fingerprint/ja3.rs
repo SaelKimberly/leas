@@ -23,6 +23,10 @@ pub struct Ja3Fields {
     pub signature_algorithms: Vec<u16>,
     /// ALPN protocols, first entry first (used by JA4).
     pub alpn: Vec<String>,
+    /// `supported_versions` entries; JA4's A-part takes the highest one.
+    pub supported_versions: Vec<u16>,
+    /// Whether a `server_name` extension is present (JA4's `d`/`i`).
+    pub sni: bool,
 }
 
 impl From<&ParsedClientHello> for Ja3Fields {
@@ -35,6 +39,8 @@ impl From<&ParsedClientHello> for Ja3Fields {
             point_formats: extract_u8_list(hello.extension(0x000b)),
             signature_algorithms: extract_u16_list(hello.extension(0x000d)),
             alpn: extract_alpn(hello.extension(0x0010)),
+            supported_versions: extract_u16_vec_u8len(hello.extension(0x002b)),
+            sni: hello.extension(0x0000).is_some(),
         }
     }
 }
@@ -61,7 +67,7 @@ const fn extension_codepoint(ext: &crate::spec::ExtensionSpec) -> u16 {
         E::RecordSizeLimit(_) => 0x001C,
         E::Padding => 0x0015,
         E::Grease => 0x0A0A,
-        E::EchGrease => 0xFE0D,
+        E::EchGrease { .. } => 0xFE0D,
         E::Cookie(_) => 0x002C,
         E::Raw { ty, .. } => *ty,
     }
@@ -83,12 +89,15 @@ impl Ja3Fields {
             point_formats: Vec::new(),
             signature_algorithms: Vec::new(),
             alpn: Vec::new(),
+            supported_versions: Vec::new(),
+            sni: spec.extensions.iter().any(|e| matches!(e, E::ServerName)),
         };
         for ext in &spec.extensions {
             match ext {
                 E::SupportedGroups(g) => out.curves.clone_from(g),
                 E::SignatureAlgorithms(s) => out.signature_algorithms.clone_from(s),
                 E::Alpn(p) => out.alpn.clone_from(p),
+                E::SupportedVersions(v) => out.supported_versions.clone_from(v),
                 E::EcPointFormats => out.point_formats = vec![0],
                 _ => {}
             }
@@ -117,10 +126,17 @@ pub fn ja3_grease_stripped(f: &Ja3Fields) -> String {
             .copied()
             .filter(|&e| !is_grease(e))
             .collect(),
-        curves: f.curves.clone(),
+        curves: f
+            .curves
+            .iter()
+            .copied()
+            .filter(|&c| !is_grease(c))
+            .collect(),
         point_formats: f.point_formats.clone(),
         signature_algorithms: f.signature_algorithms.clone(),
         alpn: f.alpn.clone(),
+        supported_versions: f.supported_versions.clone(),
+        sni: f.sni,
     };
     ja3_string(&clean)
 }
@@ -138,12 +154,59 @@ pub fn ja3_string(f: &Ja3Fields) -> String {
     )
 }
 
+/// The **classic** on-wire JA3 pre-hash string: decimal ids, `-` inside a
+/// list and `,` between lists (`771,4865-4866,...,0-10-11,...`).
+///
+/// [`ja3_string`] is this crate's historical hex/comma rendering and is kept
+/// under its own name so stored values do not silently change meaning; when a
+/// value must match an upstream JA3 database, use this one.
+///
+/// GREASE stance: classic JA3 famously does **not** strip GREASE (which is why
+/// Chrome's 2023 permutation killed it). This function renders whatever the
+/// caller put in the fields, so caller-supplied GREASE reaches the string; use
+/// [`ja3_grease_stripped`] for the normalized variant (JA3N-style).
+#[must_use]
+pub fn ja3_classic_string(f: &Ja3Fields) -> String {
+    format!(
+        "{},{},{},{},{}",
+        f.version,
+        join_dec16(&f.ciphers),
+        join_dec16(&f.extensions),
+        join_dec16(&f.curves),
+        join_dash(&f.point_formats),
+    )
+}
+
+fn join_dash(values: &[u8]) -> String {
+    values
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Classic JA3 hash: md5 hex of [`ja3_classic_string`].
+#[must_use]
+pub fn ja3_classic_hash(f: &Ja3Fields) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(ja3_classic_string(f).as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// The JA3 hash: md5 hex of [`ja3_string`].
 #[must_use]
 pub fn ja3_hash(f: &Ja3Fields) -> String {
     let mut hasher = Md5::new();
     hasher.update(ja3_string(f).as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn join_dec16(values: &[u16]) -> String {
+    values
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn join_hex(values: &[u16]) -> String {
@@ -165,6 +228,23 @@ fn join_dec(values: &[u8]) -> String {
 /// Decodes a u16-BE list behind a 2-byte length prefix (the RFC 8446 vector
 /// shape shared by `supported_groups` and `signature_algorithms`). Returns
 /// an empty list for a missing or malformed body.
+/// `supported_versions` uses a **u8** byte-length prefix (RFC 8446
+/// §4.2.1), unlike every other u16 id-list extension.
+fn extract_u16_vec_u8len(body: Option<&[u8]>) -> Vec<u16> {
+    let Some(body) = body else {
+        return Vec::new();
+    };
+    let Some((&len, rest)) = body.split_first() else {
+        return Vec::new();
+    };
+    rest[..usize::from(len).min(rest.len())]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect()
+}
+
 fn extract_u16_list(body: Option<&[u8]>) -> Vec<u16> {
     let Some(body) = body else {
         return Vec::new();
@@ -349,7 +429,42 @@ mod tests {
                 point_formats: vec![],
                 signature_algorithms: vec![0x0403],
                 alpn: vec![],
+                supported_versions: vec![],
+                sni: false,
             })
         );
+    }
+
+    #[test]
+    fn classic_ja3_uses_decimal_dash_form() {
+        let f = Ja3Fields {
+            version: 771,
+            ciphers: vec![4865, 4866],
+            extensions: vec![0, 10],
+            curves: vec![29, 23],
+            point_formats: vec![0, 1],
+            signature_algorithms: vec![],
+            alpn: vec![],
+            supported_versions: vec![],
+            sni: true,
+        };
+        assert_eq!(ja3_classic_string(&f), "771,4865-4866,0-10,29-23,0-1");
+        assert_ne!(ja3_classic_hash(&f), ja3_hash(&f));
+    }
+
+    #[test]
+    fn grease_stripped_removes_curves_too() {
+        let f = Ja3Fields {
+            version: 771,
+            ciphers: vec![0xCACA, 4865],
+            extensions: vec![0x0A0A, 0],
+            curves: vec![0x1A1A, 29],
+            point_formats: vec![0],
+            signature_algorithms: vec![],
+            alpn: vec![],
+            supported_versions: vec![],
+            sni: true,
+        };
+        assert_eq!(ja3_grease_stripped(&f), "771,1301,0,1d,0");
     }
 }

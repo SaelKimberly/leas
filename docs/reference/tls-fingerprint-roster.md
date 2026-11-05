@@ -61,9 +61,12 @@ Every kept entry's built `ClientHello` must reproduce its registered source
 JA4 (`GenEntry.ja4`; for the hand profiles, the hand-captured value):
 
 - **Offline gate** (`tests/generated_ja4_gate.rs`, runs in every
-  `cargo test`): all 69 generated entries — 49 full-hash exact, 16
-  padding-in-hello, 4 padding-omitted (512-byte target rule), 0 no-sig, 3
-  corpus-`ht` entries, 0 failures. The 2 hand profiles are pinned offline by
+  `cargo test`): all 69 generated entries — **66 full-hash exact**, 0
+  padding-in-hello, 0 padding-omitted, 0 no-sig, 3 corpus-`ht` entries,
+  0 failures. The encoder moved to the FoxIO scheme (padding `0015` stays in
+  `hash2`, matching the corpus rule), which absorbed the former padding
+  classes; the 3 residual entries differ only in the A-part ALPN letter, where
+  the corpus renders `http/1.1` as `ht` and FoxIO takes first+last (`h1`). The 2 hand profiles are pinned offline by
   `tests/tls_peet_ws.rs::local_fingerprints_match_locked_constants`
   (chrome_130 JA4-v2 and GREASE-stripped JA3 md5 under the fixed seed) and by
   the resolver JA4-fidelity tests.
@@ -99,6 +102,15 @@ no-ALPN entries) are graded over an HTTP/1.1 GET (`Connection: close`,
 Content-Length/chunked aware).
 
 ## Live results summary (2026-08-25, two full runs — identical)
+
+> **Historical.** These numbers describe the pre-S1 roster and its July sweep.
+> S1 era-gated the post-quantum key share (pre-124 Chromium rows no longer
+> offer `X25519MLKEM768`), so a fresh sweep will report different class
+> counts; the offline gate has been re-derived (49 full / 20
+> padding-in-hello / 0 padding-omitted / 3 `ht`). Roster membership is
+> unchanged: `brave_89_windows_desktop` / `brave_90_macos_desktop` were
+> briefly dropped in an intermediate S1 revision and are back, so the live
+> table's 3 `ht` rows still match the current count.
 
 | Family | Total | Full | Pad+ | Pad− | No-sig | `ht` | Wire-ok | Reg-ok | Fail |
 |---|---|---|---|---|---|---|---|---|---|
@@ -180,19 +192,20 @@ enforced at emit time now instead of relying on `select_roster` alone.)
 - 14 no-ALPN entries: connect over HTTP/1.1 default; the server omits the
   A-part letter entirely and uses non-padded counts (see methodology).
 
-### Finding 4 — 50 low-fidelity slots (JA4-faithful tier, by design)
+### Finding 4 — low-fidelity slots (JA4-faithful tier, by design)
 
-At selection time **50 of the 71 slots were low-fidelity** — 48 of the 69 kept
-generated entries are flagged `low_fidelity` in the manifest (their byte-level
-wire shape — sigalgs ordering, extension bodies — is synthesized, not
-observed; only their JA4 is corpus-faithful), plus the 2 upgraded slots
-(`chrome_148_windows_desktop`, `edge_149_windows_desktop`) which were
-low-fidelity generated entries replaced by wire-exact hand profiles. The 2
-hand profiles are wire-exact (transcribed from real browser hellos); the
-remaining 48 generated entries are **JA4-faithful**: they reproduce the
-registered JA4 exactly (pinned offline and live) while their byte-level shape
-may diverge from a real browser. This is the documented JA4-faithful tier —
-JA4 reproduction is the contract, not byte-level wire mimicry.
+**2 of the 69 kept generated entries** are flagged `low_fidelity` in the
+manifest (their byte-level wire shape — sigalgs ordering, extension bodies —
+is synthesized, not observed; only their JA4 is corpus-faithful). The other
+**67 generated entries are JA4-faithful**: they reproduce the registered JA4
+exactly (pinned offline and live) while their byte-level shape may diverge
+from a real browser. This is the documented JA4-faithful tier — JA4
+reproduction is the contract, not byte-level wire mimicry.
+
+Separately, two low-fidelity generated slots (`chrome_148_windows_desktop`,
+`edge_149_windows_desktop`) were **replaced by** the wire-exact hand profiles
+`chrome_130` / `edge_106` (transcribed from real browser hellos), so they are
+not part of the 69.
 
 ### Finding 5 — dropped artifacts (historical)
 

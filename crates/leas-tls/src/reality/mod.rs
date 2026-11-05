@@ -125,6 +125,81 @@ fn chrome_130_hybrid_spec() -> ClientHelloSpec {
 static CHROME_130_HYBRID: std::sync::LazyLock<ClientHelloSpec> =
     std::sync::LazyLock::new(chrome_130_hybrid_spec);
 
+/// Every roster spec that can carry REALITY's auth payload.
+///
+/// The filter is [`ClientHelloSpec::reality_eligible`]: TLS 1.3 AEAD, a
+/// 32-byte session-id slot and a real X25519 key share. Differential stats,
+/// weighting and poisoning are deliberately absent — this is an initial
+/// uniform slice.
+#[must_use]
+pub fn reality_candidates() -> Vec<(&'static str, crate::spec::ClientHelloSpec)> {
+    let mut out: Vec<(&'static str, crate::spec::ClientHelloSpec)> =
+        crate::profiles::generated::GENERATED
+            .iter()
+            .map(|g| (g.name, (g.spec_fn)()))
+            .filter(|(_, spec)| spec.reality_eligible())
+            .collect();
+    for (name, spec_fn) in [
+        (
+            "chrome_130",
+            crate::profiles::hand_selected::chrome_130 as fn() -> crate::spec::ClientHelloSpec,
+        ),
+        ("edge_106", crate::profiles::hand_selected::edge_106),
+    ] {
+        let spec = spec_fn();
+        if spec.reality_eligible() {
+            out.push((name, spec));
+        }
+    }
+    out
+}
+
+/// Uniform random pick over [`reality_candidates`].
+///
+/// One draw per call; callers pick once per dial and never re-pick mid-
+/// connection. Returns `None` only when the roster has no eligible row (a
+/// build-time invariant, impossible with the shipped profiles — so callers can
+/// fall back to [`FixedChrome130Hybrid`] without special-casing).
+pub fn random_reality_spec(
+    rng: &dyn crate::SecureRandom,
+) -> core::result::Result<Option<(&'static str, crate::spec::ClientHelloSpec)>, TlsError> {
+    let candidates = reality_candidates();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; 8];
+    rng.fill(&mut bytes)
+        .map_err(|_| TlsError::Crypto("reality pick failed".to_string()))?;
+    let len = u64::try_from(candidates.len())
+        .map_err(|_| TlsError::Spec("reality candidate list too long".to_string()))?;
+    let idx = usize::try_from(u64::from_be_bytes(bytes) % len)
+        .map_err(|_| TlsError::Spec("reality index overflow".to_string()))?;
+    Ok(candidates.into_iter().nth(idx))
+}
+
+/// REALITY provisioner that picks one eligible roster spec per dial.
+///
+/// The wire stays a real browser fingerprint (the pick comes from the roster,
+/// nothing is synthesized), and the only transform is the session-id auth
+/// slot — `SpecProvisioner` already enforces that.
+pub struct RandomEligible;
+
+impl HelloProvisioner for RandomEligible {
+    fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello> {
+        let Some((_name, spec)) = random_reality_spec(params.rng)? else {
+            return FixedChrome130Hybrid.provision(params);
+        };
+        SpecProvisioner::new(spec).provision(params)
+    }
+
+    fn offers_hybrid_key_share(&self) -> bool {
+        // Whether the picked spec carries PQ is a per-dial fact; report the
+        // conservative answer (no PQ) so callers never assume a hybrid share
+        // this provisioner cannot guarantee.
+        false
+    }
+}
+
 /// Fixed Chrome-shaped provisioner (first engine; ported from shoes).
 ///
 /// Serves the surviving wire-exact Chrome desktop spec
@@ -231,6 +306,10 @@ pub struct SpiderConfig {
     pub max_gets: usize,
     /// Delay between GETs; default 1s.
     pub request_interval: std::time::Duration,
+    /// Browser family the spider must imitate. It follows the REALITY
+    /// fingerprint when one is configured, so a Firefox-shaped hello is never
+    /// followed by a Chrome `User-Agent`; default Chromium.
+    pub browser: crate::fingerprints::Browser,
 }
 
 impl Default for SpiderConfig {
@@ -239,6 +318,7 @@ impl Default for SpiderConfig {
             paths: vec!["/".to_string()],
             max_gets: 4,
             request_interval: std::time::Duration::from_secs(1),
+            browser: crate::fingerprints::Browser::Chrome,
         }
     }
 }
@@ -1042,5 +1122,111 @@ mod tests {
             .await
             .expect("server task timed out")
             .unwrap();
+    }
+
+    /// The REALITY transform must not move any fingerprint field.
+    ///
+    /// Proven at the JA4 level rather than byte-for-byte: `AuthPayload` zeroes
+    /// the 32-byte slot instead of drawing it, so every later GREASE draw in
+    /// that hello lands on different (still valid, still JA4-invisible)
+    /// values. A byte comparison would therefore fail on a spec that carries a
+    /// GREASE slot after the session id — that is the RNG stream, not the
+    /// fingerprint.
+    #[test]
+    fn reality_transform_is_fingerprint_neutral() {
+        use crate::crypto::fingerprint::ja3::Ja3Fields;
+        use crate::crypto::fingerprint::ja4::full_ja4;
+        use crate::hello::{BuildParams, build_hello};
+        use crate::spec::SessionIdSpec;
+
+        // Nibble-cycling so repeated GREASE draws stay distinct within a
+        // namespace (edge_106 has two standalone GREASE slots; a constant
+        // byte would trip the hard-error draw).
+        struct Cycling {
+            pos: std::sync::atomic::AtomicU8,
+        }
+        impl crate::SecureRandom for Cycling {
+            fn fill(&self, dest: &mut [u8]) -> core::result::Result<(), ring::error::Unspecified> {
+                use std::sync::atomic::Ordering;
+                for b in dest.iter_mut() {
+                    let n = self.pos.fetch_add(1, Ordering::Relaxed);
+                    *b = 0x40 | (n & 0x0F);
+                }
+                Ok(())
+            }
+        }
+
+        let ja4 = |spec: &crate::spec::ClientHelloSpec| {
+            let rng = Cycling {
+                pos: std::sync::atomic::AtomicU8::new(0),
+            };
+            let (pk, _) = Mlkem768::generate_keypair();
+            let hello = build_hello(
+                spec,
+                &BuildParams {
+                    server_name: "example.org",
+                    alpn: None,
+                    x25519_pub: &[0xAB; 32],
+                    mlkem768_pub: Some(pk.as_bytes()),
+                    rng: &rng,
+                },
+            )
+            .unwrap();
+            let parsed = crate::hello::parse::parse_hello(&hello.handshake_bytes).unwrap();
+            full_ja4(&Ja3Fields::from(&parsed))
+        };
+
+        for (name, spec) in super::reality_candidates() {
+            let mut reality = spec.clone();
+            reality.session_id = SessionIdSpec::AuthPayload { len: 32 };
+            assert_eq!(reality.session_id_wire_len(), 32, "{name}");
+            assert_eq!(
+                ja4(&spec),
+                ja4(&reality),
+                "{name}: the auth transform changed the JA4"
+            );
+        }
+    }
+
+    #[test]
+    fn every_candidate_is_reality_eligible_and_unique() {
+        let candidates = super::reality_candidates();
+        assert!(
+            candidates.len() >= 40,
+            "eligible pool shrank unexpectedly: {}",
+            candidates.len()
+        );
+        let mut names: Vec<&str> = candidates.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), candidates.len(), "duplicate candidate names");
+        for (name, spec) in candidates {
+            assert!(spec.reality_eligible(), "{name} is not REALITY-eligible");
+            assert_eq!(spec.session_id_wire_len(), 32, "{name}");
+            assert!(spec.supports_tls13_aead(), "{name}");
+        }
+    }
+
+    #[test]
+    fn random_pick_only_returns_eligible_specs() {
+        // Seeded RNG: every drawn index must land on an eligible row, and the
+        // session-id transform must be the only edit the provisioner makes.
+        for seed in 0u8..32 {
+            let rng = FixedBytes { byte: seed };
+            let picked = super::random_reality_spec(&rng).unwrap().unwrap();
+            assert!(picked.1.reality_eligible(), "{}", picked.0);
+        }
+    }
+
+    /// Constant RNG (repeats one byte) — enough to exercise index selection.
+    struct FixedBytes {
+        byte: u8,
+    }
+
+    impl crate::SecureRandom for FixedBytes {
+        fn fill(&self, dest: &mut [u8]) -> core::result::Result<(), ring::error::Unspecified> {
+            dest.fill(self.byte);
+            Ok(())
+        }
     }
 }

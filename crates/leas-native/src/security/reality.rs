@@ -24,6 +24,8 @@ pub use leas_tls::reality::{
 pub enum HelloProvisionerChoice {
     #[default]
     FixedChrome130Hybrid,
+    /// Uniform random pick over the REALITY-eligible roster, one per dial.
+    RandomEligible,
     Custom(Arc<dyn HelloProvisioner>),
 }
 
@@ -31,6 +33,7 @@ impl std::fmt::Debug for HelloProvisionerChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FixedChrome130Hybrid => f.write_str("FixedChrome130Hybrid"),
+            Self::RandomEligible => f.write_str("RandomEligible"),
             // `dyn HelloProvisioner` is deliberately not `Debug`; the
             // concrete provisioner is observable through the type itself.
             Self::Custom(_) => f.write_str("Custom(..)"),

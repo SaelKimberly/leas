@@ -8,35 +8,37 @@
 
 use crate::Stream;
 use crate::http2;
+use crate::http2_profile::Http2Profile;
 use crate::reality::SpiderConfig;
 use crate::record::stream::TlsStream;
 
 /// Padding cookie zeros (xray `SpiderY[0..1]`).
 const PADDING_MAX: usize = 512;
 
-/// Default browser ("nav") header set applied to every spider GET — the
-/// `TryDefaultHeadersWith(…, "nav")` Chrome navigation set from xray-core
+/// Browser ("nav") header set applied to every spider GET — the
+/// `TryDefaultHeadersWith(…, "nav")` navigation set from xray-core
 /// (`thirdparty/Xray-core/common/utils/browser.go`). A real browser opening
 /// the steal target sends these; a bare `:authority/:method/:path/:scheme`
-/// GET plus cookie is a DPI tell. Values are kept short (<128 bytes each;
-/// the HPACK encoder handles longer values via the base-128 varint either
-/// way).
-const BROWSER_HEADERS: &[(&str, &str)] = &[
-    (
-        "user-agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    ),
-    (
-        "accept",
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    ),
-    ("accept-language", "en-US,en;q=0.9"),
-    ("accept-encoding", "gzip, deflate, br"),
-    ("sec-fetch-dest", "document"),
-    ("sec-fetch-mode", "navigate"),
-    ("sec-fetch-site", "none"),
-    ("upgrade-insecure-requests", "1"),
-];
+/// GET plus cookie is a DPI tell.
+///
+/// The `User-Agent`, `Accept` and `Accept-Language` values come from the
+/// browser family of the REALITY fingerprint ([`Http2Profile`]), so the HTTP
+/// layer cannot contradict the TLS hello. The Chromium-specific
+/// `sec-fetch-*`/`upgrade-insecure-requests` navigation hints are sent for every
+/// family: Firefox sends the same navigation set, and omitting them would be a
+/// larger tell than a family-level mismatch in these opaque hints.
+const fn browser_headers(profile: Http2Profile) -> [(&'static str, &'static str); 8] {
+    [
+        ("user-agent", profile.user_agent),
+        ("accept", profile.accept),
+        ("accept-language", profile.accept_language),
+        ("accept-encoding", "gzip, deflate, br"),
+        ("sec-fetch-dest", "document"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-site", "none"),
+        ("upgrade-insecure-requests", "1"),
+    ]
+}
 
 /// Bounded Spider-X session: `max_gets` HTTP/2 GETs to `https://<sni><path>`
 /// with default browser ("nav") headers, a padding cookie, Referer chaining,
@@ -53,6 +55,7 @@ pub(crate) async fn run<S: Stream + 'static>(
         return;
     }
     let mut conn = conn;
+    let headers = browser_headers(Http2Profile::for_browser(spider.browser));
     let mut client = http2::Client::new();
     let rng = ring::rand::SystemRandom::new();
     let mut prev_path: Option<String> = None;
@@ -67,8 +70,8 @@ pub(crate) async fn run<S: Stream + 'static>(
         let referer = prev_path
             .as_ref()
             .map(|prev| format!("https://{sni}{prev}"));
-        let mut extra_refs: Vec<(&str, &str)> = Vec::with_capacity(BROWSER_HEADERS.len() + 2);
-        extra_refs.extend_from_slice(BROWSER_HEADERS);
+        let mut extra_refs: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 2);
+        extra_refs.extend_from_slice(&headers);
         extra_refs.push(("cookie", pad_cookie.as_str()));
         if let Some(referer) = referer.as_deref() {
             extra_refs.push(("referer", referer));
@@ -86,5 +89,50 @@ pub(crate) async fn run<S: Stream + 'static>(
         let millis = u64::try_from(spider.request_interval.as_millis()).unwrap_or(0);
         let jittered = std::time::Duration::from_millis(millis * tenths / 10);
         tokio::time::sleep(jittered.max(std::time::Duration::from_millis(1))).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fingerprints::Browser;
+
+    fn ua(browser: Browser) -> &'static str {
+        browser_headers(Http2Profile::for_browser(browser))
+            .iter()
+            .find(|(k, _)| *k == "user-agent")
+            .map(|(_, v)| *v)
+            .expect("user-agent header")
+    }
+
+    #[test]
+    fn spider_user_agent_follows_the_fingerprint_family() {
+        // The bug this guards: a Firefox-shaped REALITY hello followed by a
+        // Chrome navigation UA.
+        assert!(ua(Browser::Firefox).contains("Firefox/"));
+        assert!(!ua(Browser::Firefox).contains("Chrome/"));
+        assert!(ua(Browser::Chrome).contains("Chrome/"));
+        assert!(ua(Browser::Safari).contains("Safari/"));
+        assert_ne!(ua(Browser::Firefox), ua(Browser::Chrome));
+    }
+
+    #[test]
+    fn spider_keeps_the_navigation_header_set() {
+        let headers = browser_headers(Http2Profile::for_browser(Browser::Firefox));
+        for key in [
+            "user-agent",
+            "accept",
+            "accept-language",
+            "accept-encoding",
+            "sec-fetch-dest",
+            "sec-fetch-mode",
+            "sec-fetch-site",
+            "upgrade-insecure-requests",
+        ] {
+            assert!(
+                headers.iter().any(|(k, _)| *k == key),
+                "spider must send {key}"
+            );
+        }
     }
 }

@@ -28,7 +28,10 @@ const PORT: u16 = 443;
 const API_PATH: &str = "/api/all";
 const ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
 
-/// Locked expected fingerprints — same constants as the grader.
+/// Locked expected fingerprints. These are **peet-rendering** values (the
+/// server's `ja4.go` excludes padding from `hash2`), which is why they differ
+/// from `tests/fingerprints.rs`'s `FoxIO` pins for the same two hand profiles.
+/// The grader's `CHROME130_JA4`/`EDGE106_JA4` hold the same peet value.
 const CHROME130_JA4: &str = "t13d1516h2_8daaf6152771_f37e75b10bcc";
 /// Stable fingerprints of the kept Firefox hello that version 128 resolves
 /// to (`firefox_139_windows_desktop` — Firefox is GREASE-free, so JA3 is
@@ -540,12 +543,28 @@ mod local {
         ja3_canonical(hello)
     }
 
-    /// Current `FoxIO` JA4 (`ja4.py`, FoxIO-LLC/ja4; `ja4.go`, `TrackMe`).
-    /// tls.peet.ws's `ja4.go` explicitly skips the padding extension
-    /// (0x0015) from the hash list (`hexStr == "0015"`), a documented
-    /// deviation from the `FoxIO` `python` implementation which includes it.
-    /// The extension *count* in the `_a_` section still includes padding.
+    /// The value `tls.peet.ws` reports for a hello: its `ja4.go` rendering.
+    ///
+    /// This is **not** the crate default. The hashes come from the crate's
+    /// `Ja4Variant::PeetWs` (padding `0015` excluded from `hash2`); the A-part
+    /// stays local because the server deviates from `FoxIO` there too —
+    /// unpadded decimal counts and no `00` letter when ALPN is absent
+    /// (see [`peet_a_part`]).
     pub fn ja4_v2(hello: &ParsedClientHello) -> String {
+        let f = Ja3Fields::from(hello);
+        format!(
+            "{}_{}_{}",
+            peet_a_part(&f),
+            leas_tls::crypto::fingerprint::ja4::hash1(&f),
+            leas_tls::crypto::fingerprint::ja4::hash2_variant(
+                &f,
+                leas_tls::crypto::fingerprint::ja4::Ja4Variant::PeetWs,
+            )
+        )
+    }
+
+    #[allow(dead_code)]
+    fn ja4_v2_local(hello: &ParsedClientHello) -> String {
         let ciphers: Vec<u16> = hello
             .cipher_suites
             .iter()

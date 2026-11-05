@@ -510,7 +510,7 @@ mod roster {
     use tokio::task::JoinSet;
 
     use leas_tls::crypto::fingerprint::ja3::Ja3Fields;
-    use leas_tls::crypto::fingerprint::ja4::{full_ja4, hash1, hash2, ja4_a};
+    use leas_tls::crypto::fingerprint::ja4::{Ja4Variant, full_ja4, hash1, hash2_variant, ja4_a};
     use leas_tls::error::TlsError;
     use leas_tls::fingerprints::{Browser, Device, Os};
     use leas_tls::handshake::{HandshakeParams, connect};
@@ -790,7 +790,14 @@ mod roster {
     /// the codec's hash1 and hash2 (peet.ws excludes padding from hash2,
     /// matching `ja4.rs`).
     fn peet_ja4(f: &Ja3Fields) -> String {
-        format!("{}_{}_{}", peet_a_part(f), hash1(f), hash2(f))
+        // `hash2` defaults to FoxIO (padding kept); the server's rendering
+        // excludes padding, so the variant must be explicit here.
+        format!(
+            "{}_{}_{}",
+            peet_a_part(f),
+            hash1(f),
+            hash2_variant(f, Ja4Variant::PeetWs)
+        )
     }
 
     /// A registered JA4 (`FoxIO` rendering: padded counts, `00`/`ht` letters)

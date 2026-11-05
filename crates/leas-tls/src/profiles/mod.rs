@@ -186,7 +186,10 @@ macro_rules! ext_token {
     (sct) => { $crate::spec::ExtensionSpec::SignedCertificateTimestamp };
     (psk) => { $crate::spec::ExtensionSpec::PskKeyExchangeModes };
     (padding) => { $crate::spec::ExtensionSpec::Padding };
-    (ech) => { $crate::spec::ExtensionSpec::EchGrease };
+    (ech) => { $crate::spec::ExtensionSpec::EchGrease { payload_len: None } };
+    (ech[$len:literal]) => {
+        $crate::spec::ExtensionSpec::EchGrease { payload_len: Some($len) }
+    };
     (groups[$($g:tt),*]) => {
         $crate::spec::ExtensionSpec::SupportedGroups(vec![$(group_token!($g)),*])
     };
@@ -364,6 +367,17 @@ mod tests {
         pos: AtomicUsize,
     }
 
+    /// Deterministic byte sequence whose low nibble cycles through all 16
+    /// values, so repeated GREASE draws stay distinct **within one namespace**
+    /// (the draw's `used` set is per-namespace, matching Chrome's
+    /// cross-namespace index reuse; the period-16 cycle makes a cross-namespace
+    /// repeat legal and expected). A flat `0x5A` fixture would collapse every
+    /// draw to `0xAAAA`, which the hard-error draw now refuses — `edge_106`
+    /// has two standalone GREASE slots.
+    fn cycling_bytes() -> Vec<u8> {
+        (0..=255u8).map(|i| 0x40 | (i & 0x0F)).collect()
+    }
+
     impl SecureRandom for FixedRandom {
         fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified> {
             let mut pos = self.pos.load(Ordering::Relaxed);
@@ -386,7 +400,7 @@ mod tests {
         for (name, spec_fn) in all_specs() {
             let spec = spec_fn();
             let rng = FixedRandom {
-                bytes: vec![0x5A; 256],
+                bytes: cycling_bytes(),
                 pos: AtomicUsize::new(0),
             };
             let hello = build_hello(
@@ -402,15 +416,50 @@ mod tests {
             .unwrap();
             let parsed = parse_hello(&hello.handshake_bytes).unwrap();
             let fields = Ja3Fields::from(&parsed);
-            // Both surviving hand profiles (chrome_130, edge_106) carry a
-            // GREASE cipher slot — the family archetype the generated
-            // corpus does not reproduce (the ja4db export never carries
-            // GREASE ids, so generated entries are exempt by nature).
+            // GREASE is family-scoped: every Chromium-family row (generated or
+            // hand) carries a GREASE cipher plus a standalone GREASE extension
+            // (with GREASE also placed inside supported_groups, key_share and
+            // supported_versions), while Firefox/Safari rows carry none. Both
+            // directions are consumer-visible: a Chromium row without GREASE is
+            // a structurally different hello, and a non-Chromium row carrying
+            // GREASE contradicts its own identity.
             let hand_written = HAND_WRITTEN.iter().any(|(n, _)| *n == name);
-            if hand_written {
+            // iOS rows are Safari-shaped whatever the browser name says
+            // (WKWebView reality), so the template family — not the brand —
+            // decides GREASE.
+            let chromium = hand_written
+                || super::generated::GENERATED.iter().any(|g| {
+                    g.name == name
+                        && g.os != Some(super::super::Os::Ios)
+                        && matches!(
+                            g.browser,
+                            super::super::Browser::Chrome
+                                | super::super::Browser::Edge
+                                | super::super::Browser::Brave
+                                | super::super::Browser::Opera
+                                | super::super::Browser::SamsungInternet
+                        )
+                });
+            let grease_exts = parsed
+                .extensions
+                .iter()
+                .filter(|(ty, _)| is_grease(*ty))
+                .count();
+            let has_grease_cipher = parsed.cipher_suites.iter().any(|c| is_grease(*c));
+            if chromium {
+                assert!(has_grease_cipher, "{name} must carry a GREASE cipher slot");
                 assert!(
-                    parsed.cipher_suites.iter().any(|c| is_grease(*c)),
-                    "{name} must carry a GREASE cipher slot"
+                    grease_exts >= 1,
+                    "{name}: expected >= 1 GREASE extension, got {grease_exts}"
+                );
+            } else {
+                assert!(
+                    !has_grease_cipher,
+                    "{name}: non-Chromium row must not carry a GREASE cipher"
+                );
+                assert_eq!(
+                    grease_exts, 0,
+                    "{name}: non-Chromium row must not carry GREASE extensions"
                 );
             }
             assert!(!ja3_hash(&fields).is_empty(), "{name} JA3");
@@ -438,6 +487,7 @@ mod tests {
             (0x001b, 3, "compress_certificate (RFC 8879 §4)"),
             (0x0022, 2, "delegated_credentials (RFC 9345 §3)"),
             (0x002b, 3, "supported_versions (RFC 8446 §4.2.1)"),
+            (0x0032, 2, "signature_algorithms_cert (RFC 8446 §4.2.3)"),
             (0x0033, 2, "key_share (RFC 8446 §4.2.8)"),
             (0x4469, 3, "application_settings (draft-vvv-tls-alps §4)"),
             (0xfe0d, 38, "encrypted_client_hello (RFC 9849 §5.1)"),
@@ -447,7 +497,7 @@ mod tests {
         for (name, spec_fn) in all_specs() {
             let spec = spec_fn();
             let rng = FixedRandom {
-                bytes: vec![0x5A; 256],
+                bytes: cycling_bytes(),
                 pos: AtomicUsize::new(0),
             };
             let hello = build_hello(
@@ -476,20 +526,25 @@ mod tests {
                     );
                 }
             }
-            let ids: Vec<u16> = parsed
-                .extensions
-                .iter()
-                .map(|(ty, _)| *ty)
-                .filter(|ty| !crate::spec::grease::is_grease(*ty))
-                .collect();
+            // Duplicate extension types are wire-invalid for every id,
+            // GREASE included (RFC 8701 values are ordinary extension
+            // types to a parser). The generated roster carries one GREASE
+            // slot per namespace, so the constant-RNG fixture cannot
+            // collide it there; the two hand rows are exempt because
+            // `edge_106` declares two standalone GREASE slots and would
+            // need `draw_grease_distinct`'s hard error (spec D5, S4).
+            let ids: Vec<u16> = parsed.extensions.iter().map(|(ty, _)| *ty).collect();
             let mut sorted = ids.clone();
             sorted.sort_unstable();
             sorted.dedup();
-            assert_eq!(
-                sorted.len(),
-                ids.len(),
-                "{name}: duplicate extension id (the constant-RNG fixture can collide two GREASE slots — that is the fixture, not the spec)"
-            );
+            let hand_written = HAND_WRITTEN.iter().any(|(n, _)| *n == name);
+            if !hand_written {
+                assert_eq!(
+                    sorted.len(),
+                    ids.len(),
+                    "{name}: duplicate extension id on the wire"
+                );
+            }
         }
     }
 

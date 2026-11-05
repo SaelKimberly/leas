@@ -91,6 +91,9 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 .ok_or_else(|| NativeError::Config("reality config missing pbk".into()))?;
             let provisioner: Arc<dyn HelloProvisioner> = match &ctx.params.reality_provisioner {
                 HelloProvisionerChoice::Custom(p) => p.clone(),
+                HelloProvisionerChoice::RandomEligible => {
+                    Arc::new(leas_tls::reality::RandomEligible)
+                }
                 HelloProvisionerChoice::FixedChrome130Hybrid => {
                     match fingerprint::resolve_fingerprint(opts.fp.as_deref()).0 {
                         // `profile_for` validates the id against the roster, so
@@ -116,11 +119,16 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                     }
                 }
             };
+            // The spider's UA family must match the hello we just sent.
             let spider = SpiderConfig {
                 paths: opts
                     .spx
                     .as_ref()
                     .map_or_else(|| vec!["/".to_string()], |s| vec![s.to_string()]),
+                browser: fingerprint::resolve_fingerprint(opts.fp.as_deref())
+                    .0
+                    .and_then(|id| fingerprint::profile_for(id).ok())
+                    .map_or(leas_tls::Browser::Chrome, |fp| fp.browser),
                 ..SpiderConfig::default()
             };
             let config = EngineTlsConfig {

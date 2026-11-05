@@ -127,8 +127,12 @@ pub enum ExtensionSpec {
     /// claims ECH support with a valid `ECHClientHello` whose `enc`/`payload`
     /// are random, so it parses everywhere and decrypts nowhere. Every
     /// Firefox/Safari/Chrome-family profile carries it; omitting it would
-    /// change the JA4 extension set.
-    EchGrease,
+    /// change the JA4 extension set. `payload_len` overrides the GREASE
+    /// payload size (default [`ECH_PAYLOAD_LEN`]); real implementations vary
+    /// it per version, and a fixed size is one more constant to fingerprint.
+    EchGrease {
+        payload_len: Option<usize>,
+    },
     /// `cookie` (RFC 8446 §4.2.2): the opaque cookie a `HelloRetryRequest`
     /// handed out, echoed verbatim in `ClientHello2`.
     Cookie(Vec<u8>),
@@ -181,6 +185,66 @@ pub struct ClientHelloSpec {
     pub compression_methods: Vec<u8>,
     pub session_id: SessionIdSpec,
     pub extensions: Vec<ExtensionSpec>,
+}
+
+impl ClientHelloSpec {
+    /// True when the spec offers a TLS 1.3 AEAD cipher (`0x1301`–`0x1303`).
+    /// GREASE placeholders never count.
+    #[must_use]
+    pub fn supports_tls13_aead(&self) -> bool {
+        self.cipher_suites
+            .iter()
+            .any(|c| matches!(c, 0x1301..=0x1303))
+    }
+
+    /// Wire length of the session-id slot: 0 for [`SessionIdSpec::Empty`],
+    /// 32 for `Random32`, and the configured length for `AuthPayload`.
+    #[must_use]
+    pub const fn session_id_wire_len(&self) -> usize {
+        match &self.session_id {
+            SessionIdSpec::Empty => 0,
+            SessionIdSpec::Random32 => 32,
+            SessionIdSpec::AuthPayload { len } => *len,
+        }
+    }
+
+    /// True when the spec offers an X25519 key share (the group REALITY's auth
+    /// ECDH needs). A GREASE slot is provisionally X25519-shaped: the builder
+    /// substitutes a GREASE group id there, which is never negotiated, so a
+    /// spec whose only "share" is GREASE is not a usable X25519 path — hence
+    /// the explicit `X25519` match, plus the GREASE slot only when a real
+    /// X25519 entry accompanies it.
+    #[must_use]
+    pub fn offers_x25519_key_share(&self) -> bool {
+        self.extensions.iter().any(|e| {
+            matches!(e, ExtensionSpec::KeyShare(groups)
+                if groups.iter().any(|g| matches!(g, KeyShareGroup::X25519)))
+        })
+    }
+
+    /// True when the spec already offers a post-quantum hybrid share.
+    #[must_use]
+    pub fn offers_mlkem_hybrid(&self) -> bool {
+        self.extensions.iter().any(|e| {
+            matches!(e, ExtensionSpec::KeyShare(groups)
+            if groups.iter().any(|g| matches!(
+                g,
+                KeyShareGroup::X25519Mlkem768
+                    | KeyShareGroup::Secp256r1Mlkem768
+                    | KeyShareGroup::Secp384r1Mlkem1024
+            )))
+        })
+    }
+
+    /// REALITY eligibility: TLS 1.3 AEAD, a 32-byte session-id slot (the auth
+    /// payload's wire length), and an X25519 key share. PQ is *not* required —
+    /// a classical-only spec stays a valid REALITY candidate.
+    #[must_use]
+    pub fn reality_eligible(&self) -> bool {
+        self.supports_tls13_aead()
+            && self.session_id_wire_len() == 32
+            && self.offers_x25519_key_share()
+    }
 }
 
 /// Apply config-driven curve preferences to a spec — the client-side mirror
@@ -415,7 +479,7 @@ impl ExtensionSpec {
                 write_ext_header(out, rt.grease_b, 1)?;
                 out.push(0x00);
             }
-            Self::EchGrease => {
+            Self::EchGrease { .. } => {
                 encode_ech_grease_into(&rt.ech, out)?;
             }
             Self::Cookie(cookie) => {
@@ -529,6 +593,22 @@ pub(crate) fn encode_supported_versions_into(
     Ok(())
 }
 
+/// Encodes a `signature_algorithms` extension from a GREASE-filled slice.
+pub(crate) fn encode_signature_algorithms_into(
+    schemes: &[u16],
+    out: &mut Vec<u8>,
+) -> Result<(), TlsError> {
+    // RFC 8446 SignatureSchemeList: u16 byte-length + schemes.
+    let byte_len = u16::try_from(schemes.len() * 2)
+        .map_err(|_| TlsError::Spec("signature_algorithms exceeds u16 length".to_string()))?;
+    write_ext_header(out, 0x000d, 2 + schemes.len() * 2)?;
+    out.extend_from_slice(&byte_len.to_be_bytes());
+    for scheme in schemes {
+        out.extend_from_slice(&scheme.to_be_bytes());
+    }
+    Ok(())
+}
+
 /// Length of ALPN entries (RFC 7301): per entry, a u8 BE length plus the
 /// raw protocol bytes. Generic over `String`/`&str`/`&[u8]` so the hello
 /// builder encodes an opaque-byte override (RFC 7301 §3.1 puts no encoding
@@ -625,7 +705,7 @@ mod tests {
             enc: [0xAB; ECH_ENC_LEN],
             payload: vec![0xCD; ECH_PAYLOAD_LEN],
         };
-        let body = ExtensionSpec::EchGrease
+        let body = ExtensionSpec::EchGrease { payload_len: None }
             .encode_body(&RuntimeValues {
                 ech,
                 ..RuntimeValues::default()
@@ -654,7 +734,7 @@ mod tests {
 
     #[test]
     fn ech_grease_refuses_an_empty_payload() {
-        let err = ExtensionSpec::EchGrease
+        let err = ExtensionSpec::EchGrease { payload_len: None }
             .encode_body(&RuntimeValues {
                 ech: EchGrease {
                     payload: Vec::new(),

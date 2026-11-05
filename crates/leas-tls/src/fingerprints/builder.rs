@@ -173,7 +173,7 @@ const fn extension_type(ext: &ExtensionSpec) -> u16 {
         ExtensionSpec::RecordSizeLimit(_) => 0x001C,
         ExtensionSpec::Padding => 0x0015,
         ExtensionSpec::Grease => GREASE_TYPE_SENTINEL,
-        ExtensionSpec::EchGrease => 0xFE0D,
+        ExtensionSpec::EchGrease { .. } => 0xFE0D,
         ExtensionSpec::Cookie(_) => 0x002C,
         ExtensionSpec::Raw { ty, .. } => *ty,
     }

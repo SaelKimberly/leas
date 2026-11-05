@@ -8,8 +8,13 @@ Semantics (FoxIO JA4):
 - hash1: sha256[:12] of sorted non-GREASE cipher ids (lowercase 4-hex,
   comma-joined).
 - hash2: sha256[:12] of sorted filtered extension ids + `_` + sig-alg ids
-  in hello order (sig algs NOT GREASE-filtered, mirroring ja4.rs hash2);
-  empty sig algs omit the `_` segment entirely.
+  in hello order, GREASE-filtered (mirrors `ja4.rs` hash2); empty sig algs
+  omit the `_` segment entirely. An empty filtered list renders
+  `000000000000`, matching `ja4.rs`.
+- A-part ALPN: this module renders the ja4db export convention (first two
+  chars, `http/1.1` -> `ht`) because it must join the corpus CSV keys;
+  `ja4.rs` implements the FoxIO first+last rule (`h1`). That difference is
+  the `ht`-letter class in the offline gate, not a bug.
 - GREASE: `(v & 0x0f0f) == 0x0a0a`.
 
 hash2 extension exclusions -- TWO rules exist in the wild:
@@ -139,21 +144,30 @@ def _sha12(payload: str) -> str:
 def ja4_hash(rc: RawComponents, *, exclude_padding: bool = False) -> str:
     """Full FoxIO JA4: `{ja4_a}_{hash1}_{hash2}`.
 
-    Default excludes {SNI, ALPN} from hash2 (ja4db/original-FoxIO rule).
-    `exclude_padding=True` adds 0x0015, reproducing
-    crypto/fingerprint/ja4.rs byte-for-byte.
+    Default excludes {SNI, ALPN} and keeps padding — the ja4db/FoxIO rule,
+    which is also `ja4.rs`'s default (`Ja4Variant::Foxio`).
+    `exclude_padding=True` additionally drops 0x0015, reproducing
+    `Ja4Variant::PeetWs` (the old pin, not the current default).
     """
     excluded = {SNI, ALPN, PADDING} if exclude_padding else {SNI, ALPN}
     cs = sorted(f"{c:04x}" for c in rc.ciphers if not is_grease(c))
+    if not cs:
+        hash1_part = "000000000000"
+    else:
+        hash1_part = _sha12(",".join(cs))
     es = sorted(
         f"{e:04x}" for e in rc.exts_sorted if not is_grease(e) and e not in excluded
     )
-    # ja4.rs appends sig algs in hello order WITHOUT GREASE filtering.
-    ss = ",".join(f"{a:04x}" for a in rc.sigalgs_ordered)
+    # Sig algs in hello order, GREASE-filtered (matches ja4.rs).
+    ss = ",".join(f"{a:04x}" for a in rc.sigalgs_ordered if not is_grease(a))
     payload = ",".join(es)
-    if rc.sigalgs_ordered:
+    if ss:
         payload += "_" + ss
-    return f"{rc.ja4_a}_{_sha12(','.join(cs))}_{_sha12(payload)}"
+    if not payload:
+        hash2_part = "000000000000"
+    else:
+        hash2_part = _sha12(payload)
+    return f"{rc.ja4_a}_{hash1_part}_{hash2_part}"
 
 
 def load_raw_rows(path: str) -> dict[str, RawComponents]:
@@ -291,15 +305,75 @@ def parse_application(application):
 # family's canonical position) only if an observed id is GREASE-shaped.
 
 GREASE_CIPHER_PLACEHOLDER = 0xCACA  # profiles' GREASE cipher slot
+GREASE_GROUP_PLACEHOLDER = 0x0A0A  # first supported_groups entry (RFC 8701)
+GREASE_VERSION_PLACEHOLDER = 0x2A2A  # first supported_versions entry
 
 
 def _template(ciphers, ext_order, groups, key_share, sig_algos,
-              compress_cert=(), session_id="random32"):
+              compress_cert=(), session_id="random32", grease=False):
     return {
         "ciphers": ciphers, "ext_order": ext_order, "groups": groups,
         "key_share": key_share, "sig_algos": sig_algos,
         "compress_cert": list(compress_cert), "session_id": session_id,
+        "grease": grease,
     }
+
+
+# --- era table (S1, grilled decision) ------------------------------------
+# The wire codepoints for post-quantum key agreement, by browser major:
+#   - Chromium < 124:           no PQ group (IETF draft X25519Kyber768Draft00
+#     was NOT yet shipped; a hybrid on the wire is an anachronism).
+#   - Chromium 124..130:        pre-standard X25519Kyber768Draft00 = 0x6399.
+#   - Chromium >= 131:          standardized X25519MLKEM768 = 0x11EC.
+#   - Firefox >= 132:           X25519MLKEM768 = 0x11EC in reality, but this
+#     generator's firefox template lists X25519 only — era gating filters, it
+#     never adds, so firefox rows stay X25519-only until the template does.
+#   - Safari: PQ arrived OS-later; template keeps X25519-only until a
+#     corpus row is attested — today's safari templates carry no ML-KEM.
+# Groups/key_share lists are **family canonical intersected by era**:
+# the family's own list is the ceiling, era gates whether the PQ group
+# is in it at all. A pre-124 chromium row gets X25519-only even though
+# the family template lists the modern group.
+PQ_ERA = {
+    "chrome": [(124, 0x6399), (131, 0x11EC)],
+    "edge": [(124, 0x6399), (131, 0x11EC)],
+    "opera": [(124, 0x6399), (131, 0x11EC)],
+    "brave": [(124, 0x6399), (131, 0x11EC)],
+    # firefox has no entry: its family template carries X25519 only, and
+    # `_era_groups_keyshare` can only FILTER a PQ group the template already
+    # lists, never add one. A real Firefox >=132 hybrid would need the
+    # firefox template to advertise 0x11EC first.
+    "samsung": [(124, 0x6399), (131, 0x11EC)],
+}
+PQ_GROUPS = {0x6399: "X25519Kyber768Draft00", 0x11EC: "X25519Mlkem768"}
+
+def _pq_group_for(family, major):
+    """The PQ named-group the family+major era permits, or None.
+    Family-less (unknown) rows never advertise PQ."""
+    for threshold, code in reversed(PQ_ERA.get(family, [])):
+        if major >= threshold:
+            return code
+    return None
+
+
+def _era_groups_keyshare(tmpl, family, major):
+    """Family canonical groups/key_share intersected by era. PQ is the
+    first element of the template's modern list; without era approval
+    it is dropped from BOTH lists (supported_groups and key_share must
+    stay consistent — key_share ⊆ supported_groups)."""
+    groups = [g for g in tmpl["groups"]]
+    ks = [g for g in tmpl["key_share"]]
+    pq_names = {PQ_GROUPS[g] for g in groups if g in PQ_GROUPS} | \
+               {"X25519Kyber768Draft00", "X25519Mlkem768"}
+    approved = _pq_group_for(family, major)
+    if approved is not None and approved in PQ_GROUPS:
+        keep = PQ_GROUPS[approved]
+        groups = [g for g in groups if g not in PQ_GROUPS or g == approved]
+        ks = [g for g in ks if g not in pq_names or g == keep]
+    else:
+        groups = [g for g in groups if g not in PQ_GROUPS]
+        ks = [g for g in ks if g not in pq_names]
+    return groups, ks
 
 
 _CHROME_CIPHERS = [
@@ -395,11 +469,13 @@ FAMILY_TEMPLATES = {
     "chrome_desktop": _template(
         _CHROME_CIPHERS, _CHROME_EXT_ORDER,
         [0x11EC, 0x001D, 0x0017, 0x0018],
-        ["X25519Mlkem768", "X25519"], _CHROME_SIG, [0x0002, 0x0003]),
+        ["X25519Mlkem768", "X25519"], _CHROME_SIG, [0x0002, 0x0003],
+        grease=True),
     # chrome_android.rs: no ALPS/compress_certificate/padding; SHA-1 sig.
     "chrome_android": _template(
         _CHROME_CIPHERS, _CHROME_ANDROID_EXT_ORDER,
-        [0x001D, 0x0017, 0x0018], ["X25519"], _CHROME_SIG + [0x0201]),
+        [0x001D, 0x0017, 0x0018], ["X25519"], _CHROME_SIG + [0x0201],
+        grease=True),
     # firefox.rs: no GREASE, distinct ordering, zlib-only compress_certificate.
     "firefox": _template(
         [0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9,
@@ -501,8 +577,10 @@ def build_extension(ty, tmpl, protocols, sig_algos):
     if ty == KEYSHARE:
         return {"ty": ty, "kind": "KeyShare", "args": [list(tmpl["key_share"])]}
     if ty == VERSIONS:
-        return {"ty": ty, "kind": "SupportedVersions",
-                "args": [[0x0304, 0x0303]]}
+        versions = [0x0304, 0x0303]
+        if tmpl.get("grease"):
+            versions.insert(0, GREASE_VERSION_PLACEHOLDER)
+        return {"ty": ty, "kind": "SupportedVersions", "args": [versions]}
     if ty == PSK_MODES:
         return {"ty": ty, "kind": "PskKeyExchangeModes"}
     if ty == SCT:
@@ -560,6 +638,16 @@ def synthesize_wire(entry):
     if tmpl is None:
         tname, tmpl = "ascending", _FALLBACK
 
+    # Era axis (S1): shallow copy so FAMILY_TEMPLATES is never mutated;
+    # groups/key_share are era-gated.
+    tmpl = dict(tmpl)
+    g, ks = _era_groups_keyshare(tmpl, entry.get("family") or "",
+                                 entry.get("browser_major") or 0)
+    if tmpl.get("grease"):
+        g = [GREASE_GROUP_PLACEHOLDER, *g]
+        ks = ["Grease", *ks]
+    tmpl["groups"], tmpl["key_share"] = g, ks
+
     # Ciphers: canonical order filtered to the row's multiset (some corpus
     # rows carry a duplicated suite id), leftovers ascending.
     grease_ciphers = [c for c in rc.ciphers if is_grease(c)]
@@ -569,12 +657,17 @@ def synthesize_wire(entry):
         if row_counts.get(c, 0):
             ordered.append(c)
             row_counts[c] -= 1
-    cipher_order = ([GREASE_CIPHER_PLACEHOLDER] * bool(grease_ciphers) +
+    emit_grease = bool(tmpl.get("grease"))
+    cipher_order = ([GREASE_CIPHER_PLACEHOLDER] * (emit_grease or bool(grease_ciphers)) +
                     ordered + sorted(row_counts.elements()))
     # Extensions. The raw-string export omits SNI/ALPN ids; reconstruct the
     # real offered set before filtering against the canonical order.
     protocols = _alpn_protocols(rc.alpn_first)
-    offered = set(rc.exts_sorted) | {SNI}
+    offered_raw = set(rc.exts_sorted) | {SNI}
+    # so the corpus count and hash2 are membership-derived. Stronger
+    # browser-fidelity (remove) is a roster-row change with JA4 churn —
+    # tracked by the codec-kept note in the spec; corpus rows are kept.
+    offered = offered_raw.copy()
     if protocols:
         offered.add(ALPN)
     grease_ids = {t for t in offered if is_grease(t)}
@@ -586,7 +679,7 @@ def synthesize_wire(entry):
     placed = set()
     for slot in tmpl["ext_order"]:
         if slot == "grease":
-            if grease_ids:
+            if emit_grease or grease_ids:
                 extensions.append({"kind": "Grease"})
             continue
         if slot in offered:
@@ -845,7 +938,8 @@ def select_roster(entries):
     used_upgrades: set[str] = set()
     for t, es in triples.items():
         flo, cap = FAMILY_RANGES[t[0]]
-        es = [e for e in es if flo <= e['browser_major'] <= cap and not is_psk(e)]
+        es = [e for e in es if flo <= e['browser_major'] <= cap
+              and not is_psk(e)]
         if not es:
             continue
         clusters = defaultdict(list)

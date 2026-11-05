@@ -16,11 +16,13 @@ pub mod spec;
 pub use fingerprints::{
     Browser, Device, Fingerprint, FingerprintBuilder, FingerprintError, GreasePolicy, Os, Resolved,
 };
+pub use http2_profile::Http2Profile;
 pub mod client;
 pub mod crypto;
 pub mod handshake;
 pub mod hello;
 pub mod http2;
+pub mod http2_profile;
 pub mod reality;
 pub mod record;
 pub mod verify;

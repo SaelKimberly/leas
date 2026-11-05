@@ -38,7 +38,7 @@ use crate::SecureRandom;
 use crate::crypto::mlkem::{Ciphertext, Mlkem768, SecretKey as MlkemSecretKey};
 use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair, tls12::Tls12Suite};
 use crate::error::{Result, TlsError};
-use crate::hello::{BuildParams, build_hello, to_record};
+use crate::hello::{BuildParams, build_hello_ordered, to_record};
 use crate::record::stream::{AppKeys, TlsStream};
 use crate::record::{
     CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
@@ -219,6 +219,8 @@ pub(crate) struct RetrySupport<'a> {
     pub(crate) x25519_pub: &'a [u8; 32],
     /// `ClientHello1`'s recorded RNG draws.
     pub(crate) draws: &'a crate::hello::RecordingRng<'a>,
+    /// Extension-order policy of the identity (Chromium ≥108 permutes).
+    pub(crate) permute_extensions: bool,
     /// Real randomness, used ONLY to mint the retry's fresh key share (never
     /// for the hello's GREASE/random, which come from `draws`).
     pub(crate) rng: &'a dyn crate::SecureRandom,
@@ -300,7 +302,7 @@ impl RetrySupport<'_> {
         }
 
         let replay = crate::hello::ReplayRng::new(self.draws.recorded());
-        let built = match build_hello(
+        let built = match build_hello_ordered(
             &spec,
             &BuildParams {
                 server_name: self.server_name,
@@ -309,6 +311,7 @@ impl RetrySupport<'_> {
                 mlkem768_pub: mlkem_pub.as_deref(),
                 rng: &replay,
             },
+            self.permute_extensions,
         ) {
             Ok(built) => built,
             // The replay fails closed inside `fill`; report the divergence
@@ -593,15 +596,30 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: S,
     params: HandshakeParams<'_>,
 ) -> Result<TlsStream<S>> {
+    connect_with_permutation(stream, params, false).await
+}
+
+/// [`connect`] with an explicit extension-order policy.
+///
+/// `permute_extensions` belongs to the *identity*, not the spec: Chromium
+/// permutes from Chrome 108 onward, Firefox's default build and Safari do not
+/// (see [`crate::hello::build_hello_ordered`]). The flag is threaded here
+/// rather than stored on every spec so the generated roster stays data-only.
+pub async fn connect_with_permutation<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: S,
+    params: HandshakeParams<'_>,
+    permute_extensions: bool,
+) -> Result<TlsStream<S>> {
     // The driver's future is large (it owns the flight buffers and the key
     // schedule); box it once per connection so every `.await` site stays
     // small (clippy::large_futures) at the cost of one allocation.
-    Box::pin(connect_inner(stream, params)).await
+    Box::pin(connect_inner(stream, params, permute_extensions)).await
 }
 
 async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: S,
     params: HandshakeParams<'_>,
+    permute_extensions: bool,
 ) -> Result<TlsStream<S>> {
     let keypair = X25519KeyPair::generate(params.rng)?;
     let x25519_pub = keypair.public_key();
@@ -629,7 +647,7 @@ async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // replays them so ClientHello2 differs only in `key_share`/`cookie`
     // (RFC 8446 §4.1.2) — the random, GREASE and session id must not change.
     let recording = crate::hello::RecordingRng::new(params.rng);
-    let hello = build_hello(
+    let hello = build_hello_ordered(
         params.spec,
         &BuildParams {
             server_name: params.server_name,
@@ -641,8 +659,10 @@ async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 .map(crate::crypto::mlkem::PublicKey::as_bytes),
             rng: &recording,
         },
+        permute_extensions,
     )?;
     let retry = RetrySupport {
+        permute_extensions,
         spec: params.spec,
         server_name: params.server_name,
         alpn: params.alpn,

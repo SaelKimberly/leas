@@ -190,7 +190,10 @@ fn every_generated_entry_hashes_to_source_ja4() {
         );
 
         // hash2 under the corpus rule; first match classifies the entry.
-        let (class, ext_delta): (&str, u8) = if corpus_hash2(&fields, false, true) == h2_r {
+        // A hash2 match with a differing A-part is the corpus's `ht` ALPN
+        // rendering (first two chars) versus the FoxIO first+last rule — the
+        // only remaining mismatch class now that the encoder keeps padding.
+        let (mut class, ext_delta): (&str, u8) = if corpus_hash2(&fields, false, true) == h2_r {
             ("padding-in-hello", 0)
         } else if corpus_hash2(&fields, true, true) == h2_r {
             ("padding-omitted", 1)
@@ -207,7 +210,11 @@ fn every_generated_entry_hashes_to_source_ja4() {
                 entry.ja4
             );
         };
+        if class == "padding-in-hello" && a_c != a_r {
+            class = "ht-letter";
+        }
         match class {
+            "ht-letter" => {}
             "padding-in-hello" => padding_in_hello += 1,
             "padding-omitted" => padding_omitted += 1,
             "no-sig" => no_sig += 1,
@@ -227,26 +234,28 @@ fn every_generated_entry_hashes_to_source_ja4() {
          padding-omitted={padding_omitted} no-sig={no_sig} ht-letter={ht_letter} failures=0"
     );
     assert_eq!(
-        full + padding_in_hello + padding_omitted + no_sig,
+        full + padding_in_hello + padding_omitted + no_sig + ht_letter,
         u32::try_from(total).expect("roster fits in u32"),
         "classification must cover the whole roster"
     );
-    // Kept-roster classification contract (recomputed over the 69 kept
-    // entries after the roster reduction; a drift in any class means the
-    // emitted roster's semantics changed and the counts are re-derived
-    // from the manifest before updating these).
+    // Kept-roster classification contract, recomputed after the JA4 encoder
+    // moved to the FoxIO default (padding kept in hash2). 66 of 69 entries now
+    // reproduce their registered hash byte-for-byte; the remaining 3 differ in
+    // the A-part only, because the corpus renders `http/1.1` as `ht` and FoxIO
+    // takes first+last (`h1`). A drift in any class means the emitted roster's
+    // semantics changed; re-derive from the manifest before updating these.
     assert_eq!(total, 69, "kept roster drifted from 69 entries");
     assert_eq!(
-        full, 49,
-        "full-hash (byte-exact) entries drifted from the kept-roster 49"
+        full, 66,
+        "full-hash (byte-exact) entries drifted from the kept-roster 66"
     );
     assert_eq!(
-        padding_in_hello, 16,
-        "padding-in-hello entries drifted from the kept-roster 16"
+        padding_in_hello, 0,
+        "padding-in-hello entries drifted from the kept-roster 0"
     );
     assert_eq!(
-        padding_omitted, 4,
-        "padding-omitted entries drifted from the kept-roster 4"
+        padding_omitted, 0,
+        "padding-omitted entries drifted from the kept-roster 0"
     );
     // The no-sig class (raw strings without a signature-algorithm segment;
     // 102 across the full 1825-entry manifest) is absent from the kept

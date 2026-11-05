@@ -258,6 +258,60 @@ mod tests {
         assert!(matches!(parse_hello(&bytes), Err(TlsError::Handshake(_))));
     }
 
+    /// Builds a hello whose declared lengths are caller-chosen, so oversized
+    /// declarations can be tested without hand-computing byte offsets.
+    fn hello_with_lengths(cs_len: u16, ext_total: u16, ext_len: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x42; 32]);
+        body.push(0); // empty session id
+        body.extend_from_slice(&cs_len.to_be_bytes());
+        body.extend_from_slice(&0x1301u16.to_be_bytes()); // one real suite
+        body.push(1);
+        body.push(0x00);
+        body.extend_from_slice(&ext_total.to_be_bytes());
+        // One extension whose declared length is `ext_len`.
+        body.extend_from_slice(&0x0000u16.to_be_bytes());
+        body.extend_from_slice(&ext_len.to_be_bytes());
+        body.extend_from_slice(&[0x00; 5]);
+
+        let mut hs = Vec::with_capacity(4 + body.len());
+        hs.push(0x01);
+        let len = u32::try_from(body.len()).expect("tiny body");
+        hs.extend_from_slice(&len.to_be_bytes()[1..]);
+        hs.extend_from_slice(&body);
+        hs
+    }
+
+    /// Every length field is bounds-checked against the bytes actually
+    /// present: an oversized declaration must be a typed error, never a
+    /// large allocation or a panic.
+    #[rstest::rstest]
+    #[case::cipher_list(0xFFFF, 11, 5)]
+    #[case::extension_total(2, 0xFFFF, 5)]
+    #[case::single_extension(2, 11, 0xFFFF)]
+    fn oversized_lengths_are_rejected(
+        #[case] cs_len: u16,
+        #[case] ext_total: u16,
+        #[case] ext_len: u16,
+    ) {
+        let bytes = hello_with_lengths(cs_len, ext_total, ext_len);
+        assert!(
+            matches!(parse_hello(&bytes), Err(TlsError::Handshake(_))),
+            "cs_len={cs_len} ext_total={ext_total} ext_len={ext_len} must be a Handshake error"
+        );
+    }
+
+    #[test]
+    fn oversized_handshake_body_is_rejected() {
+        let mut bytes = minimal_hello();
+        // 3-byte handshake length far beyond the buffer.
+        bytes[1] = 0xFF;
+        bytes[2] = 0xFF;
+        bytes[3] = 0xFF;
+        assert!(matches!(parse_hello(&bytes), Err(TlsError::Handshake(_))));
+    }
+
     #[test]
     fn rejects_empty_input() {
         assert!(matches!(parse_hello(&[]), Err(TlsError::Handshake(_))));

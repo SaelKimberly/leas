@@ -12,7 +12,8 @@ use crate::error::TlsError;
 use crate::spec::grease::GREASE_PLACEHOLDER;
 use crate::spec::{
     ClientHelloSpec, EchGrease, ExtensionSpec, KeyShareGroup, RuntimeValues, SessionIdSpec,
-    encode_alpn_override_into, encode_supported_groups_into, encode_supported_versions_into,
+    encode_alpn_override_into, encode_signature_algorithms_into, encode_supported_groups_into,
+    encode_supported_versions_into,
 };
 
 pub mod parse;
@@ -156,6 +157,22 @@ impl SecureRandom for ReplayRng {
 }
 
 pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<BuiltHello, TlsError> {
+    build_hello_ordered(spec, params, false)
+}
+
+/// Builds a hello, optionally permuting the extension order per connection.
+///
+/// Chromium permutes extension order from Chrome 108 onward (Chrome Platform
+/// Status 5124606246518784; shipped through 108/109 in January 2023) to resist
+/// ossification. `pre_shared_key` must stay last (RFC 8446 §4.2.11) and the
+/// padding extension stays last among the rest so the 512-byte target rule
+/// keeps its shape. Firefox's default build and Safari do **not** permute, so
+/// callers pass `false` for those identities.
+pub fn build_hello_ordered(
+    spec: &ClientHelloSpec,
+    params: &BuildParams,
+    permute_extensions: bool,
+) -> Result<BuiltHello, TlsError> {
     // GREASE pairing (Chrome family): the first placeholder in each of
     // {cipher_suites, supported_groups, supported_versions, key_share} is
     // replaced with `grease_a`; the first standalone GREASE extension uses
@@ -165,7 +182,10 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
     // (Go's TLS parser rejects duplicate extension types). Specs without
     // placeholders (Firefox family) skip the draws entirely.
     let (grease_a, grease_b) = if spec_has_grease(spec) {
-        (draw_grease(params.rng)?, draw_grease(params.rng)?)
+        (
+            crate::spec::grease::random_grease(params.rng)?,
+            crate::spec::grease::random_grease(params.rng)?,
+        )
     } else {
         (0x0A0A, 0x1A1A)
     };
@@ -183,10 +203,20 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
     // GREASE ECH material, drawn only when the spec asks for it (a spec
     // without `EchGrease` must not consume RNG bytes — the fixtures in the
     // hello tests and the JA4 gate pin the draw sequence).
+    // A spec may pin the GREASE payload size (`ech[N]`); otherwise the
+    // default applies.
+    for ext in &spec.extensions {
+        if let ExtensionSpec::EchGrease {
+            payload_len: Some(n),
+        } = ext
+        {
+            rt.ech.payload = vec![0u8; *n];
+        }
+    }
     if spec
         .extensions
         .iter()
-        .any(|e| matches!(e, ExtensionSpec::EchGrease))
+        .any(|e| matches!(e, ExtensionSpec::EchGrease { .. }))
     {
         params
             .rng
@@ -274,13 +304,20 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
     body.push(comp_len);
     body.extend_from_slice(&spec.compression_methods);
 
-    // Extensions in spec order.
+    // Extension visit order: spec order, or a per-connection permutation.
+    let order: Vec<usize> = if permute_extensions {
+        permuted_order(spec, params.rng)?
+    } else {
+        (0..spec.extensions.len()).collect()
+    };
+
     let mut ext_bytes = Vec::with_capacity(spec.extensions.len() * 8);
     let mut first_grease_ext = true;
     let mut used_ext = [0u16; 16];
     used_ext[0] = rt.grease_b;
     let mut used_ext_len = 1usize;
-    for ext in &spec.extensions {
+    for &idx in &order {
+        let ext = &spec.extensions[idx];
         match ext {
             ExtensionSpec::Alpn(_) => {
                 match params.alpn {
@@ -338,6 +375,22 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                 } else {
                     ext.encode_body_into(&rt, &mut ext_bytes)?;
                 }
+            }
+            ExtensionSpec::SignatureAlgorithms(schemes)
+                if schemes.contains(&GREASE_PLACEHOLDER) =>
+            {
+                // Same rule as groups/versions: a `grease` entry in the DSL
+                // is a placeholder for a per-connection value, never a
+                // literal 0xCACA on the wire.
+                let mut tmp = [0u16; 64];
+                if schemes.len() > tmp.len() {
+                    return Err(TlsError::Spec(
+                        "signature_algorithms exceeds 64 entries".to_string(),
+                    ));
+                }
+                tmp[..schemes.len()].copy_from_slice(schemes);
+                fill_grease(&mut tmp[..schemes.len()], grease_a, params.rng)?;
+                encode_signature_algorithms_into(&tmp[..schemes.len()], &mut ext_bytes)?;
             }
             ExtensionSpec::Padding => {
                 // Accumulated RECORD size without the padding extension:
@@ -435,6 +488,7 @@ fn spec_has_grease(spec: &ClientHelloSpec) -> bool {
     spec.cipher_suites.contains(&GREASE_PLACEHOLDER)
         || spec.extensions.iter().any(|e| match e {
             ExtensionSpec::SupportedGroups(groups) => groups.contains(&GREASE_PLACEHOLDER),
+            ExtensionSpec::SignatureAlgorithms(schemes) => schemes.contains(&GREASE_PLACEHOLDER),
             ExtensionSpec::SupportedVersions(versions) => versions.contains(&GREASE_PLACEHOLDER),
             ExtensionSpec::KeyShare(groups) => {
                 groups.iter().any(|g| matches!(g, KeyShareGroup::Grease))
@@ -465,15 +519,41 @@ fn fill_grease(values: &mut [u16], grease_a: u16, rng: &dyn SecureRandom) -> Res
     Ok(())
 }
 ///
-/// Mirrors `spec::grease::random_grease`, which is bounded to ring's sealed
-/// `SecureRandom` and therefore unusable through the crate-local seam.
-fn draw_grease(rng: &dyn SecureRandom) -> Result<u16, TlsError> {
-    let mut byte = [0u8; 1];
-    rng.fill(&mut byte)
-        .map_err(|_| TlsError::Crypto("random grease failed".to_string()))?;
-    // The low nibble indexes the 16 GREASE byte values 0x0A..0xFA.
-    let b = 0x0A + (byte[0] & 0x0F) * 0x10;
-    Ok((u16::from(b) << 8) | u16::from(b))
+/// A per-connection extension order: Fisher–Yates over the spec's indices,
+/// with `pre_shared_key` (`0x0029`) and the padding extension pinned last (in
+/// that relative order) so the RFC constraint and the 512-byte padding rule
+/// survive permutation.
+fn permuted_order(spec: &ClientHelloSpec, rng: &dyn SecureRandom) -> Result<Vec<usize>, TlsError> {
+    let mut movable = Vec::with_capacity(spec.extensions.len());
+    let mut tail = Vec::new();
+    for (idx, ext) in spec.extensions.iter().enumerate() {
+        match ext {
+            // Padding then pre_shared_key form the pinned tail (the sort
+            // below orders the two).
+            ExtensionSpec::Padding | ExtensionSpec::Raw { ty: 0x0029, .. } => tail.push(idx),
+            _ => movable.push(idx),
+        }
+    }
+    // Fisher–Yates, drawing 4 bytes per swap (uniform enough for an order
+    // nobody can learn: the draw is per connection).
+    let mut i = movable.len();
+    while i > 1 {
+        let mut buf = [0u8; 4];
+        rng.fill(&mut buf)
+            .map_err(|_| TlsError::Crypto("extension order draw failed".to_string()))?;
+        let j = usize::try_from(u64::from(u32::from_be_bytes(buf)) % u64::try_from(i).unwrap_or(1))
+            .unwrap_or(0);
+        i -= 1;
+        movable.swap(i, j);
+    }
+    // Padding last, then PSK last-of-all (RFC 8446 §4.2.11 wins over the
+    // padding placement convention).
+    tail.sort_by_key(|&idx| match &spec.extensions[idx] {
+        ExtensionSpec::Raw { ty: 0x0029, .. } => 1,
+        _ => 0,
+    });
+    movable.extend(tail);
+    Ok(movable)
 }
 
 /// Draws a GREASE value not already recorded in `used`, recording it before
@@ -494,18 +574,22 @@ fn draw_grease_distinct(
     used_len: &mut usize,
 ) -> Result<u16, TlsError> {
     const ATTEMPTS: usize = 8;
-    let mut last = 0;
     for _ in 0..ATTEMPTS {
-        last = draw_grease(rng)?;
-        if !used[..*used_len].contains(&last) {
+        let value = crate::spec::grease::random_grease(rng)?;
+        if !used[..*used_len].contains(&value) {
             if *used_len < used.len() {
-                used[*used_len] = last;
+                used[*used_len] = value;
                 *used_len += 1;
             }
-            return Ok(last);
+            return Ok(value);
         }
     }
-    Ok(last)
+    // Emitting a duplicate would put two identical GREASE values in one
+    // namespace, which a strict peer rejects and which no real browser
+    // produces. Refuse instead of silently degrading the wire.
+    Err(TlsError::Crypto(
+        "could not draw a distinct GREASE value after 8 attempts".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -514,7 +598,7 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{BuildParams, SecureRandom, build_hello, to_record};
+    use super::{BuildParams, SecureRandom, build_hello, build_hello_ordered, to_record};
     use crate::error::TlsError;
     use crate::hello::parse::parse_hello;
     use crate::spec::grease::GREASE_PLACEHOLDER;
@@ -704,6 +788,206 @@ mod tests {
         assert_eq!(parsed.cipher_suites[0], 0x0A0A);
         assert_eq!(parsed.cipher_suites[1], 0x2A2A);
         assert_eq!(parsed.cipher_suites[2], 0x1301);
+    }
+
+    #[test]
+    fn permuted_order_differs_per_connection_and_pins_the_tail() {
+        let spec = crate::profiles::hand_selected::chrome_130();
+        let build = |seed: u8| {
+            let rng = FixedRandom {
+                bytes: vec![seed; 1024],
+                pos: AtomicUsize::new(0),
+            };
+            let hello = build_hello_ordered(
+                &spec,
+                &BuildParams {
+                    server_name: "example.com",
+                    alpn: None,
+                    x25519_pub: &[0xAB; 32],
+                    mlkem768_pub: None,
+                    rng: &rng,
+                },
+                true,
+            )
+            .unwrap();
+            parse_hello(&hello.handshake_bytes)
+                .unwrap()
+                .extensions
+                .iter()
+                .map(|(ty, _)| *ty)
+                .collect::<Vec<_>>()
+        };
+        let a = build(0x11);
+        let b = build(0x77);
+        assert_ne!(a, b, "two connections must not share an extension order");
+        // Padding stays last (the 512-byte rule reads the accumulated length).
+        assert_eq!(a.last(), Some(&0x0015));
+        assert_eq!(b.last(), Some(&0x0015));
+        // Same set, only the order moved. GREASE ids are drawn per connection
+        // (that is the point of GREASE), so compare the non-GREASE set.
+        let mut sa: Vec<u16> = a
+            .iter()
+            .copied()
+            .filter(|ty| !crate::spec::grease::is_grease(*ty))
+            .collect();
+        let mut sb: Vec<u16> = b
+            .iter()
+            .copied()
+            .filter(|ty| !crate::spec::grease::is_grease(*ty))
+            .collect();
+        sa.sort_unstable();
+        sb.sort_unstable();
+        assert_eq!(sa, sb);
+    }
+
+    #[test]
+    fn unpermuted_build_keeps_spec_order() {
+        let spec = crate::profiles::hand_selected::chrome_130();
+        let rng = FixedRandom {
+            bytes: vec![0x11; 1024],
+            pos: AtomicUsize::new(0),
+        };
+        let hello = build_hello(
+            &spec,
+            &BuildParams {
+                server_name: "example.com",
+                alpn: None,
+                x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+        )
+        .unwrap();
+        let parsed = parse_hello(&hello.handshake_bytes).unwrap();
+        // GREASE draws replace the placeholder id, so compare the non-GREASE
+        // sequence only.
+        let got: Vec<u16> = parsed
+            .extensions
+            .iter()
+            .map(|(ty, _)| *ty)
+            .filter(|ty| !crate::spec::grease::is_grease(*ty))
+            .collect();
+        let want: Vec<u16> = crate::crypto::fingerprint::ja3::Ja3Fields::from_spec(&spec)
+            .extensions
+            .into_iter()
+            .filter(|ty| !crate::spec::grease::is_grease(*ty))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn ech_payload_length_is_spec_configurable() {
+        // `ech[N]` pins the GREASE payload size; the wire must carry N bytes,
+        // not the 144-byte default.
+        let spec = ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Random32,
+            extensions: vec![ExtensionSpec::EchGrease {
+                payload_len: Some(200),
+            }],
+        };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 1024],
+            pos: AtomicUsize::new(0),
+        };
+        let hello = build_hello(
+            &spec,
+            &BuildParams {
+                server_name: "example.com",
+                alpn: None,
+                x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+        )
+        .unwrap();
+        let parsed = parse_hello(&hello.handshake_bytes).unwrap();
+        let body = parsed.extension(0xfe0d).expect("ECH grease");
+        // ECHClientHello: type(1) + kdf(2) + aead(2) + config_id(1)
+        // + enc(2+32) + payload(2+N).
+        let payload_len = usize::from(u16::from_be_bytes([body[40], body[41]]));
+        assert_eq!(payload_len, 200);
+    }
+
+    #[test]
+    fn duplicate_grease_exhaustion_is_a_typed_error() {
+        // A degenerate RNG that always returns the same value cannot produce
+        // two distinct GREASE extension types; the builder must refuse rather
+        // than emit a duplicate id that a strict peer rejects.
+        let spec = ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Random32,
+            extensions: vec![ExtensionSpec::Grease, ExtensionSpec::Grease],
+        };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 256],
+            pos: AtomicUsize::new(0),
+        };
+        let err = build_hello(
+            &spec,
+            &BuildParams {
+                server_name: "example.com",
+                alpn: None,
+                x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+        )
+        .err()
+        .expect("constant RNG must not yield a duplicate GREASE id");
+        assert!(
+            matches!(err, TlsError::Crypto(_)),
+            "expected a typed Crypto error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sigalgs_grease_placeholder_is_drawn_not_literal() {
+        // A `sigalgs[grease, ..]` entry is a per-connection placeholder: the
+        // wire must carry a drawn GREASE value, never the 0xCACA sentinel.
+        let spec = ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Random32,
+            extensions: vec![ExtensionSpec::SignatureAlgorithms(vec![
+                GREASE_PLACEHOLDER,
+                0x0403,
+            ])],
+        };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
+        let hello = build_hello(
+            &spec,
+            &BuildParams {
+                server_name: "example.com",
+                alpn: None,
+                x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+        )
+        .unwrap();
+        let parsed = parse_hello(&hello.handshake_bytes).unwrap();
+        let body = parsed.extension(0x000d).expect("signature_algorithms");
+        let schemes: Vec<u16> = body[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        assert_ne!(
+            schemes[0], GREASE_PLACEHOLDER,
+            "sentinel leaked to the wire"
+        );
+        assert!(crate::spec::grease::is_grease(schemes[0]));
+        assert_eq!(schemes[1], 0x0403);
     }
 
     #[test]

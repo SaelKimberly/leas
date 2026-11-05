@@ -99,6 +99,24 @@ impl TlsConfig {
     }
 }
 
+/// Whether this identity permutes its extension order.
+///
+/// Chromium (Chrome/Edge/Brave/Opera/Samsung) from major 108; the resolved
+/// row fills in a version when the query left it unset, so a bare
+/// `Browser::Chrome` follows its roster row's major.
+fn permutes_extensions(requested: &Fingerprint, resolved: &Fingerprint) -> bool {
+    let chromium = matches!(
+        resolved.browser,
+        Browser::Chrome
+            | Browser::Edge
+            | Browser::Brave
+            | Browser::Opera
+            | Browser::SamsungInternet
+    );
+    let major = resolved.version.or(requested.version).unwrap_or(0);
+    chromium && major >= 108
+}
+
 /// Run a TLS/REALITY connect over `stream`, dispatching on `config.mode`.
 pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Result<TlsStream<S>> {
     match &config.mode {
@@ -124,7 +142,11 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
                 .alpn
                 .as_ref()
                 .map(|list| list.iter().map(Vec::as_slice).collect());
-            let tls = handshake::connect(
+            // Extension permutation is an identity property, not a spec one:
+            // Chromium permutes from Chrome 108 (Platform Status 5124606246518784),
+            // Firefox's default build and Safari do not.
+            let permute = permutes_extensions(&fp, &resolved.fingerprint);
+            let tls = handshake::connect_with_permutation(
                 stream,
                 HandshakeParams {
                     spec: &spec,
@@ -133,6 +155,7 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
                     verifier: verifier.as_ref(),
                     rng: config.rng.as_ref(),
                 },
+                permute,
             )
             .await?;
             Ok(tls)
@@ -335,5 +358,56 @@ mod tests {
             &[0x00, 0x03, 0x02, 0xFF, 0x00],
             "the opaque protocol bytes must be framed as list_len || len || bytes"
         );
+    }
+
+    #[test]
+    fn extension_permutation_is_family_and_era_scoped() {
+        use crate::fingerprints::Browser;
+        let fp = |browser, version: Option<u16>| Fingerprint {
+            browser,
+            version,
+            os: None,
+            device: None,
+        };
+        // Chromium from 108 permutes; 107 does not.
+        assert!(super::permutes_extensions(
+            &fp(Browser::Chrome, Some(108)),
+            &fp(Browser::Chrome, Some(108)),
+        ));
+        assert!(!super::permutes_extensions(
+            &fp(Browser::Chrome, Some(107)),
+            &fp(Browser::Chrome, Some(107)),
+        ));
+        // Every Chromium brand follows the same rule.
+        for brand in [
+            Browser::Edge,
+            Browser::Brave,
+            Browser::Opera,
+            Browser::SamsungInternet,
+        ] {
+            assert!(super::permutes_extensions(
+                &fp(brand, Some(140)),
+                &fp(brand, Some(140))
+            ));
+        }
+        // Firefox (default NSS build) and Safari stay fixed-order, whatever
+        // the version.
+        assert!(!super::permutes_extensions(
+            &fp(Browser::Firefox, Some(150)),
+            &fp(Browser::Firefox, Some(150)),
+        ));
+        assert!(!super::permutes_extensions(
+            &fp(Browser::Safari, Some(26)),
+            &fp(Browser::Safari, Some(26)),
+        ));
+        // The resolved row's major wins when the query left it unset.
+        assert!(super::permutes_extensions(
+            &fp(Browser::Chrome, None),
+            &fp(Browser::Chrome, Some(131)),
+        ));
+        assert!(!super::permutes_extensions(
+            &fp(Browser::Chrome, None),
+            &fp(Browser::Chrome, Some(93)),
+        ));
     }
 }

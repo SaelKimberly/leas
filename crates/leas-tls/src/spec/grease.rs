@@ -20,7 +20,11 @@ pub const fn is_grease(v: u16) -> bool {
 
 /// Picks a GREASE value uniformly from the 16 valid values
 /// (`0x0A0A`, `0x1A1A`, ..., `0xFAFA`).
-pub fn random_grease(rng: &dyn ring::rand::SecureRandom) -> Result<u16, TlsError> {
+///
+/// Takes the crate-local [`SecureRandom`](crate::SecureRandom) seam so the
+/// hello builder and tests share one implementation; a ring-bound signature
+/// would be unreachable from deterministic fixtures.
+pub fn random_grease(rng: &dyn crate::SecureRandom) -> Result<u16, TlsError> {
     let mut byte = [0u8; 1];
     rng.fill(&mut byte)
         .map_err(|_| TlsError::Crypto("random grease failed".to_string()))?;
