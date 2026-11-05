@@ -19,7 +19,13 @@ pub async fn connect(
                 limit: timeout,
             })?
             .map_err(|e| NativeError::Dial(format!("{socket}: {e}")))?;
-        let _ = stream.set_nodelay(true);
+        // The one socket option every dial has always set, now through the
+        // `sockopt` seam so a future config surface has a single owner.
+        let opts = crate::sockopt::SockOpts {
+            nodelay: Some(true),
+            ..crate::sockopt::SockOpts::default()
+        };
+        opts.apply_to_stream(&stream);
         Ok(Box::new(stream))
     }
 }

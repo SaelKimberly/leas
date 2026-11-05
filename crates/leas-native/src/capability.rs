@@ -113,6 +113,13 @@ pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow
     if !kind_supported(kind) {
         return Some(Cow::Borrowed(KIND_UNSUPPORTED_REASON));
     }
+    // A TLS knob the native engine would silently drop is a refusal, not a
+    // no-op: `ech=` is parsed and stored but real ECH is not implemented yet,
+    // and accepting-and-ignoring a privacy feature is the worst of the three
+    // possible answers.
+    if let Some(reason) = security_reason(kind, config) {
+        return Some(reason);
+    }
     // The Shadowsocks arm is dispatched first, and apart from ordering it is
     // also the one that can name a VALUE from the row (a plugin option), which
     // needs an owned string rather than a `&'static` reason.
@@ -134,6 +141,24 @@ pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow
         }
         _ => Some(Cow::Borrowed("protocol kind and config type do not match")),
     }
+}
+
+/// TLS/REALITY knobs the native engine cannot honour. Every arm is a named
+/// refusal (`security=` stays honest); the protocol reasons run afterwards.
+fn security_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow<'static, str>> {
+    let security = match (kind, config) {
+        (_, ProtocolConfig::Vless(c)) => &c.security,
+        (_, ProtocolConfig::Vmess(c)) => &c.security,
+        (_, ProtocolConfig::Trojan(c)) => &c.security,
+        _ => return None,
+    };
+    if security.ech().is_some() {
+        // `ech` is a real capability gap (plan T9b), not a spelling problem:
+        // an ECH config that silently does nothing leaks the SNI the user
+        // asked to hide.
+        return Some(Cow::Borrowed("tls ech is not implemented"));
+    }
+    None
 }
 
 /// True when native should serve this exact protocol+config row.
@@ -314,19 +339,14 @@ fn mlkem_encryption_supported(enc: &str) -> bool {
 /// `chacha20` are xray-only (rejected server-side by xray 26.x too, but
 /// native has no arm at all), refused as `"legacy vmess payload security is
 /// not implemented"`. A non-zero `alter_id` selects the legacy pre-AEAD
-/// session scheme native never implemented, refused as `"vmess alter_id is
-/// not implemented"`. A transport refusal appends the
-/// [`transport_reason`] string.
+/// session scheme, which native dials (CFB header + four-byte response peel,
+/// `protocol::vmess::legacy`), so it is NOT refused. A transport refusal
+/// appends the [`transport_reason`] string.
 fn vmess_reason(cfg: &VmessConfig) -> Option<&'static str> {
     if let Some(enc) = cfg.security.enc.as_deref()
         && !(enc.is_empty() || enc == "auto" || enc == "aes-128-gcm" || enc == "chacha20-poly1305")
     {
         return Some("legacy vmess payload security is not implemented");
-    }
-    if let Some(aid) = cfg.alter_id.as_deref()
-        && !(aid.is_empty() || aid == "0")
-    {
-        return Some("vmess alter_id is not implemented");
     }
     transport_reason(&cfg.transport, cfg.path.as_deref())
 }
@@ -977,10 +997,28 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_alter_id_deferred() {
+    fn ech_is_refused_by_name() {
+        // Accepting an `ech` config and ignoring it would leak the SNI the
+        // user asked to hide — the refusal must name the knob.
+        let mut cfg = vless_cfg();
+        cfg.security.tls = Some(leas_proto::proto_spec::common::TlsConfig::Tls(
+            leas_proto::proto_spec::common::TlsOpts {
+                ech: Some(TinyText::from("AEX+DQBB")),
+                ..Default::default()
+            },
+        ));
+        let reason = support_reason(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg))
+            .expect("ech must be refused");
+        assert!(reason.contains("ech"), "{reason}");
+    }
+
+    #[test]
+    fn nonzero_alter_id_is_supported() {
+        // The legacy wire is dialed by `protocol::vmess::legacy`; only the
+        // payload security gate remains for this row.
         let mut cfg = vmess_cfg();
         cfg.alter_id = Some(TinyText::from("4"));
-        assert!(!supported(ProtocolKind::Vmess, &ProtocolConfig::Vmess(cfg)));
+        assert!(supported(ProtocolKind::Vmess, &ProtocolConfig::Vmess(cfg)));
     }
 
     #[test]

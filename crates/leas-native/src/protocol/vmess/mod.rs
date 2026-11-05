@@ -13,15 +13,28 @@ use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
 use crate::protocol::vmess::header::{
-    SECURITY_AES128_GCM, SECURITY_CHACHA20_POLY1305, Session, encode_request,
+    SECURITY_AES128_GCM, SECURITY_CHACHA20_POLY1305, Session, encode_request, encode_request_legacy,
 };
 use crate::protocol::vmess::keys::cmd_key;
 use crate::protocol::vmess::stream::VmessClientStream;
 
 pub mod header;
 pub mod keys;
+pub mod legacy;
+pub mod pad;
 pub mod stream;
 pub mod udp;
+
+/// True when the config asks for the legacy (`alterId > 0`) wire: the field
+/// is already parsed (`VmessConfig::alter_id`), and a non-zero value selects
+/// the pre-AEAD header.
+#[must_use]
+pub fn is_legacy(cfg: &VmessConfig) -> bool {
+    cfg.alter_id
+        .as_deref()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .is_some_and(|n| n > 0)
+}
 
 /// Validate the `VMess` payload security the config requests.
 pub fn check_security(cfg: &VmessConfig) -> Result<(), NativeError> {
@@ -65,6 +78,26 @@ async fn handshake(
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .unwrap_or(0);
+    if is_legacy(cfg) {
+        // Legacy (`alterId > 0`) wire: plaintext idHash prefix, CFB-encrypted
+        // header, then the response stream is CFB-decrypted as a whole.
+        let request =
+            encode_request_legacy(&uuid, &ck, &session, &ctx.target, command, ts, &mut entropy)?;
+        let timeout = timeouts::PROTOCOL;
+        let mut stream = stream;
+        tokio::time::timeout(timeout, stream.write_all(&request))
+            .await
+            .map_err(|_| NativeError::Timeout {
+                step,
+                limit: timeout,
+            })??;
+        let reader = crate::protocol::vmess::legacy::CfbReader::new(
+            stream,
+            &session.response_body_key,
+            &session.response_body_iv,
+        );
+        return Ok(VmessClientStream::new_legacy(Box::new(reader), session));
+    }
     let request = encode_request(&ck, &session, &ctx.target, command, ts, &mut entropy)?;
     let timeout = timeouts::PROTOCOL;
     let mut stream = stream;

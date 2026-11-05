@@ -38,9 +38,6 @@ pub(crate) enum PeelAck {
     Pending,
     /// The header arrived: the server accepted this config.
     Accepted,
-    /// The header was NOT a vless header: a non-vless endpoint answered, so
-    /// the ack is not applicable to this row.
-    NotApplicable,
     /// The header was truncated (EOF before it completed): POSITIVE rejection
     /// evidence — the server closed instead of accepting.
     Rejected,
@@ -60,9 +57,6 @@ pub(crate) struct Peel {
     addons: [u8; 255],
     addons_total: usize,
     state: PeelState,
-    /// A non-vless first byte (REALITY transparent-proxy fallback) handed
-    /// back to the reader as payload via [`Peel::take_passthrough`].
-    passthrough: Option<u8>,
     /// The shared slot the ack is reported into — owned so the peel can
     /// report AT READ TIME (the ack is observed lazily, on the tunnel's first
     /// read, which happens during the probe's target-TLS handshake, long
@@ -80,7 +74,6 @@ impl Peel {
             addons: [0; 255],
             addons_total: 0,
             state: PeelState::Head,
-            passthrough: None,
             ack_slot,
             ack: PeelAck::Pending,
         }
@@ -93,19 +86,14 @@ impl Peel {
         matches!(self.state, PeelState::Done)
     }
 
-    /// Returns the non-vless first byte, if the peel stashed one (REALITY
-    /// transparent-proxy fallback: the first byte is payload, not a vless
-    /// response header).
-    #[must_use]
-    pub(crate) const fn take_passthrough(&mut self) -> Option<u8> {
-        self.passthrough.take()
-    }
-
     /// Reads the VLESS response header (`version|addons_len|addons`) once.
     ///
     /// Reuses the exact `VlessClientStream` logic: eager/lazy-server-safe,
-    /// fragmented-header-safe, non-vless passthrough (stashed via
-    /// [`Peel::take_passthrough`]), EOF-before-header is `UnexpectedEof`.
+    /// fragmented-header-safe, EOF-before-header is `UnexpectedEof`. A
+    /// non-zero version is a hard error: Xray's `DecodeResponseHeader` refuses
+    /// it, and the "REALITY transparent-proxy fallback" it used to justify a
+    /// pass-through cannot reach here — an unauthorised REALITY client fails
+    /// its certificate check before the VLESS peel runs.
     pub(crate) async fn ensure_peeled<R: AsyncRead + Unpin>(
         &mut self,
         r: &mut R,
@@ -138,15 +126,21 @@ impl Peel {
                         }
                         self.ver_read = true;
                         if tmp[0] != header::VERSION {
-                            // No vless response header: hand the byte back
-                            // as payload. The peer is not a vless server, so
-                            // the ack does not apply to this row (the
-                            // REALITY transparent-proxy fallback).
-                            self.state = PeelState::Done;
-                            self.ack = PeelAck::NotApplicable;
-                            self.ack_slot.set(crate::protocol::AuthAck::NotApplicable);
-                            self.passthrough = Some(tmp[0]);
-                            return Ok(());
+                            // A vless response header ALWAYS starts with
+                            // version 0x00. Anything else is not this
+                            // protocol: Xray's DecodeResponseHeader refuses
+                            // it, and passing the byte to the application
+                            // would deliver a wrong endpoint's bytes as
+                            // payload instead of failing.
+                            self.ack = PeelAck::Rejected;
+                            self.ack_slot.set(crate::protocol::AuthAck::Failed);
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "vless response version 0x{:02X}: not a VLESS response header",
+                                    tmp[0]
+                                ),
+                            ));
                         }
                     }
                     // Version matches: read the addon length.
@@ -254,12 +248,6 @@ impl AsyncRead for VlessClientStream {
     ) -> Poll<io::Result<()>> {
         loop {
             let this = self.as_mut().get_mut();
-            // A NON-vless endpoint's first byte was stashed by the peel:
-            // return it as payload before streaming the tunnel.
-            if let Some(b) = this.peel.take_passthrough() {
-                buf.put_slice(&[b]);
-                return Poll::Ready(Ok(()));
-            }
             if this.peel.is_peeled() {
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
@@ -344,17 +332,24 @@ mod tests {
             "an EOF during the peel is POSITIVE rejection evidence, never Unknown"
         );
 
-        // ── the not-applicable case: a non-vless first byte ──
+        // ── the wrong-protocol case: a non-vless first byte ──
         let (client, mut server) = pair();
         let slot = crate::protocol::AuthAckSlot::new(crate::protocol::AuthAck::Unknown);
-        let stream = VlessClientStream::with_ack_slot(Box::new(client), slot.clone());
-        // A first byte that is not the vless version: a transparent proxy.
+        let mut stream = VlessClientStream::with_ack_slot(Box::new(client), slot.clone());
+        // A first byte that is not the vless version is a hard error, not
+        // payload and not an "inapplicable" ack.
         server.write_all(b"HTTP/1.1 200 OK").await.unwrap();
-        let _ = read_n(stream, 1).await;
+        let mut buf = [0u8; 1];
+        assert!(
+            tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .is_err(),
+            "a non-zero response version must fail the peel"
+        );
         assert_eq!(
             slot.get(),
-            crate::protocol::AuthAck::NotApplicable,
-            "a non-vless peer means the ack does not apply"
+            crate::protocol::AuthAck::Failed,
+            "a wrong version is positive rejection evidence"
         );
     }
 
@@ -408,18 +403,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passes_through_non_vless_response() {
-        // A REALITY transparent-proxy fallback terminates the client's TLS
-        // session at a non-vless endpoint: the first byte is payload, not a
-        // vless response header, and must pass through untouched.
+    async fn non_vless_response_version_is_an_error() {
+        // Xray's DecodeResponseHeader refuses a non-zero version; passing the
+        // byte through would deliver a wrong endpoint's bytes as payload.
         use tokio::io::AsyncReadExt;
         let (client, mut server) = pair();
         let mut stream = VlessClientStream::new(Box::new(client));
-        let expected = b"HTTP/1.1 200 OK\r\nhello";
-        server.write_all(expected).await.unwrap();
-        let mut out = vec![0u8; expected.len()];
-        stream.read_exact(&mut out).await.unwrap();
-        assert_eq!(&out, expected);
+        server.write_all(b"HTTP/1.1 200 OK\r\nhello").await.unwrap();
+        let mut out = [0u8; 4];
+        let err = stream.read(&mut out).await.expect_err("must reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("0x48"), "{err}");
     }
 
     #[tokio::test]

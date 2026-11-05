@@ -589,7 +589,7 @@ Layering follows Xray composition order, folded by `connect_chain`:
 previous phase's `BoxStream` (the `Stream` seam: AsyncRead+AsyncWrite+Unpin+Send)
 and returns the next.
 
-- `transport/` — TCP dial, ws/grpc/httpupgrade/xhttp/v2rayhttp upgrade framing, fresh-UDP mKCP dial, and the QUIC dial (`connect_quic` — quinn/rustls internal to QUIC, shared by the xhttp h3 arm and the hysteria2 client).
+- `transport/` — TCP dial (socket options through `sockopt.rs`, the SAFE `socket2` surface only), ws/grpc/httpupgrade/xhttp/v2rayhttp upgrade framing (ws `?ed=N` early data defers the upgrade to the first write so those bytes ride `Sec-WebSocket-Protocol`; the h2 client seeds its windows from `leas_tls::Http2Profile` resolved from the same fingerprint the hello used), fresh-UDP mKCP dial, and the QUIC dial (`connect_quic` — quinn/rustls internal to QUIC, shared by the xhttp h3 arm and the hysteria2 client).
 - `transport/v2ray/` — SIP003 plugin framing over an established stream:
   `http_obfs.rs` (`obfs=http`), `tls_obfs.rs` (`obfs=tls` — a SYNTHETIC
   TLS-1.0 record writer with the payload hidden in `session_ticket`, not a
@@ -614,7 +614,10 @@ and returns the next.
   `TlsMode::Reality`) — the rustls client path is gone; rustls remains only
   as the server-side test double + quinn's internal QUIC TLS. Trust:
   `insecure` / `pin_sha256` (pin replaces chain walk + SAN but never the
-  CertificateVerify signature).
+  CertificateVerify signature). REALITY additionally verifies the optional
+  ML-DSA-65 certificate extension (`RealityOpts.mldsa65_verify`, share-link
+  `pqv`): `HMAC-SHA512(auth_key, ed25519_pub ‖ ClientHello.Raw ‖
+  ServerHello.Raw)` against the certificate's FIRST extension.
 - `protocol/` — 20 protocol modules; `vless`, `vmess`, `trojan` + `hysteria2` are implemented
   (trojan = TCP-stream family via the uniform pipeline; hysteria2 = `ConnectShape::Quic`
   fresh quinn dial), plus the `socks` CLIENT handshake (RFC 1928/1929 greeting →
@@ -624,6 +627,12 @@ and returns the next.
   `shape.rs` `ConnectShape` marks the divergent paths (device tunnels:
   WireGuard/Tailscale; own-handshake: SSH; outbound-only kinds: Redirect/TProxy/
   Mixed).
+  VMess speaks two wires from the same module: AEAD (option `0x0c`, SHAKE128
+  size mask + per-record cleartext padding) and the legacy `alterId > 0` one
+  (`legacy.rs` — CFB-128 header, four-byte response peel), the latter still
+  accepted by v2ray-core 4.x and sing-box. VLESS `encryption` composes with
+  `flow`: vision frames the decrypted stream and its Direct handoff targets the
+  sealing layer, never the outer TLS.
   `PacketTunnel` (the UDP datagram tunnel) additionally exposes
   `split() -> (PacketReader, PacketWriter)`: every carrier separates its
   per-direction framing state from the transport, so a reader task and a writer

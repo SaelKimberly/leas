@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
-use crate::transport::http::{IncomingReader, ReqBody, h2_client};
+use crate::transport::http::{IncomingReader, ReqBody, h2_client_with};
 
 /// Write-side buffering cap before pushing into the upload pipe. The h2 DATA
 /// frames flow continuously (no server-side chunk cap like xhttp packet-up);
@@ -69,7 +69,7 @@ pub fn request_head(ctx: &LinkContext) -> Result<(String, String, String), Nativ
 /// authority goes in the URI, not a `host` header.
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     let (method, authority, path) = request_head(ctx)?;
-    let mut sender = h2_client(stream).await?;
+    let mut sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
     let (tx, body) = ReqBody::channel();
 
     let uri = http::Uri::builder()

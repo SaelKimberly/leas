@@ -33,6 +33,9 @@ pub enum TlsMode {
         public_key: [u8; 32],
         /// The REALITY short id (≤8 bytes).
         short_id: Vec<u8>,
+        /// REALITY's ML-DSA-65 verification key (1952 bytes) when the profile
+        /// carries `pqv`; `None` keeps the HMAC+Ed25519 rule alone.
+        mldsa65_verify: Option<Vec<u8>>,
         /// Spider-X fallback behavior on auth failure.
         spider: SpiderConfig,
     },
@@ -81,6 +84,7 @@ impl TlsConfig {
         provisioner: Arc<dyn HelloProvisioner>,
         public_key: [u8; 32],
         short_id: Vec<u8>,
+        mldsa65_verify: Option<Vec<u8>>,
         spider: SpiderConfig,
         server_name: impl Into<String>,
     ) -> Self {
@@ -89,6 +93,7 @@ impl TlsConfig {
                 provisioner,
                 public_key,
                 short_id,
+                mldsa65_verify,
                 spider,
             },
             server_name: server_name.into(),
@@ -164,6 +169,7 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
             provisioner,
             public_key,
             short_id,
+            mldsa65_verify,
             spider,
         } => {
             reality::connect_reality(
@@ -173,6 +179,7 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
                     public_key,
                     short_id,
                     provisioner: provisioner.as_ref(),
+                    mldsa65_verify: mldsa65_verify.as_deref(),
                     rng: config.rng.as_ref(),
                     spider,
                 },
@@ -312,6 +319,7 @@ mod tests {
             ),
             [0xAB; 32],
             vec![],
+            None,
             SpiderConfig::default(),
             "localhost",
         );

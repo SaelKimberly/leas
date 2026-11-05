@@ -28,7 +28,7 @@ use crate::context::{LinkContext, split_alpn};
 use crate::error::{NativeError, timeouts};
 use leas_proto::proto_spec::{SecurityConfig, TlsConfig};
 
-use crate::transport::http::{IncomingReader, ReqBody, h1_client, h2_client};
+use crate::transport::http::{IncomingReader, ReqBody, h1_client, h2_client_with};
 
 /// packet-up chunk size (bytes) — xray default `scMaxEachPostBytes`.
 const MAX_POST_BYTES: usize = 1_000_000;
@@ -37,22 +37,31 @@ const POST_INTERVAL: Duration = Duration::from_millis(30);
 /// `x_padding` length range (xray default `xPaddingBytes` 100..1000).
 const PAD_MIN: usize = 100;
 const PAD_MAX: usize = 1000;
-/// Static `x_padding` alphabet: 1000 `X` characters (X/Z are 8-bit HPACK
-/// huffman codes, so byte length == HPACK length — valid under every server
-/// validation path, incl. the tokenish huffman-length check). Slicing this
-/// per request replaces the per-request `"X".repeat(len)` allocation.
-static X_PAD: [u8; PAD_MAX] = [b'X'; PAD_MAX];
+/// The `x_padding` alphabet: ASCII characters whose HPACK Huffman code is
+/// exactly 8 bits, so the byte length always equals the Huffman length the
+/// server validates (`& * , ; X Z`). Varying the content inside that set is
+/// free; stepping outside it would make the length check depend on the mix.
+const PAD_ALPHABET: &[u8] = b"&*,;XZ";
 
-/// Random `x_padding` value: a 100–1000 `X` slice of the static [`X_PAD`].
-fn x_padding() -> &'static str {
+/// Random `x_padding` value: length uniform on `[PAD_MIN, PAD_MAX)` (Xray's
+/// `RandBetween` is half-open), content drawn from [`PAD_ALPHABET`].
+fn x_padding() -> String {
     let mut buf = [0u8; 2];
     SystemRandom::new()
         .fill(&mut buf)
         .expect("ring CSPRNG fills");
-    // `PAD_MAX - PAD_MIN + 1` keeps the inclusive [100, 1000] range (xray's
-    // RangeConfig rand is inclusive).
-    let len = PAD_MIN + usize::from(u16::from_be_bytes(buf)) % (PAD_MAX - PAD_MIN + 1);
-    std::str::from_utf8(&X_PAD[..len]).expect("static pad is ASCII X")
+    let len = PAD_MIN + usize::from(u16::from_be_bytes(buf)) % (PAD_MAX - PAD_MIN);
+    let mut out = String::with_capacity(len);
+    let mut bytes = vec![0u8; len];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("ring CSPRNG fills");
+    for b in bytes {
+        out.push(char::from(
+            PAD_ALPHABET[usize::from(b) % PAD_ALPHABET.len()],
+        ));
+    }
+    out
 }
 
 /// Normalize a path to start with `/` and ensure a trailing `/` before
@@ -69,6 +78,15 @@ fn normalize_path(path: &str) -> String {
 /// URL-safe session id (uuid v4).
 fn session_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// A per-POST size target in `[1, MAX_POST_BYTES)`, drawn once per request.
+fn random_post_size() -> usize {
+    let mut buf = [0u8; 4];
+    SystemRandom::new()
+        .fill(&mut buf)
+        .expect("ring CSPRNG fills");
+    1 + (u32::from_be_bytes(buf) as usize) % (MAX_POST_BYTES - 1)
 }
 
 /// Host for the HTTP requests: config `host` > endpoint host.
@@ -607,7 +625,10 @@ async fn upload_loop_core<S: V3Send>(
             last = Instant::now();
             #[cfg(test)]
             POST_STARTS.lock().expect("post-starts lock").push(last);
-            let take = chunk.len().min(MAX_POST_BYTES);
+            // Xray draws a random POST size per request, bounded by
+            // `scMaxEachPostBytes` (`dialer.go:472-487`); a constant cap is
+            // itself a signature.
+            let take = chunk.len().min(random_post_size());
             let payload = chunk.split_to(take).freeze();
             url_path.clear();
             write!(url_path, "{session_base}/{seq}").expect("write! to String cannot fail");
@@ -837,7 +858,7 @@ async fn packet_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let host = http_host(ctx);
     let session = session_id();
     let get_path = path_with(ctx, &session, None);
-    let mut sender = h2_client(stream).await?;
+    let mut sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
     let get_req = build_request(ctx, "GET", &get_path, &host)?.map(|()| V3Body::Empty);
     let resp = send_200(&mut sender, get_req, "xhttp download GET").await?;
     let reader = resp.reader;
@@ -901,7 +922,7 @@ async fn stream_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let host = http_host(ctx);
     let session = session_id();
     let url = path_with(ctx, &session, None);
-    let mut sender = h2_client(stream).await?;
+    let mut sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
     let get_req = build_request(ctx, "GET", &url, &host)?.map(|()| V3Body::Empty);
     let resp = send_200(&mut sender, get_req, "xhttp stream-up GET").await?;
     let reader = resp.reader;
@@ -967,7 +988,7 @@ async fn stream_one_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream
 async fn stream_one_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     let host = http_host(ctx);
     let url = base_path(ctx);
-    let mut sender = h2_client(stream).await?;
+    let mut sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
     let (wt, wrx) = mpsc::channel::<Bytes>(16);
     let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::PipeFull(wrx));
     req.headers_mut().insert(
@@ -1521,16 +1542,22 @@ mod tests {
     }
 
     #[test]
-    fn padding_is_repeat_x_within_range() {
+    fn padding_uses_the_eight_bit_alphabet_within_a_half_open_range() {
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
             let pad = x_padding();
             assert!(
-                pad.len() >= PAD_MIN && pad.len() <= PAD_MAX,
-                "len {}",
+                pad.len() >= PAD_MIN && pad.len() < PAD_MAX,
+                "len {} must be in [{PAD_MIN}, {PAD_MAX})",
                 pad.len()
             );
-            assert!(pad.bytes().all(|b| b == b'X'), "repeat-X only");
+            for b in pad.bytes() {
+                assert!(PAD_ALPHABET.contains(&b), "byte {b:#x} outside the set");
+                seen.insert(b);
+            }
         }
+        // Content varies: a constant string is its own signature.
+        assert!(seen.len() > 1, "padding content must vary");
     }
 
     #[test]
@@ -1543,8 +1570,11 @@ mod tests {
         let referer = req.headers()["referer"].to_str().unwrap();
         let (url, pad) = referer.split_once("?x_padding=").unwrap();
         assert_eq!(url, "http://example.com/x/");
-        assert!((100..=1000).contains(&pad.len()), "len {}", pad.len());
-        assert!(pad.bytes().all(|b| b == b'X'), "repeat-X only");
+        assert!((100..1000).contains(&pad.len()), "len {}", pad.len());
+        assert!(
+            pad.bytes().all(|b| PAD_ALPHABET.contains(&b)),
+            "outside the 8-bit alphabet"
+        );
     }
 
     #[test]
@@ -1889,16 +1919,16 @@ mod tests {
         }
     }
 
-    /// Referer = `{scheme}://{host}{base}?x_padding={X..}` — `X`s in the
-    /// xray `xPaddingBytes` [100, 1000] range (the v3 padding the client
-    /// sends on every request).
+    /// Referer = `{scheme}://{host}{base}?x_padding={…}` — the v3 padding the
+    /// client sends on every request, drawn from the 8-bit Huffman alphabet
+    /// over `[PAD_MIN, PAD_MAX)`.
     fn assert_referer(referer: &str) {
         let (url, pad) = referer
             .split_once("?x_padding=")
             .expect("referer carries x_padding");
         assert_eq!(url, "https://localhost/x/", "{referer}");
-        assert!(pad.bytes().all(|b| b == b'X'), "{referer}");
-        assert!((PAD_MIN..=PAD_MAX).contains(&pad.len()), "{referer}");
+        assert!(pad.bytes().all(|b| PAD_ALPHABET.contains(&b)), "{referer}");
+        assert!((PAD_MIN..PAD_MAX).contains(&pad.len()), "{referer}");
     }
 
     /// Read an h3 request body to EOF, concatenated. The client always
@@ -2160,13 +2190,24 @@ mod tests {
     /// may itself outlast the window, and the idle-window flush can mask a
     /// missing sleep altogether.
     fn assert_chunked_uploads(o: &H3Obs, payload: &[u8]) {
-        assert_eq!(o.posts.len(), 2, "{o:#?}");
+        assert!(o.posts.len() >= 2, "a chunked upload is at least two POSTs");
         let (s0, b0, r0, _) = &o.posts[0];
         let (s1, b1, r1, _) = &o.posts[1];
         assert_eq!(*s0, 0, "seq order");
         assert_eq!(*s1, 1, "seq order");
-        assert_eq!(b0.len(), MAX_POST_BYTES, "first chunk = the size cap");
-        assert_eq!(b1.len(), 200_000, "tail chunk");
+        for (expect, (seq, body, _, _)) in o.posts.iter().enumerate() {
+            assert_eq!(
+                *seq,
+                u64::try_from(expect).unwrap(),
+                "seq is dense and ordered"
+            );
+            assert!(!body.is_empty(), "no empty POST");
+            assert!(body.len() < MAX_POST_BYTES, "under the size cap");
+        }
+        // The first chunk is a random size below `scMaxEachPostBytes`; what
+        // must hold is the bound, the order, and full coverage.
+        assert!(b0.len() < MAX_POST_BYTES, "first chunk under the cap");
+        assert!(!b0.is_empty(), "first chunk non-empty");
         let mut joined = Vec::with_capacity(b0.len() + b1.len());
         joined.extend_from_slice(b0);
         joined.extend_from_slice(b1);
@@ -2237,9 +2278,11 @@ mod tests {
         assert_eq!(&out[..], H3_DOWNLOAD);
         drop(t);
 
-        // Both POSTs arrive (the channel-close flushes the tail after the
-        // tunnel dropped), then the h3 connection closes.
-        wait_obs(&obs, |o| o.posts.len() == 2 && o.conn_closed).await;
+        // Every POST arrives (the channel-close flushes the tail after the
+        // tunnel dropped), then the h3 connection closes. The split COUNT is
+        // random now (each POST draws its own size), so the wait is on the
+        // close, and `assert_chunked_uploads` checks bounds + coverage.
+        wait_obs(&obs, |o| o.conn_closed && !o.posts.is_empty()).await;
         assert_chunked_uploads(&obs.data.lock().expect("obs lock"), &payload);
 
         // The pacing is the client's own guarantee, so it is asserted on the

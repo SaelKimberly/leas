@@ -5,10 +5,11 @@
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
-use std::task::{Context as TaskCx, Poll};
+use std::task::{Context, Context as TaskCx, Poll};
 
 use bytes::{Buf, Bytes};
 use futures_core::Stream;
+use futures_core::future::BoxFuture;
 use futures_sink::Sink;
 use leas_proto::proto_spec::common::WebSocketConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -54,13 +55,182 @@ fn http_name(k: &str) -> HeaderName {
 }
 
 /// Run the WS upgrade over the established (secured) stream.
+///
+/// With `max_early_data` set (`?ed=N` in a share link), the upgrade is
+/// DEFERRED to the first protocol write so those N bytes can ride the
+/// `Sec-WebSocket-Protocol` header — Xray's early-data trick
+/// (`transport/internet/websocket/dialer.go:143-145`). Deferring (instead of
+/// prefetching from a pipe) keeps the upgrade in the caller's own future, so a
+/// rejected handshake still surfaces as [`NativeError::TransportRejected`]
+/// rather than as an anonymous EOF on a background task.
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     let cfg = ctx.transport_ws().ok_or_else(|| {
         NativeError::Config("ws transport requested but config has no ws settings".into())
     })?;
+    if let Some(max) = cfg.max_early_data.filter(|n| *n > 0) {
+        return Ok(Box::new(EarlyDataDial::new(
+            cfg.clone(),
+            ctx.params.server.host.as_str().to_string(),
+            stream,
+            usize::try_from(max).unwrap_or(usize::MAX),
+        )));
+    }
     let req = ws_request(cfg, ctx.params.server.host.as_str())?;
     let ws = upgrade_with(req, stream, "ws").await?;
     Ok(Box::new(WsStream::new(ws)))
+}
+
+/// `Sec-WebSocket-Protocol` carrying URL-safe base64 of the first bytes.
+///
+/// Xray's server decodes it, feeds those bytes to the tunnel BEFORE the first
+/// frame, and echoes the same header back; we send them as the first binary
+/// frame, which is equivalent on the wire (the server accepts both — see
+/// `hub.go:55-59`).
+fn early_data_request(
+    cfg: &WebSocketConfig,
+    host: &str,
+    early: &[u8],
+) -> Result<Request<()>, NativeError> {
+    use base64::Engine as _;
+    let mut req = ws_request(cfg, host)?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(early);
+    req.headers_mut().insert(
+        HeaderName::from_static("sec-websocket-protocol"),
+        HeaderValue::from_str(&encoded)
+            .map_err(|e| NativeError::Config(format!("ws early-data header: {e}")))?,
+    );
+    Ok(req)
+}
+
+/// The deferred-upgrade stream behind [`connect`] when early data is on.
+pub struct EarlyDataDial {
+    cfg: WebSocketConfig,
+    host: String,
+    /// The secured stream, consumed when the upgrade starts.
+    stream: Option<BoxStream>,
+    /// The upgrade future, created on the first write.
+    upgrading: Option<
+        BoxFuture<'static, Result<tokio_tungstenite::WebSocketStream<BoxStream>, NativeError>>,
+    >,
+    ws: Option<WsStream>,
+    /// Bytes captured from the caller's first write, sent as the first frame
+    /// once the upgrade lands.
+    early: Vec<u8>,
+    early_pos: usize,
+    max_early: usize,
+}
+
+impl EarlyDataDial {
+    fn new(cfg: WebSocketConfig, host: String, stream: BoxStream, max_early: usize) -> Self {
+        Self {
+            cfg,
+            host,
+            stream: Some(stream),
+            upgrading: None,
+            ws: None,
+            early: Vec::new(),
+            early_pos: 0,
+            max_early,
+        }
+    }
+}
+
+impl AsyncRead for EarlyDataDial {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        // Reads cannot precede the upgrade: drive it first.
+        if this.ws.is_none() {
+            if let Some(fut) = this.upgrading.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(ws)) => this.ws = Some(WsStream::new(ws)),
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Err(io::Error::other(e.to_string())));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            return Poll::Pending;
+        }
+        let ws = this.ws.as_mut().expect("checked above");
+        Pin::new(ws).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for EarlyDataDial {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        if this.ws.is_none() {
+            if this.upgrading.is_none() {
+                // First write: capture up to `max_early` bytes and start
+                // the upgrade with them in the header.
+                let take = data.len().min(this.max_early.max(1));
+                this.early.extend_from_slice(&data[..take]);
+                let Some(stream) = this.stream.take() else {
+                    return Poll::Ready(Err(io::Error::other("ws early-data: no stream")));
+                };
+                let req = match early_data_request(&this.cfg, &this.host, &this.early) {
+                    Ok(req) => req,
+                    Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+                };
+                this.upgrading = Some(Box::pin(upgrade_with(req, stream, "ws")));
+                return Poll::Pending;
+            }
+            let Some(fut) = this.upgrading.as_mut() else {
+                return Poll::Ready(Err(io::Error::other("ws early-data: no upgrade")));
+            };
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(ws)) => {
+                    this.ws = Some(WsStream::new(ws));
+                    this.upgrading = None;
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        // Send the early bytes as the first frame, then the caller's.
+        while this.early_pos < this.early.len() {
+            let ws = this.ws.as_mut().expect("checked above");
+            let remaining = &this.early[this.early_pos..];
+            match Pin::new(ws).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero)));
+                }
+                Poll::Ready(Ok(n)) => this.early_pos += n,
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            }
+        }
+        let ws = this.ws.as_mut().expect("checked above");
+        match Pin::new(ws).poll_write(cx, data) {
+            Poll::Ready(Ok(n)) => {
+                let early_len = this.early.len();
+                Poll::Ready(Ok(n.max(early_len.min(data.len()))))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.ws
+            .as_mut()
+            .map_or(Poll::Ready(Ok(())), |ws| Pin::new(ws).poll_flush(cx))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.ws
+            .as_mut()
+            .map_or(Poll::Ready(Ok(())), |ws| Pin::new(ws).poll_shutdown(cx))
+    }
 }
 
 /// Run the WS upgrade for a caller-built request, and wrap the negotiated
@@ -202,6 +372,36 @@ impl AsyncWrite for WsStream {
         Pin::new(&mut self.inner)
             .poll_close(cx)
             .map_err(io::Error::other)
+    }
+}
+
+#[cfg(test)]
+mod early_data_tests {
+    use super::*;
+
+    fn cfg(max: Option<u32>) -> WebSocketConfig {
+        WebSocketConfig {
+            path: Some("/x".into()),
+            max_early_data: max,
+            ..WebSocketConfig::default()
+        }
+    }
+
+    /// Xray's rule: the header carries URL-safe base64 of the first bytes,
+    /// and is absent when the knob is unset (a request that grew a header for
+    /// no reason would be its own fingerprint).
+    #[test]
+    fn early_data_header_is_present_only_when_configured() {
+        let early = b"GET / HTTP/1.1\r\n";
+        let req = early_data_request(&cfg(Some(32)), "example.com", early).unwrap();
+        assert_eq!(
+            req.headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("R0VUIC8gSFRUUC8xLjENCg")
+        );
+        let plain = ws_request(&cfg(None), "example.com").unwrap();
+        assert!(plain.headers().get("sec-websocket-protocol").is_none());
     }
 }
 

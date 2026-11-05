@@ -105,15 +105,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> DirectMode
 /// corrupting the tunnel after a Direct frame.
 impl DirectMode for Box<dyn crate::Stream> {
     fn set_write_direct(&mut self) {
-        tls_stream_mut(self)
-            .expect("vision must wrap an engine TlsStream")
-            .set_write_direct();
+        set_direct(self, true);
     }
     fn set_read_direct(&mut self) {
-        tls_stream_mut(self)
-            .expect("vision must wrap an engine TlsStream")
-            .set_read_direct();
+        set_direct(self, false);
     }
+}
+
+/// Switch the underlying stream to Direct for one direction.
+///
+/// Two shapes are legitimate:
+/// 1. the engine `TlsStream` (plain TLS/REALITY) — the record layer is
+///    bypassed and the raw socket is spliced;
+/// 2. the `mlkem` encryption conn — Direct targets the SEALING layer
+///    (`CanSpliceCopy = 3`, `proxy/vless/outbound/outbound.go:262-267`), so the
+///    outer TLS is never peeled: the codec stops framing, the encryption conn
+///    keeps sealing. There is nothing to switch, and that is the point.
+fn set_direct(stream: &mut Box<dyn crate::Stream>, write: bool) {
+    if let Some(tls) = tls_stream_mut(stream) {
+        if write {
+            tls.set_write_direct();
+        } else {
+            tls.set_read_direct();
+        }
+        return;
+    }
+    assert!(
+        wraps_encryption_conn(stream),
+        "vision must wrap an engine TlsStream or an mlkem encryption conn"
+    );
+}
+
+/// True when the box (optionally through the response peel) holds the
+/// `mlkem` `CommonConn` — the composition whose Direct handoff is a no-op.
+fn wraps_encryption_conn(stream: &mut Box<dyn crate::Stream>) -> bool {
+    use crate::protocol::vless::encryption::CommonConn;
+    let any: &mut dyn std::any::Any = &mut **stream;
+    if any.downcast_mut::<CommonConn>().is_some() {
+        return true;
+    }
+    let Some(peeled) = any.downcast_mut::<VlessClientStream>() else {
+        return false;
+    };
+    let wrapped: &mut dyn std::any::Any = &mut **peeled.inner_mut();
+    wrapped.downcast_mut::<CommonConn>().is_some()
 }
 
 /// Recover the concrete engine `TlsStream` behind the boxed seam (upcast

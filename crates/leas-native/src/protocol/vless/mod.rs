@@ -63,9 +63,14 @@ pub async fn connect(
 }
 
 /// The `mlkem768x25519plus` connect path (spec §4.3, §5.3): PQ handshake,
-/// then the plain request header through the encrypted tunnel, then the
-/// response-peeled tunnel. Flow addons cannot combine with it (xray treats
-/// the encryption as the account's whole identity layer).
+/// then the request header through the encrypted tunnel, then the
+/// response-peeled tunnel.
+///
+/// A `flow` composes ON TOP of the encryption layer, exactly as Xray does:
+/// `ob.CanSpliceCopy = 3` is set because the conn is an
+/// `*encryption.CommonConn` (`proxy/vless/outbound/outbound.go:262-267`), i.e.
+/// the Direct handoff targets the sealing layer and the outer TLS is never
+/// peeled — the encryption conn keeps framing while vision stops doing so.
 async fn connect_encrypted(
     ctx: &LinkContext,
     stream: BoxStream,
@@ -76,14 +81,25 @@ async fn connect_encrypted(
     let parsed = parse_mlkem_encryption(enc)
         .map_err(|e| invalid(e.to_string()))?
         .ok_or_else(|| invalid(format!("unsupported encryption value {enc}")))?;
-    if cfg.flow.as_deref().is_some_and(|f| !f.is_empty()) {
-        return Err(invalid(
-            "flow cannot be combined with mlkem encryption".into(),
-        ));
-    }
     let uuid = header::uuid_bytes(&cfg.uuid)?;
     let ecfg = encryption::EncryptionConfig::try_from_parsed(&parsed)?;
-    let mut conn = encryption::handshake(stream, &ecfg).await?;
+    let conn = encryption::handshake(stream, &ecfg).await?;
+    match cfg.flow.as_deref() {
+        None | Some("") => {}
+        Some(FLOW_XTLS_RPRX_VISION | FLOW_XTLS_RPRX_VISION_UDP443) => {
+            // Vision over the sealed layer: the request header gains the flow
+            // addon and the codec frames the DECRYPTED stream; Direct hands
+            // off to the encryption conn (which keeps sealing), never to the
+            // outer TLS.
+            return connect_vision_over(ctx, Box::new(conn), uuid, cfg.flow.as_deref()).await;
+        }
+        Some(other) => {
+            return Err(NativeError::NotImplemented {
+                feature: format!("vless flow {other}"),
+            });
+        }
+    }
+    let mut conn = conn;
     let request = header::encode_request(&uuid, &ctx.target, header::CMD_TCP, None)?;
     let timeout = timeouts::PROTOCOL;
     tokio::time::timeout(timeout, conn.write_all(&request))
@@ -148,7 +164,19 @@ async fn connect_vision(
             "XTLS only supports the TCP transport for now".into(),
         ));
     }
+    connect_vision_over(ctx, stream, uuid, flow).await
+}
 
+/// The vision pipeline over an ALREADY-SECURED stream: header + camouflage
+/// frame, then the padded codec with the response peel inside it. Called by
+/// the plain path (TLS/REALITY underneath) and by the `mlkem` path (the
+/// encryption conn underneath, which keeps framing after Direct).
+async fn connect_vision_over(
+    ctx: &LinkContext,
+    stream: BoxStream,
+    uuid: [u8; 16],
+    flow: Option<&str>,
+) -> Result<BoxStream, NativeError> {
     // Step 2: request header with the flow addon (addon_len = 18; the
     // udp443 variant's addon is truncated to `xtls-rprx-vision` — spec
     // §4.3).
@@ -515,6 +543,43 @@ mod tests {
     fn stream_pair() -> (BoxStream, tokio::io::DuplexStream) {
         let (client, peer) = tokio::io::duplex(1024);
         (Box::new(client), peer)
+    }
+
+    /// `encryption` + `flow` is a legal Xray configuration: the graph is
+    /// encryption → vision, with Direct targeting the sealing layer
+    /// (`CanSpliceCopy = 3`). The old guard refused it at config time; now the
+    /// dispatch proceeds into the PQ handshake, so the failure is a transport
+    /// one (here: the peer closed) rather than a `Config` refusal.
+    #[test]
+    fn encryption_and_flow_compose() {
+        let mut obj = serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "tcp" },
+            "flow": "xtls-rprx-vision",
+            "encryption": "mlkem768x25519plus.native.1rtt.100-200.0000000000000000000000000000000000000000000000000000000000000000",
+            "security": { "type": "tls", "sni": "example.com" },
+        });
+        obj["encryption"] = serde_json::json!(
+            "mlkem768x25519plus.native.1rtt.100-200.0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        let cfg: VlessConfig = serde_json::from_value(obj).expect("config parses");
+        let ctx = ctx_for(&cfg);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (stream, peer) = stream_pair();
+            drop(peer); // the handshake hits EOF instead of blocking
+            let Err(err) = connect(&ctx, stream, &cfg).await else {
+                panic!("the handshake cannot complete against a closed peer");
+            };
+            assert!(
+                !matches!(&err, NativeError::Config(m) if m.contains("cannot be combined")),
+                "encryption+flow must not be refused at config time: {err:?}"
+            );
+        });
     }
 
     /// The flow gates reject the invalid configs, identically for both entry

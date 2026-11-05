@@ -56,6 +56,10 @@ hex.workspace = true
 # keeps ciphertexts and shared secrets inline (no heap), which the
 # allocation-free `encapsulate_into` path depends on.
 ml-kem = { version = "0.3.3", default-features = false, features = ["zeroize"] }
+# REALITY's ML-DSA-65 certificate extension verification (Xray
+# `realitySettings.mldsa65Verify`, FIPS 204). Verify-only: no signing key is
+# ever constructed, so the RNG/PKCS#8 default features are off.
+ml-dsa = { version = "0.1.2", default-features = false, features = ["alloc"] }
 # RNG trait for the adapter in `crypto::mlkem`: `RingRng` bridges ring's CSPRNG
 # into `encapsulate_with_rng`, so ML-KEM key material keeps the workspace's one
 # RNG provider instead of a second OS-RNG path.

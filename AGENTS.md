@@ -38,7 +38,7 @@ This file is auto-detected project context: commands, structure, conventions. Th
 
 ## Key Conventions
 - Tests live beside code (unit) or in `tests/` (integration); `thiserror` for error types, `anyhow` for propagation.
-- `#![forbid(unsafe_code)]` in `leas-tls` and `leas-native`; crypto standard is `ring` (plus `x25519-dalek`, RustCrypto `ml-kem`). Consult `docs/reference/crypto-dependencies.md` before adding a primitive.
+- `#![forbid(unsafe_code)]` in `leas-tls` and `leas-native`; crypto standard is `ring` (plus `x25519-dalek`, RustCrypto `ml-kem`, `ml-dsa` — the last verify-only, for REALITY's certificate extension). Socket options stay on `socket2`'s SAFE surface for the same reason; `SO_MARK`/`SO_BINDTODEVICE`/`TCP_CONGESTION` need an ADR. Consult `docs/reference/crypto-dependencies.md` before adding a primitive.
 - All DB access is async on `Database`; the typed path is the default, raw SQL needs a recorded cause in `docs/reference/database-manual-sql.md`.
 - The schema cursor is `PRAGMA user_version` (`crate::schema`): a supported older version MIGRATES, an unknown one wipes. NEVER bump `SCHEMA_VERSION` for a change; an identity re-key is a DATA step, not a schema bump.
 - `leas-hakari` is generated — regenerate with `cargo hakari` after any `Cargo.lock` change; never edit it by hand.

@@ -4,10 +4,12 @@
 //!
 //! Mirrors Xray-core
 //! `proxy/vmess/encoding/client.go` (`DecodeResponseHeader`,
-//! `DecodeResponseBody`, `EncodeRequestBody`) with the request option byte 0
-//! — the server chunk-decodes AEAD bodies regardless
-//! (`crypto.PlainChunkSizeParser`), so no ChunkStream/ChunkMasking option bit
-//! is ever set.
+//! `DecodeResponseBody`, `EncodeRequestBody`) with the request option bits
+//! `0x0c` — chunk masking (`0x04`) and global padding (`0x08`), which every
+//! real client sets (`proxy/vmess/outbound/outbound.go:109-115`). Both
+//! directions mask the 2-byte size field with a SHAKE128 keystream seeded by
+//! that direction's body IV and draw a per-record cleartext padding length
+//! from the same stream (see [`crate::protocol::vmess::pad`]).
 //!
 //! Record framing (both directions): `2B BE ciphertext-length | AES-128-GCM(
 //! key = session.{request,response}_body_key, nonce = IV-with-first-2-bytes-
@@ -31,6 +33,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
 use crate::BoxStream;
 use crate::protocol::vmess::header::{SECURITY_AES128_GCM, SECURITY_CHACHA20_POLY1305, Session};
 use crate::protocol::vmess::keys;
+use crate::protocol::vmess::pad::{PADDING_MAX, ShakeSizeParser};
+use crate::rand;
 
 /// Peel salt paths (Go `aead.KDFSaltConstAEADRespHeader*`), as byte slices for
 /// [`keys::kdf16_bytes_path`].
@@ -46,6 +50,11 @@ const RESP_PAYLOAD_IV_SALT: &[u8] = b"AEAD Resp Header IV";
 /// `udp::MAX_SEND_PAYLOAD`).
 pub(super) const MAX_RECORD_PLAINTEXT: usize = u16::MAX as usize - 16;
 
+/// The send side's per-record ceiling: the framed size field counts the
+/// ciphertext PLUS the record's cleartext padding (up to 64), so a record we
+/// emit must leave room for it.
+const MAX_WRITE_PLAINTEXT: usize = MAX_RECORD_PLAINTEXT - PADDING_MAX;
+
 /// Read-side state machine (Copy so no borrow of `self` is held across
 /// awaits; buffers live on the struct, fill counters in the state).
 #[derive(Clone, Copy)]
@@ -57,7 +66,11 @@ enum ReadState {
     /// Filling the 2-byte BE record field (ciphertext size, plaintext+tag).
     RecordLen { filled: usize },
     /// Filling the `field`-byte record ciphertext.
-    RecordData { total: usize, filled: usize },
+    RecordData {
+        total: usize,
+        padding: usize,
+        filled: usize,
+    },
     /// Terminal error: every subsequent poll returns the same error.
     Dead(&'static str),
 }
@@ -138,13 +151,34 @@ struct VmessRead {
     resp_cipher: Cipher,
     resp_nonce: [u8; 12],
     resp_counter: u16,
+    /// Response-direction size mask / padding draw (SHAKE128 over
+    /// `response_body_iv`). Boxed: a SHAKE state is ~200 bytes and it is
+    /// constant per tunnel, so it must not inflate the enum that holds it.
+    resp_size: Box<ShakeSizeParser>,
+    /// Whether records carry the mask+padding framing (`0x04|0x08`). The
+    /// legacy wire (`alterId > 0`) sets `0x01` only, so its size field is
+    /// plain and nothing is padded.
+    masked: bool,
+    /// Legacy peel: four plaintext bytes (`echo`, `option`, `0`, `0`) instead
+    /// of the AEAD response header.
+    legacy_peel: bool,
 }
 
 impl VmessRead {
     fn new(session: Session) -> Self {
+        Self::with_mode(session, true, false)
+    }
+
+    /// Legacy (`alterId > 0`) wire: plain size field, four-byte response peel.
+    fn new_legacy(session: Session) -> Self {
+        Self::with_mode(session, false, true)
+    }
+
+    fn with_mode(session: Session, masked: bool, legacy_peel: bool) -> Self {
         let mut resp_nonce = [0u8; 12];
         resp_nonce.copy_from_slice(&session.response_body_iv[..12]);
         let resp_cipher = Cipher::new(session.security, &session.response_body_key);
+        let resp_size = Box::new(ShakeSizeParser::new(&session.response_body_iv));
         Self {
             session,
             read_state: ReadState::PeelLen { filled: 0 },
@@ -156,6 +190,9 @@ impl VmessRead {
             resp_cipher,
             resp_nonce,
             resp_counter: 0,
+            resp_size,
+            masked,
+            legacy_peel,
         }
     }
 
@@ -193,7 +230,10 @@ impl VmessRead {
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, msg)));
                 }
                 ReadState::PeelLen { filled } => {
-                    let mut rb = ReadBuf::new(&mut self.peel_len[filled..]);
+                    // Legacy: four plaintext bytes (`echo|option|0|0`); AEAD:
+                    // the 18-byte sealed length.
+                    let need = if self.legacy_peel { 4 } else { 18 };
+                    let mut rb = ReadBuf::new(&mut self.peel_len[filled..need]);
                     ready!(Pin::new(&mut *inner).poll_read(cx, &mut rb))?;
                     let got = rb.filled().len();
                     if got == 0 {
@@ -204,8 +244,31 @@ impl VmessRead {
                         )));
                     }
                     let filled = filled + got;
-                    if filled < 18 {
+                    if filled < need {
                         self.read_state = ReadState::PeelLen { filled };
+                        continue;
+                    }
+                    if self.legacy_peel {
+                        // Go `DecodeResponseHeader` (non-AEAD): the echo byte,
+                        // the option byte, and a zero third byte. Anything
+                        // else means the peer is not speaking this wire.
+                        if self.peel_len[0] != self.session.response_header {
+                            self.read_state =
+                                ReadState::Dead("vmess legacy response header echo mismatch");
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "vmess legacy response header echo mismatch",
+                            )));
+                        }
+                        if self.peel_len[2] != 0 {
+                            self.read_state =
+                                ReadState::Dead("vmess legacy response header option byte");
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "vmess legacy response header has a non-zero reserved byte",
+                            )));
+                        }
+                        self.read_state = ReadState::RecordLen { filled: 0 };
                         continue;
                     }
                     // Decrypt the 2-byte plaintext length.
@@ -320,19 +383,44 @@ impl VmessRead {
                         continue;
                     }
                     let field = u16::from_be_bytes(self.len_buf);
-                    // End-of-stream markers: a record carrying only the GCM
-                    // tag (field == 16) or a zero field (Go: `size ==
-                    // auth.Overhead()` -> io.EOF).
-                    if field == 0 || field == 16 {
+                    // Go `AuthenticationReader.readSize`: the padding length
+                    // is drawn BEFORE the mask is applied.
+                    let padding = if self.masked {
+                        self.resp_size.next_padding()
+                    } else {
+                        0
+                    };
+                    let total = if self.masked {
+                        usize::from(self.resp_size.decode(field))
+                    } else {
+                        usize::from(field)
+                    };
+                    // End-of-stream marker: a record carrying only the GCM tag
+                    // (Go `size == auth.Overhead() + padding` -> io.EOF).
+                    if total == 0 || total == 16 + padding {
                         return Poll::Ready(Ok(()));
                     }
-                    // The field is the full wire size (plaintext + tag).
-                    let total = field as usize;
+                    if total < 16 + padding {
+                        self.read_state =
+                            ReadState::Dead("vmess response record shorter than its padding");
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vmess response record shorter than its padding",
+                        )));
+                    }
                     self.pending.resize(total, 0);
                     self.pending_pos = 0;
-                    self.read_state = ReadState::RecordData { total, filled: 0 };
+                    self.read_state = ReadState::RecordData {
+                        total,
+                        padding,
+                        filled: 0,
+                    };
                 }
-                ReadState::RecordData { total, filled } => {
+                ReadState::RecordData {
+                    total,
+                    padding,
+                    filled,
+                } => {
                     let mut rb = ReadBuf::new(&mut self.pending[filled..total]);
                     ready!(Pin::new(&mut *inner).poll_read(cx, &mut rb))?;
                     let got = rb.filled().len();
@@ -345,9 +433,16 @@ impl VmessRead {
                     }
                     let filled = filled + got;
                     if filled < total {
-                        self.read_state = ReadState::RecordData { total, filled };
+                        self.read_state = ReadState::RecordData {
+                            total,
+                            padding,
+                            filled,
+                        };
                         continue;
                     }
+                    // Drop the cleartext padding tail: only the ciphertext is
+                    // opened (Go `size -= padding` then `auth.Open`).
+                    self.pending.truncate(total - padding);
                     let nonce = record_nonce(&self.resp_nonce, self.resp_counter);
                     self.resp_counter = self.resp_counter.wrapping_add(1);
                     // Decrypt in place: the staging buffer already holds the
@@ -390,10 +485,23 @@ struct VmessWrite {
     req_cipher: Cipher,
     req_nonce: [u8; 12],
     req_counter: u16,
+    /// Request-direction size mask / padding draw (SHAKE128 over
+    /// `request_body_iv`). Boxed for the same reason as [`Self::req_size`].
+    req_size: Box<ShakeSizeParser>,
+    /// Pre-record snapshot of `req_size`, so a record sealed but never put on
+    /// the wire can be rolled back together with its counter. Allocated only
+    /// on the datagram path (the only one that can abandon a sealed record).
+    prev_size: Option<Box<ShakeSizeParser>>,
+    /// Mask+padding framing on (`0x04|0x08`) or the legacy plain field.
+    masked: bool,
 }
 
 impl VmessWrite {
     fn new(session: &Session) -> Self {
+        Self::with_mode(session, true)
+    }
+
+    fn with_mode(session: &Session, masked: bool) -> Self {
         let mut req_nonce = [0u8; 12];
         req_nonce.copy_from_slice(&session.request_body_iv[..12]);
         Self {
@@ -403,6 +511,9 @@ impl VmessWrite {
             req_cipher: Cipher::new(session.security, &session.request_body_key),
             req_nonce,
             req_counter: 0,
+            req_size: Box::new(ShakeSizeParser::new(&session.request_body_iv)),
+            prev_size: None,
+            masked,
         }
     }
 
@@ -410,15 +521,15 @@ impl VmessWrite {
     /// under the request counter's nonce (Go
     /// `AuthenticationWriter.seal`). The counter is consumed here, so the
     /// caller MUST have cleared any previous record first.
-    fn seal_pending(&mut self, payload: &[u8]) -> io::Result<()> {
+    fn seal_pending(&mut self, payload: &[u8], snapshot: bool) -> io::Result<()> {
         debug_assert!(
             self.seal.is_empty(),
             "exactly one record is sealed at a time"
         );
-        if payload.len() > MAX_RECORD_PLAINTEXT {
+        if payload.len() > MAX_WRITE_PLAINTEXT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("vmess record too large (max {MAX_RECORD_PLAINTEXT} bytes per record)"),
+                format!("vmess record too large (max {MAX_WRITE_PLAINTEXT} bytes per record)"),
             ));
         }
         let nonce = record_nonce(&self.req_nonce, self.req_counter);
@@ -438,12 +549,46 @@ impl VmessWrite {
                 "vmess request record seal failed",
             ));
         }
-        let field =
-            u16::try_from(payload.len() + 16).expect("record size bounded by the guard above");
-        self.seal.splice(0..0, field.to_be_bytes());
+        // Go `AuthenticationWriter.seal`: draw the padding length FIRST, then
+        // the size mask, from one keystream (`common/crypto/auth.go:249-273`).
+        // The snapshot makes an unwritten record rollback-able.
+        let padding = if self.masked {
+            if snapshot {
+                self.prev_size = Some(self.req_size.clone());
+            }
+            self.req_size.next_padding()
+        } else {
+            0
+        };
+        let framed = payload.len() + 16 + padding;
+        let field = if self.masked {
+            self.req_size
+                .encode(u16::try_from(framed).expect("record size bounded by the guard above"))
+        } else {
+            u16::try_from(framed)
+                .expect("record size bounded by the guard above")
+                .to_be_bytes()
+        };
+        self.seal.splice(0..0, field);
+        if padding > 0 {
+            // Cleartext padding (`rand.Read` upstream): appended after the
+            // ciphertext, its length implied by the keystream.
+            let start = self.seal.len();
+            self.seal.resize(start + padding, 0);
+            rand::fill_nonsecret(&mut self.seal[start..]);
+        }
         self.write_pos = 0;
         self.req_counter = self.req_counter.wrapping_add(1);
         Ok(())
+    }
+
+    /// Undo the keystream and counter advance of a sealed-but-unwritten
+    /// record (the datagram cancel-safety path).
+    fn rollback_sealed(&mut self) {
+        if let Some(prev) = self.prev_size.take() {
+            self.req_size = prev;
+            self.req_counter = self.req_counter.wrapping_sub(1);
+        }
     }
 
     /// Flush the pending write record to `inner`. Returns `Ok(())` once the
@@ -494,8 +639,8 @@ impl VmessWrite {
         // flushed, the caller is retrying with the same buffer (tokio poll
         // contract) — the pending record was built from its prefix.
         if self.seal.is_empty() {
-            let take = buf.len().min(MAX_RECORD_PLAINTEXT);
-            if let Err(e) = self.seal_pending(&buf[..take]) {
+            let take = buf.len().min(MAX_WRITE_PLAINTEXT);
+            if let Err(e) = self.seal_pending(&buf[..take], false) {
                 return Poll::Ready(Err(e));
             }
             self.write_len = take;
@@ -553,11 +698,13 @@ impl VmessWrite {
                 if self.write_pos > 0 {
                     ready!(self.flush_pending(&mut *inner, cx))?;
                 } else if !self.seal.is_empty() {
+                    // The record never reached the wire: give back BOTH the
+                    // counter and the keystream slot it consumed.
                     self.seal.clear();
-                    self.req_counter = self.req_counter.wrapping_sub(1);
+                    self.rollback_sealed();
                 }
                 self.write_len = 0;
-                self.seal_pending(payload)?;
+                self.seal_pending(payload, true)?;
                 sealed = true;
             }
             let flushed = ready!(self.flush_pending(&mut *inner, cx));
@@ -590,6 +737,17 @@ impl<S> VmessClientStream<S> {
         // response-header peel needs the session itself, so it takes it.
         let write = VmessWrite::new(&session);
         let read = VmessRead::new(session);
+        Self { inner, read, write }
+    }
+
+    /// Legacy (`alterId > 0`) framing: plain size field, four-byte response
+    /// peel. `inner` is expected to be the CFB-decrypted wrapper
+    /// ([`crate::protocol::vmess::legacy::CfbReader`]) — the response stream
+    /// is encrypted as a whole on that wire.
+    #[must_use]
+    pub fn new_legacy(inner: S, session: Session) -> Self {
+        let write = VmessWrite::with_mode(&session, false);
+        let read = VmessRead::new_legacy(session);
         Self { inner, read, write }
     }
 
@@ -771,24 +929,43 @@ mod tests {
     /// Server-side response record (mirrors Go `EncodeResponseBody` chunk):
     /// 2B BE ciphertext length (plaintext + GCM tag) + AES-128-GCM data,
     /// counter nonce from the response IV.
-    fn seal_record(key: &[u8; 16], iv: &[u8; 16], counter: u16, data: &[u8]) -> Vec<u8> {
+    fn seal_record(
+        key: &[u8; 16],
+        iv: &[u8; 16],
+        counter: u16,
+        data: &[u8],
+        size: &mut ShakeSizeParser,
+    ) -> Vec<u8> {
         let mut nonce = *iv;
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
         let ct = Aes128Gcm::new_from_slice(key)
             .unwrap()
             .encrypt((&nonce[..12]).try_into().unwrap(), data)
             .unwrap();
-        u16::try_from(data.len() + 16)
-            .unwrap()
-            .to_be_bytes()
-            .into_iter()
-            .chain(ct)
-            .collect()
+        seal_framed(&ct, size)
+    }
+
+    /// Frame one sealed record the way Go `AuthenticationWriter.seal` does:
+    /// draw the padding length, then the size mask, then emit
+    /// `masked(size) | ciphertext | padding`.
+    fn seal_framed(ct: &[u8], size: &mut ShakeSizeParser) -> Vec<u8> {
+        let padding = size.next_padding();
+        let field = size.encode(u16::try_from(ct.len() + padding).unwrap());
+        let mut out = field.to_vec();
+        out.extend_from_slice(ct);
+        out.resize(out.len() + padding, 0xAB);
+        out
     }
 
     /// Server-side chacha20-poly1305 response record (Go `EncodeResponseBody`
     /// with security 4): 2B BE ciphertext length + chacha20poly1305 data.
-    fn seal_record_chacha(key16: &[u8; 16], iv: &[u8; 16], counter: u16, data: &[u8]) -> Vec<u8> {
+    fn seal_record_chacha(
+        key16: &[u8; 16],
+        iv: &[u8; 16],
+        counter: u16,
+        data: &[u8],
+        size: &mut ShakeSizeParser,
+    ) -> Vec<u8> {
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
         let mut nonce = *iv;
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
@@ -797,12 +974,7 @@ mod tests {
             .unwrap()
             .encrypt((&nonce[..12]).try_into().unwrap(), data)
             .unwrap();
-        u16::try_from(data.len() + 16)
-            .unwrap()
-            .to_be_bytes()
-            .into_iter()
-            .chain(ct)
-            .collect()
+        seal_framed(&ct, size)
     }
 
     /// Both record ciphers round-trip through `VmessClientStream` and the
@@ -836,12 +1008,14 @@ mod tests {
                 &session.response_body_iv,
                 &[0x99, 0, 0, 0],
             );
+            let mut resp_size = ShakeSizeParser::new(&session.response_body_iv);
             let record = if cipher.is_some() {
                 seal_record_chacha(
                     &session.response_body_key,
                     &session.response_body_iv,
                     0,
                     payload,
+                    &mut resp_size,
                 )
             } else {
                 seal_record(
@@ -849,6 +1023,7 @@ mod tests {
                     &session.response_body_iv,
                     0,
                     payload,
+                    &mut resp_size,
                 )
             };
             wire.extend_from_slice(&record);
@@ -884,11 +1059,13 @@ mod tests {
                 &session.response_body_iv,
                 &[0x99, 0, 0, 0],
             );
+            let mut resp_size = ShakeSizeParser::new(&session.response_body_iv);
             wire.extend_from_slice(&seal_record(
                 &session.response_body_key,
                 &session.response_body_iv,
                 0,
                 b"",
+                &mut resp_size,
             ));
             server_side.write_all(&wire).await.unwrap();
             drop(server_side);
@@ -946,13 +1123,16 @@ mod tests {
         key: &[u8; 16],
         iv: &[u8; 16],
         counter: u16,
+        size: &mut ShakeSizeParser,
     ) -> Vec<u8> {
         use aes_gcm::aead::Aead;
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf).await.unwrap();
-        let field = u16::from_be_bytes(len_buf) as usize;
-        let mut ct = vec![0u8; field];
+        let padding = size.next_padding();
+        let total = usize::from(size.decode(u16::from_be_bytes(len_buf)));
+        let mut ct = vec![0u8; total];
         stream.read_exact(&mut ct).await.unwrap();
+        ct.truncate(total - padding);
         let mut nonce = *iv;
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
         Aes128Gcm::new_from_slice(key)
@@ -983,12 +1163,13 @@ mod tests {
             tunnel.flush().await.unwrap();
 
             // Each write_all produced exactly one record with its own counter.
+            let mut req_size = ShakeSizeParser::new(&req_iv);
             assert_eq!(
-                read_record(&mut server_side, &req_key, &req_iv, 0).await,
+                read_record(&mut server_side, &req_key, &req_iv, 0, &mut req_size).await,
                 b"first"
             );
             assert_eq!(
-                read_record(&mut server_side, &req_key, &req_iv, 1).await,
+                read_record(&mut server_side, &req_key, &req_iv, 1, &mut req_size).await,
                 b"second-payload"
             );
         });
@@ -1015,10 +1196,10 @@ mod tests {
 
             // Drain the wire concurrently so the writer never blocks on the
             // full 1-byte buffer.
-            let reader =
-                tokio::spawn(
-                    async move { read_record(&mut server_side, &req_key, &req_iv, 0).await },
-                );
+            let reader = tokio::spawn(async move {
+                let mut req_size = ShakeSizeParser::new(&req_iv);
+                read_record(&mut server_side, &req_key, &req_iv, 0, &mut req_size).await
+            });
 
             let mut tunnel = VmessClientStream::new(Box::new(client_side), session);
             tunnel
@@ -1059,9 +1240,10 @@ mod tests {
             drop(tunnel);
             let mut got = Vec::new();
             let mut counter = 0u16;
+            let mut req_size = ShakeSizeParser::new(&req_iv);
             while got.len() < payload.len() {
                 got.extend_from_slice(
-                    &read_record(&mut server_side, &req_key, &req_iv, counter).await,
+                    &read_record(&mut server_side, &req_key, &req_iv, counter, &mut req_size).await,
                 );
                 counter = counter.wrapping_add(1);
             }
@@ -1088,7 +1270,14 @@ mod tests {
             let (resp_key, resp_iv) = (session.response_body_key, session.response_body_iv);
 
             let mut wire = seal_response_header(&resp_key, &resp_iv, &[0x99, 0, 0, 0]);
-            wire.extend_from_slice(&seal_record(&resp_key, &resp_iv, 0, b"peeled and decoded"));
+            let mut resp_size = ShakeSizeParser::new(&resp_iv);
+            wire.extend_from_slice(&seal_record(
+                &resp_key,
+                &resp_iv,
+                0,
+                b"peeled and decoded",
+                &mut resp_size,
+            ));
             server_side.write_all(&wire).await.unwrap();
 
             let (mut reader, mut writer) =
@@ -1099,12 +1288,13 @@ mod tests {
             writer.write_datagram(b"datagram").await.unwrap();
             writer.write_all(b"bytes").await.unwrap();
             writer.flush().await.unwrap();
+            let mut req_size = ShakeSizeParser::new(&req_iv);
             assert_eq!(
-                read_record(&mut server_side, &req_key, &req_iv, 0).await,
+                read_record(&mut server_side, &req_key, &req_iv, 0, &mut req_size).await,
                 b"datagram"
             );
             assert_eq!(
-                read_record(&mut server_side, &req_key, &req_iv, 1).await,
+                read_record(&mut server_side, &req_key, &req_iv, 1, &mut req_size).await,
                 b"bytes"
             );
 

@@ -224,9 +224,26 @@ pub fn verify_certificate_verify_signature(
         .map_err(|_| TlsError::Verify("CertificateVerify signature verification failed".into()))
 }
 
+/// The inputs of REALITY's optional ML-DSA-65 extension check
+/// (`thirdparty/Xray-core/transport/internet/reality/reality.go:111-127`).
+pub struct Mldsa65<'a> {
+    /// The 1952-byte public key from the profile (`pqv`).
+    pub public_key: &'a [u8],
+    /// The `ClientHello` handshake message exactly as sent.
+    pub client_hello: &'a [u8],
+    /// The `ServerHello` handshake message exactly as received.
+    pub server_hello: &'a [u8],
+}
+
 /// Full REALITY server authentication: certificate HMAC + Ed25519
 /// `CertificateVerify` over the transcript up to (excluding) the
-/// `CertificateVerify` message.
+/// `CertificateVerify` message, plus the optional ML-DSA-65 extension check.
+///
+/// The ML-DSA-65 check is ADDITIVE on Go's side: a valid signature marks the
+/// server verified and skips the PKI chain entirely, while a failure falls
+/// through to the ordinary chain check (which a REALITY certificate cannot
+/// pass). Modelled here as a hard rejection, which is the same observable
+/// outcome without pretending a REALITY cert is publicly trusted.
 pub fn verify_server(
     cert_der: &[u8],
     cv_message: &[u8],
@@ -234,11 +251,99 @@ pub fn verify_server(
     // `Transcript-Hash(ClientHello .. Certificate)`, already hashed by the
     // key schedule's streaming context (RFC 8446 §4.4.3).
     transcript_hash: &[u8],
+    mldsa: Option<&Mldsa65<'_>>,
 ) -> Result<()> {
     verify_certificate_hmac(cert_der, auth_key)?;
     let public_key = extract_ed25519_public_key(cert_der)?;
+    if let Some(m) = mldsa {
+        verify_mldsa65(cert_der, auth_key, &public_key, m)?;
+    }
     let signature = extract_certificate_verify_signature(cv_message)?;
     verify_certificate_verify_signature(&public_key, &signature, transcript_hash)
+}
+
+/// The ML-DSA-65 extension check: `signature` lives in the certificate's FIRST
+/// extension (by position — Xray guards `len(Extensions) > 0` and never looks
+/// at the OID), over `HMAC-SHA512(auth_key, ed25519_pub ‖ CH ‖ SH)`.
+fn verify_mldsa65(
+    cert_der: &[u8],
+    auth_key: &[u8; 32],
+    ed25519_public: &[u8; 32],
+    m: &Mldsa65<'_>,
+) -> Result<()> {
+    let signature = extract_first_extension_value(cert_der).ok_or_else(|| {
+        TlsError::Verify(
+            "REALITY mldsa65Verify is set but the certificate carries no extension".into(),
+        )
+    })?;
+    let key = hmac::Key::new(hmac::HMAC_SHA512, auth_key);
+    let mut ctx = hmac::Context::with_key(&key);
+    ctx.update(ed25519_public);
+    ctx.update(m.client_hello);
+    ctx.update(m.server_hello);
+    let message = ctx.sign();
+    if crate::crypto::mldsa::verify(m.public_key, message.as_ref(), signature) {
+        Ok(())
+    } else {
+        Err(TlsError::Verify(
+            "REALITY ML-DSA-65 extension signature does not verify".into(),
+        ))
+    }
+}
+
+/// The value of a certificate's FIRST extension, in DER order.
+///
+/// `TBSCertificate ::= SEQUENCE { [0] version?, serial, signature, issuer,
+/// validity, subject, spki, [3] extensions? }` — the extensions block is the
+/// context-tagged `[3]` child, and each `Extension ::= SEQUENCE { oid,
+/// critical?, OCTET STRING }`. Xray reads `Extensions[0].Value`, i.e. the
+/// first entry by position, so this returns the same bytes it would.
+fn extract_first_extension_value(cert_der: &[u8]) -> Option<&[u8]> {
+    let mut pos = 0;
+    let (tag, cert) = read_tlv(cert_der, &mut pos).ok()?;
+    if tag != 0x30 {
+        return None;
+    }
+    let mut inner = 0;
+    let (tag, tbs) = read_tlv(cert, &mut inner).ok()?;
+    if tag != 0x30 {
+        return None;
+    }
+    let mut p = 0;
+    // Walk TBS children until the [3] (0xA3) extensions block.
+    while p < tbs.len() {
+        let (tag, value) = read_tlv(tbs, &mut p).ok()?;
+        if tag != 0xa3 {
+            continue;
+        }
+        // [3] wraps a SEQUENCE OF Extension.
+        let mut q = 0;
+        let (seq_tag, seq) = read_tlv(value, &mut q).ok()?;
+        if seq_tag != 0x30 {
+            return None;
+        }
+        let mut r = 0;
+        let (ext_tag, ext) = read_tlv(seq, &mut r).ok()?;
+        if ext_tag != 0x30 {
+            return None;
+        }
+        let mut s = 0;
+        let (_oid_tag, _oid) = read_tlv(ext, &mut s).ok()?;
+        // Optional `critical BOOLEAN` before the value.
+        let (tag, value) = read_tlv(ext, &mut s).ok()?;
+        if tag == 0x01 {
+            let (tag, value) = read_tlv(ext, &mut s).ok()?;
+            if tag != 0x04 {
+                return None;
+            }
+            return Some(value);
+        }
+        if tag != 0x04 {
+            return None;
+        }
+        return Some(value);
+    }
+    None
 }
 
 // ── DER helpers ────────────────────────────────────────────────────────────
@@ -417,6 +522,124 @@ mod tests {
     }
 
     /// A real (unmodified) certificate signature fails the HMAC check.
+    /// Minimal DER: `SEQUENCE { TBS, sigalg, BITSTRING sig }` with one
+    /// extension inside TBS's `[3]`, so `extract_first_extension_value` reads
+    /// the same bytes Xray's `Extensions[0].Value` would.
+    fn der(tag: u8, value: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = value.len();
+        if len < 0x80 {
+            out.push(u8::try_from(len).unwrap());
+        } else if len <= 0xff {
+            out.push(0x81);
+            out.push(u8::try_from(len).unwrap());
+        } else {
+            out.push(0x82);
+            out.push(u8::try_from(len >> 8).unwrap());
+            out.push(u8::try_from(len & 0xff).unwrap());
+        }
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn synthetic_cert(extension_value: &[u8]) -> Vec<u8> {
+        let ed_pub = [0x11u8; 32];
+        let mut spki_body = vec![0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70];
+        let mut bit = vec![0x00];
+        bit.extend_from_slice(&ed_pub);
+        spki_body.extend_from_slice(&der(0x03, &bit));
+        let spki = der(0x30, &spki_body);
+
+        // Extension ::= SEQUENCE { OID, OCTET STRING value }
+        let oid = [0x06, 0x03, 0x2b, 0x65, 0x70];
+        let mut ext_body = oid.to_vec();
+        ext_body.extend_from_slice(&der(0x04, extension_value));
+        let ext = der(0x30, &ext_body);
+        let exts = der(0xa3, &der(0x30, &ext));
+
+        let mut tbs_body = Vec::new();
+        tbs_body.extend_from_slice(&der(0x02, &[0x01]));
+        tbs_body.extend_from_slice(&spki);
+        tbs_body.extend_from_slice(&exts);
+        let tbs = der(0x30, &tbs_body);
+
+        let mut outer = tbs;
+        outer.extend_from_slice(&der(0x30, &[]));
+        outer.extend_from_slice(&der(0x03, &[0x00]));
+        der(0x30, &outer)
+    }
+
+    /// The ML-DSA-65 extension check reads extension **index 0** by position
+    /// (Xray `certs[0].Extensions[0].Value`) and binds the transcript
+    /// `HMAC(auth_key, ed25519_pub || ClientHello.Raw || ServerHello.Raw)`.
+    ///
+    /// The signature is Go 1.27 `crypto/mldsa` over exactly that message with
+    /// `auth_key = 32 x 0x77`, `ed_pub = 32 x 0x11`, `CH = "client-hello-raw"`,
+    /// `SH = "server-hello-raw"` — a Rust-only signer would only prove we call
+    /// ourselves.
+    #[test]
+    fn mldsa65_extension_binds_the_hello_transcript() {
+        use crate::crypto::mldsa;
+        let auth_key = [0x77u8; 32];
+        let ed_pub = [0x11u8; 32];
+        let ch = b"client-hello-raw";
+        let sh = b"server-hello-raw";
+
+        let pk = unhex(include_str!("../../tests/fixtures/mldsa65_pub.hex"));
+        let sig = unhex(include_str!("../../tests/fixtures/mldsa65_reality_sig.hex"));
+        assert_eq!(sig.len(), mldsa::MLDSA65_SIGNATURE_LEN);
+
+        let good = synthetic_cert(&sig);
+        let m = Mldsa65 {
+            public_key: &pk,
+            client_hello: ch,
+            server_hello: sh,
+        };
+        verify_mldsa65(&good, &auth_key, &ed_pub, &m).expect("Go-signed transcript must verify");
+
+        // One byte of the transcript is enough to reject.
+        let m_bad = Mldsa65 {
+            public_key: &pk,
+            client_hello: ch,
+            server_hello: b"server-hello-raW",
+        };
+        assert!(verify_mldsa65(&good, &auth_key, &ed_pub, &m_bad).is_err());
+
+        // A certificate WITHOUT the extension is a hard rejection when the
+        // key is configured (Xray guards `len(Extensions) > 0`).
+        let bare = synthetic_cert_without_extension();
+        assert!(verify_mldsa65(&bare, &auth_key, &ed_pub, &m).is_err());
+
+        // Wrong key: same bytes, different trust anchor.
+        let other = [0x22u8; 32];
+        assert!(verify_mldsa65(&good, &auth_key, &other, &m).is_err());
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let s = s.trim();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    fn synthetic_cert_without_extension() -> Vec<u8> {
+        let ed_pub = [0x11u8; 32];
+        let mut spki_body = vec![0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70];
+        let mut bit = vec![0x00];
+        bit.extend_from_slice(&ed_pub);
+        spki_body.extend_from_slice(&der(0x03, &bit));
+        let spki = der(0x30, &spki_body);
+        let mut tbs_body = Vec::new();
+        tbs_body.extend_from_slice(&der(0x02, &[0x01]));
+        tbs_body.extend_from_slice(&spki);
+        let tbs = der(0x30, &tbs_body);
+        let mut outer = tbs;
+        outer.extend_from_slice(&der(0x30, &[]));
+        outer.extend_from_slice(&der(0x03, &[0x00]));
+        der(0x30, &outer)
+    }
+
     #[test]
     fn verify_certificate_hmac_invalid_signature() {
         let (cert_der, _) = ed25519_cert();
@@ -543,9 +766,9 @@ mod tests {
         let mut cv = vec![0x0f, 0x00, 0x00, 0x44, 0x08, 0x07, 0x00, 0x40];
         cv.extend_from_slice(signature.as_ref());
 
-        verify_server(&cert_der, &cv, &auth_key, &th).unwrap();
+        verify_server(&cert_der, &cv, &auth_key, &th, None).unwrap();
 
         // A wrong auth_key fails the whole chain.
-        assert!(verify_server(&cert_der, &cv, &[0x43; 32], &th).is_err());
+        assert!(verify_server(&cert_der, &cv, &[0x43; 32], &th, None).is_err());
     }
 }

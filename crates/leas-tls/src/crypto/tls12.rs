@@ -33,6 +33,45 @@ pub enum Tls12Suite {
     EcdheEcdsaChacha20Poly1305Sha256,
 }
 
+/// The TLS 1.2 cipher suites the generated roster ADVERTISES but this engine
+/// refuses by policy.
+///
+/// Xray's own client hello carries them (they are real Chrome/Safari offers),
+/// so a legacy server may legitimately select one; serving it would mean
+/// hand-rolling HMAC-then-encrypt, which `docs/reference/crypto-dependencies.md`
+/// §3 forbids in as many words ("CBC suites are refused, not hand-rolled").
+/// The refusal is therefore a NAMED limit: the error identifies the suite, and
+/// reopening it needs an ADR that amends that row with a cause, an independent
+/// oracle and a retirement trigger.
+///
+/// `0xc013`/`0xc014` = ECDHE RSA AES-128/256-CBC-SHA; `0xc009`/`0xc00a` =
+/// ECDHE ECDSA variants; `0x009c`/`0x009d`/`0x002f`/`0x0035` = static RSA;
+/// `0x000a`/`0x0005` = TLS 1.0-era RSA CBC; `0x0004`/`0x0003` = RC4.
+pub const REFUSED_TLS12_SUITES: &[u16] = &[
+    0xc013, 0xc014, 0xc009, 0xc00a, 0x009c, 0x009d, 0x002f, 0x0035, 0x000a, 0x0005, 0x0004, 0x0003,
+];
+
+/// Human-readable name for a refused suite, so the refusal names it rather
+/// than dumping a hex id at the user.
+#[must_use]
+pub const fn refused_suite_name(id: u16) -> &'static str {
+    match id {
+        0xc013 => "ECDHE-RSA-AES128-SHA (CBC)",
+        0xc014 => "ECDHE-RSA-AES256-SHA (CBC)",
+        0xc009 => "ECDHE-ECDSA-AES128-SHA (CBC)",
+        0xc00a => "ECDHE-ECDSA-AES256-SHA (CBC)",
+        0x009c => "RSA-AES128-GCM-SHA256 (static RSA)",
+        0x009d => "RSA-AES256-GCM-SHA384 (static RSA)",
+        0x002f => "RSA-AES128-SHA (static RSA, CBC)",
+        0x0035 => "RSA-AES256-SHA (static RSA, CBC)",
+        0x000a => "RSA-AES256-SHA (TLS 1.0, CBC)",
+        0x0005 => "RSA-AES128-SHA (TLS 1.0, CBC)",
+        0x0004 => "RSA-RC4-128-SHA (RC4)",
+        0x0003 => "RSA-RC4-128-MD5 (RC4)",
+        _ => "refused suite",
+    }
+}
+
 impl Tls12Suite {
     /// Maps a wire cipher-suite value to a variant.
     #[must_use]

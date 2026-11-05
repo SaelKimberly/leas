@@ -418,6 +418,34 @@ impl SecurityConfig {
             None
         }
     }
+    /// The `ech` TLS knob (an `ECHConfigList`), when the profile carries one.
+    #[must_use]
+    pub fn ech(&self) -> Option<&str> {
+        if let Some(TlsConfig::Tls(TlsOpts {
+            ech: Some(ref ech), ..
+        })) = self.tls
+        {
+            Some(ech.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// REALITY's ML-DSA-65 verification key (base64, Xray
+    /// `mldsa65Verify` / share-link `pqv`).
+    #[must_use]
+    pub const fn mldsa65_verify(&self) -> Option<&str> {
+        if let Some(TlsConfig::Reality(RealityOpts {
+            mldsa65_verify: Some(ref key),
+            ..
+        })) = self.tls
+        {
+            Some(key.as_str())
+        } else {
+            None
+        }
+    }
+
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.tls.is_none() && self.enc.is_none()
@@ -464,7 +492,6 @@ pub struct TlsOpts {
     pub curves: Option<TinyText>,
     pub fp: Option<TinyText>,
     pub insecure: Option<bool>,
-    pub pqv: Option<TinyText>,
     pub ech: Option<TinyText>,
     pub vcn: Option<bool>,
     pub pcs: Option<TinyText>,
@@ -527,6 +554,15 @@ pub struct RealityOpts {
     pub pbk: Option<String>,
     pub sid: Option<TinyText>,
     pub spx: Option<TinyText>,
+    /// REALITY's ML-DSA-65 verification key, base64 of the 1952-byte public
+    /// key (Xray `realitySettings.mldsa65Verify`, share-link key `pqv`).
+    ///
+    /// A REALITY-only knob: it lives here, not on [`TlsOpts`], because the
+    /// clients that carry it (v2rayN, v2rayNG, xrat) attach it to the REALITY
+    /// block, and Xray's own config nests it there. `pqv` stays a serde alias
+    /// so a JSON export from those clients round-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "pqv")]
+    pub mldsa65_verify: Option<String>,
 }
 
 /// Convert Clash TLS fields to a `SecurityConfig`.
@@ -867,7 +903,6 @@ pub(crate) fn write_security(w: &mut IdentityWriter, security: &SecurityConfig) 
             w.nonempty_str(SEC_FP, opts.fp.as_deref());
             w.opt_flag(SEC_INSECURE, opts.insecure);
             w.nonempty_str(SEC_CURVES, opts.curves.as_deref());
-            w.nonempty_str(SEC_PQV, opts.pqv.as_deref());
             w.nonempty_str(SEC_ECH, opts.ech.as_deref());
             w.opt_flag(SEC_VCN, opts.vcn);
             w.nonempty_str(SEC_PCS, opts.pcs.as_deref());
@@ -880,6 +915,7 @@ pub(crate) fn write_security(w: &mut IdentityWriter, security: &SecurityConfig) 
             w.nonempty_str(SEC_PBK, opts.pbk.as_deref());
             w.nonempty_str(SEC_SID, opts.sid.as_deref());
             w.nonempty_str(SEC_SPX, opts.spx.as_deref());
+            w.nonempty_str(SEC_PQV, opts.mldsa65_verify.as_deref());
         }
         None => {}
     }
@@ -903,7 +939,6 @@ pub(crate) fn tls_block_is_inert(security: &SecurityConfig) -> bool {
                 && o.curves.is_none()
                 && o.fp.is_none()
                 && o.insecure != Some(true)
-                && o.pqv.is_none()
                 && o.ech.is_none()
                 && o.vcn != Some(true)
                 && o.pcs.is_none()

@@ -53,6 +53,14 @@ hkdf = "0.13.0"
 # 2022-blake3 session subkey: blake3::derive_key("shadowsocks 2022 session subkey",
 # psk || salt). Promoted from dev-dependency (b3.rs cross-validation uses it too).
 blake3 = { version = "1.8.7", features = ["zeroize"] }
+# VMess chunk masking / global padding: SHAKE128 keystream (Xray
+# `ShakeSizeParser`). `shake` is the XOF half of RustCrypto's hash family and
+# is already compiled for this crate via ml-kem; `sha3` 0.12 no longer carries
+# the XOF types, so this is the crate to depend on directly.
+shake = "0.1.0"
+# Outbound socket options on the SAFE surface only (`#![forbid(unsafe_code)]`
+# forbids raw setsockopt); SO_MARK/SO_BINDTODEVICE/TCP_CONGESTION need an ADR.
+socket2 = { version = "0.6", default-features = false, features = ["all"] }
 wide = "1.7.1"
 inout = "0.2.5"
 

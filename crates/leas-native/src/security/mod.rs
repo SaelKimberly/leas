@@ -136,6 +136,10 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                     provisioner,
                     public_key: reality::decode_pbk(pbk)?,
                     short_id: reality::decode_sid(sec.sid().unwrap_or_default())?,
+                    mldsa65_verify: sec
+                        .mldsa65_verify()
+                        .map(reality::decode_mldsa65_verify)
+                        .transpose()?,
                     spider,
                 },
                 // The REALITY steal target: `ctx.server_name()` walks

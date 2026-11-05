@@ -184,7 +184,11 @@ pub(crate) enum ServerAuth<'a> {
     Verifier(&'a dyn ServerVerifier),
     /// REALITY mode: authenticate with the REALITY auth key (HMAC +
     /// Ed25519 `CertificateVerify` over the transcript).
-    Reality { auth_key: &'a [u8; 32] },
+    Reality {
+        auth_key: &'a [u8; 32],
+        /// REALITY's ML-DSA-65 key, when the profile carries `pqv`.
+        mldsa65: Option<&'a [u8]>,
+    },
 }
 
 /// The result of the auth dispatch inside [`drive`].
@@ -369,7 +373,17 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let server_hello = loop {
         stream.write_all(&to_record(&current_hello)).await?;
         match read_server_hello(&mut stream, &current_sid).await? {
-            ServerReply::Hello(sh) => break *sh,
+            ServerReply::Hello(sh) => {
+                // RFC 8446 §4.1.3 / RFC 5246 §7.4.1.2: the server MUST select
+                // a suite the client offered. Parse the hello we actually
+                // sent (GREASE values included as drawn), not the spec.
+                let offered = crate::hello::parse::parse_hello(&current_hello)?.cipher_suites;
+                let selected = sh
+                    .suite12
+                    .map_or_else(|| sh.suite.to_u16(), Tls12Suite::to_u16);
+                ensure_offered_suite(&offered, selected)?;
+                break *sh;
+            }
             ServerReply::Retry(hrr) => {
                 let Some(retry) = retry else {
                     return Err(TlsError::HelloRetryRequest);
@@ -517,17 +531,27 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
             })?;
             AuthOutcome::Ok
         }
-        ServerAuth::Reality { auth_key } => {
+        ServerAuth::Reality { auth_key, mldsa65 } => {
             let Some(cert_der) = flight.chain.first() else {
                 return Err(TlsError::Verify(
                     "REALITY server sent no certificate".into(),
                 ));
             };
+            // Go `reality.go:111-127`: the ML-DSA-65 signature covers
+            // HMAC-SHA512(auth_key, ed25519_pub ‖ ClientHello.Raw ‖
+            // ServerHello.Raw). The raws are the ones we sent and received —
+            // never a re-serialisation.
+            let mldsa = mldsa65.map(|public_key| crate::reality::verify::Mldsa65 {
+                public_key,
+                client_hello: &current_hello,
+                server_hello: &server_hello.raw,
+            });
             match crate::reality::verify::verify_server(
                 cert_der,
                 &flight.cv_raw,
                 auth_key,
                 &transcript_hash[..transcript_hash_len],
+                mldsa.as_ref(),
             ) {
                 Ok(()) => AuthOutcome::Ok,
                 // Any REALITY auth failure = a real certificate (transparent
@@ -716,6 +740,19 @@ const fn keyshare_group_for(wire: u16) -> Option<KeyShareGroup> {
 
 /// Whether `spec` listed `wire` in `supported_groups` (an absent extension
 /// imposes no constraint — the hello offered nothing).
+/// RFC 8446 §4.1.3 / RFC 5246 §7.4.1.2: a server may only select a suite the
+/// client offered. The list comes from the hello we actually sent, so a GREASE
+/// slot can never be "matched" by a server (the drawn value is never a real
+/// suite id).
+fn ensure_offered_suite(offered: &[u16], selected: u16) -> Result<()> {
+    if offered.contains(&selected) {
+        return Ok(());
+    }
+    Err(TlsError::Handshake(format!(
+        "ServerHello selected cipher suite 0x{selected:04X}, which this client did not offer"
+    )))
+}
+
 fn offered_group(spec: &ClientHelloSpec, wire: u16) -> bool {
     spec.extensions
         .iter()
@@ -1101,9 +1138,21 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
     // relaxed (TLS 1.2 servers may echo a different id or send none,
     // RFC 5246 §7.4.1.2).
     let suite12 = Tls12Suite::from_u16(suite_wire).ok_or_else(|| {
-        TlsError::Handshake(format!(
-            "TLS 1.2 server selected cipher suite 0x{suite_wire:04X}: only AEAD suites (ECDHE + AES-GCM/ChaCha20-Poly1305) are supported, CBC suites are not"
-        ))
+        // Named limit, not a generic miss: the roster advertises these (they
+        // are real browser offers) but the engine refuses them by policy —
+        // docs/reference/crypto-dependencies.md §3 forbids hand-rolling
+        // HMAC-then-encrypt. Saying WHICH suite lets a user pick a profile
+        // that does not offer it, or file the ADR that would serve it.
+        if crate::crypto::tls12::REFUSED_TLS12_SUITES.contains(&suite_wire) {
+            TlsError::Handshake(format!(
+                "TLS 1.2 server selected cipher suite 0x{suite_wire:04X} ({}), which this profile advertises but the engine refuses by policy (crypto-dependencies.md §3: CBC/static-RSA are not hand-rolled). Use a profile whose hello omits it.",
+                crate::crypto::tls12::refused_suite_name(suite_wire)
+            ))
+        } else {
+            TlsError::Handshake(format!(
+                "TLS 1.2 server selected unsupported cipher suite 0x{suite_wire:04X}"
+            ))
+        }
     })?;
     Ok(ParsedReply::Hello(Box::new(ParsedServerHello {
         version: TlsVersion::Tls12,
@@ -1159,9 +1208,10 @@ mod tests {
         AEAD_TAG_LEN, AcceptAll, CONTENT_APPLICATION_DATA, HRR_RANDOM, HS_CERTIFICATE,
         HS_CERTIFICATE_VERIFY, HS_COMPRESSED_CERTIFICATE, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED,
         HS_MESSAGE_HASH, HS_SERVER_HELLO, HandshakeParams, ParsedReply, ParsedServerHello,
-        TlsVersion, connect, decompress_bounded, decompress_certificate_message,
-        ensure_offered_sigalg, make_hs_msg, parse_certificate_message, parse_certificate_verify,
-        parse_encrypted_extensions, parse_server_hello, read_server_hs_messages,
+        Tls12Suite, TlsVersion, connect, decompress_bounded, decompress_certificate_message,
+        ensure_offered_sigalg, ensure_offered_suite, make_hs_msg, parse_certificate_message,
+        parse_certificate_verify, parse_encrypted_extensions, parse_server_hello,
+        read_server_hs_messages,
     };
     use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
@@ -1525,6 +1575,43 @@ mod tests {
     /// A real HRR carries `selected_group` as a 2-byte `key_share` — the
     /// `ServerHello` key-share parser used to reject it as "too short", so the
     /// typed retry signal never fired.
+    #[test]
+    fn a_server_suite_the_client_did_not_offer_is_refused() {
+        // The hello offered 1.3 suites only; a server that answers with a
+        // 1.2 AEAD suite it never saw is a protocol violation.
+        let offered = [0x1301u16, 0x1302, 0x1303];
+        assert!(ensure_offered_suite(&offered, 0x1301).is_ok());
+        let err = ensure_offered_suite(&offered, 0xc02f).expect_err("must refuse");
+        match err {
+            TlsError::Handshake(m) => {
+                assert!(m.contains("0xC02F"), "{m}");
+                assert!(m.contains("did not offer"), "{m}");
+            }
+            other => panic!("expected Handshake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refused_tls12_suites_are_named_not_generic() {
+        // The policy table is the single source of truth for "advertised but
+        // refused"; it must stay in sync with the generator's cipher lists.
+        for id in crate::crypto::tls12::REFUSED_TLS12_SUITES {
+            assert!(
+                Tls12Suite::from_u16(*id).is_none(),
+                "0x{id:04X} is in the refused list but the engine maps it"
+            );
+            assert_ne!(
+                crate::crypto::tls12::refused_suite_name(*id),
+                "refused suite",
+                "0x{id:04X} has no name"
+            );
+        }
+        assert_eq!(
+            crate::crypto::tls12::refused_suite_name(0xc013),
+            "ECDHE-RSA-AES128-SHA (CBC)"
+        );
+    }
+
     #[test]
     fn parse_server_hello_recognises_a_hint_bearing_hrr() {
         let msg = hrr_message(&[0x11; 32], Some(0x11EC), Some(b"c00k13"));

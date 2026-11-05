@@ -60,6 +60,24 @@ pub(crate) fn decode_pbk(s: &str) -> Result<[u8; 32], NativeError> {
     Ok(pbk)
 }
 
+/// Decode a REALITY `mldsa65Verify` key (base64, any alphabet) to its 1952
+/// bytes. A wrong length is a CONFIG defect — the server was never reached.
+pub(crate) fn decode_mldsa65_verify(s: &str) -> Result<Vec<u8>, NativeError> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let bytes = [URL_SAFE_NO_PAD, URL_SAFE, STANDARD_NO_PAD, STANDARD]
+        .iter()
+        .find_map(|e| e.decode(s).ok())
+        .ok_or_else(|| NativeError::Config("invalid mldsa65Verify base64".into()))?;
+    if bytes.len() != leas_tls::crypto::mldsa::MLDSA65_PUBLIC_KEY_LEN {
+        return Err(NativeError::Config(format!(
+            "mldsa65Verify must decode to {} bytes, got {}",
+            leas_tls::crypto::mldsa::MLDSA65_PUBLIC_KEY_LEN,
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Decode a REALITY short id (hex, ≤8 bytes) to its bytes.
 ///
 /// Same rule as [`decode_pbk`]: a malformed short id is a config defect, not a
@@ -104,6 +122,16 @@ mod tests {
                 "{err:?} must not be read as a peer verdict"
             );
         }
+    }
+
+    #[test]
+    fn decode_mldsa65_verify_accepts_1952_bytes_and_refuses_others() {
+        let key = vec![0x5Au8; leas_tls::crypto::mldsa::MLDSA65_PUBLIC_KEY_LEN];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&key);
+        assert_eq!(decode_mldsa65_verify(&b64).unwrap(), key);
+        let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
+        assert!(decode_mldsa65_verify(&short).is_err(), "wrong length");
+        assert!(decode_mldsa65_verify("!!!").is_err(), "not base64");
     }
 
     #[test]

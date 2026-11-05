@@ -67,6 +67,7 @@ pub(crate) mod rand;
 pub mod security;
 pub mod server;
 pub mod shape;
+pub mod sockopt;
 pub mod telemetry;
 pub mod transport;
 

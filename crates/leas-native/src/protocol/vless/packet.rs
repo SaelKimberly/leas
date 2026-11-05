@@ -146,14 +146,6 @@ impl ReadState {
         if !self.peel.is_peeled() {
             self.peel.ensure_peeled(r).await?;
         }
-        // A non-vless first byte (REALITY transparent-proxy fallback) has
-        // no valid UDP framing; error rather than drop or mis-deliver it.
-        if self.peel.take_passthrough().is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "vless udp: non-vless response byte (REALITY fallback not supported for UDP)",
-            ));
-        }
         let Some(frame) = self.frames.read_frame(r).await? else {
             return Ok(None);
         };

@@ -335,6 +335,9 @@ pub struct RealityParams<'a> {
     pub short_id: &'a [u8],
     /// The `ClientHello` fingerprint provisioner.
     pub provisioner: &'a dyn HelloProvisioner,
+    /// REALITY's ML-DSA-65 verification key (Xray `mldsa65Verify`), decoded:
+    /// 1952 bytes. `None` keeps the HMAC+Ed25519 rule alone.
+    pub mldsa65_verify: Option<&'a [u8]>,
     /// Random source — the crate's [`SecureRandom`] seam. ring's
     /// `SystemRandom` coerces via the blanket impl; tests implement the
     /// trait directly for fixed-seed vectors.
@@ -429,6 +432,7 @@ async fn connect_reality_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         params.server_name,
         ServerAuth::Reality {
             auth_key: &auth_key,
+            mldsa65: params.mldsa65_verify,
         },
         // HRR under REALITY is a documented non-goal: the sealed session id is
         // bound to the FIRST hello, so a retry would need a re-seal this
@@ -819,6 +823,7 @@ mod tests {
                 public_key: &[0xAB; 32],
                 short_id: &[],
                 provisioner: &FixedChrome130Hybrid,
+                mldsa65_verify: None,
                 rng: &rng,
                 spider: &SpiderConfig::default(),
             },
@@ -1100,6 +1105,7 @@ mod tests {
                     public_key: &static_pub,
                     short_id: &[],
                     provisioner: &FixedChrome130Hybrid,
+                    mldsa65_verify: None,
                     rng: &rng,
                     spider: &SpiderConfig::default(),
                 },

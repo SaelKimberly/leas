@@ -305,6 +305,9 @@ impl VlessConfig {
                     pbk: utils::query_get(&query, "pbk").map(str::to_string),
                     sid: utils::query_get(&query, "sid").map(TinyText::from),
                     spx: utils::query_get(&query, "spx").map(TinyText::from),
+                    // `pqv` is the share-link spelling of Xray's
+                    // `mldsa65Verify` (v2rayN BaseFmt.cs, v2rayNG FmtBase.kt).
+                    mldsa65_verify: utils::query_get(&query, "pqv").map(str::to_string),
                 })),
                 enc: None,
             },
@@ -510,6 +513,9 @@ impl VlessConfig {
                         }
                         if let Some(ref v) = opts.spx {
                             q.append_pair("spx", v);
+                        }
+                        if let Some(ref v) = opts.mldsa65_verify {
+                            q.append_pair("pqv", v);
                         }
                     }
                 }

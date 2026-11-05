@@ -46,7 +46,7 @@ futures-util = { version = "0.3", default-features = false, features = ["async-a
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hashbrown = { version = "0.17" }
 http-body-util = { version = "0.1", features = ["channel"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["ctutils", "extra-sizes", "zeroize"] }
+hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
 icu_locale_core = { version = "2", default-features = false, features = ["alloc", "zerovec"] }
@@ -81,6 +81,7 @@ serde = { version = "1", features = ["alloc", "derive"] }
 serde_core = { version = "1", features = ["alloc"] }
 sha1 = { version = "0.11", features = ["zeroize"] }
 sha2 = { version = "0.11", features = ["zeroize"] }
+shake = { version = "0.1" }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 siphasher = { version = "1" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
@@ -168,7 +169,7 @@ chacha20 = { version = "0.10", default-features = false, features = ["rng", "xch
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["ctutils", "extra-sizes", "zeroize"] }
+hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["io_uring", "pipe", "process", "stdio", "system", "termios", "time"] }
@@ -194,7 +195,7 @@ chacha20 = { version = "0.10", default-features = false, features = ["rng", "xch
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["ctutils", "extra-sizes", "zeroize"] }
+hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 zeroize = { version = "1", features = ["derive"] }
@@ -218,7 +219,7 @@ chacha20 = { version = "0.10", default-features = false, features = ["rng", "xch
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["ctutils", "extra-sizes", "zeroize"] }
+hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 zeroize = { version = "1", features = ["derive"] }
@@ -299,6 +300,7 @@ ignored = [
     "serde_core",
     "sha1",
     "sha2",
+    "shake",
     "simd-adler32",
     "siphasher",
     "slab",

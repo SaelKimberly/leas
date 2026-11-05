@@ -45,7 +45,11 @@ use crate::protocol::vmess::stream::{
 /// per buffer (`proxy/freedom/freedom.go:586-593`) — the datagram boundary is
 /// silently lost. Same 8192 rationale as the trojan sibling's
 /// `MAX_UDP_PAYLOAD`.
-const MAX_SEND_PAYLOAD: usize = 8192 - 2 - 16;
+// Go `AuthenticationWriter.seal` bounds `sizeBytes + encryptedSize +
+// paddingSize` to `buf.Size` (8192). With global padding on (we always set
+// it) the padding reserve is Xray's `MaxPaddingLen` (64), so a datagram can
+// fill at most 8192 - 2 - 16 - 64 bytes.
+const MAX_SEND_PAYLOAD: usize = 8192 - 2 - 16 - 64;
 
 /// Receive-direction state: the staging buffer one record's plaintext lands
 /// in, grown once to the record ceiling and reused — the caller gets a
@@ -283,7 +287,14 @@ mod tests {
     /// A session plus a field-identical copy (`Session` is not `Clone`): one
     /// for the stream under test, one for the fake server to seal with.
     fn twin_session() -> (Session, Session) {
+        // Fixed session material: with mask+padding the record LENGTH now
+        // depends on the (random) IV's keystream, so two independent runs are
+        // only comparable when they share a session.
         let mut session = Session::new();
+        session.request_body_iv = [0x11; 16];
+        session.request_body_key = [0x22; 16];
+        session.response_body_key = [0x44; 16];
+        session.response_body_iv = [0x55; 16];
         session.security = SECURITY_AES128_GCM;
         session.response_header = 0x33;
         let mut twin = Session::new();
@@ -327,8 +338,27 @@ mod tests {
         wire
     }
 
-    /// Server-side record seal: `[2B BE ciphertext len][AES-128-GCM]` with
-    /// the counter nonce.
+    /// The mask/padding stream after `records` records have been drawn —
+    /// one padding length plus one size mask per record, in that order.
+    fn parser_at(iv: &[u8; 16], records: u16) -> crate::protocol::vmess::pad::ShakeSizeParser {
+        let mut p = crate::protocol::vmess::pad::ShakeSizeParser::new(iv);
+        for _ in 0..records {
+            let _ = p.next_padding();
+            let _ = p.encode(0);
+        }
+        p
+    }
+
+    /// Wire length of one request record carrying `plain` plaintext bytes at
+    /// `counter`: `2 (masked size) + plain + 16 (tag) + padding`.
+    fn record_wire_len(iv: &[u8; 16], counter: u16, plain: usize) -> usize {
+        let mut size = parser_at(iv, counter);
+        let padding = size.next_padding();
+        2 + plain + 16 + padding
+    }
+
+    /// Server-side record seal: `[masked size][AES-128-GCM][padding]` with the
+    /// counter nonce.
     fn seal_record(key: &[u8; 16], iv: &[u8; 16], counter: u16, data: &[u8]) -> Vec<u8> {
         use aes_gcm::aead::{Aead, Payload};
         use aes_gcm::{Aes128Gcm, KeyInit};
@@ -344,9 +374,12 @@ mod tests {
                 },
             )
             .unwrap();
-        let field = u16::try_from(data.len() + 16).unwrap();
-        let mut wire = field.to_be_bytes().to_vec();
+        let mut size = parser_at(iv, counter);
+        let padding = size.next_padding();
+        let field = size.encode(u16::try_from(data.len() + 16 + padding).unwrap());
+        let mut wire = field.to_vec();
         wire.extend_from_slice(&ct);
+        wire.resize(wire.len() + padding, 0xAB);
         wire
     }
 
@@ -356,7 +389,10 @@ mod tests {
     fn open_record(key: &[u8; 16], iv: &[u8; 16], counter: u16, wire: &[u8]) -> (Vec<u8>, usize) {
         use aes_gcm::aead::{Aead, Payload};
         use aes_gcm::{Aes128Gcm, KeyInit};
-        let field = usize::from(u16::from_be_bytes([wire[0], wire[1]]));
+        let mut size = parser_at(iv, counter);
+        let padding = size.next_padding();
+        let field = usize::from(size.decode(u16::from_be_bytes([wire[0], wire[1]])));
+        let ct_len = field - padding;
         let mut nonce = *iv;
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
         let plain = Aes128Gcm::new_from_slice(key)
@@ -364,7 +400,7 @@ mod tests {
             .decrypt(
                 (&nonce[..12]).try_into().unwrap(),
                 Payload {
-                    msg: &wire[2..2 + field],
+                    msg: &wire[2..2 + ct_len],
                     aad: &[],
                 },
             )
@@ -467,10 +503,11 @@ mod tests {
     async fn send_writes_one_record() {
         let (mut conn, mut server, view) = record_stream(4096);
         conn.send(None, b"hi").await.unwrap();
-        // The peer sees ONE `[2B len][AEAD]` record, sealed with the request
-        // keys at counter 0, whose plaintext is the datagram.
-        let mut got = vec![0u8; 64];
-        let n = server.read(&mut got).await.unwrap();
+        // The peer sees ONE `[masked size][AEAD][padding]` record, sealed
+        // with the request keys at counter 0, whose plaintext is the datagram.
+        let mut got = vec![0u8; record_wire_len(&view.request_body_iv, 0, 2)];
+        let n = server.read_exact(&mut got).await.unwrap();
+        let _ = n;
         let (payload, used) = open_record(&view.request_body_key, &view.request_body_iv, 0, &got);
         assert_eq!(payload, b"hi");
         assert_eq!(n, used, "exactly one record per send");
@@ -528,9 +565,11 @@ mod tests {
         // `sizeBytes(2) + encryptedSize(len + 16) + paddingSize(0) <=
         // buf.Size(8192)` (auth.go `seal`) — the largest record xray will
         // seal must go out, one byte more must not.
-        assert_eq!(MAX_SEND_PAYLOAD, 8174);
-        let wire_len = 2 + MAX_SEND_PAYLOAD + 16;
-        let (mut conn, mut server, view) = record_stream(wire_len);
+        assert_eq!(MAX_SEND_PAYLOAD, 8110);
+        // The record carries padding on top of `2 + payload + 16`, and the
+        // padding length comes from the session IV's keystream.
+        let (mut conn, mut server, view) = record_stream(8192);
+        let wire_len = record_wire_len(&view.request_body_iv, 0, MAX_SEND_PAYLOAD);
 
         let err = conn
             .send(None, &vec![0u8; MAX_SEND_PAYLOAD + 1])
@@ -781,7 +820,7 @@ mod tests {
         // unsplit conn cannot serve, since its `recv` future would have to be
         // dropped to reach `send`.
         writer.send(None, b"outbound").await.unwrap();
-        let mut sent = vec![0u8; 2 + b"outbound".len() + 16];
+        let mut sent = vec![0u8; record_wire_len(&view.request_body_iv, 0, b"outbound".len())];
         server.read_exact(&mut sent).await.unwrap();
         let (payload, used) = open_record(&view.request_body_key, &view.request_body_iv, 0, &sent);
         assert_eq!(payload, b"outbound");
