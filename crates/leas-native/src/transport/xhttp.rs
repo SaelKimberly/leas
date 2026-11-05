@@ -2191,11 +2191,8 @@ mod tests {
     /// missing sleep altogether.
     fn assert_chunked_uploads(o: &H3Obs, payload: &[u8]) {
         assert!(o.posts.len() >= 2, "a chunked upload is at least two POSTs");
-        let (s0, b0, r0, _) = &o.posts[0];
-        let (s1, b1, r1, _) = &o.posts[1];
-        assert_eq!(*s0, 0, "seq order");
-        assert_eq!(*s1, 1, "seq order");
-        for (expect, (seq, body, _, _)) in o.posts.iter().enumerate() {
+        assert_eq!(o.posts[0].0, 0, "seq order");
+        for (expect, (seq, body, referer, _)) in o.posts.iter().enumerate() {
             assert_eq!(
                 *seq,
                 u64::try_from(expect).unwrap(),
@@ -2203,17 +2200,16 @@ mod tests {
             );
             assert!(!body.is_empty(), "no empty POST");
             assert!(body.len() < MAX_POST_BYTES, "under the size cap");
+            assert_referer(referer);
         }
-        // The first chunk is a random size below `scMaxEachPostBytes`; what
-        // must hold is the bound, the order, and full coverage.
-        assert!(b0.len() < MAX_POST_BYTES, "first chunk under the cap");
-        assert!(!b0.is_empty(), "first chunk non-empty");
-        let mut joined = Vec::with_capacity(b0.len() + b1.len());
-        joined.extend_from_slice(b0);
-        joined.extend_from_slice(b1);
+        // Each POST draws its own size below `scMaxEachPostBytes`, so the
+        // split count varies: what must hold is the bound, the dense order and
+        // full coverage of the payload.
+        let mut joined = Vec::with_capacity(payload.len());
+        for (_, body, _, _) in &o.posts {
+            joined.extend_from_slice(body);
+        }
         assert_eq!(joined, payload, "no byte loss across the split");
-        assert_referer(r0);
-        assert_referer(r1);
     }
 
     /// Assert the stream-up observations: session-open GET with Referer, one
@@ -2282,7 +2278,18 @@ mod tests {
         // tunnel dropped), then the h3 connection closes. The split COUNT is
         // random now (each POST draws its own size), so the wait is on the
         // close, and `assert_chunked_uploads` checks bounds + coverage.
-        wait_obs(&obs, |o| o.conn_closed && !o.posts.is_empty()).await;
+        // Completion is "the peer has every byte", not "some POST arrived":
+        // the split count and each POST's size are random, so a bare
+        // `conn_closed` can observe a half-read tail body.
+        wait_obs(&obs, |o| {
+            o.conn_closed
+                && o.posts
+                    .iter()
+                    .map(|(_, body, _, _)| body.len())
+                    .sum::<usize>()
+                    >= payload.len()
+        })
+        .await;
         assert_chunked_uploads(&obs.data.lock().expect("obs lock"), &payload);
 
         // The pacing is the client's own guarantee, so it is asserted on the
