@@ -2182,13 +2182,15 @@ mod tests {
         assert_referer(post_referer);
     }
 
-    /// Assert the chunked-upload observations: two packet POSTs, seqs 0 + 1
-    /// in arrival order, each ≤ the 1 MB cap, concatenated == the payload,
-    /// both carrying the Referer. The *pacing* is asserted on the client's own
-    /// POST stamps in the test body: no arrival-based bound can carry it, since
-    /// the client paces POST *starts* (`xhttp.rs:589-594`) while the first send
-    /// may itself outlast the window, and the idle-window flush can mask a
-    /// missing sleep altogether.
+    /// Assert the chunked-upload observations: at least two packet POSTs,
+    /// dense seqs in arrival order (each POST draws its own random size, so
+    /// the split COUNT varies), each non-empty and under the size cap,
+    /// concatenated == the payload, every one carrying the Referer. The
+    /// *pacing* is asserted on the client's own POST stamps in the test body:
+    /// no arrival-based bound can carry it, since the client paces POST
+    /// *starts* (`xhttp.rs:589-594`) while the first send may itself outlast
+    /// the window, and the idle-window flush can mask a missing sleep
+    /// altogether.
     fn assert_chunked_uploads(o: &H3Obs, payload: &[u8]) {
         assert!(o.posts.len() >= 2, "a chunked upload is at least two POSTs");
         assert_eq!(o.posts[0].0, 0, "seq order");
