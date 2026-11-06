@@ -254,13 +254,14 @@ pub fn vmess_inbound(
 /// Names are the ones the PINNED core (26.3.27) accepts: `mkcp-original`,
 /// `mkcp-aes128gcm` and `header-*`. (Xray HEAD renamed the first two to
 /// `mkcp-legacy`; 26.3.27 rejects that name, and 26.3.27 is what the suite
-/// tests against.) The array order is the wire order, reversed twice on the
-/// way in: v2rayN emits `[header, envelope]` and reverses it to
-/// `[envelope, header]`, and `NewFinalMask` reverses again, so the FIRST
-/// element ends up INNERMOST. Emitting `[envelope, header]` therefore yields
-/// `header || envelope(payload)` — the layout `transport::kcp::mask` frames
-/// and the byte vectors in that module pin. `""` means the knob is absent;
-/// with no seed the envelope is the bare `original` entry.
+/// tests against.)
+///
+/// The array order is the wire order, outermost first: 26.3.27's
+/// `NewUdpmaskManager` does NOT reverse (HEAD's `NewFinalMask` does), so
+/// `[envelope, header]` yields `envelope(header || payload)` — exactly what
+/// `transport::kcp::mask` frames and what the oracle vectors in that module
+/// pin. `""` means the knob is absent; with no seed the envelope is the bare
+/// `original` entry.
 #[must_use]
 pub fn apply_kcp_mask(config: &str, header: &str, seed: &str) -> String {
     let mut json: serde_json::Value =

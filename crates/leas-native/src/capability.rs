@@ -114,9 +114,9 @@ pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow
         return Some(Cow::Borrowed(KIND_UNSUPPORTED_REASON));
     }
     // A TLS knob the native engine would silently drop is a refusal, not a
-    // no-op: `ech=` is parsed and stored but real ECH is not implemented yet,
-    // and accepting-and-ignoring a privacy feature is the worst of the three
-    // possible answers.
+    // no-op: `ech=` is implemented (`leas_tls::ech`), so what `security_reason`
+    // still refuses is a VALUE it cannot honour, never the feature itself —
+    // accepting a malformed config would leak the SNI the user asked to hide.
     if let Some(reason) = security_reason(kind, config) {
         return Some(reason);
     }
