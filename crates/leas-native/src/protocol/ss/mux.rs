@@ -92,10 +92,19 @@ impl SsMux {
             .await
             .map_err(|e| NativeError::Transport(format!("v2ray-plugin mux session: {e}")))?;
         let stream: BoxStream = Box::new(session);
-        match self.method.family {
+        match self.method.family() {
             SsFamily::Classic => stream::connect_to(target, stream, &self.cfg, self.method).await,
             SsFamily::Blake3_2022 => {
                 stream2022::connect_to(target, stream, &self.cfg, self.method).await
+            }
+            SsFamily::Stream => {
+                crate::protocol::ss::stream_legacy::connect_to(
+                    target,
+                    stream,
+                    &self.cfg,
+                    self.method,
+                )
+                .await
             }
         }
     }

@@ -288,7 +288,7 @@ ERROR, not a mis-sort.
 | *(PK autoindex)* | `endpoint_rank(endpoint_id)` | rank-row writes/lookups |
 | `endpoint_rank_key_v2` *(raw)* | `endpoint_rank(band, rank_bin, rank_stab, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id, rank_proven)` | the default page order — a covering index, so the page is an index scan. `rank_proven` is TRAILING (placing it between `band` and the order terms filesorts), so every scope filters inline on an index scan with no sorter. **A NEW NAME, never an edit in place**: `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on an existing database. It supersedes `endpoint_rank_key`, which the same DDL list drops |
 | `rank_weight_meta` *(raw)* | `rank_weight_meta(id, weight_version)` | one row: the version of every INPUT to the stored keys — the compiled weight tables AND the stability thresholds (`KEY_INPUTS_VERSION`). A mismatch at open recomputes every key — the ONLY trigger that can replace the `ADD COLUMN` defaults materialized for pre-existing rows |
-| `endpoint_rank_band_window` *(raw)* | `endpoint_rank(band, rank_newest_seen)` | the directional reband sweep (`band=0 AND rank_newest_seen < ?`) |
+| `endpoint_rank_band_window` *(raw)* | `endpoint_rank(band, rank_newest_seen)` | the directional reband sweep (`band<2 AND rank_newest_seen < ?`) |
 
 The two raw sets exist because toasty's `#[index]` is single-column and cannot
 express a mixed-direction composite. They are created with
@@ -496,7 +496,7 @@ flowchart LR
 | --- | --- | --- |
 | `profiles_page` | count + ordered ids | drives from `endpoint_rank`; the default order is a covering-index scan |
 | `profiles_anchor` | count of rows sorting before a key tuple | used to re-anchor the window after a re-sort moved the selection |
-| `profiles_aggregate` | `COUNT(*)` + six `SUM(CASE WHEN …)` arms | the Details panel's bucket counts, one statement per scope (global = live `rank_newest_seen` vs the TTL; view = the swept `band`); the partition arms are `PlanScope::predicate` verbatim. Raw SQL (cause C7) |
+| `profiles_aggregate` | `COUNT(*)` + seven `SUM(CASE WHEN …)` arms | the Details panel's bucket counts, one statement per scope (global = live `rank_newest_seen` + `rank_alive`; view = the swept `band`). `alive` (band 0) and `active` (band 1) are distinct; the partition arms are `PlanScope::predicate` verbatim. Raw SQL (cause C7) |
 | `load_page_projection` | one hydration statement, ids inlined | the page's rows (display columns only; the three deferred JSON carriers stay unloaded) |
 | `load_page_rows` | typed `in_list` reads + in-memory join | the reference implementation the projection is pinned against |
 | `update_endpoint_resolution` | `UPDATE endpoints` + `endpoint_ip` set rewrite + rank refresh | one transaction, retried on write contention |

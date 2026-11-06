@@ -97,7 +97,7 @@ impl Half {
     fn new(method: SsMethod, key: &[u8], salt: &[u8]) -> Self {
         Self {
             subkey: stream_subkey(method, key, salt),
-            counter: NonceCounter::new(method.aead.nonce_len()),
+            counter: NonceCounter::new(method.aead().nonce_len()),
         }
     }
 }
@@ -175,12 +175,12 @@ impl<S> SsStream<S> {
         let write = Half::new(method, &key, salt);
         let mut stream = Self {
             inner,
-            aead: method.aead,
+            aead: method.aead(),
             method,
             key: Some(key),
             write,
             read: None,
-            out: Vec::with_capacity(wire_chunk_len(method.aead) + method.aead.salt_len()),
+            out: Vec::with_capacity(wire_chunk_len(method.aead()) + method.aead().salt_len()),
             out_pos: 0,
             sealed: 0,
             step: ReadStep::Salt,
@@ -188,7 +188,7 @@ impl<S> SsStream<S> {
             filled: 0,
             pending: Vec::new(),
             pending_pos: 0,
-            salt_len: method.aead.salt_len(),
+            salt_len: method.aead().salt_len(),
             eof: false,
         };
         stream.out.extend_from_slice(salt);
@@ -498,14 +498,14 @@ pub async fn connect_to(
     cfg: &SsConfig,
     method: SsMethod,
 ) -> Result<BoxStream, NativeError> {
-    if method.family != SsFamily::Classic {
+    if method.family() != SsFamily::Classic {
         return Err(NativeError::Config(format!(
             "shadowsocks classic AEAD codec requires a classic method, got {:?}",
             cfg.method
         )));
     }
     let key = password_key(method, &cfg.password)?;
-    let mut salt = Zeroizing::new(vec![0u8; method.aead.salt_len()]);
+    let mut salt = Zeroizing::new(vec![0u8; method.aead().salt_len()]);
     crate::rand::fill_nonsecret(&mut salt);
     let first = encode_addr_port_last(target)?;
     let mut stream = SsStream::new(stream, method, key, &salt, Some(first));
@@ -582,7 +582,7 @@ mod tests {
         target: TargetAddr,
         client: &mut DuplexStream,
     ) -> Result<(), NativeError> {
-        let mut salt = Zeroizing::new(vec![0u8; method.aead.salt_len()]);
+        let mut salt = Zeroizing::new(vec![0u8; method.aead().salt_len()]);
         crate::rand::fill_nonsecret(&mut salt);
         let first = encode_addr_port_last(&target)?;
         let mut stream = SsStream::new(
@@ -623,11 +623,11 @@ mod tests {
     ) -> (Vec<u8>, Vec<usize>) {
         const TAG: usize = 16;
         const LEN_FIELD: usize = 2;
-        let mut got_salt = vec![0u8; method.aead.salt_len()];
+        let mut got_salt = vec![0u8; method.aead().salt_len()];
         server.read_exact(&mut got_salt).await.unwrap();
         assert_eq!(got_salt, salt, "the stream leads with the writer's salt");
         let subkey = stream_subkey(method, &key, &got_salt);
-        let mut counter = NonceCounter::new(method.aead.nonce_len());
+        let mut counter = NonceCounter::new(method.aead().nonce_len());
         let mut plain = Vec::new();
         let mut lens = Vec::new();
         loop {
@@ -636,7 +636,7 @@ mod tests {
                 return (plain, lens);
             }
             let len = method
-                .aead
+                .aead()
                 .open(&subkey, counter.next_nonce(), b"", &head)
                 .expect("the length seal authenticates");
             let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
@@ -650,7 +650,7 @@ mod tests {
                 .expect("a declared length arrives in full");
             plain.extend_from_slice(
                 &method
-                    .aead
+                    .aead()
                     .open(&subkey, counter.next_nonce(), b"", &body)
                     .expect("the payload seal authenticates"),
             );
@@ -679,12 +679,12 @@ mod tests {
         let sub = stream_subkey(method, &key, &wire[..16]);
         let mut counter = NonceCounter::new(12);
         let len_pt = method
-            .aead
+            .aead()
             .open(&sub, counter.next_nonce(), b"", &wire[16..34])
             .unwrap();
         assert_eq!(len_pt, vec![0x00, 0x07]);
         let payload = method
-            .aead
+            .aead()
             .open(&sub, counter.next_nonce(), b"", &wire[34..57])
             .unwrap();
         assert_eq!(payload, expected_addr);
@@ -836,11 +836,11 @@ mod tests {
         let salt = [0x99u8; 16];
         let (client, mut server) = duplex(4096);
         let subkey = stream_subkey(method, &key, &salt);
-        let mut counter = NonceCounter::new(method.aead.nonce_len());
+        let mut counter = NonceCounter::new(method.aead().nonce_len());
         server.write_all(&salt).await.unwrap();
         for plain in [&0u16.to_be_bytes()[..], &[]] {
             let sealed = method
-                .aead
+                .aead()
                 .seal(&subkey, counter.next_nonce(), b"", plain)
                 .unwrap();
             server.write_all(&sealed).await.unwrap();
@@ -868,14 +868,14 @@ mod tests {
         let salt = [0xBBu8; 32];
         let (client, mut server) = duplex(4096);
         let subkey = stream_subkey(method, &key, &salt);
-        let mut counter = NonceCounter::new(method.aead.nonce_len());
+        let mut counter = NonceCounter::new(method.aead().nonce_len());
         server.write_all(&salt).await.unwrap();
         let head = method
-            .aead
+            .aead()
             .seal(&subkey, counter.next_nonce(), b"", &5u16.to_be_bytes())
             .unwrap();
         let mut body = method
-            .aead
+            .aead()
             .seal(&subkey, counter.next_nonce(), b"", b"hello")
             .unwrap();
         let last = body.len() - 1;
@@ -906,10 +906,10 @@ mod tests {
         let salt = [0xDDu8; 16];
         let (client, mut server) = duplex(4096);
         let subkey = stream_subkey(method, &key, &salt);
-        let mut counter = NonceCounter::new(method.aead.nonce_len());
+        let mut counter = NonceCounter::new(method.aead().nonce_len());
         server.write_all(&salt).await.unwrap();
         let mut head = method
-            .aead
+            .aead()
             .seal(&subkey, counter.next_nonce(), b"", &5u16.to_be_bytes())
             .unwrap();
         let last = head.len() - 1;
@@ -944,7 +944,7 @@ mod tests {
         // A full length seal announcing 5 bytes at the all-zero first nonce,
         // then EOF: the body never arrives.
         let head = method
-            .aead
+            .aead()
             .seal(&subkey, &[0u8; 12], b"", &5u16.to_be_bytes())
             .unwrap();
         server.write_all(&head).await.unwrap();
@@ -1008,14 +1008,14 @@ mod tests {
         let mut salt = [0u8; 16];
         server.read_exact(&mut salt).await.unwrap();
         let subkey = stream_subkey(method, &key, &salt);
-        let mut counter = NonceCounter::new(method.aead.nonce_len());
+        let mut counter = NonceCounter::new(method.aead().nonce_len());
         let addr = encode_addr_port_last(&target).unwrap();
         let mut body = vec![0u8; addr.len() + 16];
         let mut head = [0u8; 2 + 16];
         server.read_exact(&mut head).await.unwrap();
         assert_eq!(
             method
-                .aead
+                .aead()
                 .open(&subkey, counter.next_nonce(), b"", &head)
                 .unwrap(),
             u16::try_from(addr.len()).unwrap().to_be_bytes()
@@ -1023,7 +1023,7 @@ mod tests {
         server.read_exact(&mut body).await.unwrap();
         assert_eq!(
             method
-                .aead
+                .aead()
                 .open(&subkey, counter.next_nonce(), b"", &body)
                 .unwrap(),
             addr
@@ -1036,7 +1036,7 @@ mod tests {
         server.read_exact(&mut head).await.unwrap();
         assert_eq!(
             method
-                .aead
+                .aead()
                 .open(&subkey, counter.next_nonce(), b"", &head)
                 .unwrap(),
             vec![0x00, 0x05]
@@ -1044,7 +1044,7 @@ mod tests {
         server.read_exact(&mut next_body).await.unwrap();
         assert_eq!(
             method
-                .aead
+                .aead()
                 .open(&subkey, counter.next_nonce(), b"", &next_body)
                 .unwrap(),
             b"hello"
@@ -1084,17 +1084,17 @@ mod tests {
         // Read direction: the peer seals two chunks of that same size; the
         // first sizes `staging`/`pending`, the second must reuse them.
         let subkey = stream_subkey(method, &key, &salt);
-        let mut counter = NonceCounter::new(method.aead.nonce_len());
+        let mut counter = NonceCounter::new(method.aead().nonce_len());
         let mut wire = Vec::new();
         wire.extend_from_slice(&salt);
         for _ in 0..2 {
             let len = u16::try_from(MAX_CHUNK).unwrap().to_be_bytes();
             method
-                .aead
+                .aead()
                 .seal_into(&subkey, counter.next_nonce(), b"", &len, &mut wire)
                 .unwrap();
             method
-                .aead
+                .aead()
                 .seal_into(&subkey, counter.next_nonce(), b"", &chunk, &mut wire)
                 .unwrap();
         }

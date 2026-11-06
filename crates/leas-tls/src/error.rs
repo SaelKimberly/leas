@@ -19,6 +19,12 @@ pub enum TlsError {
     /// valid). Split out of [`Self::Verify`] for the same reason.
     #[error("certificate verification failed: chain verification failed: {0}")]
     CertExpired(String),
+    /// The leaf's SPKI does not match the configured pin. Split out of
+    /// [`Self::Verify`] so a purge decision reads the typed cause: a pin
+    /// mismatch is a statement about this row's trust anchor, not a generic
+    /// handshake failure.
+    #[error("certificate verification failed: pinned SPKI mismatch: {0}")]
+    PinMismatch(String),
     /// The peer answered in cleartext instead of a TLS record.
     ///
     /// Split out of [`Self::Handshake`]: the diagnosis is a statement about the

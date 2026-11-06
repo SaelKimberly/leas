@@ -217,7 +217,7 @@ fn open_response_header(
 ) -> Result<(u16, Half), NativeError> {
     let mut half = Half::new(method, key, salt);
     let plain = method
-        .aead
+        .aead()
         .open(&half.subkey, half.counter.next_nonce(), b"", fixed_ct)
         .map_err(reclassify)?;
     let len = validate_response_header(&plain, request_salt)?;
@@ -257,7 +257,7 @@ fn sealed_response_header_with(
     len: u16,
     timestamp: u64,
 ) -> Vec<u8> {
-    let mut salt = vec![0u8; method.aead.salt_len()];
+    let mut salt = vec![0u8; method.aead().salt_len()];
     crate::rand::fill_nonsecret(&mut salt);
     let mut header = Vec::with_capacity(response_fixed_len(request_salt.len()));
     header.push(ty);
@@ -267,10 +267,10 @@ fn sealed_response_header_with(
     let subkey = stream_subkey(method, key, &salt);
     let mut out = salt;
     method
-        .aead
+        .aead()
         .seal_into(
             &subkey,
-            NonceCounter::new(method.aead.nonce_len()).next_nonce(),
+            NonceCounter::new(method.aead().nonce_len()).next_nonce(),
             b"",
             &header,
             &mut out,
@@ -295,7 +295,7 @@ impl Half {
     fn new(method: SsMethod, key: &[u8], salt: &[u8]) -> Self {
         Self {
             subkey: stream_subkey(method, key, salt),
-            counter: NonceCounter::new(method.aead.nonce_len()),
+            counter: NonceCounter::new(method.aead().nonce_len()),
         }
     }
 }
@@ -385,10 +385,10 @@ impl<S> Ss2022Stream<S> {
         // sizing `out` for it avoids an early realloc without reserving a
         // 0xFFFF chunk (~65 KiB) for every connection that never sends one.
         let capacity =
-            salt.len() + REQUEST_FIXED_LEN + MAX_VARIABLE_HEADER + 2 * method.aead.tag_len();
+            salt.len() + REQUEST_FIXED_LEN + MAX_VARIABLE_HEADER + 2 * method.aead().tag_len();
         Self {
             inner,
-            aead: method.aead,
+            aead: method.aead(),
             method,
             key: Some(key),
             write,
@@ -401,7 +401,7 @@ impl<S> Ss2022Stream<S> {
             filled: 0,
             pending: Vec::new(),
             pending_pos: 0,
-            salt_len: method.aead.salt_len(),
+            salt_len: method.aead().salt_len(),
             server_salt: Vec::new(),
             request_salt: salt,
             target,
@@ -768,14 +768,14 @@ pub async fn connect_to(
     cfg: &SsConfig,
     method: SsMethod,
 ) -> Result<BoxStream, NativeError> {
-    if method.family != SsFamily::Blake3_2022 {
+    if method.family() != SsFamily::Blake3_2022 {
         return Err(NativeError::Config(format!(
             "shadowsocks-2022 codec requires a 2022-blake3 method, got {}",
             cfg.method
         )));
     }
     let key = password_key(method, &cfg.password)?;
-    let mut salt = Zeroizing::new(vec![0u8; method.aead.salt_len()]);
+    let mut salt = Zeroizing::new(vec![0u8; method.aead().salt_len()]);
     crate::rand::fill_nonsecret(&mut salt);
     let mut stream = Ss2022Stream::new(stream, method, key, salt.to_vec(), target.clone());
     let timeout = timeouts::PROTOCOL;
@@ -1058,7 +1058,7 @@ mod tests {
         {
             let index = u64::try_from(index).expect("four chunks");
             method
-                .aead
+                .aead()
                 .seal_into(&subkey, &nonce(index), b"", chunk, &mut wire)
                 .unwrap();
         }
@@ -1093,7 +1093,7 @@ mod tests {
             {
                 let index = u64::try_from(index).expect("three chunks");
                 method
-                    .aead
+                    .aead()
                     .seal_into(&subkey, &nonce(index), b"", chunk, &mut wire)
                     .unwrap();
                 if index == tamper {
@@ -1140,7 +1140,7 @@ mod tests {
         {
             let index = u64::try_from(index).expect("three chunks");
             method
-                .aead
+                .aead()
                 .seal_into(&subkey, &nonce(index), b"", chunk, &mut wire)
                 .unwrap();
         }
@@ -1389,14 +1389,14 @@ mod tests {
         key: &[u8],
         now: u64,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<usize>) {
-        let tag = method.aead.tag_len();
-        let mut salt = vec![0u8; method.aead.salt_len()];
+        let tag = method.aead().tag_len();
+        let mut salt = vec![0u8; method.aead().salt_len()];
         server.read_exact(&mut salt).await.unwrap();
         let subkey = reference_subkey(method, key, &salt);
         let mut fixed = vec![0u8; REQUEST_FIXED_LEN + tag];
         server.read_exact(&mut fixed).await.unwrap();
         let fixed = method
-            .aead
+            .aead()
             .open(&subkey, &nonce(0), b"", &fixed)
             .expect("the fixed header seal opens at counter 0");
         assert_eq!(fixed[0], HEADER_TYPE_CLIENT_STREAM, "request type");
@@ -1409,7 +1409,7 @@ mod tests {
         let mut var = vec![0u8; var_len + tag];
         server.read_exact(&mut var).await.unwrap();
         let variable = method
-            .aead
+            .aead()
             .open(&subkey, &nonce(1), b"", &var)
             .expect("the variable header seal opens at counter 1");
         assert_eq!(
@@ -1426,7 +1426,7 @@ mod tests {
                 return (salt, variable, plain, lens);
             }
             let len = method
-                .aead
+                .aead()
                 .open(&subkey, &nonce(2 + 2 * index), b"", &head)
                 .expect("the length seal opens at its own counter");
             let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
@@ -1436,7 +1436,7 @@ mod tests {
                 .expect("a declared length arrives in full");
             plain.extend_from_slice(
                 &method
-                    .aead
+                    .aead()
                     .open(&subkey, &nonce(3 + 2 * index), b"", &body)
                     .expect("the payload seal opens at its own counter"),
             );

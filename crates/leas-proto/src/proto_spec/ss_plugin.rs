@@ -165,43 +165,37 @@ impl PluginMode {
     }
 }
 
-/// A presence-only flag that still has to survive a garbage value.
+/// The `tls` option — a **presence-only** flag.
 ///
-/// `Invalid(v)` keeps the operator's own text verbatim so the connect-time
-/// refusal can quote it instead of inventing a reason.
+/// Both references read the key, never the value: v2ray-plugin does
+/// `if _, b := opts.Get("tls"); b { *tlsEnabled = true }` (`main.go:276-278`)
+/// and sing-box enables TLS on the key's presence
+/// (`transport/sip003/v2ray.go:27-29`). The value is never inspected, so
+/// `tls=0` and `tls=false` enable TLS exactly like a bare `tls` — a row that
+/// meant "off" never dialed upstream either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsSetting {
     /// Key absent.
     Unset,
-    /// `tls`, `tls=1`, JSON `true`.
+    /// Key present, with any value.
     On,
-    /// `tls=0`, JSON `false`.
-    Off,
-    /// Present with a value we do not accept; refused at connect.
-    Invalid(String),
 }
 
 impl TlsSetting {
-    /// Parse a `tls` option value. A bare key arrives as `1` (`args.go`).
+    /// The value to write back out, or `None` when at its default/`Unset`.
     #[must_use]
-    pub fn parse(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Self::On,
-            "0" | "false" | "no" | "off" => Self::Off,
-            _ => Self::Invalid(value.to_string()),
+    pub const fn value(&self) -> Option<&str> {
+        match self {
+            Self::On => Some("1"),
+            Self::Unset => None,
         }
     }
 
-    /// The value to write back out, or `None` when at its default/`Unset`.
+    /// Whether the row asks for TLS on its session.
     #[must_use]
-    pub fn value(&self) -> Option<&str> {
-        match self {
-            Self::On => Some("1"),
-            Self::Off => Some("0"),
-            Self::Invalid(v) => Some(v),
-            Self::Unset => None,
-        }
+    pub const fn is_on(&self) -> bool {
+        matches!(self, Self::On)
     }
 }
 
@@ -321,6 +315,54 @@ impl Default for PluginSpec {
     }
 }
 
+/// Split a SIP003 option string into `key`/`value` tokens exactly like the
+/// reference reader (`v2ray-plugin/args.go:70-108` `indexUnescaped`): a `\`
+/// escapes the next character, so `\;`, `\=` and `\\` land in the token
+/// literally instead of splitting it. `certRaw` is the key that needs this —
+/// its base64 body carries `=` padding and can carry `;`.
+///
+/// A trailing lone `\` is kept literally; the reference errors instead, and
+/// nothing in a feed depends on that difference.
+fn option_tokens(value: &str) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut key = String::new();
+    let mut val: Option<String> = None;
+    let mut escaped = false;
+    for c in value.chars() {
+        if escaped {
+            match &mut val {
+                Some(v) => v.push(c),
+                None => key.push(c),
+            }
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            ';' => {
+                if !key.trim().is_empty() || val.is_some() {
+                    out.push((std::mem::take(&mut key), val.take()));
+                } else {
+                    key.clear();
+                    val = None;
+                }
+            }
+            '=' if val.is_none() => val = Some(String::new()),
+            _ => match &mut val {
+                Some(v) => v.push(c),
+                None => key.push(c),
+            },
+        }
+    }
+    if escaped {
+        key.push('\\');
+    }
+    if !key.trim().is_empty() || val.is_some() {
+        out.push((key, val));
+    }
+    out
+}
+
 impl PluginSpec {
     /// Split a SIP003 option string into `(name, options)`, where the first
     /// token without `=` becomes the name.
@@ -341,22 +383,22 @@ impl PluginSpec {
     fn split_with(value: &str, take_name: bool) -> (Option<String>, BTreeMap<String, String>) {
         let mut name = None;
         let mut opts = BTreeMap::new();
-        for token in value.split(';') {
-            let token = token.trim();
-            if token.is_empty() {
+        for (key, val) in option_tokens(value) {
+            let key = key.trim();
+            if key.is_empty() {
                 continue;
             }
-            match token.split_once('=') {
-                Some((k, v)) => {
-                    opts.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            match val {
+                Some(v) => {
+                    opts.insert(key.to_ascii_lowercase(), v.trim().to_string());
                 }
                 None => {
                     // A bare key means the value `1` (`args.go`), unless the
                     // slot is still open for the name.
                     if take_name && name.is_none() {
-                        name = Some(token.to_string());
+                        name = Some(key.to_string());
                     } else {
-                        opts.insert(token.to_ascii_lowercase(), "1".to_string());
+                        opts.insert(key.to_ascii_lowercase(), "1".to_string());
                     }
                 }
             }
@@ -549,6 +591,21 @@ impl PluginSpec {
         self.tls == TlsSetting::On || self.resolved_mode() == PluginMode::Quic
     }
 
+    /// The `cert` option: a local path to a PEM certificate (v2ray-plugin
+    /// `main.go:70-71`). Kept in `extra` — identity-bearing, and not a field the
+    /// wire spelling normalizes.
+    #[must_use]
+    pub fn cert_path(&self) -> Option<&str> {
+        self.extra.get("cert").map(String::as_str)
+    }
+
+    /// The `certRaw` option: a PEM body without armour (v2ray-plugin
+    /// `main.go:73-76`). Keys are lowercased by the splitter.
+    #[must_use]
+    pub fn cert_raw(&self) -> Option<&str> {
+        self.extra.get("certraw").map(String::as_str)
+    }
+
     /// Whether the production path must use the mux protocol phase.
     ///
     /// `mux_active(link) == resolved_mode.is_stream() && resolved_mux > 0` — the
@@ -638,9 +695,10 @@ impl PluginSpec {
             None if family == PluginFamily::Unknown => PluginMode::Unset,
             None => PluginMode::default_for(family),
         };
+        // Presence only: the value is never inspected (v2ray-plugin `main.go:276`).
         let tls = map
             .remove("tls")
-            .map_or(TlsSetting::Unset, |value| TlsSetting::parse(&value));
+            .map_or(TlsSetting::Unset, |_| TlsSetting::On);
         let mux = map
             .remove("mux")
             .map_or(MuxSetting::Unset, |value| MuxSetting::parse(&value));
@@ -884,19 +942,46 @@ mod tests {
         );
     }
 
-    /// `tls` carries a real boolean in the base64-JSON spelling, so presence-only
-    /// reading would turn `"tls":false` into a handshake against a plaintext
-    /// port.
+    /// Option strings honour the reference's backslash escapes
+    /// (`args.go:70-108`): `\;`, `\=`, `\\` stay inside the token.
     #[test]
-    fn tls_distinguishes_presence_from_false() {
+    fn escapes_keep_delimiters_inside_values() {
+        let s = spec("v2ray-plugin", r"certRaw=AAA\=BBB;host=h");
+        assert_eq!(
+            s.extra.get("certraw").map(String::as_str),
+            Some("AAA=BBB"),
+            "an escaped `=` belongs to the value"
+        );
+        assert_eq!(s.host.as_deref(), Some("h"));
+
+        let s = spec("v2ray-plugin", r"path=/a\;b");
+        assert_eq!(s.path.as_deref(), Some("/a;b"));
+
+        let s = spec("v2ray-plugin", r"path=/a\\b");
+        assert_eq!(s.path.as_deref(), Some(r"/a\b"));
+
+        // Escape-free strings are byte-identical to the pre-escape reading.
+        assert_eq!(
+            spec("v2ray-plugin", "mode=websocket;host=h")
+                .host
+                .as_deref(),
+            Some("h")
+        );
+        assert_eq!(spec("obfs-local", "obfs=http;obfs-host=x").path, None);
+    }
+
+    /// `tls` is read by PRESENCE, which is what both references do
+    /// (v2ray-plugin `main.go:276-278`, sing-box `sip003/v2ray.go:27-29`): every
+    /// value — including `0` and `false` — asks for TLS.
+    #[test]
+    fn tls_is_presence_only_for_every_value() {
         assert_eq!(spec("v2ray-plugin", "tls").tls, TlsSetting::On);
         assert_eq!(spec("v2ray-plugin", "tls=1").tls, TlsSetting::On);
-        assert_eq!(spec("v2ray-plugin", "tls=0").tls, TlsSetting::Off);
-        assert_eq!(spec("v2ray-plugin", "tls=false").tls, TlsSetting::Off);
-        assert!(matches!(
-            spec("v2ray-plugin", "tls=maybe").tls,
-            TlsSetting::Invalid(_)
-        ));
+        assert_eq!(spec("v2ray-plugin", "tls=0").tls, TlsSetting::On);
+        assert_eq!(spec("v2ray-plugin", "tls=false").tls, TlsSetting::On);
+        assert_eq!(spec("v2ray-plugin", "tls=maybe").tls, TlsSetting::On);
+        // A row without the key is the only "off".
+        assert_eq!(spec("v2ray-plugin", "host=h").tls, TlsSetting::Unset);
     }
 
     /// An absent mode key normalizes to the family default at parse, so an
@@ -1097,7 +1182,8 @@ mod tests {
         assert_eq!(spec("obfs-local", "obfs=tls").render_opts(), "obfs=tls");
         assert_eq!(spec("v2ray-plugin", "mode=websocket").render_opts(), "");
         assert_eq!(spec("v2ray-plugin", "mode=quic").render_opts(), "mode=quic");
-        assert_eq!(spec("v2ray-plugin", "tls=0").render_opts(), "tls=0");
+        // Presence-only: any value renders as the one On spelling.
+        assert_eq!(spec("v2ray-plugin", "tls=0").render_opts(), "tls=1");
         assert_eq!(spec("v2ray-plugin", "mux=8").render_opts(), "mux=8");
     }
 
@@ -1207,8 +1293,8 @@ mod tests {
         );
         assert_eq!(
             PluginSpec::from_parts(Some("v2ray-plugin"), "tls=false").tls,
-            TlsSetting::Off,
-            "a Clash `tls=false` must not be read as TLS on"
+            TlsSetting::On,
+            "presence is what both references read, `false` included"
         );
     }
 

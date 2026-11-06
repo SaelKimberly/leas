@@ -158,11 +158,11 @@ async fn load_profiles_page_only(
 /// Build the query request a [`ProfilesLoad`] describes.
 fn page_request(load: &ProfilesLoad) -> PageRequest {
     let now = leas_db::models::to_epoch(now_ts());
-    // One bound, two directions: Active is `rank_newest_seen >= active`,
-    // Purgatory is `< active`. The stored maximum is live-only (decision 16), so
-    // an endpoint whose links are all purged sits below both bounds by
-    // construction and needs no second predicate. Passing `now` would make the
-    // window `>= now`, i.e. an empty tab (a sync only ever stamps the past).
+    // One bound materializes three bands: Alive (0) and Active (1) are inside
+    // the window, Purgatory (2) is outside. The stored maximum is live-only
+    // (decision 16), so an endpoint whose links are all purged sits below the
+    // bound by construction. Passing `now` would make the window `>= now`,
+    // i.e. an empty tab (a sync only ever stamps the past).
     let active_threshold = match load.view {
         PurgatoryView::Active | PurgatoryView::Purgatory => {
             now.saturating_sub(load.purgatory_ttl_secs)
@@ -711,6 +711,9 @@ pub fn fields_to_parsed(
     // rejected here exactly as an imported one is. `allow_private_ips` is off
     // for the form: a single-label/private host cannot key an endpoint.
     leas_config::import_export::validate_host(&parsed, validation).map_err(|e| e.to_string())?;
+    // Same hard gate the URL funnel applies: a form-built row no stack can
+    // dial (malformed 2022 key, cleartext `none`, `mode=quic`) never stores.
+    leas_config::import_export::validate_ss_config(&parsed).map_err(|e| e.to_string())?;
     Ok(parsed)
 }
 

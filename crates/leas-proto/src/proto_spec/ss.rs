@@ -112,13 +112,15 @@ impl SsConfig {
     /// sing-box and AEAD/2022 ciphers to xray-core.
     pub fn try_parse_proto(raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
         let (userinfo, hostport) = if let Some(hostport) = raw.hostport {
-            // SIP002 format: base64(method:password)@host:port
-            let decoded = utils::decode_base64(raw.userinfo).map_err(|e| {
-                ParseError::InvalidUserInfo(format!("{}: {e}", raw.userinfo).into())
-            })?;
-            let text = String::from_utf8(decoded).map_err(|e| {
-                ParseError::InvalidUserInfo(format!("{}: {e}", raw.userinfo).into())
-            })?;
+            // SIP002: base64(method:password)@host:port. A userinfo that does
+            // not decode to a `method:password` pair is the PLAIN form
+            // `method:password@host:port` (go-shadowsocks2's `parseURL`), which
+            // the module docs promise and which real feeds carry.
+            let decoded = utils::decode_base64(raw.userinfo)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|text| text.contains(':'));
+            let text = decoded.unwrap_or_else(|| plain_userinfo(raw.userinfo));
             (text, hostport.to_string())
         } else {
             // Legacy QR format: base64(method:password@host:port) — no @ in URL
@@ -288,15 +290,105 @@ impl SsConfig {
     }
 }
 
+/// The plain-form userinfo (`method:password@host:port`), percent-decoded.
+///
+/// Used only when the base64 reading produced no `method:password` pair, so a
+/// feed's plain row imports instead of being dropped as "invalid userinfo".
+/// `${}` is left untouched by `urlencoding::decode` too, so a single malformed
+/// escape cannot lose the whole row.
+fn plain_userinfo(userinfo: &str) -> String {
+    urlencoding::decode(userinfo).map_or_else(|_| userinfo.to_owned(), std::borrow::Cow::into_owned)
+}
+
 /// Cipher-aware Shadowsocks kind: `2022-blake3-*` methods are
 /// [`ProtocolKind::Shadowsocks2022`], everything else is
 /// [`ProtocolKind::Shadowsocks`].
+///
+/// Case-insensitive, like every consumer of the method string
+/// (`core_mapping::xray_supports_ss_method`, `SsMethod::from_method`, and
+/// xray's own `cipherFromString`/`GetCipherMethod`, both of which lowercase):
+/// a `2022-BLAKE3-AES-256-GCM` row is the same row as its lowercase spelling.
 fn proto_kind_for_method(method: &str) -> ProtocolKind {
-    if method.starts_with("2022-blake3-") {
+    if method.to_ascii_lowercase().starts_with("2022-blake3-") {
         ProtocolKind::Shadowsocks2022
     } else {
         ProtocolKind::Shadowsocks
     }
+}
+
+/// How a `2022-blake3-*` password encodes its PSK.
+///
+/// The reference is xray-core's `shadowsocks_2022.ParseKey`
+/// (`proxy/shadowsocks_2022/kdf.go`): decode the string as STANDARD base64, and
+/// only when that FAILS treat the literal UTF-8 bytes as the key. Either way
+/// the result must be exactly the method's key length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ss2022Key<'a> {
+    /// Standard base64 (`+`, `/`, padding) — the common form.
+    Base64(&'a str),
+    /// The literal key bytes, which xray accepts when base64 decoding fails.
+    Raw(&'a str),
+}
+
+/// The `PSK`/key length a `2022-blake3-*` method needs, or `None` for any
+/// other method.
+///
+/// Mirrors xray's `CipherMethod.KeySaltLength` table (16 for
+/// `2022-blake3-aes-128-gcm`, 32 for the `2022-blake3-aes-256-gcm` and
+/// `2022-blake3-chacha20-poly1305` variants), case-insensitively like
+/// `GetCipherMethod`.
+#[must_use]
+pub fn ss2022_key_len(method: &str) -> Option<usize> {
+    match method.to_ascii_lowercase().as_str() {
+        "2022-blake3-aes-128-gcm" => Some(16),
+        "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => Some(32),
+        _ => None,
+    }
+}
+
+/// xray's `ParseKey` rule: how `password` encodes a `key_len` PSK, or `None`
+/// when neither form decodes to exactly `key_len` bytes.
+///
+/// A base64 string that decodes to the WRONG length is not retried as raw
+/// bytes — xray returns the length error instead of falling back, because a
+/// string that decodes is a base64 key, not a literal one. That is also what
+/// keeps a 16-character typo of a base64 key from silently becoming a raw key.
+#[must_use]
+pub fn ss2022_key(password: &str, key_len: usize) -> Option<Ss2022Key<'_>> {
+    let trimmed = password.trim();
+    if base64::prelude::BASE64_STANDARD
+        .decode(trimmed)
+        .is_ok_and(|key| key.len() == key_len)
+    {
+        return Some(Ss2022Key::Base64(trimmed));
+    }
+    (password.len() == key_len).then_some(Ss2022Key::Raw(password))
+}
+
+/// True when every `:`-separated PSK in `password` is usable for `method`.
+///
+/// A single key is the common case; a list is xray's multi-user client form
+/// (`ParsePSKList` splits on `:`), so such a row is a VALID config even where
+/// this client cannot serve it. Non-2022 methods are not this rule's business
+/// and always answer `true`; an UNKNOWN `2022-blake3-*` variant answers
+/// `false` — no core can name its key length, so the row can never dial.
+#[must_use]
+pub fn ss2022_password_usable(method: &str, password: &str) -> bool {
+    if !method.to_ascii_lowercase().starts_with("2022-blake3-") {
+        return true;
+    }
+    let Some(key_len) = ss2022_key_len(method) else {
+        return false;
+    };
+    // xray's client refuses a multi-key list for chacha20-poly1305
+    // (`outbound.go`: "multi-key is not supported for chacha20-poly1305"), so
+    // such a row can never dial anywhere and is irreparable, not deferred.
+    if password.contains(':') && method.eq_ignore_ascii_case("2022-blake3-chacha20-poly1305") {
+        return false;
+    }
+    password
+        .split(':')
+        .all(|part| ss2022_key(part, key_len).is_some())
 }
 
 /// Legacy [`ProtoSpec`] bridge — kept so `ProtocolConfig` dispatch (and the
@@ -456,9 +548,8 @@ impl ProtoIdentity for SsConfig {
             w.present_u64(ID_PLUGIN_PORT, plugin.port.map(u64::from));
             w.opt_str(ID_PLUGIN_PATH, plugin.path.as_deref(), "/");
             match &plugin.tls {
-                TlsSetting::Unset | TlsSetting::Off => {}
+                TlsSetting::Unset => {}
                 TlsSetting::On => w.str(ID_PLUGIN_TLS, "1"),
-                TlsSetting::Invalid(value) => w.str(ID_PLUGIN_TLS, value),
             }
             match &plugin.mux {
                 MuxSetting::Unset | MuxSetting::On(1) => {}
@@ -1060,7 +1151,8 @@ mod tests {
             ("v2ray-plugin;host=h", "v2ray-plugin;mode=websocket;host=h"),
             ("obfs-local;obfs-host=h", "obfs-local;obfs=http;obfs-host=h"),
             ("v2ray-plugin", "v2ray-plugin;path=%2F"),
-            ("v2ray-plugin", "v2ray-plugin;tls=0"),
+            // Presence-only `tls`: every value is the same On row.
+            ("v2ray-plugin;tls", "v2ray-plugin;tls=0"),
             // Row 13's `mux` pair: `write_identity` elides `MuxSetting::Unset`
             // against `On(1)`, because a v2ray-plugin row's default IS mux-on for
             // the websocket and unset modes (`active_for`), so the two spellings
@@ -1077,6 +1169,14 @@ mod tests {
                 "{absent} and {explicit} must be one row"
             );
         }
+
+        // The anti-overreach for `tls`: an ABSENT key is still a different row
+        // from any present one (no TLS at all vs TLS on).
+        assert_ne!(
+            uid_of("v2ray-plugin"),
+            uid_of("v2ray-plugin;tls"),
+            "absent tls and `tls=0` ask for different transports"
+        );
 
         // The anti-overreach: `mux=0` really does turn mux OFF for a websocket
         // row (`active_for`: `Off` → false), so it is a DIFFERENT stored config
@@ -1386,5 +1486,111 @@ mod tests {
                 expected[index].0
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod key_rule_tests {
+    use rstest::rstest;
+
+    use super::{Ss2022Key, SsConfig, ss2022_key, ss2022_key_len, ss2022_password_usable};
+    use crate::urlx::RawUrlX;
+
+    /// xray's `ParseKey`: standard base64 first, then the LITERAL bytes, and a
+    /// base64 string of the wrong length is never retried as raw.
+    #[rstest]
+    #[case::std_base64(
+        "AAAAAAAAAAAAAAAAAAAAAA==",
+        Some(Ss2022Key::Base64("AAAAAAAAAAAAAAAAAAAAAA=="))
+    )]
+    #[case::raw_with_symbol("r@w-key-01234567", Some(Ss2022Key::Raw("r@w-key-01234567")))]
+    #[case::base64_of_wrong_length("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", None)]
+    #[case::unpadded_base64("AAAAAAAAAAAAAAAAAAAAAA", None)]
+    #[case::too_short("c2hvcnQ=", None)]
+    fn key_shape_matches_xray_parse_key(
+        #[case] password: &str,
+        #[case] want: Option<Ss2022Key<'_>>,
+    ) {
+        assert_eq!(ss2022_key(password, 16), want);
+    }
+
+    #[rstest]
+    #[case::aes_128("2022-blake3-aes-128-gcm", Some(16))]
+    #[case::aes_256("2022-blake3-aes-256-gcm", Some(32))]
+    #[case::chacha("2022-blake3-chacha20-poly1305", Some(32))]
+    // xray's GetCipherMethod lowercases; so does every consumer here.
+    #[case::uppercase("2022-BLAKE3-AES-256-GCM", Some(32))]
+    #[case::classic("aes-256-gcm", None)]
+    fn key_len_is_case_insensitive(#[case] method: &str, #[case] want: Option<usize>) {
+        assert_eq!(ss2022_key_len(method), want);
+    }
+
+    /// A `:`-separated list is xray's multi-user form: a VALID config that this
+    /// client cannot serve — it must not be mistaken for a malformed key.
+    #[rstest]
+    #[case::single("AAAAAAAAAAAAAAAAAAAAAA==", true)]
+    #[case::list("AAAAAAAAAAAAAAAAAAAAAA==:AAAAAAAAAAAAAAAAAAAAAA==", true)]
+    #[case::list_with_bad_part("AAAAAAAAAAAAAAAAAAAAAA==:c2hvcnQ=", false)]
+    #[case::unknown_2022_variant("2022-blake3-aes-192-gcm", false)]
+    fn multi_user_list_is_valid_but_unknown_variant_is_not(
+        #[case] password: &str,
+        #[case] want: bool,
+    ) {
+        assert_eq!(
+            ss2022_password_usable("2022-blake3-aes-128-gcm", password),
+            want
+        );
+    }
+
+    /// xray's client refuses a multi-key list for chacha20-poly1305, so that
+    /// combination is irreparable rather than merely unimplemented here.
+    #[test]
+    fn chacha_multi_key_is_outside_the_list_rule() {
+        let list = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert!(!ss2022_password_usable(
+            "2022-blake3-chacha20-poly1305",
+            list
+        ));
+        assert!(ss2022_password_usable(
+            "2022-blake3-chacha20-poly1305",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        ));
+    }
+
+    #[test]
+    fn classic_methods_are_outside_the_key_rule() {
+        assert!(ss2022_password_usable("aes-256-gcm", "any password at all"));
+    }
+
+    /// The plain `method:password@host:port` form is documented (module docs,
+    /// go-shadowsocks2 `parseURL`) and real feeds carry it; the SIP002 base64
+    /// reading must fall back to it rather than drop the row.
+    #[test]
+    fn plain_userinfo_parses_when_base64_yields_no_pair() {
+        let parsed = SsConfig::try_parse_proto(&RawUrlX::from(
+            "ss://chacha20-ietf-poly1305:s%40cret@example.com:8388#plain",
+        ))
+        .expect("a plain-form ss URL must parse");
+        let crate::proto_spec::ProtocolConfig::Ss(cfg) = parsed.protocol.config else {
+            panic!("ss URL parsed to a non-ss config");
+        };
+        assert_eq!(cfg.method.as_str(), "chacha20-ietf-poly1305");
+        assert_eq!(cfg.password, "s@cret", "percent-decoded, like any userinfo");
+        assert_eq!(parsed.endpoints[0].port, 8388);
+    }
+
+    /// The kind is derived from the method case-insensitively, like the core
+    /// rosters and xray's own method tables; an uppercase 2022 spelling must
+    /// not be filed as a classic Shadowsocks row.
+    #[test]
+    fn uppercase_2022_method_keeps_its_kind() {
+        let parsed = SsConfig::try_parse_proto(&RawUrlX::from(
+            "ss://2022-BLAKE3-AES-256-GCM:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=@example.com:8388",
+        ))
+        .expect("uppercase 2022 row must parse");
+        assert_eq!(
+            parsed.protocol.proto_kind,
+            crate::proto_spec::ProtocolKind::Shadowsocks2022
+        );
     }
 }

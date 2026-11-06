@@ -53,6 +53,7 @@ use crate::protocol::ss::consts::{
 use crate::protocol::ss::method::{
     SsFamily, SsMethod, password_key, stream_subkey, stream_subkey_into,
 };
+use crate::protocol::ss::stream_legacy::keystream;
 use crate::rand::{fill_nonsecret, u32_below};
 
 /// Largest datagram this carrier reads into its scratch buffer — one UDP
@@ -168,7 +169,10 @@ fn seal_datagram_into(
     payload: &[u8],
     buf: &mut SendBuf,
 ) -> Result<(), NativeError> {
-    let salt_len = method.aead.salt_len();
+    if method.family() == SsFamily::Stream {
+        return seal_stream_datagram_into(method, key, dest, payload, buf);
+    }
+    let salt_len = method.aead().salt_len();
     let mut salt = [0u8; 32];
     let salt = &mut salt[..salt_len];
     fill_nonsecret(salt);
@@ -183,9 +187,9 @@ fn seal_datagram_into(
     // The classic codec seals under the all-zero nonce (`mihomo` `_zerononce`);
     // one datagram per seal is what makes that safe.
     let zero_nonce = [0u8; CHACHA_NONCE_LEN];
-    method.aead.seal_into(
+    method.aead().seal_into(
         &buf.subkey,
-        &zero_nonce[..method.aead.nonce_len()],
+        &zero_nonce[..method.aead().nonce_len()],
         b"",
         &buf.body,
         &mut buf.packet,
@@ -211,15 +215,18 @@ fn open_datagram(
     key: &[u8],
     packet: &[u8],
 ) -> Result<(TargetAddr, Vec<u8>), NativeError> {
-    let salt_len = method.aead.salt_len();
-    if packet.len() < salt_len + method.aead.tag_len() {
+    if method.family() == SsFamily::Stream {
+        return open_stream_datagram(method, key, packet);
+    }
+    let salt_len = method.aead().salt_len();
+    if packet.len() < salt_len + method.aead().tag_len() {
         return Err(datagram_error("short datagram"));
     }
     let subkey = stream_subkey(method, key, &packet[..salt_len]);
     let zero_nonce = [0u8; CHACHA_NONCE_LEN];
-    let body = method.aead.open(
+    let body = method.aead().open(
         &subkey,
-        &zero_nonce[..method.aead.nonce_len()],
+        &zero_nonce[..method.aead().nonce_len()],
         b"",
         &packet[salt_len..],
     )?;
@@ -227,6 +234,60 @@ fn open_datagram(
         return Err(datagram_error("undecodable address in datagram"));
     };
     Ok((dest, payload.to_vec()))
+}
+
+/// One legacy (stream-cipher) datagram INTO `buf`: `[IV] cipher(addr ‖ payload)`.
+///
+/// A fresh IV per datagram: reusing one would restart the keystream with the
+/// same key. `none` sends neither IV nor keystream.
+fn seal_stream_datagram_into(
+    method: SsMethod,
+    key: &[u8],
+    dest: &TargetAddr,
+    payload: &[u8],
+    buf: &mut SendBuf,
+) -> Result<(), NativeError> {
+    let cipher = method
+        .stream()
+        .ok_or_else(|| NativeError::Config("shadowsocks legacy method has no cipher".into()))?;
+    buf.begin();
+    let mut iv = vec![0u8; cipher.iv_len()];
+    fill_nonsecret(&mut iv);
+    buf.packet.extend_from_slice(&iv);
+    write_addr_port_last(&mut buf.body, dest)?;
+    buf.body.extend_from_slice(payload);
+    if let Some(mut state) = keystream(cipher, key, &iv)
+        .map_err(|e| NativeError::Config(format!("shadowsocks legacy udp keystream: {e}")))?
+    {
+        state.encrypt(&mut buf.body);
+    }
+    buf.packet.extend_from_slice(&buf.body);
+    Ok(())
+}
+
+/// One received legacy datagram: strip its IV, decrypt, decode the address.
+fn open_stream_datagram(
+    method: SsMethod,
+    key: &[u8],
+    packet: &[u8],
+) -> Result<(TargetAddr, Vec<u8>), NativeError> {
+    let cipher = method
+        .stream()
+        .ok_or_else(|| NativeError::Config("shadowsocks legacy method has no cipher".into()))?;
+    if packet.len() < cipher.iv_len() {
+        return Err(datagram_error("short datagram"));
+    }
+    let (iv, body) = packet.split_at(cipher.iv_len());
+    let mut body = body.to_vec();
+    if let Some(mut state) = keystream(cipher, key, iv)
+        .map_err(|e| NativeError::Config(format!("shadowsocks legacy udp keystream: {e}")))?
+    {
+        state.decrypt(&mut body);
+    }
+    decode_addr_port_last(&body).map_or_else(
+        || Err(datagram_error("undecodable address in datagram")),
+        |(dest, payload)| Ok((dest, payload.to_vec())),
+    )
 }
 
 /// AES-ECB encrypt one 16-byte block under the PSK — the 2022 separate
@@ -332,13 +393,15 @@ fn udp_session_subkey(method: SsMethod, key: &[u8], session_id: u64) -> Zeroizin
 /// though its TCP stream uses plain ChaCha20-Poly1305 — spec §4.1: "For TCP,
 /// AES-GCM is simply replaced by ChaCha-Poly1305. For UDP, a slightly
 /// different construction is used."
-const fn udp_cipher(method: SsMethod) -> SsAead {
-    match method.family {
-        SsFamily::Blake3_2022 => match method.aead {
+fn udp_cipher(method: SsMethod) -> SsAead {
+    match method.family() {
+        SsFamily::Blake3_2022 => match method.aead() {
             SsAead::ChaCha20Poly1305 => SsAead::XChaCha20Poly1305,
             other => other,
         },
-        SsFamily::Classic => method.aead,
+        SsFamily::Classic => method.aead(),
+        // Only the 2022 body codec calls this; a legacy row has no body AEAD.
+        SsFamily::Stream => unreachable!("the 2022 body cipher belongs to a 2022 row"),
     }
 }
 
@@ -503,7 +566,7 @@ struct ServerSlot {
 
 impl ServerSlot {
     fn new(method: SsMethod, key: &[u8], server_id: u64, now: Instant) -> Self {
-        let body_subkey = match method.aead {
+        let body_subkey = match method.aead() {
             SsAead::Aes128Gcm | SsAead::Aes256Gcm => {
                 Some(udp_session_subkey(method, key, server_id))
             }
@@ -1169,8 +1232,9 @@ pub async fn connect_udp(
         .connect(server)
         .await
         .map_err(|e| NativeError::Dial(format!("shadowsocks udp connect: {e}")))?;
-    let (s2022_writer, s2022_reader) = match method.family {
-        SsFamily::Classic => (None, None),
+    let (s2022_writer, s2022_reader) = match method.family() {
+        // Both stateless families keep no per-association sender state.
+        SsFamily::Classic | SsFamily::Stream => (None, None),
         SsFamily::Blake3_2022 => {
             let writer = Ss2022WriterState::new(method, Arc::clone(&key));
             let reader = Ss2022ReaderState::new(method, Arc::clone(&key), writer.client_session_id);
@@ -1433,7 +1497,7 @@ mod tests {
         origin: &TargetAddr,
         payload: &[u8],
     ) -> Vec<u8> {
-        let header = separate_header_aes(method.aead, psk, server_id, packet_id).unwrap();
+        let header = separate_header_aes(method.aead(), psk, server_id, packet_id).unwrap();
         let mut body = vec![HEADER_TYPE_SERVER_PACKET];
         body.extend_from_slice(&timestamp);
         body.extend_from_slice(&client_id.to_be_bytes());
@@ -1442,7 +1506,7 @@ mod tests {
         body.extend_from_slice(payload);
         let mut out = header.to_vec();
         method
-            .aead
+            .aead()
             .seal_into(
                 &udp_session_subkey(method, psk, server_id),
                 &separate_header_nonce(server_id, packet_id),
@@ -1497,12 +1561,12 @@ mod tests {
     ) -> Option<(u64, u64, TargetAddr, Vec<u8>)> {
         let mut header =
             <[u8; SEPARATE_HEADER_LEN]>::try_from(wire.get(..SEPARATE_HEADER_LEN)?).ok()?;
-        aes_ecb_decrypt(method.aead, psk, &mut header).ok()?;
+        aes_ecb_decrypt(method.aead(), psk, &mut header).ok()?;
         let (session_id, _) = read_u64(&header)?;
         let (packet_id, _) = read_u64(&header[8..])?;
         let subkey = reference_subkey(method, psk, session_id);
         let body = method
-            .aead
+            .aead()
             .open(
                 &subkey,
                 &separate_header_nonce(session_id, packet_id),
@@ -1543,7 +1607,7 @@ mod tests {
         assert_eq!(packet.len(), 16 + 7 + 5 + 16);
         let subkey = stream_subkey(method, &key, &packet[..16]);
         let body = method
-            .aead
+            .aead()
             .open(&subkey, &[0u8; 12], b"", &packet[16..])
             .unwrap();
         assert_eq!(&body[..7], &encode_addr_port_last(&dest).unwrap()[..]);
@@ -1587,6 +1651,34 @@ mod tests {
             assert_eq!(decoded, dest);
             assert_eq!(payload, b"payload");
         }
+    }
+
+    /// Legacy stream-cipher datagrams: `[IV] cipher(addr ‖ payload)`, a fresh
+    /// IV per datagram, and `none` with no IV at all.
+    #[test]
+    fn legacy_udp_datagrams_carry_a_fresh_iv_and_round_trip() {
+        let dest = TargetAddr::new(Host::Domain("example.com".into()), 53);
+        for name in ["aes-256-cfb", "chacha20-ietf", "rc4-md5"] {
+            let method = SsMethod::from_method(name).unwrap();
+            let key = Zeroizing::new(vec![0x44u8; method.key_len()]);
+            let iv_len = method.iv_len();
+            let a = seal_datagram(method, &key, &dest, b"payload").unwrap();
+            let b = seal_datagram(method, &key, &dest, b"payload").unwrap();
+            let addr_len = crate::addr::encode_addr_port_last(&dest).unwrap().len();
+            assert_eq!(a.len(), iv_len + addr_len + 7, "{name}");
+            assert_ne!(a[..iv_len], b[..iv_len], "{name}: IV must be fresh");
+            let (decoded, payload) = open_datagram(method, &key, &a).unwrap();
+            assert_eq!(decoded, dest);
+            assert_eq!(payload, b"payload");
+        }
+
+        let none = SsMethod::from_method("none").unwrap();
+        let packet = seal_datagram(none, &[], &dest, b"payload").unwrap();
+        let addr_len = crate::addr::encode_addr_port_last(&dest).unwrap().len();
+        assert_eq!(packet.len(), addr_len + 7, "none has no IV");
+        let (decoded, payload) = open_datagram(none, &[], &packet).unwrap();
+        assert_eq!(decoded, dest);
+        assert_eq!(payload, b"payload");
     }
 
     #[tokio::test]
@@ -1785,11 +1877,11 @@ mod tests {
         let method = SsMethod::from_method("2022-blake3-aes-256-gcm").unwrap();
         let psk = [0x03u8; 32];
         let ids = 0x0102_0304_0506_0708u64;
-        let header = separate_header_aes(method.aead, &psk, ids, 0x11).unwrap();
+        let header = separate_header_aes(method.aead(), &psk, ids, 0x11).unwrap();
         // AES-ECB is a permutation, not the identity.
         assert_ne!(&header[..8], &ids.to_be_bytes());
         let mut plain = header;
-        aes_ecb_decrypt(method.aead, &psk, &mut plain).unwrap();
+        aes_ecb_decrypt(method.aead(), &psk, &mut plain).unwrap();
         assert_eq!(&plain[..8], &ids.to_be_bytes());
         assert_eq!(&plain[8..], &0x11u64.to_be_bytes());
     }
@@ -1808,7 +1900,7 @@ mod tests {
             nonce
         };
         assert_eq!(separate_header_nonce(session_id, packet_id), expected);
-        let wire = separate_header_aes(method.aead, &psk, session_id, packet_id).unwrap();
+        let wire = separate_header_aes(method.aead(), &psk, session_id, packet_id).unwrap();
         assert_ne!(
             expected,
             wire[4..16],
@@ -2149,11 +2241,11 @@ mod tests {
         body.extend_from_slice(&[0xEEu8; 5]);
         body.extend_from_slice(&encode_addr_port_last(&origin).unwrap());
         body.extend_from_slice(b"reply");
-        let mut wire = separate_header_aes(method.aead, &psk, server_id, packet_id)
+        let mut wire = separate_header_aes(method.aead(), &psk, server_id, packet_id)
             .unwrap()
             .to_vec();
         method
-            .aead
+            .aead()
             .seal_into(
                 &udp_session_subkey(method, &psk, server_id),
                 &separate_header_nonce(server_id, packet_id),

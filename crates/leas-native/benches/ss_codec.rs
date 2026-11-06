@@ -73,7 +73,7 @@ use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main};
 use leas_native::addr::{Host, TargetAddr, decode_addr_port_last, write_addr_port_last};
 use leas_native::crypto::aead::{NonceCounter, SsAead};
-use leas_native::protocol::ss::method::{SsFamily, SsMethod, password_key, stream_subkey};
+use leas_native::protocol::ss::method::{SsMethod, password_key, stream_subkey};
 use ring::rand::{SecureRandom as _, SystemRandom};
 
 type Group<'a> = BenchmarkGroup<'a, WallTime>;
@@ -209,7 +209,7 @@ fn separate_header(
 /// method's UDP cipher is XChaCha20-Poly1305 even though its TCP stream is
 /// ChaCha20-Poly1305 (spec §4.1).
 const fn udp_cipher(method: SsMethod) -> SsAead {
-    match method.aead {
+    match method.aead() {
         SsAead::ChaCha20Poly1305 => SsAead::XChaCha20Poly1305,
         other => other,
     }
@@ -321,8 +321,7 @@ fn classic_chunks(group: &mut Group<'_>) {
     let payload = vec![0xABu8; CLASSIC_CHUNK];
     for (name, aead) in classic_ciphers() {
         let method = SsMethod {
-            aead,
-            family: SsFamily::Classic,
+            cipher: leas_native::protocol::ss::method::SsCipher::Aead2017(aead),
         };
         // Per-cipher master key and client salt, exactly as `connect` derives
         // them: `EVP_BytesToKey` truncated to `key_len` (16/24/32) and
@@ -346,7 +345,7 @@ fn s2022_chunks(group: &mut Group<'_>) {
         let method = SsMethod::from_method(name).expect("2022 method");
         let psk = password_key(method, S2022_PSK).expect("2022 PSK");
         let subkey = stream_subkey(method, &psk, &salt);
-        chunk_rows(group, "s2022", name, method.aead, &subkey, &payload);
+        chunk_rows(group, "s2022", name, method.aead(), &subkey, &payload);
     }
 }
 
@@ -381,7 +380,7 @@ fn udp_classic_seal(
     payload: &[u8],
     rng: &SystemRandom,
 ) {
-    let aead = method.aead;
+    let aead = method.aead();
     let salt_len = aead.salt_len();
     let zero_nonce = [0u8; UDP_CHACHA_NONCE];
     let nonce = &zero_nonce[..aead.nonce_len()];
@@ -419,7 +418,7 @@ fn udp_classic_open(
     dest: &TargetAddr,
     payload: &[u8],
 ) {
-    let aead = method.aead;
+    let aead = method.aead();
     let salt_len = aead.salt_len();
     let zero_nonce = [0u8; UDP_CHACHA_NONCE];
     let nonce = &zero_nonce[..aead.nonce_len()];
@@ -462,7 +461,7 @@ fn udp_s2022_aes_seal(
     dest: &TargetAddr,
     payload: &[u8],
 ) {
-    let aead = method.aead;
+    let aead = method.aead();
     // One subkey per session: `udp_session_subkey(method, psk, client_id)`.
     let subkey = stream_subkey(method, psk, &S2022_SESSION_ID.to_be_bytes());
     let mut body = Vec::with_capacity(S2022_CLIENT_FIXED + IPV4_ADDR + payload.len());
@@ -500,7 +499,7 @@ fn udp_s2022_aes_open(
     dest: &TargetAddr,
     payload: &[u8],
 ) {
-    let aead = method.aead;
+    let aead = method.aead();
     let server_subkey = stream_subkey(method, psk, &S2022_SERVER_ID.to_be_bytes());
     let packet_id = 7u64;
     let packet = {
@@ -634,8 +633,7 @@ fn udp_classic_rows(group: &mut Group<'_>) {
         ("chacha20-ietf-poly1305", SsAead::ChaCha20Poly1305),
     ] {
         let method = SsMethod {
-            aead,
-            family: SsFamily::Classic,
+            cipher: leas_native::protocol::ss::method::SsCipher::Aead2017(aead),
         };
         let key = password_key(method, CLASSIC_PASSWORD).expect("classic key");
         udp_classic_seal(group, name, method, &key, &dest, &payload, &rng);

@@ -138,6 +138,7 @@ impl ProbeFailure {
             NativeError::Dial(_) => ProbeClass::Dial,
             NativeError::Tls(_)
             | NativeError::CertNotValidForName(_)
+            | NativeError::CertPinMismatch(_)
             | NativeError::CertExpired(_)
             | NativeError::CleartextPeer(_) => ProbeClass::Tls,
             NativeError::Reality(_) => ProbeClass::Reality,

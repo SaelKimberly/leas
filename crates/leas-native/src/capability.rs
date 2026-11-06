@@ -31,14 +31,14 @@ use std::borrow::Cow;
 use leas_proto::proto_spec::common::{KcpConfig, TransportConfig};
 use leas_proto::proto_spec::{
     Hysteria2Config, MuxSetting, PluginFamily, PluginMode, PluginSpec, ProtocolConfig,
-    ProtocolKind, SsConfig, TlsSetting, TrojanConfig, VlessConfig, VlessMux, VmessConfig,
+    ProtocolKind, SsConfig, TrojanConfig, VlessConfig, VlessMux, VmessConfig,
 };
 use leas_proto::proto_spec::{
     SecurityConfig, TlsConfig,
     ss_plugin::{OBFS_KEYS, V2RAY_KEYS},
 };
 
-use crate::protocol::ss::method::password_key;
+use crate::protocol::ss::method::{SsFamily, password_key};
 use crate::protocol::ss::resolve_method;
 use crate::protocol::vless::encryption::EncryptionConfig;
 
@@ -402,10 +402,11 @@ const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
 /// - [`resolve_method`] is the connect path's ONE config entry point
 ///   (`ss::connect` calls it before dispatching to a family codec), so the
 ///   gate and the codec cannot drift: routing through the same function
-///   rejects exactly what the dial would reject — legacy stream ciphers
-///   (`aes-*-cfb/ctr`, `rc4-md5`, `chacha20-ietf`, `none`, …) and unknown
-///   names — and keeps those rows on sing-box. Should `resolve_method` ever
-///   grow a check, this gate inherits it.
+///   rejects exactly what the dial would reject — an unknown method name —
+///   and keeps those rows on the subprocess. The legacy stream set
+///   (`aes-*-cfb/ctr`, `rc4-md5`, `chacha20-ietf`, `xchacha20`, `none`) is
+///   served natively since the stream codecs landed. Should `resolve_method`
+///   ever grow a check, this gate inherits it.
 /// - Method family vs `kind`: the two kinds share `SsConfig`, and
 ///   `2022-blake3-*` selects the BLAKE3 schedule while everything else uses
 ///   HKDF-SHA1, so a mismatch means the wrong KDF, not a fallback.
@@ -414,9 +415,11 @@ const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
 ///   (spec §8): the parse/store layer never refuses, so every verdict lives here
 ///   and reaches the row as the `[untestable]` marker — which is also what keeps
 ///   `remove_failed_servers` from deleting a row we merely cannot serve.
-/// - `password_key`: a malformed 2022 PSK (not base64, or the wrong length
-///   for the method) is a fatal `NativeError::Config` in the connect path, so
-///   refusing at gate time keeps Auto resolution on the subprocess.
+/// - `password_key`: a 2022 PSK that is neither standard base64 nor an exact
+///   raw-length key is a fatal `NativeError::Config` in the connect path, so
+///   refusing at gate time keeps Auto resolution on the subprocess. The shape
+///   rule is xray's `ParseKey` ([`leas_proto::proto_spec::ss2022_key`]), and
+///   the import funnel drops such a row before it is ever stored.
 ///
 /// A fingerprint id is no longer a refusal here: `security::wrap` resolves
 /// every id, approximating one with no roster row rather than failing.
@@ -433,6 +436,18 @@ fn ss_reason(kind: ProtocolKind, cfg: &SsConfig) -> Option<Cow<'static, str>> {
         && let Some(reason) = plugin_reason(plugin, &cfg.security)
     {
         return Some(reason);
+    }
+    // A `:`-separated list is xray's multi-user client form: a VALID config we
+    // do not serve (no extensible identity header, single-user PSK only). It is
+    // named as unimplemented, not as a malformed key — the import funnel keeps
+    // such a row precisely because it is valid.
+    if method.family() == SsFamily::Blake3_2022
+        && cfg.password.contains(':')
+        && leas_proto::proto_spec::ss2022_password_usable(&cfg.method, &cfg.password)
+    {
+        return Some(Cow::Borrowed(
+            "shadowsocks 2022 multi-user PSK list is not implemented",
+        ));
     }
     if password_key(method, &cfg.password).is_err() {
         return Some(Cow::Borrowed("shadowsocks 2022 password key is malformed"));
@@ -451,8 +466,9 @@ fn ss_reason(kind: ProtocolKind, cfg: &SsConfig) -> Option<Cow<'static, str>> {
 /// `mode=quic`: named, deliberately not served, and not because it is hard.
 /// The full evidence is in the comment at the refusal site; the short form is
 /// what a row's marker has to say.
-const QUIC_WIRE_UNPINNED: &str = "shadowsocks plugin mode `quic` is not implemented — its client wire could not be pinned \
-     from evidence (v2ray-plugin embeds V2Ray 4.38.3, whose source is not in-tree)";
+const QUIC_WIRE_UNPINNED: &str = "shadowsocks plugin mode `quic` is not implemented — the peer speaks \
+     QUIC draft-29/32/34 (v2ray-plugin v1.3.2 embeds v2ray-core 4.38.3 + quic-go 0.20.1) and every QUIC \
+     stack here speaks RFC 9000 v1; new rows of this shape are rejected at import";
 
 fn plugin_reason(spec: &PluginSpec, security: &SecurityConfig) -> Option<Cow<'static, str>> {
     // A row that speaks both vocabularies is not decidable: the two describe
@@ -512,22 +528,10 @@ fn plugin_reason(spec: &PluginSpec, security: &SecurityConfig) -> Option<Cow<'st
             "shadowsocks plugin option `mux={value}` is not a number we can use"
         )));
     }
-    if let TlsSetting::Invalid(value) = &spec.tls {
-        return Some(Cow::Owned(format!(
-            "shadowsocks plugin option `tls={value}` is not a boolean we can use"
-        )));
-    }
-    // A client CA pin is never silently ignored: ignoring a pin is the one
-    // failure mode this change refuses to ship. Matched lowercased, because the
-    // parser lowercases option keys (feeds spell these both ways).
-    for key in ["cert", "certraw"] {
-        if spec.extra.contains_key(key) {
-            let spelled = if key == "certraw" { "certRaw" } else { "cert" };
-            return Some(Cow::Owned(format!(
-                "shadowsocks plugin option `{spelled}` pins a client CA, which the native engine does not implement"
-            )));
-        }
-    }
+    // `cert` / `certRaw` used to be refused here ("a client CA pin the engine
+    // does not implement"). They are now honoured as a per-row SPKI pin
+    // (`security::pin`), so the row is servable — the pin is enforced at the
+    // TLS verifier, and a mismatch earns `[cert]` rather than a gate verdict.
     // The `security` layer: on a TLS-bearing plugin mode it is the *supported*
     // case (it supplies the SNI/fingerprint/insecure the plugin's own `tls` key
     // turns on). REALITY never is — a steal target around an obfs stream is a
@@ -1085,7 +1089,6 @@ mod tests {
             (ProtocolKind::Vless, ProtocolConfig::Vless(vless_quic)),
             (ProtocolKind::Vmess, ProtocolConfig::Vmess(vmess_sec)),
             (ProtocolKind::Vmess, ProtocolConfig::Vmess(vmess_alter)),
-            (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_legacy)),
             (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_family)),
             (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_plugin)),
             (
@@ -1112,6 +1115,9 @@ mod tests {
                 ProtocolKind::Shadowsocks,
                 ProtocolConfig::Ss(ss_cfg("aes-256-gcm", "secret")),
             ),
+            // The legacy stream set is native (spec D1): a servable row, not a
+            // refusal.
+            (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_legacy)),
         ];
 
         let mut refusals = 0;
@@ -1126,9 +1132,13 @@ mod tests {
                 refusals += 1;
             }
         }
+        // Every refusal class in the table above: kind, kind/config mismatch,
+        // ech, vless encryption/flow/mux/vision, vmess security, transport,
+        // kcp header, kcp-by-transport, and the plugin family. The legacy
+        // cipher class left this list when the stream codecs landed (spec D1).
         assert!(
-            refusals >= 11,
-            "the table must exercise every refusal class"
+            refusals >= 10,
+            "the table must exercise every refusal class (got {refusals})"
         );
     }
 
@@ -1428,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn ss_kinds_are_native_and_legacy_methods_defer() {
+    fn ss_kinds_are_native_and_stream_methods_are_served() {
         assert!(kind_supported(ProtocolKind::Shadowsocks));
         assert!(kind_supported(ProtocolKind::Shadowsocks2022));
         assert!(ss_row(
@@ -1442,8 +1452,26 @@ mod tests {
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
             )
         ));
-        // legacy + unknown methods stay on sing-box
-        for method in ["aes-256-cfb", "none", "rc4-md5", "chacha20-ietf"] {
+        // The legacy stream set is native now (spec D1).
+        for method in [
+            "aes-128-cfb",
+            "aes-192-cfb",
+            "aes-256-cfb",
+            "aes-128-ctr",
+            "aes-192-ctr",
+            "aes-256-ctr",
+            "rc4-md5",
+            "chacha20-ietf",
+            "xchacha20",
+            "none",
+        ] {
+            assert!(
+                ss_row(ProtocolKind::Shadowsocks, ss_cfg(method, "pw")),
+                "{method} must be served natively"
+            );
+        }
+        // A name in neither roster still defers to the subprocess.
+        for method in ["salsa20", "bf-cfb", "bogus"] {
             assert!(
                 !ss_row(ProtocolKind::Shadowsocks, ss_cfg(method, "pw")),
                 "{method}"
@@ -1465,6 +1493,42 @@ mod tests {
         ));
     }
 
+    /// The 2022 key rule is xray's `ParseKey`, so the rows it refuses are named
+    /// for what they are: a valid multi-user list is NOT a malformed key.
+    #[test]
+    fn ss2022_key_verdicts_name_the_real_cause() {
+        let kind = ProtocolKind::Shadowsocks2022;
+        // xray's raw-bytes fallback: a literal 16-byte key is served.
+        assert!(ss_row(
+            kind,
+            ss_cfg("2022-blake3-aes-128-gcm", "r@w-key-01234567")
+        ));
+        // A valid `:`-separated multi-user list: refused as unimplemented.
+        assert_eq!(
+            support_reason(
+                kind,
+                &ProtocolConfig::Ss(ss_cfg(
+                    "2022-blake3-aes-128-gcm",
+                    "AAAAAAAAAAAAAAAAAAAAAA==:AAAAAAAAAAAAAAAAAAAAAA=="
+                ))
+            )
+            .as_deref(),
+            Some("shadowsocks 2022 multi-user PSK list is not implemented")
+        );
+        // Neither base64 nor the method's raw length: malformed.
+        assert_eq!(
+            support_reason(
+                kind,
+                &ProtocolConfig::Ss(ss_cfg(
+                    "2022-blake3-aes-128-gcm",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                ))
+            )
+            .as_deref(),
+            Some("shadowsocks 2022 password key is malformed")
+        );
+    }
+
     /// Every plugin shape gets its OWN named verdict (spec §8), and the shapes
     /// we do implement are accepted.
     #[test]
@@ -1476,6 +1540,11 @@ mod tests {
             ("v2ray-plugin", "host=cdn.example"),
             ("v2ray-plugin", "mode=websocket;host=cdn.example;mux=0"),
             ("v2ray-plugin", "host=cdn.example;tls"),
+            // presence-only `tls`: a value the old parser called invalid still
+            // asks for TLS, exactly as both references read it.
+            ("v2ray-plugin", "host=cdn.example;tls=maybe"),
+            // a pinned certificate is honoured at the verifier, not refused.
+            ("v2ray-plugin", "host=cdn.example;certRaw=PEM"),
         ] {
             assert!(
                 ss_row(
@@ -1499,13 +1568,6 @@ mod tests {
                 "legacy smux dialect",
             ),
             ("v2ray-plugin", "host=h;mux=many", "mux=many"),
-            ("v2ray-plugin", "host=h;tls=maybe", "tls=maybe"),
-            (
-                "v2ray-plugin",
-                "host=h;cert=/tmp/ca.pem",
-                "pins a client CA",
-            ),
-            ("v2ray-plugin", "host=h;certRaw=PEM", "pins a client CA"),
             (
                 "obfs-local",
                 "obfs=http;obfs-host=h;mode=websocket",

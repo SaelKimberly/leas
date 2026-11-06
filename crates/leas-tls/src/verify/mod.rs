@@ -36,6 +36,28 @@ const SERVER_CV_CONTEXT: &[u8] = b"TLS 1.3, server CertificateVerify\x00";
 
 // ── Verifier ───────────────────────────────────────────────────────────────
 
+/// The SHA-256 of a certificate's `SubjectPublicKeyInfo` (DER).
+///
+/// Exactly the value [`WebPkiVerifier::with_pin`] compares against, so a
+/// `cert`/`certRaw` trust anchor can be expressed as the same pin without a
+/// second verifier.
+///
+/// # Errors
+///
+/// [`TlsError::Verify`] when `cert_der` is not a parsable X.509 certificate.
+pub fn spki_sha256(cert_der: &[u8]) -> Result<[u8; 32]> {
+    let cert = CertificateDer::from(cert_der.to_vec());
+    let end_entity = EndEntityCert::try_from(&cert)
+        .map_err(|e| TlsError::Verify(format!("invalid certificate DER: {e}")))?;
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        end_entity.subject_public_key_info().as_ref(),
+    );
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    Ok(out)
+}
+
 /// Real certificate verification via `rustls-webpki` + `ring`.
 #[derive(Clone)]
 pub struct WebPkiVerifier {
@@ -123,7 +145,7 @@ impl ServerVerifier for WebPkiVerifier {
                 end_entity.subject_public_key_info().as_ref(),
             );
             if digest.as_ref() != pin {
-                return Err(TlsError::Verify(
+                return Err(TlsError::PinMismatch(
                     "server certificate SPKI does not match the configured pin".to_string(),
                 ));
             }
@@ -331,7 +353,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{WebPkiVerifier, verify_certificate_verify};
+    use super::{WebPkiVerifier, spki_sha256, verify_certificate_verify};
     use crate::crypto::CipherSuiteId;
     use crate::error::{Result, TlsError};
     use crate::handshake::SignedData;
@@ -420,6 +442,68 @@ mod tests {
             .as_ref()
             .try_into()
             .unwrap()
+    }
+
+    /// `spki_sha256` is the value `with_pin` compares against: it must equal
+    /// the key's SPKI digest, and a re-issued certificate for the SAME key must
+    /// keep it (the renewal tolerance D7 relies on).
+    #[test]
+    fn spki_sha256_is_key_identity_not_certificate_identity() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert_a = rcgen::CertificateParams::new(vec!["a.example".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_b = rcgen::CertificateParams::new(vec!["b.example".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        assert_ne!(
+            cert_a.der(),
+            cert_b.der(),
+            "the two certificates must really differ"
+        );
+        let pin_a = spki_sha256(cert_a.der()).unwrap();
+        assert_eq!(pin_a, spki_pin(&key));
+        assert_eq!(
+            pin_a,
+            spki_sha256(cert_b.der()).unwrap(),
+            "a renewal keeping the key keeps the pin"
+        );
+
+        let other = rcgen::generate_simple_self_signed(vec!["c.example".into()]).unwrap();
+        assert_ne!(pin_a, spki_sha256(other.cert.der()).unwrap());
+    }
+
+    /// A verifier pinned to cert A accepts a server presenting certificate B
+    /// when both carry the same key — the D7 behaviour end to end.
+    #[tokio::test]
+    async fn pin_accepts_a_reissued_certificate_for_the_same_key() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert_a = rcgen::CertificateParams::new(vec!["a.example".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_b = rcgen::CertificateParams::new(vec!["b.example".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let verifier = WebPkiVerifier::webpki_roots().with_pin(spki_sha256(cert_a.der()).unwrap());
+        connect_server(&verifier, "b.example", &cert_b, &key)
+            .await
+            .unwrap();
+
+        // A different key is still refused.
+        let other = rcgen::generate_simple_self_signed(vec!["b.example".into()]).unwrap();
+        let err = connect_server(
+            &WebPkiVerifier::webpki_roots().with_pin(spki_sha256(cert_a.der()).unwrap()),
+            "b.example",
+            &other.cert,
+            &other.signing_key,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, TlsError::PinMismatch(_)), "got: {err}");
     }
 
     /// Spawns a rustls server presenting `cert`/`key` and connects our TLS
@@ -590,7 +674,10 @@ mod tests {
         let err = connect_server(&verifier, "localhost", &leaf_cert, &leaf_key)
             .await
             .unwrap_err();
-        assert!(matches!(err, TlsError::Verify(_)), "got: {err}");
+        assert!(
+            matches!(err, TlsError::PinMismatch(_)),
+            "a pin mismatch is its own typed cause, so the row earns `[cert]`: {err}"
+        );
     }
 
     #[tokio::test]

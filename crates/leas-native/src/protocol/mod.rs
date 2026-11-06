@@ -142,7 +142,7 @@ pub fn initial_auth_ack(protocol: &ProtocolConfig) -> AuthAck {
         // laziness argument applies to the reply's arrival. Classic-AEAD
         // Shadowsocks has no server ack at all.
         ProtocolConfig::Ss(cfg) => match ss::resolve_method(cfg) {
-            Ok(method) if method.family == ss::method::SsFamily::Blake3_2022 => AuthAck::Unknown,
+            Ok(method) if method.family() == ss::method::SsFamily::Blake3_2022 => AuthAck::Unknown,
             _ => AuthAck::NotApplicable,
         },
         // Every other family the engine serves has no server ack; every

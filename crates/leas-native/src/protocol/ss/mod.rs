@@ -1,19 +1,22 @@
-//! Shadowsocks — native client (classic AEAD + 2022-blake3, TCP).
+//! Shadowsocks — native client (classic AEAD + 2022-blake3 + legacy stream
+//! ciphers, TCP).
 //!
-//! Cipher scope is the AEAD set + 2022-blake3 (`method.rs`); legacy stream
-//! ciphers route to sing-box via [`crate::capability`]. SIP003 plugins are
-//! gated off there too. References: shadowsocks-rust `relay/`, mihomo
+//! Cipher scope is the AEAD set, 2022-blake3 and the legacy stream ciphers
+//! (`method.rs`): `aes-*-cfb`, `aes-*-ctr`, `rc4-md5`, `chacha20-ietf`,
+//! `xchacha20`, `none`. SIP003 plugins are gated in [`crate::capability`]. References: shadowsocks-rust `relay/`, mihomo
 //! `transport/shadowsocks/`, and the 2022 edition spec.
 //!
 //! [`connect`] resolves the row's method and hands the stream to the family
-//! codec — [`stream`] for the 2017 AEAD set, [`stream2022`] for 2022-blake3 —
-//! which writes the handshake and returns the tunnel.
+//! codec — [`stream`] for the 2017 AEAD set, [`stream2022`] for 2022-blake3,
+//! [`stream_legacy`] for the legacy stream ciphers — which writes the
+//! handshake and returns the tunnel.
 
 pub mod consts;
 pub mod method;
 pub mod mux;
 pub mod stream;
 pub mod stream2022;
+pub mod stream_legacy;
 pub mod udp;
 
 use leas_proto::proto_spec::SsConfig;
@@ -44,9 +47,10 @@ pub async fn connect(
     cfg: &SsConfig,
 ) -> Result<BoxStream, NativeError> {
     let method = resolve_method(cfg)?;
-    match method.family {
+    match method.family() {
         SsFamily::Classic => stream::connect(ctx, stream, cfg, method).await,
         SsFamily::Blake3_2022 => stream2022::connect(ctx, stream, cfg, method).await,
+        SsFamily::Stream => stream_legacy::connect(ctx, stream, cfg, method).await,
     }
 }
 
@@ -85,15 +89,23 @@ mod tests {
     #[tokio::test]
     async fn dispatch_picks_the_family_codec() {
         let method = SsMethod::from_method("2022-blake3-aes-256-gcm").unwrap();
-        assert_eq!(method.family, SsFamily::Blake3_2022);
+        assert_eq!(method.family(), SsFamily::Blake3_2022);
         let method = SsMethod::from_method("aes-128-gcm").unwrap();
-        assert_eq!(method.family, SsFamily::Classic);
+        assert_eq!(method.family(), SsFamily::Classic);
+        // The legacy arm has its own dispatch (`stream_legacy::connect`), so the
+        // family must be derivable from the cipher without a third lookup.
+        let method = SsMethod::from_method("aes-256-cfb").unwrap();
+        assert_eq!(method.family(), SsFamily::Stream);
+        assert_eq!(
+            method.kind(),
+            leas_proto::proto_spec::ProtocolKind::Shadowsocks
+        );
     }
 
     #[tokio::test]
     async fn unknown_method_is_a_config_error() {
         let cfg = SsConfig {
-            method: "aes-256-cfb".into(),
+            method: "salsa20".into(),
             password: "pw".into(),
             security: SecurityConfig::default(),
             remarks: None,
@@ -127,16 +139,16 @@ mod tests {
         );
     }
 
-    /// A legacy cipher never reaches either codec: the guard refuses it and
+    /// An unknown cipher never reaches any codec: the guard refuses it and
     /// the stream is dropped unwritten, so the peer sees a clean EOF instead
     /// of a handshake.
     #[tokio::test]
-    async fn legacy_method_is_refused_before_any_codec_writes() {
-        let cfg = ss_cfg("aes-256-cfb", "pw");
+    async fn unknown_method_is_refused_before_any_codec_writes() {
+        let cfg = ss_cfg("salsa20", "pw");
         let (ctx, _target) = link(&cfg);
         let (client, mut server) = duplex(1 << 16);
         let Err(err) = connect(&ctx, Box::new(client), &cfg).await else {
-            panic!("a legacy cipher must be refused");
+            panic!("an unknown cipher must be refused");
         };
         assert!(matches!(err, NativeError::Config(_)), "got {err:?}");
 
@@ -145,6 +157,27 @@ mod tests {
             server.read(&mut wire).await.unwrap(),
             0,
             "the guard fires before any handshake byte"
+        );
+    }
+
+    /// A legacy row reaches `stream_legacy`: the wire opens with the cipher's
+    /// IV (16 bytes for `aes-256-cfb`) followed by ciphertext, and the address
+    /// rides inside that keystream — no salt, no length/tag framing.
+    #[tokio::test]
+    async fn legacy_method_dispatches_to_the_stream_codec() {
+        let cfg = ss_cfg("aes-256-cfb", "pw");
+        let (ctx, target) = link(&cfg);
+        let (client, mut server) = duplex(1 << 16);
+        let tunnel = connect(&ctx, Box::new(client), &cfg).await.unwrap();
+        drop(tunnel);
+
+        let addr_len = encode_addr_port_last(&target).unwrap().len();
+        let mut wire = [0u8; 256];
+        let n = server.read(&mut wire).await.unwrap();
+        assert_eq!(
+            n,
+            16 + addr_len,
+            "stream framing: [IV 16][cipher(addr)] — no chunk seals"
         );
     }
 }

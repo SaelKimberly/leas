@@ -5,6 +5,13 @@ Status: `approved (rev. 14) — plan: docs/aegis/plans/2026-09-30-ss-plugin.md`
 Scope: `xray-tui-proto`, `xray-tui-native`, `xray-tui-core`, `xray-tui`, docs
 Related: `NATIVE_CORE.md` (Shadowsocks capability table + the `obfs plugins (SS)` deferral row), `AGENTS.md` decisions 2, 4, 11, 20, `docs/aegis/specs/2026-09-23-ws-path-canonicalization-design.md`
 
+> **Superseded in part (2026-11-06):** `specs/2026-11-06-shadowsocks-coverage-design.md`
+> replaces §3.5's `cert`/`certRaw` treatment and the §8 verdicts for `tls=<value>`,
+> `cert`/`certRaw` and `mode=quic` (quic rows are now rejected at import; `tls` is
+> presence-only; the cert is an SPKI pin). Plan T22's "could not be pinned" stop reason
+> is moot — its source is vendored — but its conclusion stands on a stronger ground.
+> Nothing else in this document is re-opened.
+
 **Revision note.** Rev. 1 specified a narrowing typed struct against an assumed single
 spelling. Review against the repo's own captured feeds (`tests/fixtures/m1n1-5ub-*.txt`)
 found **seven wire shapes built from four parse mechanisms**, one of which has no `plugin=`

@@ -6,6 +6,7 @@
 //! rustls client path and the `TlsProvider` plug are gone.
 
 pub mod fingerprint;
+pub mod pin;
 pub mod reality;
 
 use std::sync::Arc;
@@ -69,9 +70,13 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 );
             }
             let fingerprint = fp_id.map(fingerprint::profile_for).transpose()?;
+            // One pin: the explicit `pinSHA256` and/or the plugin's
+            // `cert`/`certRaw` (D6/D7). Conflicting anchors are a config error,
+            // so the two can never be silently merged.
+            let pin = pin::resolve(opts.pin_sha256.as_deref(), ctx.plugin_spec()).await?;
             let verifier: Arc<dyn ServerVerifier> = Arc::new(fingerprint::verifier_for(
                 opts.insecure.unwrap_or(false),
-                fingerprint::decode_pin_sha256(opts.pin_sha256.as_deref())?,
+                pin,
             ));
             let config = EngineTlsConfig {
                 mode: TlsMode::Plain {
@@ -190,8 +195,10 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
         // row to say `insecure`, and an earlier version of this comment claimed
         // otherwise.
         None if ctx.plugin_spec().is_some_and(PluginSpec::needs_tls) => {
-            let verifier: Arc<dyn ServerVerifier> =
-                Arc::new(fingerprint::verifier_for(false, None));
+            // A plugin row that states `cert`/`certRaw` here pins the same way;
+            // there is no `security` block to carry an explicit `pinSHA256`.
+            let pin = pin::resolve(None, ctx.plugin_spec()).await?;
+            let verifier: Arc<dyn ServerVerifier> = Arc::new(fingerprint::verifier_for(false, pin));
             let config = EngineTlsConfig {
                 mode: TlsMode::Plain {
                     fingerprint: None,
@@ -232,6 +239,9 @@ fn map_tls_err(e: TlsError) -> NativeError {
         TlsError::CertNotValidForName(detail) => NativeError::CertNotValidForName(detail),
         TlsError::CertExpired(detail) => NativeError::CertExpired(detail),
         TlsError::CleartextPeer(detail) => NativeError::CleartextPeer(detail),
+        // A pin mismatch is a statement about THIS row's trust anchor, so it
+        // keeps its own variant (and earns `[cert]` through the evidence map).
+        TlsError::PinMismatch(detail) => NativeError::CertPinMismatch(detail),
         // The variant's own Display already carries the `TLS error: ` prefix.
         other => NativeError::Tls(other.to_string()),
     }
@@ -242,6 +252,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::sync::Arc;
 
+    use base64::Engine as _;
     use leas_proto::proto_spec::ProtocolConfig;
     use leas_proto::proto_spec::endpoint::EndpointEssentials;
     use rustls;
@@ -498,5 +509,84 @@ mod tests {
             }
             Ok(_) => panic!("REALITY against a plain server must fail"),
         }
+    }
+    /// A `certRaw` pin: the row accepts exactly the server whose leaf SPKI
+    /// matches, and a pin for another key is refused with `[cert]` evidence.
+    ///
+    /// This is the wiring test: `leas-tls` already proves the verifier's
+    /// semantics, and `security::pin` proves the digest derivation; this pins
+    /// the two together through `wrap`'s plugin-TLS arm.
+    #[tokio::test]
+    async fn plugin_cert_raw_pins_the_server_key() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let addr = spawn_echo_tls_server(
+            &certified.cert.pem(),
+            &certified.signing_key.serialize_pem(),
+        );
+        let body = base64::engine::general_purpose::STANDARD.encode(certified.cert.der());
+
+        let ctx = ss_plugin_ctx(&body, addr);
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut out = wrap(&ctx, Box::new(sock))
+            .await
+            .expect("the pin accepts the server's own key");
+        out.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        out.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // The same row with ANOTHER certificate's pin: the server's key is not
+        // the one this config names.
+        let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let other_body = base64::engine::general_purpose::STANDARD.encode(other.cert.der());
+        // A fresh listener serving the SAME certificate, while the pin names a
+        // DIFFERENT key: the refusal is the pin alone, not a handshake fault.
+        // Do not "simplify" this by reusing the first listener — the second
+        // listener exists because the echo server accepts exactly one
+        // connection, not because the certificate differs.
+        let addr = spawn_echo_tls_server(
+            &certified.cert.pem(),
+            &certified.signing_key.serialize_pem(),
+        );
+        let ctx = ss_plugin_ctx(&other_body, addr);
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let Err(err) = wrap(&ctx, Box::new(sock)).await else {
+            panic!("a different key must be refused");
+        };
+        assert!(
+            matches!(err, NativeError::CertPinMismatch(_)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            err.evidence(),
+            Some(crate::error::FailureEvidence::CertNotValidForName),
+            "a pin mismatch earns `[cert]`"
+        );
+    }
+
+    /// An SS plugin row whose TLS is the plugin's `tls` key (no `security`
+    /// block), pinned by `certRaw`.
+    fn ss_plugin_ctx(cert_raw: &str, addr: std::net::SocketAddr) -> LinkContext {
+        let cfg = leas_proto::proto_spec::SsConfig {
+            method: "aes-128-gcm".into(),
+            password: "pw".into(),
+            security: leas_proto::proto_spec::SecurityConfig::default(),
+            remarks: None,
+            plugin: Some(leas_proto::proto_spec::PluginSpec::from_parts(
+                Some("v2ray-plugin"),
+                &format!("host=localhost;tls;certRaw={cert_raw}"),
+            )),
+        };
+        let params = NativeConnectParams::new(
+            ProtocolConfig::Ss(cfg),
+            EndpointEssentials::new(addr.ip().to_string(), addr.port()),
+            TargetAddr::new(Host::Domain("example.com".into()), 80),
+        );
+        LinkContext::new(
+            params,
+            TargetAddr::new(Host::Domain("example.com".into()), 80),
+        )
     }
 }

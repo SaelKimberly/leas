@@ -1496,6 +1496,7 @@ fn reply_for(error: &NativeError) -> socks5::ReplyCode {
         NativeError::Config(_)
         | NativeError::Tls(_)
         | NativeError::CertNotValidForName(_)
+        | NativeError::CertPinMismatch(_)
         | NativeError::CertExpired(_)
         | NativeError::CleartextPeer(_)
         | NativeError::Reality(_)

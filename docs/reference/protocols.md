@@ -266,23 +266,19 @@ Also accepts:
 | `password` | userinfo | `String` | ✅ | — | Shared secret |
 | `host` | hostport | `HostSpec` | ✅ | — | Server address |
 | `port` | hostport | `u16` | ✅ | `8388` | Server port |
-| ~~`plugin`~~ | query `plugin` | — | ❌ | — | **NOT STORED** — precision gap |
-| ~~`plugin_opts`~~ | query `plugin_opts` | — | ❌ | — | **NOT STORED** — precision gap |
+| `plugin` | query `plugin` | `Option<PluginSpec>` | ❌ | `None` | SIP003 plugin, total-lossless (`proto_spec/ss_plugin.rs`) |
+| `plugin_opts` | wrapped into `plugin` | `PluginSpec` fields | ❌ | — | options are typed fields + `extra`, never a second string |
 | `remarks` | `#` fragment | `Option<TinyText>` | ❌ | `None` | Display name |
 
 ### Valid Ciphers
 
-- **Legacy**: `rc4-md5`, `aes-256-cfb`, `aes-128-cfb`, `chacha20`, `salsa20`, `bf-cfb`, `des-cfb`, `camellia-128-cfb`, `camellia-256-cfb`
+- **Legacy (native)**: `aes-{128,192,256}-cfb`, `aes-{128,192,256}-ctr`, `rc4-md5`, `chacha20-ietf`, `xchacha20`, `none`
 - **AEAD**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`, `xchacha20-ietf-poly1305`
 - **AEAD-2022**: `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`
 
-### ⚠️ Precision Gap
+### Plugin storage
 
-`SsConfig` **lacks `plugin` and `plugin_opts` fields**. SIP003 plugins (simple-obfs, v2ray-plugin, etc.) are parsed by `import_export.rs` into the legacy JSON blob but are NOT stored in the typed struct. On proto_spec round-trip (parse → reconstruct), plugin config is silently dropped.
-
-**Workaround**: Use the legacy `import_export.rs` path (`parse_share_url`/`format_share_url`) which preserves plugin in the JSON blob bridge.
-
-**Fix**: Add `plugin: Option<TinyText>` + `plugin_opts: Option<TinyText>` to `SsConfig`, wire into `try_parse`/`reconstruct`.
+`SsConfig` carries `plugin: Option<PluginSpec>` — the lossless typed form (name, family, mode, host, port, path, `tls`, `mux`, plus a sorted `extra` map for keys we preserve but do not interpret). Parsing is the one splitter the URL, Clash and form paths share, and `reconstruct_proto` writes every non-default field back, so a plugin row round-trips byte-stably.
 
 ### Upstream References
 
@@ -297,7 +293,7 @@ Also accepts:
 |-------|--------|
 | Basic parse → reconstruct | ✅ Tested |
 | Remarks preservation | ✅ Tested |
-| **Plugin round-trip** | ❌ **LOST — not in struct** |
+| **Plugin round-trip** | ✅ Tested (`corpus_plugin_rows_parse_and_round_trip`) |
 | AEAD-2022 ciphers | ✅ Handled (method string only) |
 | Legacy QR format | ✅ Accepted |
 | JSON serde round-trip | ✅ Tested |
@@ -921,10 +917,9 @@ None of these have share URL formats. They are selected and configured internall
 
 | # | Protocol | Field | Impact | Fix Priority |
 |---|----------|-------|--------|-------------|
-| 1 | Shadowsocks | `plugin`, `plugin_opts` | SIP003 plugins silently dropped on proto_spec round-trip | **HIGH** — functional loss |
-| 2 | ShadowsocksR | `obfsparam`, `protoparam` | Stored in generic HashMap, no typed access | LOW — round-trip preserved |
-| 3 | Hysteria2 | `up`/`down` as strings | Config builder must parse to Mbps int | LOW — string parse is safe |
-| 4 | All placeholder | Entire config | No typed fields, opaque JSON blob only | MEDIUM — no loss today but no validation |
+| 1 | ShadowsocksR | `obfsparam`, `protoparam` | Stored in generic HashMap, no typed access | LOW — round-trip preserved |
+| 2 | Hysteria2 | `up`/`down` as strings | Config builder must parse to Mbps int | LOW — string parse is safe |
+| 3 | All placeholder | Entire config | No typed fields, opaque JSON blob only | MEDIUM — no loss today but no validation |
 
 ### Missing Fields (JSON config only — not in share URLs)
 
@@ -950,7 +945,7 @@ These are fields present in upstream option structs that never appear in share U
 | Multi-variant round-trip | VLESS only | VLESS tests 3 variants + XHttp + httpupgrade |
 | `security=none` | Trojan only | Trojan tests explicit no-TLS round-trip |
 | Serde round-trip | All 8 real configs | JSON serialize → deserialize → compare |
-| Plugin round-trip | **NONE** | SS plugin not tested (gap) |
+| Plugin round-trip | ✅ `corpus_plugin_rows_parse_and_round_trip` | parse → export → re-import is identity-stable over the captured feed corpus |
 | All-fields round-trip | **NONE** | No test exercises every optional field |
 | JSON config round-trip | **NONE** | No `to_json_config` → parse → compare test |
 | Bridge precision | **NONE** | No `Profile` → `ProtocolConfig` → `Profile` test |
@@ -1000,7 +995,6 @@ Clients that consume share URLs directly (v2rayN, v2rayNG, xray-checker) and con
 | 13 | AnyTLS | `anytls://` | ✅ `AnytlsFmt` | ❌ | ✅ `explodeAnyTLS` | ❌ | ✅ full | ⚠️ Placeholder |
 | 14 | ShadowTLS | `shadowtls://` | ❌ | ❌ | ❌ | ❌ | ✅ full | ⚠️ Placeholder |
 
-> `⚠️\*` = SsConfig missing `plugin`/`plugin_opts` (confirmed precision loss).
 > v2ray-core and v2ray-core-legacy have **zero** URL parsing — they are proxy runtimes, not clients.
 
 ### 24.2 Standard URL Query Parameter Vocabulary
@@ -1063,8 +1057,8 @@ They form the de-facto standard for v2ray-style share URLs.
 | WireGuard | `reserved` | Reserved bytes (3-byte) | ✅ `WireguardConfig.reserved` |
 | WireGuard | `address` | Interface address CIDR | ✅ `WireguardConfig.address` |
 | WireGuard | `mtu` | Interface MTU | ✅ `WireguardConfig.mtu` |
-| Shadowsocks | `plugin` | SIP003 plugin (e.g. `obfs-local`) | ❌ **SsConfig precision loss** |
-| Shadowsocks | `plugin_opts` | SIP003 plugin options | ❌ **SsConfig precision loss** |
+| Shadowsocks | `plugin` | SIP003 plugin (e.g. `obfs-local`) | ✅ `SsConfig.plugin: Option<PluginSpec>` |
+| Shadowsocks | `plugin_opts` | SIP003 plugin options | ✅ typed fields + `extra` in the same struct |
 
 ### 24.3 Upstream Fmt File Reference
 

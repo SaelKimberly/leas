@@ -53,7 +53,7 @@ pub use naive::NaiveConfig;
 pub use security_rank::protocol_security_rank;
 pub use shadowtls::ShadowTlsConfig;
 pub use socks::Socks5Config;
-pub use ss::SsConfig;
+pub use ss::{Ss2022Key, SsConfig, ss2022_key, ss2022_key_len, ss2022_password_usable};
 pub use ss_plugin::{MuxSetting, PluginFamily, PluginMode, PluginSpec, TlsSetting};
 pub use ssh::SshConfig;
 pub use ssr::SsrConfig;

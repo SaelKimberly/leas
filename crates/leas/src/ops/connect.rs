@@ -86,9 +86,12 @@ const fn asks_native(forced: Option<CoreType>) -> bool {
 /// `xray`/`sing-box` therefore only vetoes native; `native`/`auto` asks for
 /// native and still faces the capability gate.
 ///
-/// Native is asked for by that override, or by an xray-stamped link on one of
-/// the six native kinds — the connect-time replacement for the old parse-time
-/// `Auto` stamp, so nothing native-specific is persisted.
+/// Native is asked for by that override, or by ANY link whose kind and loaded
+/// config the engine can serve — not only an `Xray`-stamped one. A `SingBox`
+/// stamp is not a statement that native cannot serve the row: legacy
+/// Shadowsocks methods and `aes-192-gcm` are stamped `SingBox` because xray's
+/// roster lacks them, and they are exactly the rows the native codecs exist
+/// for (spec D8). A concrete `xray`/`sing-box` override still vetoes native.
 fn resolve_runtime_core(
     link_core: CoreType,
     kind: ProtocolKind,
@@ -97,8 +100,7 @@ fn resolve_runtime_core(
     proxy_all_blocked: bool,
 ) -> (CoreType, Option<&'static str>) {
     let forces_legacy = matches!(forced, Some(CoreType::Xray | CoreType::SingBox));
-    let asked_for_native = asks_native(forced) || (!forces_legacy && link_core == CoreType::Xray);
-    if !asked_for_native {
+    if forces_legacy {
         return (link_core, None);
     }
     if !capability::kind_supported(kind) {
@@ -1115,9 +1117,9 @@ mod tests {
         CoreType::Xray, ProtocolKind::Vless, Some(CoreType::SingBox), Some(TransportConfig::Tcp), false,
         (CoreType::Xray, None)
     )]
-    #[case::singbox_stamped_link_never_runs_native(
+    #[case::singbox_stamped_link_whose_config_native_serves_runs_native(
         CoreType::SingBox, ProtocolKind::Vless, None, Some(TransportConfig::Tcp), false,
-        (CoreType::SingBox, None)
+        (CoreType::Native, None)
     )]
     #[case::non_native_kind_keeps_the_link_core_silently(
         CoreType::Xray, ProtocolKind::Socks, None, None, false,

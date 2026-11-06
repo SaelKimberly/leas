@@ -495,3 +495,29 @@ batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes
   remapped to `mixed-in` so stored routing rules keep matching.
 - ✅ **Tests** — one listener serving both protocols (real sockets), supersede assertions for both
   builders, port-precedence and tag-remap units; targeted suites plus workspace clippy green.
+
+## Phase 34 — Shadowsocks coverage: legacy ciphers, admission policy, plugin TLS ✅
+
+- ✅ **Ten legacy stream ciphers are native** — `aes-{128,192,256}-cfb`, `aes-{128,192,256}-ctr`,
+  `rc4-md5`, `chacha20-ietf`, `xchacha20`, `none`: single-keystream TCP codec
+  (`protocol/ss/stream_legacy.rs`), per-datagram-IV UDP arm, `rc4-md5` keyed by
+  `MD5(master ‖ IV)`. AES-CFB-128 moved out of the VMess legacy header into
+  `crypto/legacy_stream.rs` (generic over key size) beside a hand-rolled RC4 (RFC 6229 KAT);
+  AES-CTR and ChaCha20/XChaCha20 reuse `ctr`/`chacha20`. `SsCipher` is the stored truth and
+  `SsFamily` is derived, so gate and dial cannot disagree.
+- ✅ **Connect-time native no longer requires an xray stamp** — a servable config is offered to
+  the in-process core whatever the link's subprocess stamp is (legacy SS and `aes-192-gcm` are
+  `SingBox`-stamped and now run native); a concrete `xray`/`sing-box` override still vetoes, and
+  the stamp stays the fallback.
+- ✅ **Import admission** — `validate_ss_config` drops three never-dialable classes at the one
+  funnel: a malformed 2022 PSK, `none` on a cleartext wire (a TLS-bearing layer exempts it;
+  `obfs=tls` does not count), and `mode=quic` (the peer speaks QUIC draft-29/32/34 and every
+  stack here speaks RFC 9000 v1). Stored rows are not migrated — they age out.
+- ✅ **Plugin TLS semantics** — `tls` is presence-only (`tls=0` means on, as both references read
+  it); `cert`/`certRaw` are honoured as a per-row **SPKI pin** (no system roots, no global pool)
+  with a mismatch earning the existing `[cert]` verdict; plugin option parsing implements the
+  reference's backslash escapes.
+- ✅ **Tests** — unit KATs (NIST CFB, RFC 6229 RC4, stream framing, UDP IV freshness), import-gate
+  matrix on both funnels, pin wiring end-to-end against a self-signed rustls origin (same key
+  accepted, different key refused), and ten sing-box-only `native-e2e` rows (opt-in).
+  Workspace gate: 2747 passed, clippy `-D warnings` clean.

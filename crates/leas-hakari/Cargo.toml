@@ -26,7 +26,7 @@ bit-vec = { version = "0.10", default-features = false, features = ["serde", "st
 bitflags = { version = "2", default-features = false, features = ["serde", "std"] }
 block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
 bytemuck = { version = "1", default-features = false, features = ["derive"] }
-chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha", "zeroize"] }
+chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 compact_str = { version = "0.10", features = ["serde"] }
 crc32fast = { version = "1" }
@@ -165,7 +165,7 @@ tower-http = { version = "0.6", default-features = false, features = ["decompres
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
-chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha", "zeroize"] }
+chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
@@ -191,7 +191,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
 block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
-chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha", "zeroize"] }
+chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
@@ -215,7 +215,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 
 [target.x86_64-pc-windows-gnu.build-dependencies]
 block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
-chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha", "zeroize"] }
+chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }

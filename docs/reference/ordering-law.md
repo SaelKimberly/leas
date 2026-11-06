@@ -281,8 +281,8 @@ under `CREATE INDEX IF NOT EXISTS` is a silent no-op).
 
 | page | plan | why |
 | --- | --- | --- |
-| Active, Test | `SEARCH … USING INDEX endpoint_rank_key_v2 (band=?)` | `band` is constant → seek, no sorter |
-| Purgatory, Test | same, `band = 1` | same shape |
+| Active, Test | `SEARCH … USING INDEX endpoint_rank_key_v2 (band<2)` | range seek → index order, no sorter |
+| Purgatory, Test | same, `band = 2` | same shape |
 | All, Test | `SCAN … USING COVERING INDEX` | `band` leads → index order, no sorter |
 | scoped batch (proven/bin predicate) | covering scan, predicate inline | no extra index needed |
 
@@ -290,18 +290,25 @@ under `CREATE INDEX IF NOT EXISTS` is a silent no-op).
 filesorts (`USE SORTER FOR ORDER BY`). The All view therefore orders by the
 mixed `band` column, never by a filter on it.
 
-`band` is the Active/Purgatory window: `0` when `rank_newest_seen >= now −
-active_ttl`, else `1`. `rank_newest_seen` is the newest **live** link's
-`last_seen_at`; an all-purged endpoint takes `NO_SEEN` (`i64::MIN`), which is
-below every window bound — exactly "it belongs to Purgatory". That is why a
-single index range serves both populations.
+`band` is the three-way view/freshness state (2026-11-06):
 
-`rank_weight` is a **raw `NOT NULL`** column (the toasty model has no seat for
-one, and declaring it there would need a schema-tag wipe). `NOT NULL` is
-load-bearing: `profiles_anchor` binds every ordering term's value back into a
-comparison, so a NULL weight is a query *error*, not a mis-sort. `write`'s
-follow-up `UPDATE` re-sets `band` after the `INSERT OR REPLACE` but **not**
-`rank_weight` — the weight is Rust-computed and already in the insert values.
+* `0` **Alive** — inside the Active window and the endpoint's newest real
+  probe succeeded (`rank_alive = 1`).
+* `1` **Active** — inside the Active window, but not Alive.
+* `2` **Purgatory** — `rank_newest_seen` is older than the window.
+
+`rank_newest_seen` is the newest **live** link's `last_seen_at`; an all-purged
+endpoint takes `NO_SEEN` (`i64::MIN`), which is below every window bound —
+exactly "it belongs to Purgatory". Band 0 and band 1 share every other sorting
+term, so Alive servers lead the page without losing the normal ordering law.
+That is why one index range serves both Active populations and a constant seek
+serves Purgatory.
+
+`rank_alive` is a **raw column** beside `band`: the reband sweep must recompute
+a row's band from stored integers alone, without reading the ring. `write`'s
+follow-up `UPDATE` sets `band` from `(rank_newest_seen, rank_alive)` after the
+`INSERT OR REPLACE`; `rank_weight` is Rust-computed and already in the insert
+values.
 
 ## 6. The resolution band and purge sink
 

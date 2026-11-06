@@ -394,7 +394,7 @@ mod tests {
         let iv = hash_timestamp(42);
         assert_eq!(hex_encode(&iv), "d5fad90694e3360d27c3001a9a2e4efc");
         let mut body = wire[16..].to_vec();
-        Cfb::new(&ck, &iv).decrypt(&mut body);
+        Cfb::new(&*ck, &iv).decrypt(&mut body);
         let expected = build_body(
             &s,
             &tgt,

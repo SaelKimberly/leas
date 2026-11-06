@@ -130,6 +130,73 @@ pub fn profile_user_id(config: &ProtocolConfig) -> Option<String> {
     }
 }
 
+/// Hard import gate for a Shadowsocks row.
+///
+/// Three rules, each a config no shipped stack can dial, so the row is dropped
+/// at the ONE funnel (`parse_share_url` + the form path) instead of being
+/// stored as a permanent `[untestable]` placeholder:
+///
+/// 1. **Malformed 2022 PSK.** xray's `ParseKey` accepts standard base64 or the
+///    literal bytes at the exact method length; every core refuses anything
+///    else at build/start. A `:`-separated list (xray's multi-user client
+///    form) is a VALID config and passes — this client cannot serve it, but
+///    that is a capability question, not a malformed key.
+/// 2. **`none` on a cleartext wire.** No cipher means the destination and
+///    payload travel in the clear. A row whose outer layer is TLS
+///    (`security` tls/reality, or the plugin's real `tls`) is not cleartext
+///    and passes; `obfs=tls` does NOT count — that is the obfs transport's
+///    synthetic hello, not encryption.
+/// 3. **`mode=quic`.** The peer speaks QUIC draft-29/32/34 (v2ray-plugin
+///    v1.3.2 embeds v2ray-core 4.38.3 / quic-go 0.20.1) and every QUIC stack
+///    we ship speaks RFC 9000 v1; no implementation here can interoperate.
+///
+/// # Errors
+///
+/// [`ImportError::Validation`] naming the row's own method/key (never the key
+/// material) when a rule refuses it.
+pub fn validate_ss_config(parsed: &ParsedProto) -> Result<()> {
+    let ProtocolConfig::Ss(cfg) = &parsed.protocol.config else {
+        return Ok(());
+    };
+    let method = cfg.method.as_str();
+    if !leas_proto::proto_spec::ss2022_password_usable(method, &cfg.password) {
+        return Err(ImportError::Validation(format!(
+            "shadowsocks-2022 key for method `{method}` is malformed: it is neither base64 \
+             nor the exact raw key length"
+        )));
+    }
+    if method.eq_ignore_ascii_case("none") && !ss_row_has_tls_layer(cfg) {
+        return Err(ImportError::Validation(
+            "shadowsocks method `none` on a cleartext wire sends the destination and payload \
+             unencrypted; only a TLS-bearing row (security tls/reality or plugin `tls`) may use it"
+                .to_owned(),
+        ));
+    }
+    if let Some(plugin) = &cfg.plugin
+        && plugin.resolved_mode() == leas_proto::proto_spec::PluginMode::Quic
+    {
+        return Err(ImportError::Validation(
+            "shadowsocks plugin `mode=quic` cannot be dialed: the peer speaks QUIC draft-29/32/34 \
+             and this client's QUIC stack speaks RFC 9000 v1"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a Shadowsocks row's outer layer is real TLS.
+///
+/// `security` tls/reality, or the SIP003 plugin's `tls` key. `obfs=tls` is the
+/// obfs transport's synthetic hello (`transport/v2ray/tls_obfs.rs`) and is
+/// deliberately not counted: it encrypts nothing.
+fn ss_row_has_tls_layer(cfg: &leas_proto::proto_spec::SsConfig) -> bool {
+    let security_is_tls = cfg.security.type_str().is_some_and(|kind| {
+        kind.eq_ignore_ascii_case("tls") || kind.eq_ignore_ascii_case("reality")
+    });
+    let plugin_tls = cfg.plugin.as_ref().is_some_and(|p| p.tls.is_on());
+    security_is_tls || plugin_tls
+}
+
 /// Parse a share URL into a typed [`ParsedProfile`].
 ///
 /// Splits the URL first (shape gate — garbage without a `://` gets a clean
@@ -151,6 +218,10 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Parse
 
     let raw = RawUrlX::from(url);
     let parsed = ProtocolConfig::try_parse_proto(&raw).map_err(ImportError::from)?;
+
+    // A config no shipped stack can dial is a hard drop, not a `validation`
+    // note; the row must never reach the store.
+    validate_ss_config(&parsed)?;
 
     let validation = validate_required_fields(&parsed);
 
@@ -1478,5 +1549,124 @@ mod tests {
             }
             other => panic!("expected Ss configs, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ss_import_gate_tests {
+    use rstest::rstest;
+
+    use super::{ValidationSettings, parse_share_url, validate_ss_config};
+    use leas_proto::proto_spec::{ParsedProto, ProtocolConfig, SsConfig};
+    use leas_proto::urlx::RawUrlX;
+
+    fn settings() -> ValidationSettings {
+        ValidationSettings {
+            allow_private_ips: true,
+            reject_insecure: false,
+        }
+    }
+
+    /// A row built from the parser, then given the layer a share URL cannot
+    /// express (the SS URL grammar never fills `security`).
+    fn ss_row(url: &str) -> ParsedProto {
+        ProtocolConfig::try_parse_proto(&RawUrlX::from(url)).expect("ss URL parses")
+    }
+
+    fn with_tls(mut parsed: ParsedProto) -> ParsedProto {
+        let ProtocolConfig::Ss(cfg) = &mut parsed.protocol.config else {
+            panic!("expected an ss row");
+        };
+        cfg.security = leas_proto::proto_spec::SecurityConfig {
+            tls: Some(leas_proto::proto_spec::TlsConfig::Tls(
+                leas_proto::proto_spec::TlsOpts::default(),
+            )),
+            enc: None,
+        };
+        parsed
+    }
+
+    fn method(parsed: &ParsedProto) -> &SsConfig {
+        let ProtocolConfig::Ss(cfg) = &parsed.protocol.config else {
+            panic!("expected an ss row");
+        };
+        cfg
+    }
+
+    /// The gates that keep a never-dialable row out of the store: malformed
+    /// 2022 PSK, cleartext `none`, `mode=quic`. Rows a stack we ship CAN dial
+    /// still import (xray's raw-key form, the multi-user list, TLS-wrapped
+    /// `none`).
+    #[rstest]
+    #[case::wrong_length_base64(
+        "ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=@example.com:8388",
+        false
+    )]
+    #[case::valid_base64(
+        "ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAA==@example.com:8388",
+        true
+    )]
+    #[case::valid_raw_fallback(
+        "ss://2022-blake3-aes-128-gcm:raw-key-0123456!@example.com:8388",
+        true
+    )]
+    #[case::valid_multi_user_list(
+        "ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAA==:AAAAAAAAAAAAAAAAAAAAAA==@example.com:8388",
+        true
+    )]
+    #[case::list_with_one_bad_key(
+        "ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAA==:c2hvcnQ=@example.com:8388",
+        false
+    )]
+    #[case::classic_method_is_outside_the_rule("ss://aes-256-gcm:anything@example.com:8388", true)]
+    #[case::none_without_a_tls_layer("ss://none:anything@example.com:8388", false)]
+    #[case::quic_plugin(
+        "ss://aes-256-gcm:pw@example.com:8388?plugin=v2ray-plugin%3Bmode%3Dquic",
+        false
+    )]
+    #[case::obfs_plugin_is_not_cleartext_none(
+        "ss://none:pw@example.com:8388?plugin=obfs-local%3Bobfs%3Dtls",
+        false
+    )]
+    fn only_undialable_rows_are_dropped(#[case] url: &str, #[case] imports: bool) {
+        let got = parse_share_url(url, &settings()).is_ok();
+        assert_eq!(got, imports, "{url}");
+    }
+
+    /// `none` passes only when the outer layer is real TLS.
+    #[test]
+    fn none_needs_a_tls_bearing_layer() {
+        let cleartext = ss_row("ss://none:pw@example.com:8388");
+        assert!(validate_ss_config(&cleartext).is_err());
+
+        let tls = with_tls(ss_row("ss://none:pw@example.com:8388"));
+        assert!(
+            validate_ss_config(&tls).is_ok(),
+            "security=tls wraps the cleartext codec"
+        );
+
+        let plugin_tls =
+            ss_row("ss://none:pw@example.com:8388?plugin=v2ray-plugin%3Bhost%3Dh%3Btls");
+        assert!(
+            validate_ss_config(&plugin_tls).is_ok(),
+            "the plugin's real TLS is a TLS layer"
+        );
+
+        // `obfs=tls` is the obfs transport's synthetic hello, not TLS.
+        let obfs_tls = ss_row("ss://none:pw@example.com:8388?plugin=obfs-local%3Bobfs%3Dtls");
+        assert!(validate_ss_config(&obfs_tls).is_err());
+    }
+
+    /// A quic row is refused whatever its cipher, and the message names the
+    /// wire mismatch rather than "not implemented".
+    #[test]
+    fn quic_is_refused_by_wire_version() {
+        let parsed =
+            ss_row("ss://aes-128-gcm:pw@example.com:8388?plugin=v2ray-plugin%3Bmode%3Dquic");
+        let err = validate_ss_config(&parsed).expect_err("quic cannot dial");
+        let text = err.to_string();
+        assert!(text.contains("draft-29"), "{text}");
+        assert!(text.contains("RFC 9000"), "{text}");
+        assert_eq!(method(&parsed).method.as_str(), "aes-128-gcm");
     }
 }

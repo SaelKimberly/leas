@@ -23,6 +23,11 @@ pub enum NativeError {
     /// The peer's certificate is expired (or not yet valid).
     #[error("TLS error: {0}")]
     CertExpired(String),
+    /// The peer's leaf SPKI does not match the row's pin (`pinSHA256`, or the
+    /// plugin's `cert`/`certRaw`). Its own variant so the message says which
+    /// trust anchor failed while the verdict stays `[cert]`.
+    #[error("TLS error: {0}")]
+    CertPinMismatch(String),
     /// The peer answered in cleartext instead of a TLS record.
     #[error("TLS error: {0}")]
     CleartextPeer(String),
@@ -88,7 +93,11 @@ impl NativeError {
         match self {
             Self::Config(_) => Some(FailureEvidence::ConfigDefect),
             Self::Reality(_) => Some(FailureEvidence::RealityFallback),
-            Self::CertNotValidForName(_) => Some(FailureEvidence::CertNotValidForName),
+            // A pin mismatch is the same verdict as a name mismatch: the
+            // server is not the one this config names.
+            Self::CertNotValidForName(_) | Self::CertPinMismatch(_) => {
+                Some(FailureEvidence::CertNotValidForName)
+            }
             Self::CertExpired(_) => Some(FailureEvidence::CertExpired),
             Self::CleartextPeer(_) => Some(FailureEvidence::CleartextPeer),
             Self::TransportRejected { status, .. } => Some(FailureEvidence::HttpRejected(*status)),

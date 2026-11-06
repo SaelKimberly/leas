@@ -202,16 +202,19 @@ native cannot parse defers to the subprocess instead of dying mid-dial):
   note is about the harness SERVER side).
 - Shadowsocks / Shadowsocks-2022: the two kinds share one `SsConfig`, so the
   method family must match `kind` (a `2022-blake3-*` method on the classic kind
-  → false, and vice versa); the method must be one native implements (the 2017
-  AEAD set + `2022-blake3-*`) — every legacy stream cipher (`aes-*-cfb/ctr`,
-  `rc4-md5`, `chacha20-ietf`, `none`) and unknown name routes to sing-box;
-  SIP003 `plugin`/`plugin_opts` are unimplemented, so a plugin row → false
-  (native would dial the bare server without its obfuscation wrapper); a 2022
-  PSK that is not base64, or not the method's key length, → false. `SsConfig`
+  → false, and vice versa); the method must be one native implements — the 2017
+  AEAD set, `2022-blake3-*`, and the ten legacy stream methods
+  (`aes-*-cfb/ctr`, `rc4-md5`, `chacha20-ietf`, `xchacha20`, `none`); only an
+  unknown name routes to the subprocess. SIP003 plugins are served natively
+  with per-shape verdicts (`capability::plugin_reason`); a 2022
+  PSK that is neither STANDARD base64 nor the literal bytes at the method's key
+  length (xray `ParseKey`) → false, and such a row is dropped at import
+  (`import_export::validate_ss_config`) because no core can load it — as are a
+  cleartext `none` row (no TLS-bearing layer) and any `mode=quic` row (the peer
+  speaks QUIC draft-29/34, this client v1). `SsConfig`
   carries no transport field, so the verdict is the plain-TCP dial plus the
   optional `security` layer (an xray-only `fp` id → false, exactly as for the
-  other kinds). Deferrals this work records: the legacy stream ciphers
-  (sing-box keeps them), SIP003 plugins, and 2022 multi-user EIH (single-user
+  other kinds). Deferrals this work records: 2022 multi-user EIH (single-user
   PSK only — the typed config has no identity field).
 - The verdict is TCP-truthful: SOCKS5 UDP ASSOCIATE through the native *proxy*
   outbound is not implemented (`proxy_params` never sets `params.udp`), so a
