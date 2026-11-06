@@ -19,6 +19,10 @@ use leas_db::profiles_query::{PageRequest, PageSort, PlanScope};
 
 use crate::AppState;
 
+/// Finished tasks retained in [`AppState::task_history`]. Nothing reads more
+/// than the tail, and nothing else prunes the list, so it needs a ceiling.
+pub const TASK_HISTORY_CAP: usize = 100;
+
 /// The kinds of job the scheduler can run. Each maps to one spawn path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
@@ -346,6 +350,12 @@ pub fn handle_terminal(state: &mut AppState, event: TerminalEvent) {
         &format!("task finished: {}", running.label),
     );
     state.task_history.push(running);
+    // Bounded: the history is session-lifetime and nothing prunes it, so a
+    // long session of single-link tests would otherwise grow it one entry per
+    // task. Only the tail is meaningful to a reader.
+    if state.task_history.len() > TASK_HISTORY_CAP {
+        state.task_history.remove(0);
+    }
     // The counts changed: the next tick refreshes the cache (spec D21).
     state.aggregates_dirty.set(true);
 }
@@ -622,6 +632,29 @@ mod tests {
         handle_terminal(&mut state, TerminalEvent::CompactFinished);
         assert!(state.running_task.is_none());
         assert_eq!(state.task_history.len(), 2);
+    }
+
+    /// The history is bounded: only the newest [`TASK_HISTORY_CAP`] tasks are
+    /// retained, so a long session of single-link tests cannot grow it.
+    #[tokio::test]
+    async fn task_history_keeps_only_the_newest_tasks() {
+        let mut state = sched_state().await;
+        let total = TASK_HISTORY_CAP + 5;
+        for i in 0..total {
+            state.running_task = Some(spec(
+                TaskKind::Compact,
+                PlanScope::All,
+                &format!("task {i}"),
+            ));
+            handle_terminal(&mut state, TerminalEvent::CompactFinished);
+        }
+        assert_eq!(state.task_history.len(), TASK_HISTORY_CAP);
+        assert_eq!(state.task_history[0].label, "task 5", "the oldest dropped");
+        assert_eq!(
+            state.task_history.last().map(|t| t.label.as_str()),
+            Some("task 104"),
+            "the newest kept"
+        );
     }
 
     /// Quitting cancels the running task and discards the queue (D48).

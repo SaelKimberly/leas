@@ -83,9 +83,11 @@ Three things made the declaration wrong in practice:
 - **ADR 0007 is not rewritten.** Its two mentions of the gnu triple are accurate
   for the decision it records; this ADR is the pointer that the target moved.
 - **Windows defects become findable.** Four became findable immediately (T14) and
-  all four are fixed; the remaining known Windows gap is the statistics memory
-  row (`proc_rss_bytes`, `roadmap.md:360`), which stays Linux-only by design
-  until `GetProcessMemoryInfo` fills it.
+  all four are fixed; the statistics memory row (`proc_rss_bytes`,
+  `roadmap.md:362`) returned 0 on Windows and now calls
+  `K32GetProcessMemoryInfo`, so the gap it named is closed. The `leas-db`
+  `cache_routing` leak guard remains Linux-only: its bound is calibrated against
+  `/proc/self/status` `VmRSS`, not against a working-set figure.
 - **Re-evaluation trigger:** if a supported Windows-on-ARM build is ever wanted,
   the declaration needs a second triple (`aarch64-pc-windows-msvc`) and the
   asset-naming table in `updater.rs` already names that combination.

@@ -482,6 +482,23 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                     }
                 }
             }
+            // Process memory plus the size of every session-lifetime
+            // collection, so a growth report can tell "our state grew" from
+            // "the DB / sockets / allocator hold the memory".
+            tracing::info!(
+                target: "tui::db_monitor",
+                "mem: rss={} KiB log_cache={} endpoint_info={} sniffer_hosts={} native_trace={} tasks={} events_queued={}",
+                crate::ops::native_connect::proc_rss_bytes() / 1024,
+                state.log_cache.len(),
+                state.endpoint_info.len(),
+                state.sniffer.latest.as_ref().map_or(0, |s| s.hosts.len()),
+                state.native_activity.entries.len(),
+                state.task_history.len(),
+                state
+                    .core_event_tx
+                    .as_ref()
+                    .map_or(0, |tx| tx.max_capacity() - tx.capacity()),
+            );
         }
         KeyCode::Delete => {
             state.confirmation = Some(crate::ConfirmAction::PurgeLogsDatabase);

@@ -295,7 +295,8 @@ hints for the current mode.
   line; `Y` copies every filtered line. Selection is made with
   `Shift+↑`/`Shift+↓` and cleared with `Esc`.
 - `c` clears the view (confirm), `Delete` purges the logs database (confirm), and
-  `d` dumps the last 20 database-monitor lines into the log.
+  `d` dumps the last 20 database-monitor lines plus a `mem:` line (process RSS
+  and the size of every session-lifetime cache) into the log.
 
 ### Settings (popup)
 
@@ -714,7 +715,7 @@ and leaves search mode.
 | `Esc` | Clear the selection, else fall through |
 | `T` / `t` | Open the target filter picker |
 | `c` | Clear the log view (confirm) |
-| `d` | Dump the last 20 database-monitor lines into the log |
+| `d` | Dump the last 20 database-monitor lines plus a `mem:` line (RSS + cache sizes) into the log |
 | `Delete` | Purge the logs database (confirm) |
 
 Target picker: `↑`/`↓` or `k`/`j` move, `Enter` applies, `t`/`T`/`q`/`Esc` closes.

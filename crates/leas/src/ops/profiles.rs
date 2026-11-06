@@ -958,6 +958,16 @@ pub async fn delete_profile(state: &mut AppState, id: i64) {
     state.log_trace("info", "tui::ops::profiles", "Profile deleted");
     state.confirmation = None;
     state.multi_select.remove(&id);
+    // The session caches are keyed by endpoint id and nothing re-reads a
+    // deleted row: without these, deleting/importing repeatedly leaves their
+    // entries behind for the rest of the process.
+    state.endpoint_info.remove(&id);
+    state
+        .testing_profiles
+        .retain(|(endpoint, _)| *endpoint != id);
+    state
+        .testing_details
+        .retain(|(endpoint, _), _| *endpoint != id);
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }

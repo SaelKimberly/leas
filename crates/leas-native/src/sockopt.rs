@@ -16,16 +16,26 @@
 
 use std::time::Duration;
 
+/// What `socket2::SockRef` accepts as an existing socket on this platform: a
+/// file descriptor on Unix, a `SOCKET` on Windows. One name keeps
+/// [`SockOpts::apply_to_stream`] a single signature instead of two cfg'd
+/// copies of the same body.
+#[cfg(unix)]
+use std::os::fd::AsFd as SockHandle;
+#[cfg(windows)]
+use std::os::windows::io::AsSocket as SockHandle;
+
 /// The options one dial may request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SockOpts {
-    /// `TCP_USER_TIMEOUT` in milliseconds.
+    /// `TCP_USER_TIMEOUT` in milliseconds. Unix only; ignored on Windows.
     pub tcp_user_timeout_ms: Option<u32>,
     /// Keepalive probe interval; `None` leaves the platform default.
     pub tcp_keepalive: Option<Duration>,
     /// `IPV6_V6ONLY` for an IPv6 socket.
     pub v6only: Option<bool>,
     /// `SO_REUSEPORT` (only meaningful on a listener; applied when set).
+    /// Unix only; ignored on Windows.
     pub reuse_port: Option<bool>,
     /// `TCP_NODELAY`; `None` keeps the historical `true`.
     pub nodelay: Option<bool>,
@@ -48,7 +58,7 @@ impl SockOpts {
 
     /// Apply to an already-connected stream (tokio or std) through
     /// [`socket2::SockRef`], so the dial path needs no socket ownership move.
-    pub fn apply_to_stream<S: std::os::fd::AsFd>(&self, stream: &S) {
+    pub fn apply_to_stream<S: SockHandle>(&self, stream: &S) {
         let sock = socket2::SockRef::from(stream);
         self.apply(&sock);
     }
@@ -58,6 +68,11 @@ impl SockOpts {
     /// the connection (the alternative — refusing the dial — turns an
     /// optimisation into an outage).
     pub fn apply(&self, socket: &socket2::SockRef<'_>) {
+        // `TCP_USER_TIMEOUT` and `SO_REUSEPORT` are Unix-only in `socket2`
+        // (no Windows method exists at all); the fields stay on the struct so
+        // one config surface describes both platforms, and requesting them on
+        // Windows is a documented no-op rather than a compile error.
+        #[cfg(unix)]
         if let Some(ms) = self.tcp_user_timeout_ms {
             let _ = socket.set_tcp_user_timeout(Some(Duration::from_millis(u64::from(ms))));
         }
@@ -68,6 +83,7 @@ impl SockOpts {
         if let Some(v6only) = self.v6only {
             let _ = socket.set_only_v6(v6only);
         }
+        #[cfg(unix)]
         if let Some(reuse) = self.reuse_port {
             let _ = socket.set_reuse_port(reuse);
         }

@@ -214,9 +214,9 @@ fn saturating_i64(value: u64) -> i64 {
 }
 
 /// Resident memory of this process (the native core runs in-process), for
-/// the statistics screen's system section. Linux-only; zero elsewhere.
+/// the statistics screen's system section and the Logs tab's `d` dump.
 #[cfg(target_os = "linux")]
-fn proc_rss_bytes() -> u64 {
+pub(crate) fn proc_rss_bytes() -> u64 {
     // `VmRSS:` is reported in kB by the kernel's own formatter, so this needs
     // no page-size assumption (the `statm` page count did, and 4096 is wrong
     // on any kernel with a larger base page).
@@ -231,7 +231,55 @@ fn proc_rss_bytes() -> u64 {
         .map_or(0, |kb| kb.saturating_mul(1024))
 }
 
-#[cfg(not(target_os = "linux"))]
-const fn proc_rss_bytes() -> u64 {
+/// The same figure on Windows: `WorkingSetSize` from
+/// `K32GetProcessMemoryInfo` — the kernel's resident set, the number Task
+/// Manager's "Memory" column shows.
+#[cfg(windows)]
+pub(crate) fn proc_rss_bytes() -> u64 {
+    /// `PROCESS_MEMORY_COUNTERS` (`psapi.h`); only `cb` and
+    /// `WorkingSetSize` are read, but the size must be exact.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    // Both live in kernel32, which the Windows target links by default.
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    let mut counters = ProcessMemoryCounters {
+        cb: u32::try_from(std::mem::size_of::<ProcessMemoryCounters>()).unwrap_or(0),
+        ..ProcessMemoryCounters::default()
+    };
+    // SAFETY: `K32GetProcessMemoryInfo` writes at most `cb` bytes into the
+    // struct we pass, and `cb` is that struct's own size. The current-process
+    // pseudo-handle needs no close.
+    let ok =
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &raw mut counters, counters.cb) };
+    if ok == 0 {
+        0
+    } else {
+        u64::try_from(counters.working_set_size).unwrap_or(u64::MAX)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub(crate) const fn proc_rss_bytes() -> u64 {
     0
 }
