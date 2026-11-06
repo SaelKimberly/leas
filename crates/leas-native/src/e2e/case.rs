@@ -12,6 +12,7 @@ use super::{
 };
 use crate::NativeConnectParams;
 use crate::protocol::vless::PacketMode;
+use leas_proto::proto_spec::common::TransportConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolKind {
@@ -126,6 +127,10 @@ pub struct CaseSpec {
     pq_assert: bool,
     /// Hysteria2 Salamander obfuscation PSK (`Some` enables it).
     obfs: Option<&'static str>,
+    /// mKCP obfuscation `(header_type, seed)`; `""` means "absent". Emitted to
+    /// the server as xray's `finalmask.udp` and to the client as the
+    /// `KcpConfig` fields (`transport::kcp::mask` frames both).
+    kcp_mask: Option<(&'static str, &'static str)>,
     /// Single-core gate: `Some(kind)` restricts the row to that core only
     /// (hysteria2 is sing-box-only — xray-core has no hysteria2 inbound; the
     /// SS TLS row is xray-only — sing-box's shadowsocks inbound has no `tls`
@@ -152,6 +157,7 @@ impl CaseSpec {
             vless_enc: None,
             pq_assert: false,
             obfs: None,
+            kcp_mask: None,
             single_core: None,
             ss_method: None,
         }
@@ -172,6 +178,7 @@ impl CaseSpec {
             vless_enc: None,
             pq_assert: false,
             obfs: None,
+            kcp_mask: None,
             single_core: None,
             ss_method: None,
         }
@@ -194,6 +201,7 @@ impl CaseSpec {
             vless_enc: None,
             pq_assert: false,
             obfs: None,
+            kcp_mask: None,
             single_core: None,
             ss_method: None,
         }
@@ -216,6 +224,7 @@ impl CaseSpec {
             vless_enc: None,
             pq_assert: false,
             obfs,
+            kcp_mask: None,
             single_core: Some(CoreKind::SingBox),
             ss_method: None,
         }
@@ -244,6 +253,7 @@ impl CaseSpec {
             vless_enc: None,
             pq_assert: false,
             obfs: None,
+            kcp_mask: None,
             single_core: None,
             ss_method: Some(method),
         }
@@ -295,6 +305,19 @@ impl CaseSpec {
     #[must_use]
     pub const fn network(&self) -> &'static str {
         self.network
+    }
+
+    /// mKCP obfuscation: `header_type` and `seed`, either may be `""`.
+    ///
+    /// The server side turns this into xray's `finalmask.udp` array (the
+    /// order v2rayN emits: envelope entry first, camouflage header second),
+    /// the client side into [`leas_proto::proto_spec::KcpConfig`]'s
+    /// `header_type`/`seed`; both frame the same bytes
+    /// (`transport::kcp::mask`).
+    #[must_use]
+    pub const fn with_kcp_mask(mut self, header: &'static str, seed: &'static str) -> Self {
+        self.kcp_mask = Some((header, seed));
+        self
     }
 
     /// Select the client-side xhttp dialect ("stream-up"; packet-up is the
@@ -465,7 +488,7 @@ impl E2eCase for CaseSpec {
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {
-        match self.protocol {
+        let json = match self.protocol {
             ProtocolKind::Vless => config::vless_inbound(
                 core,
                 env,
@@ -488,6 +511,10 @@ impl E2eCase for CaseSpec {
                 self.ss_method.expect("shadowsocks case requires a method"),
                 self.app == AppKind::Udp,
             ),
+        };
+        match self.kcp_mask {
+            Some((header, seed)) => config::apply_kcp_mask(&json, header, seed),
+            None => json,
         }
     }
 
@@ -534,6 +561,13 @@ impl E2eCase for CaseSpec {
             && let leas_proto::proto_spec::ProtocolConfig::Vless(cfg) = &mut params.protocol
         {
             cfg.encryption = Some(client.as_str().into());
+        }
+        // mKCP obfuscation: the dial frames from these two knobs alone.
+        if let Some((header, seed)) = self.kcp_mask
+            && let Some(TransportConfig::Kcp(kcp)) = params.protocol.transport_mut()
+        {
+            kcp.header_type = (!header.is_empty()).then(|| header.into());
+            kcp.seed = (!seed.is_empty()).then(|| seed.into());
         }
         // UDP rows: the VLESS UDP datagram tunnel dispatches on the params'
         // packet mode (`connect_udp` requires it; the proto has no

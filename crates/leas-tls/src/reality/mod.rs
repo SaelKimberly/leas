@@ -438,6 +438,9 @@ async fn connect_reality_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         // bound to the FIRST hello, so a retry would need a re-seal this
         // engine does not define (see `docs/reference/native-core.md`).
         None,
+        // REALITY owns the hello shape (its own session-id payload), so ECH
+        // does not compose with it — the capability gate refuses the pair.
+        None,
     )
     .await?;
     match outcome {

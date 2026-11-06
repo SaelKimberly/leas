@@ -140,6 +140,10 @@ pub struct HandshakeParams<'a> {
     /// `SystemRandom` coerces via the blanket impl; tests implement the
     /// trait directly for fixed-seed vectors.
     pub rng: &'a dyn SecureRandom,
+    /// `Encrypted ClientHello` configs (`RFC 9849`). `None` sends a single hello;
+    /// `Some` splits it into an outer hello (public name) and a sealed inner
+    /// hello (the real SNI) — see [`crate::ech::build_hellos`].
+    pub ech: Option<&'a crate::ech::EchConfigList>,
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -361,8 +365,14 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // `Some` when the caller can rebuild `ClientHello2` for one
     // HelloRetryRequest (plain TLS only — see [`RetrySupport`]).
     retry: Option<&RetrySupport<'_>>,
+    // `Some((wire, state))` for an ECH handshake: `wire` is the outer hello
+    // actually sent, `hello` above is the inner one that seeds the transcript.
+    ech: Option<(&[u8], &crate::ech::EchState)>,
 ) -> Result<(TlsStream<S>, AuthOutcome)> {
     let mut stream = stream;
+    // The bytes on the wire differ from the transcript seed only under ECH;
+    // a retried hello is written as rebuilt (the two coincide there).
+    let mut wire_hello = ech.map_or(hello, |(wire, _)| wire).to_vec();
 
     // RFC 8446 §4.1.4: at most one retry. `first_hello` is kept because the
     // post-retry transcript starts with `message_hash(ClientHello1)`.
@@ -371,7 +381,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut first_hello: Option<Vec<u8>> = None;
     let mut retry_message: Option<Vec<u8>> = None;
     let server_hello = loop {
-        stream.write_all(&to_record(&current_hello)).await?;
+        stream.write_all(&to_record(&wire_hello)).await?;
         match read_server_hello(&mut stream, &current_sid).await? {
             ServerReply::Hello(sh) => {
                 // RFC 8446 §4.1.3 / RFC 5246 §7.4.1.2: the server MUST select
@@ -403,6 +413,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 retry_message = Some(hrr.raw);
                 first_hello = Some(std::mem::take(&mut current_hello));
                 current_sid = rebuilt.session_id().to_vec();
+                wire_hello = rebuilt.handshake_bytes.clone();
                 current_hello = rebuilt.handshake_bytes;
                 // RFC 8446 §4.2.8.2: ClientHello2 carries a NEW share, so the
                 // key schedule must use the new private half.
@@ -415,6 +426,30 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
         }
     };
+    // RFC 9849 §7.2.1: with ECH the server confirms acceptance by replacing
+    // the last 8 bytes of `ServerHello.random`. A mismatch means it decrypted
+    // nothing and answered the OUTER hello — the SNI the user asked to hide
+    // would have been sent in the clear, so this is a hard error, never a
+    // quiet fallback to the public name.
+    if let Some((_, state)) = ech {
+        let expected = state.confirm(server_hello.suite.digest(), &server_hello.raw)?;
+        let mut diff = 0u8;
+        for (a, b) in server_hello.server_random[24..32]
+            .iter()
+            .zip(expected.iter())
+        {
+            diff |= a ^ b;
+        }
+        if diff != 0 {
+            return Err(TlsError::Handshake(
+                "server rejected the encrypted client hello (ECH): it answered the public name \
+                 instead of the inner hello, so the real SNI would have leaked; the published \
+                 ECHConfig is stale"
+                    .into(),
+            ));
+        }
+    }
+
     // TLS 1.2: dispatch to the separate 1.2 handshake driver.
     // REALITY (ServerAuth::Reality) is TLS 1.3 only — error if a REALITY
     // server negotiates 1.2.
@@ -671,20 +706,35 @@ async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // replays them so ClientHello2 differs only in `key_share`/`cookie`
     // (RFC 8446 §4.1.2) — the random, GREASE and session id must not change.
     let recording = crate::hello::RecordingRng::new(params.rng);
-    let hello = build_hello_ordered(
-        params.spec,
-        &BuildParams {
-            server_name: params.server_name,
-            alpn: params.alpn,
-            x25519_pub: &x25519_pub,
-            mlkem768_pub: mlkem
-                .0
-                .as_ref()
-                .map(crate::crypto::mlkem::PublicKey::as_bytes),
-            rng: &recording,
-        },
-        permute_extensions,
-    )?;
+    let build_params = BuildParams {
+        server_name: params.server_name,
+        alpn: params.alpn,
+        x25519_pub: &x25519_pub,
+        mlkem768_pub: mlkem
+            .0
+            .as_ref()
+            .map(crate::crypto::mlkem::PublicKey::as_bytes),
+        rng: &recording,
+    };
+    // RFC 9849: with an ECHConfig the real SNI rides inside a sealed inner
+    // hello and the wire carries the public name. `ech_ctx` keeps the state
+    // the acceptance check needs; `hello` stays the transcript seed.
+    let ech_ctx = match params.ech {
+        Some(list) => {
+            let config = list.select()?;
+            let (outer, inner, state) =
+                crate::ech::build_hellos(params.spec, &build_params, config, permute_extensions)?;
+            Some((outer, inner, state))
+        }
+        None => None,
+    };
+    let (hello, ech_ctx) = match ech_ctx {
+        Some((outer, inner, state)) => (inner, Some((outer, state))),
+        None => (
+            build_hello_ordered(params.spec, &build_params, permute_extensions)?,
+            None,
+        ),
+    };
     let retry = RetrySupport {
         permute_extensions,
         spec: params.spec,
@@ -694,6 +744,9 @@ async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
         draws: &recording,
         rng: params.rng,
     };
+    let ech = ech_ctx
+        .as_ref()
+        .map(|(outer, state)| (outer.handshake_bytes.as_slice(), state));
     let (tls, _) = drive(
         stream,
         &hello.handshake_bytes,
@@ -703,6 +756,7 @@ async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
         params.server_name,
         ServerAuth::Verifier(params.verifier),
         Some(&retry),
+        ech,
     )
     .await?;
     Ok(tls)
@@ -1443,6 +1497,7 @@ mod tests {
                 alpn: Some(&[b"http/1.1"]),
                 verifier: &AcceptAll,
                 rng: &rng,
+                ech: None,
             },
         )
         .await
@@ -1520,6 +1575,7 @@ mod tests {
                 alpn: Some(&[b"http/1.1"]),
                 verifier: &AcceptAll,
                 rng: &rng,
+                ech: None,
             },
         )
         .await
@@ -1710,6 +1766,7 @@ mod tests {
                     alpn: None,
                     verifier: &AcceptAll,
                     rng: &rng,
+                    ech: None,
                 },
             )
             .await
@@ -1858,6 +1915,7 @@ mod tests {
                     alpn: None,
                     verifier: &AcceptAll,
                     rng: &rng,
+                    ech: None,
                 },
             )
             .await
@@ -1933,6 +1991,7 @@ mod tests {
                     alpn: None,
                     verifier: &AcceptAll,
                     rng: &rng,
+                    ech: None,
                 },
             )
             .await
@@ -1979,6 +2038,7 @@ mod tests {
                     alpn: None,
                     verifier: &AcceptAll,
                     rng: &rng,
+                    ech: None,
                 },
             )
             .await
@@ -2645,6 +2705,7 @@ mod tests {
                 alpn: None,
                 verifier: &AcceptAll,
                 rng: &rng,
+                ech: None,
             },
         )
         .await
@@ -2811,6 +2872,7 @@ mod tests {
                 alpn: Some(&[b"http/1.1"]),
                 verifier: &AcceptAll,
                 rng: &rng,
+                ech: None,
             },
         )
         .await
@@ -2855,6 +2917,7 @@ mod tests {
                 alpn: Some(&[b"http/1.1"]),
                 verifier: &verifier,
                 rng: &rng,
+                ech: None,
             },
         )
         .await
@@ -2931,6 +2994,7 @@ mod tests {
                 alpn: Some(&[b"http/1.1"]),
                 verifier: &AcceptAll,
                 rng: &rng,
+                ech: None,
             },
         )
         .await
@@ -2966,6 +3030,7 @@ mod tests {
                 alpn: Some(&[b"http/1.1"]),
                 verifier: &AcceptAll,
                 rng: &rng,
+                ech: None,
             },
         )
         .await

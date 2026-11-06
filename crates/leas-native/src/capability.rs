@@ -152,11 +152,13 @@ fn security_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow<'s
         (_, ProtocolConfig::Trojan(c)) => &c.security,
         _ => return None,
     };
-    if security.ech().is_some() {
-        // `ech` is a real capability gap (plan T9b), not a spelling problem:
-        // an ECH config that silently does nothing leaks the SNI the user
-        // asked to hide.
-        return Some(Cow::Borrowed("tls ech is not implemented"));
+    if let Some(ech) = security.ech() {
+        // ECH is implemented (`leas_tls::ech`); what is not is guessing: a
+        // value that is not a base64 `ECHConfigList` would leave the real SNI
+        // in the clear, so it is refused by name rather than ignored.
+        if leas_tls::ech::EchConfigList::from_base64(ech).is_err() {
+            return Some(Cow::Borrowed("tls ech config is not a valid ECHConfigList"));
+        }
     }
     None
 }
@@ -206,31 +208,21 @@ fn transport_supported(transport: &TransportConfig, path: Option<&str>) -> bool 
     transport_reason(transport, path).is_none()
 }
 
-/// mKCP row: only the settings the native dial actually reads.
+/// mKCP row: the settings the native dial reads.
 ///
-/// `transport::kcp::connect` reads `mtu` + `tti` and nothing else (spec §4.5
-/// defaults otherwise). Capacity/congestion/buffer fields are local pacing
-/// knobs — ignoring them still interoperates. Two fields are not knobs but
-/// WIRE FORMAT, so ignoring them frames every datagram differently than the
-/// server expects: the packets are dropped and the dial hangs instead of
-/// failing loudly, the worst failure shape there is. Either of them is
-/// refused as `"mKCP seed or header_type is not implemented"`.
-///
-/// - `seed`: mKCP's global obfuscation key. Clash configs carry it in
-///   `KcpConfig::seed`; share links carry it in the protocol row's `path`
-///   (`vless://…?type=kcp&path=<seed>`), which is why `path` is checked here
-///   too. Native has no obfuscator at all.
-/// - `header_type`: the packet camouflage header (`srtp`, `utp`,
-///   `wechat-video`, `dtls`, `wireguard`, `dns`). Only the default `none`
-///   is a bare mKCP datagram.
-fn kcp_reason(cfg: &KcpConfig, path: Option<&str>) -> Option<&'static str> {
-    let seeded =
-        cfg.seed.as_deref().is_some_and(|s| !s.is_empty()) || path.is_some_and(|s| !s.is_empty());
-    let camouflaged = cfg
+/// `mtu`, `tti`, `uplink_capacity` and `downlink_capacity` are read by
+/// [`crate::transport::kcp::connect`]; `seed` and `header_type` are WIRE
+/// FORMAT and are implemented by [`crate::transport::kcp::mask`] (AES-128-GCM
+/// for a seed, the camouflage prefixes for a header name). Only an unknown
+/// `header_type` is refused: ignoring it would frame every datagram
+/// differently than the peer expects, and the datagrams would be dropped
+/// rather than the dial failing — the worst failure shape there is.
+fn kcp_reason(cfg: &KcpConfig, _path: Option<&str>) -> Option<&'static str> {
+    let known = cfg
         .header_type
         .as_deref()
-        .is_some_and(|h| !(h.is_empty() || h == "none"));
-    (seeded || camouflaged).then_some("mKCP seed or header_type is not implemented")
+        .is_none_or(crate::transport::kcp::mask::header_supported);
+    (!known).then_some("mKCP header_type is not a known camouflage header")
 }
 
 // The fingerprint refusal gate is retired: an id with no engine hello is now
@@ -997,18 +989,36 @@ mod tests {
     }
 
     #[test]
-    fn ech_is_refused_by_name() {
-        // Accepting an `ech` config and ignoring it would leak the SNI the
-        // user asked to hide — the refusal must name the knob.
-        let mut cfg = vless_cfg();
-        cfg.security.tls = Some(leas_proto::proto_spec::common::TlsConfig::Tls(
-            leas_proto::proto_spec::common::TlsOpts {
-                ech: Some(TinyText::from("AEX+DQBB")),
-                ..Default::default()
-            },
-        ));
-        let reason = support_reason(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg))
-            .expect("ech must be refused");
+    fn ech_config_is_validated_not_ignored() {
+        // ECH is implemented (`leas_tls::ech`). What the gate still refuses is
+        // a value that is not a base64 `ECHConfigList` — accepting that would
+        // leave the SNI the user asked to hide in the clear.
+        let row = |ech: &str| {
+            let mut vless = vless_cfg();
+            vless.security = leas_proto::proto_spec::SecurityConfig {
+                tls: Some(leas_proto::proto_spec::TlsConfig::Tls(
+                    leas_proto::proto_spec::TlsOpts {
+                        ech: Some(TinyText::from(ech)),
+                        ..Default::default()
+                    },
+                )),
+                enc: None,
+            };
+            (ProtocolKind::Vless, ProtocolConfig::Vless(vless))
+        };
+
+        // A real deployed config (crypto.cloudflare.com) is accepted…
+        let (kind, config) = row(
+            "AEX+DQBBlwAgACD5y8b2ysonYsAe68O0szS1iyyKWjiOA8gN1ZFyYLh7aQAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=",
+        );
+        assert!(
+            support_reason(kind, &config).is_none(),
+            "a valid ECHConfigList must be dialable"
+        );
+
+        // …and something that is not one is named, not ignored.
+        let (kind, config) = row("not-base64!!");
+        let reason = support_reason(kind, &config).expect("invalid ech must be refused");
         assert!(reason.contains("ech"), "{reason}");
     }
 
@@ -1048,6 +1058,7 @@ mod tests {
         vless_flow.flow = Some("xtls-rprx-direct".into());
         let mut vless_kcp = vless_cfg();
         vless_kcp.transport = TransportConfig::Kcp(KcpConfig {
+            header_type: Some("mux.cool".into()),
             seed: Some("obfs".into()),
             ..KcpConfig::default()
         });
@@ -1309,38 +1320,52 @@ mod tests {
     }
 
     #[test]
-    fn kcp_seed_deferred() {
-        // Clash carrier: `mkcp-opts.seed` → `KcpConfig::seed`. Native has no
-        // obfuscator, so it would frame every datagram unmasked and the
-        // server would silently drop them.
+    fn kcp_seed_is_supported() {
+        // Clash carrier: `mkcp-opts.seed` → `KcpConfig::seed`. The dial masks
+        // with an AES-128-GCM envelope keyed by the seed
+        // (`transport::kcp::mask`).
         let kcp = KcpConfig {
             seed: Some(TinyText::from("hunter2")),
             ..KcpConfig::default()
         };
-        assert_eq!(kcp_rows_supported(&kcp, None), [false; 3]);
+        assert_eq!(kcp_rows_supported(&kcp, None), [true; 3]);
     }
 
     #[test]
-    fn kcp_share_link_seed_path_deferred() {
-        // Share-link carrier: `?type=kcp&path=<seed>` lands in the protocol
-        // row's `path`, never in `KcpConfig`.
+    fn kcp_share_link_seed_path_is_supported() {
+        // Share-link carrier: `?type=kcp&path=<seed>` — the link parser copies
+        // the path into `seed`, so a path on its own is not a refusal either.
         assert_eq!(
             kcp_rows_supported(&KcpConfig::default(), Some("hunter2")),
-            [false; 3]
-        );
-        // An empty path is no seed at all.
-        assert_eq!(
-            kcp_rows_supported(&KcpConfig::default(), Some("")),
             [true; 3]
         );
     }
 
     #[test]
-    fn kcp_header_type_deferred() {
-        // Packet camouflage: native writes bare mKCP datagrams, so any
-        // header type frames the packets differently than the server reads
-        // them — a silent drop + hang, not an error.
-        for header in ["srtp", "utp", "wechat-video", "dtls", "wireguard", "dns"] {
+    fn kcp_header_type_is_supported() {
+        // Packet camouflage: every name the mask layer frames is accepted…
+        for header in [
+            "srtp",
+            "utp",
+            "wechat",
+            "wechat-video",
+            "dtls",
+            "wireguard",
+            "dns",
+        ] {
+            let kcp = KcpConfig {
+                header_type: Some(TinyText::from(header)),
+                ..KcpConfig::default()
+            };
+            assert_eq!(kcp_rows_supported(&kcp, None), [true; 3], "{header}");
+        }
+    }
+
+    #[test]
+    fn kcp_unknown_header_type_is_refused() {
+        // …and a name nothing frames is refused, not ignored: the server would
+        // drop every datagram and the dial would hang instead of erroring.
+        for header in ["mux.cool", "srtp2", "DNS "] {
             let kcp = KcpConfig {
                 header_type: Some(TinyText::from(header)),
                 ..KcpConfig::default()

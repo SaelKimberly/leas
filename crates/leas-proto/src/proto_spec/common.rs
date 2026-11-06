@@ -138,7 +138,12 @@ impl TransportConfig {
                 ..HttpConfig::default()
             }))),
             Some("quic") => Ok(Some(Self::Quic)),
-            Some("kcp" | "mkcp") => Ok(Some(Self::Kcp(KcpConfig::default()))),
+            // mKCP carries its obfuscation seed in the link's `path`
+            // (`?type=kcp&path=<seed>`, the v2ray/v2rayN spelling).
+            Some("kcp" | "mkcp") => Ok(Some(Self::Kcp(KcpConfig {
+                seed: path.map(TinyText::from),
+                ..KcpConfig::default()
+            }))),
             Some("httpupgrade") => Ok(Some(Self::HttpUpgrade(HttpUpgradeConfig {
                 path: Some(TinyText::from(path.unwrap_or("/"))),
                 ..HttpUpgradeConfig::default()

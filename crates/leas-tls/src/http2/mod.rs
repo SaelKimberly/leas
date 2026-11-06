@@ -543,6 +543,7 @@ mod tests {
                 alpn: None, // the spec already offers h2/http/1.1
                 verifier: &AcceptAll,
                 rng: &rng,
+                ech: None,
             },
         )
         .await

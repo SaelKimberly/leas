@@ -19,6 +19,7 @@ pub use fingerprints::{
 pub use http2_profile::Http2Profile;
 pub mod client;
 pub mod crypto;
+pub mod ech;
 pub mod handshake;
 pub mod hello;
 pub mod http2;

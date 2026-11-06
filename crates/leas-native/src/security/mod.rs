@@ -23,6 +23,21 @@ use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
 use crate::security::reality::{FixedChrome130Hybrid, HelloProvisionerChoice};
 
+/// The link's `ech=` value as a parsed config list (`RFC 9849`). `None` when the
+/// security config carries no ECH; a malformed value is a dial error, never a
+/// silent plain-SNI fallback (that would leak the name the user asked to hide).
+fn ech_config(ctx: &LinkContext) -> Result<Option<leas_tls::ech::EchConfigList>, NativeError> {
+    let Some(value) = ctx
+        .security()
+        .and_then(leas_proto::proto_spec::SecurityConfig::ech)
+    else {
+        return Ok(None);
+    };
+    leas_tls::ech::EchConfigList::from_base64(value)
+        .map(Some)
+        .map_err(|e| NativeError::Config(format!("tls ech: {e}")))
+}
+
 /// Wrap the transport stream according to the profile's security config.
 ///
 /// Both arms build an engine [`EngineTlsConfig`] from the proto security
@@ -69,6 +84,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                     let ids = ctx.curve_ids();
                     (!ids.is_empty()).then_some(ids)
                 },
+                ech: ech_config(ctx)?,
                 rng,
             };
             let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
@@ -148,6 +164,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 server_name: ctx.server_name(),
                 alpn: None,
                 curves: None,
+                ech: ech_config(ctx)?,
                 rng,
             };
             let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
@@ -186,6 +203,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                     let ids = ctx.curve_ids();
                     (!ids.is_empty()).then_some(ids)
                 },
+                ech: ech_config(ctx)?,
                 rng,
             };
             let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))

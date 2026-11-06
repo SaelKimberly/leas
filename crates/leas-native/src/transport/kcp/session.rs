@@ -138,11 +138,19 @@ impl KcpSettings {
     /// formula is authoritative here.
     #[must_use]
     pub fn new(mtu: usize, tti: u32) -> Self {
+        Self::with_capacities(mtu, tti, UPLINK_MBPS, DOWNLINK_MBPS)
+    }
+
+    /// `uplink`/`downlink` are the link's advertised capacities in Mbps
+    /// (`KcpConfig::uplink_capacity`/`downlink_capacity`); the in-flight sizes
+    /// follow Go's `GetSendingInFlightSize`/`GetReceivingInFlightSize`.
+    #[must_use]
+    pub fn with_capacities(mtu: usize, tti: u32, uplink: u32, downlink: u32) -> Self {
         let mtu = mtu.max(DATA_SEGMENT_OVERHEAD + 1);
         let mtu_u32 = u32::try_from(mtu).unwrap_or(u32::MAX);
         let ticks = (1000 / tti.max(1)).max(1);
-        let snd_inflight = (UPLINK_MBPS * 1024 * 1024 / mtu_u32 / ticks).max(8);
-        let rcv_inflight = (DOWNLINK_MBPS * 1024 * 1024 / mtu_u32 / ticks).max(8);
+        let snd_inflight = (uplink * 1024 * 1024 / mtu_u32 / ticks).max(8);
+        let rcv_inflight = (downlink * 1024 * 1024 / mtu_u32 / ticks).max(8);
         let snd_buf = MAX_SENDING_WINDOW / mtu_u32;
         Self {
             mtu,
@@ -1442,6 +1450,24 @@ mod tests {
 
     fn settings() -> KcpSettings {
         KcpSettings::new(1350, 50)
+    }
+
+    /// The capacity knobs are the link's advertised Mbps: the in-flight sizes
+    /// follow Go's `GetSendingInFlightSize`/`GetReceivingInFlightSize`, and the
+    /// Go floor of 8 survives a zero.
+    #[test]
+    fn capacities_shape_the_in_flight_windows() {
+        // Defaults: 5/20 Mbps (xray's `init()`), 1350 B, 20 ticks/s.
+        let base = settings();
+        assert_eq!((base.snd_inflight, base.rcv_inflight), (194, 776));
+        let faster = KcpSettings::with_capacities(1350, 50, 10, 40);
+        // Twice the advertised Mbps; the integer division differs by one on
+        // the downlink (1553 vs 776·2), so pin the formula's own result.
+        assert_eq!(faster.snd_inflight, 388);
+        assert_eq!(faster.rcv_inflight, 1553);
+        // A zero capacity keeps Go's floor instead of collapsing the window.
+        let zero = KcpSettings::with_capacities(1350, 50, 0, 0);
+        assert_eq!((zero.snd_inflight, zero.rcv_inflight), (8, 8));
     }
 
     fn sent_collector() -> (Sent, impl FnMut(&[u8]) -> io::Result<()>) {

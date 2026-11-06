@@ -58,6 +58,9 @@ pub struct TlsConfig {
     pub curves: Option<Vec<u16>>,
     /// Random source; `SystemRandom` default.
     pub rng: Arc<dyn SecureRandom>,
+    /// `Encrypted ClientHello` config list (`RFC 9849`, from the link's `ech=`
+    /// value). `None` sends a single hello.
+    pub ech: Option<crate::ech::EchConfigList>,
 }
 
 impl TlsConfig {
@@ -76,6 +79,7 @@ impl TlsConfig {
             alpn: None,
             curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
+            ech: None,
         }
     }
 
@@ -100,6 +104,7 @@ impl TlsConfig {
             alpn: None,
             curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
+            ech: None,
         }
     }
 }
@@ -159,6 +164,7 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
                     alpn: alpn.as_deref(),
                     verifier: verifier.as_ref(),
                     rng: config.rng.as_ref(),
+                    ech: config.ech.as_ref(),
                 },
                 permute,
             )
@@ -345,6 +351,7 @@ mod tests {
             alpn: Some(vec![vec![0xFF, 0x00]]),
             curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
+            ech: None,
         };
         let handshake = tokio::spawn(async move { connect(client, &config).await });
 

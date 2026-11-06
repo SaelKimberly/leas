@@ -260,6 +260,16 @@ async fn vless_against_cores(
 // dial + security-wrap composition arms.
 #[case::kcp_plain(vless_tls("kcp", no_tls()), CoreKind::Xray)]
 #[case::kcp_chrome(vless_tls("kcp", fp("chrome")), CoreKind::Xray)]
+// mKCP obfuscation (Xray `finalmask` `mkcp-legacy`): the camouflage header,
+// the AES-128-GCM seed envelope, both together, and the FNV `original`
+// envelope a header alone implies. The server emits the mask from the same
+// knobs the client frames with (`transport::kcp::mask`); a counter or layout
+// mismatch stalls the session instead of the row passing by luck.
+#[case::kcp_mask_srtp(vless_tls("kcp", no_tls()).with_kcp_mask("srtp", ""), CoreKind::Xray)]
+#[case::kcp_mask_dns(vless_tls("kcp", no_tls()).with_kcp_mask("dns", ""), CoreKind::Xray)]
+#[case::kcp_mask_seed(vless_tls("kcp", no_tls()).with_kcp_mask("", "hunter2"), CoreKind::Xray)]
+#[case::kcp_mask_srtp_seed(vless_tls("kcp", no_tls()).with_kcp_mask("srtp", "hunter2"), CoreKind::Xray)]
+#[case::kcp_mask_wechat_seed(vless_tls("kcp", no_tls()).with_kcp_mask("wechat-video", "s3cret"), CoreKind::Xray)]
 // SP7 (VLESS ML-KEM) PQ rows (spec §7.3) — xray-single-core: sing-box
 // 1.13.16 has no VLESS account encryption, so pq-enc pins xray; reality-pq
 // is blocked by the harness dest regardless of core.

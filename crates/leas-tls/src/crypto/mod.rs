@@ -9,6 +9,7 @@
 //! RFC 8448 vectors.
 
 pub mod fingerprint;
+pub mod hpke;
 pub mod mldsa;
 pub mod mlkem;
 pub mod tls12;

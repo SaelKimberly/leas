@@ -249,6 +249,52 @@ pub fn vmess_inbound(
     serde_json::to_string(&json).expect("vmess server config serializes")
 }
 
+/// Add xray's mKCP obfuscation (`finalmask.udp`) to a kcp server config.
+///
+/// Names are the ones the PINNED core (26.3.27) accepts: `mkcp-original`,
+/// `mkcp-aes128gcm` and `header-*`. (Xray HEAD renamed the first two to
+/// `mkcp-legacy`; 26.3.27 rejects that name, and 26.3.27 is what the suite
+/// tests against.) The array order is the wire order, reversed twice on the
+/// way in: v2rayN emits `[header, envelope]` and reverses it to
+/// `[envelope, header]`, and `NewFinalMask` reverses again, so the FIRST
+/// element ends up INNERMOST. Emitting `[envelope, header]` therefore yields
+/// `header || envelope(payload)` — the layout `transport::kcp::mask` frames
+/// and the byte vectors in that module pin. `""` means the knob is absent;
+/// with no seed the envelope is the bare `original` entry.
+#[must_use]
+pub fn apply_kcp_mask(config: &str, header: &str, seed: &str) -> String {
+    let mut json: serde_json::Value =
+        serde_json::from_str(config).expect("generated server config is JSON");
+    let envelope = if seed.is_empty() {
+        serde_json::json!({ "type": "mkcp-original" })
+    } else {
+        serde_json::json!({
+            "type": "mkcp-aes128gcm",
+            "settings": { "password": seed }
+        })
+    };
+    let mut masks = vec![envelope];
+    if !header.is_empty() {
+        // The core's type names are the finalmask ones: `header-wechat`, not
+        // the share-link spelling `wechat-video`.
+        let name = if header == "wechat-video" {
+            "wechat"
+        } else {
+            header
+        };
+        let mut entry = serde_json::json!({ "type": format!("header-{name}") });
+        if header == "dns" {
+            // The client frames the core's default domain; name it so the row
+            // pins the bytes instead of the default.
+            entry["settings"] = serde_json::json!({ "domain": "www.baidu.com" });
+        }
+        masks.push(entry);
+    }
+    let stream = &mut json["inbounds"][0]["streamSettings"];
+    stream["finalmask"] = serde_json::json!({ "udp": masks });
+    serde_json::to_string(&json).expect("server config serializes")
+}
+
 /// VLESS inbound JSON for `core` (no payload security dimension).
 ///
 /// `flow` selects the VLESS flow control: `Flow::Vision` emits

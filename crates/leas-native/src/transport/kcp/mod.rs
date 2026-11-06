@@ -10,7 +10,9 @@ use tokio::net::UdpSocket;
 use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::NativeError;
+use mask::MaskChain;
 
+pub mod mask;
 pub mod session;
 pub mod stream;
 pub mod wire;
@@ -50,20 +52,38 @@ pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxSt
     let cfg = ctx
         .transport_kcp()
         .ok_or_else(|| NativeError::Config("kcp transport missing its transport config".into()))?;
-    // Spec §4.5 defaults when the params omit mtu/tti.
-    let settings = KcpSettings::new(
+    // Spec §4.5 defaults when the params omit mtu/tti; the capacity knobs are
+    // the link's advertised Mbps (Go `GetSendingInFlightSize` formulas).
+    let settings = KcpSettings::with_capacities(
         usize::try_from(cfg.mtu.unwrap_or(1350)).unwrap_or(1350),
         cfg.tti.unwrap_or(50),
+        cfg.uplink_capacity.unwrap_or(5),
+        cfg.downlink_capacity.unwrap_or(20),
     );
+    // `header_type`/`seed` are wire format, not knobs: an unsupported header
+    // name is refused here rather than producing datagrams the peer drops.
+    // Two chains: the write half owns the per-connection counters, the read
+    // half needs only the prefix width and the key, so the tasks share no lock.
+    let build = |()| {
+        MaskChain::from_settings(cfg.header_type.as_deref(), cfg.seed.as_deref())
+            .map_err(|e| NativeError::Config(e.to_string()))
+    };
+    let send_mask = build(())?;
+    let read_mask = build(())?;
     let addr = ctx.server_socket().await?;
-    dial(addr, settings).await
+    dial(addr, settings, send_mask, read_mask).await
 }
 
 /// Bind an ephemeral UDP socket, connect to the server, wire the session
 /// (output closure → send task; recv task → `session.input`) and return the
 /// stream adapter boxed. The socket error path follows spec §6: the input
 /// task logs and stops; the session then EOFs via its own state machine.
-async fn dial(addr: SocketAddr, settings: KcpSettings) -> Result<BoxStream, NativeError> {
+async fn dial(
+    addr: SocketAddr,
+    settings: KcpSettings,
+    mut send_mask: Option<MaskChain>,
+    read_mask: Option<MaskChain>,
+) -> Result<BoxStream, NativeError> {
     let sock = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
             .await
@@ -91,7 +111,11 @@ async fn dial(addr: SocketAddr, settings: KcpSettings) -> Result<BoxStream, Nati
     let send_sock = Arc::clone(&sock);
     tokio::spawn(async move {
         while let Some(buf) = rx.recv().await {
-            if let Err(e) = send_sock.send(&buf).await {
+            let wire = match &mut send_mask {
+                Some(mask) => mask.seal(&buf),
+                None => buf,
+            };
+            if let Err(e) = send_sock.send(&wire).await {
                 tracing::warn!(%e, "mKCP: udp send failed; stopping sender");
                 break;
             }
@@ -105,7 +129,14 @@ async fn dial(addr: SocketAddr, settings: KcpSettings) -> Result<BoxStream, Nati
         loop {
             match recv_sock.recv(&mut buf).await {
                 Ok(n) => {
-                    recv_session.input(&buf[..n]);
+                    let mut plain = &mut buf[..n];
+                    if let Some(mask) = &read_mask {
+                        let Ok(opened) = mask.open(plain) else {
+                            continue; // not a mask datagram: drop, like Go
+                        };
+                        plain = opened;
+                    }
+                    recv_session.input(plain);
                     if recv_session.state() == State::Terminated {
                         break; // handshake done — no more datagrams matter
                     }

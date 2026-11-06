@@ -474,6 +474,7 @@ mod tests {
                 alpn: Some(&[b"http/1.1"]),
                 verifier,
                 rng: &rng,
+                ech: None,
             },
         )
         .await;

@@ -179,6 +179,7 @@ async fn grade(profile: &'static str, fingerprint: &Fingerprint) -> Result<(), B
             alpn: Some(ALPN),
             verifier: &verifier,
             rng: &ring::rand::SystemRandom::new(),
+            ech: None,
         },
     )
     .await?;
@@ -989,6 +990,7 @@ mod roster {
                 alpn: None,
                 verifier: &verifier,
                 rng: &ring::rand::SystemRandom::new(),
+                ech: None,
             },
         )
         .await
