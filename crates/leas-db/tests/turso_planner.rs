@@ -32,6 +32,7 @@
 use turso::Builder;
 
 /// Reference-feed scale (the 2026-10-06 `data.db` endpoint count).
+#[cfg(feature = "perf-lab")]
 const N: usize = 74_723;
 
 /// The covering index the shipped schema uses (`endpoint_rank_key`, v18) —
@@ -123,15 +124,15 @@ async fn turso_planner_gate() {
     // Queries: the three page paths + the two traps.
     let cases: [(&str, String); 5] = [
         (
-            "Active band=0 seek",
+            "Active band<2 seek",
             format!(
-                "SELECT endpoint_id FROM endpoint_rank WHERE band=0 ORDER BY {KEY} LIMIT 200 OFFSET 5000"
+                "SELECT endpoint_id FROM endpoint_rank WHERE band<2 ORDER BY {KEY} LIMIT 200 OFFSET 5000"
             ),
         ),
         (
-            "Purgatory band=1 seek",
+            "Purgatory band=2 seek",
             format!(
-                "SELECT endpoint_id FROM endpoint_rank WHERE band=1 ORDER BY {KEY} LIMIT 200 OFFSET 5000"
+                "SELECT endpoint_id FROM endpoint_rank WHERE band=2 ORDER BY {KEY} LIMIT 200 OFFSET 5000"
             ),
         ),
         (
@@ -162,7 +163,7 @@ async fn turso_planner_gate() {
     // The reband sweep's range — must be an index range, no scan of the table.
     let p = plan(
         &conn,
-        "UPDATE endpoint_rank SET band=1 WHERE band=0 AND rank_newest_seen < 100",
+        "UPDATE endpoint_rank SET band=2 WHERE band<2 AND rank_newest_seen < 100",
     )
     .await;
     println!("\n[reband sweep]\n  {p:?}");
@@ -208,8 +209,8 @@ async fn every_scope_plan_is_index_served_without_a_sorter() {
     conn.execute(KEY_INDEX, ()).await.expect("key index");
 
     let scope_cases = [
-        ("Active", "band = 0", ""),
-        ("Purgatory", "band = 1", ""),
+        ("Active", "band < 2", ""),
+        ("Purgatory", "band = 2", ""),
         ("Successful", "band = 0", " AND rank_proven = 1"),
         ("New", "band = 0", " AND rank_proven = 0 AND rank_bin = 12"),
         (

@@ -55,7 +55,7 @@ pub const ENDPOINT_RANK_KEY_V2: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank
 /// rank refresh.
 pub const ENDPOINT_RANK_KEY_DROP: &str = "DROP INDEX IF EXISTS endpoint_rank_key";
 
-/// The directional reband sweep seeks `band = 0 AND rank_newest_seen < ?`.
+/// The directional reband sweep seeks `band < 2 AND rank_newest_seen < ?`.
 pub const ENDPOINT_RANK_BAND_WINDOW: &str =
     "CREATE INDEX IF NOT EXISTS endpoint_rank_band_window ON endpoint_rank(band, rank_newest_seen)";
 
@@ -108,6 +108,7 @@ pub const ENDPOINT_RANK_ADD_COLUMNS: &[&str] = &[
      NOT NULL DEFAULT x'0000000000000000'",
     "ALTER TABLE endpoint_rank ADD COLUMN rank_stab INTEGER NOT NULL DEFAULT 4",
     "ALTER TABLE endpoint_rank ADD COLUMN rank_proven INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE endpoint_rank ADD COLUMN rank_alive INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Indexes and tables created AFTER the ALTERs above (the covering index names

@@ -539,8 +539,8 @@ async fn main() -> Result<()> {
                     return;
                 }
                 // Demote endpoints that aged out of the Active window since the
-                // last tick (band 0 → 1) — a cheap directional index sweep, run
-                // every tick even when retention is disabled.
+                // last tick (band 0/1 → 2) — a cheap directional index sweep,
+                // run every tick even when retention is disabled.
                 if let Err(e) = purge_db.reband_expired().await {
                     tracing::warn!(target: "tui::main", "reband sweep failed: {e}");
                 }

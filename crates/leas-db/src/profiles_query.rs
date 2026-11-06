@@ -124,13 +124,8 @@ impl PlanScope {
 #[derive(Debug, Clone)]
 pub struct PageRequest {
     pub view: PurgatoryView,
-    /// The view bound, in epoch seconds (the unit the key columns store):
-    /// `Active` selects `>= active`, `Purgatory` selects `< active`.
-    ///
-    /// There is no lower bound: with a live-only `rank_newest_seen`, an endpoint
-    /// whose only live links are older than retention while a purged link was
-    /// confirmed today is a state this feature creates deliberately, and a lower
-    /// bound would hide it from both views. The retention sweep owns deletion.
+    /// The stored band is materialized from this bound: `0` Alive and `1`
+    /// Active when inside the window, `2` Purgatory when outside it.
     pub active_threshold: i64,
     pub search: Option<String>,
     pub group_id: Option<String>,
@@ -166,17 +161,21 @@ pub struct PageMeta {
 /// The four **partition members** — [`proven`][Self::proven],
 /// [`untested`][Self::untested], [`failed`][Self::failed],
 /// [`other`][Self::other] — are pairwise disjoint and sum to
-/// [`total`][Self::total]. [`alive`][Self::alive] and
-/// [`reliable`][Self::reliable] are **orthogonal**: they are filters over the
-/// same rows and overlap any partition member, so they must never be drawn as
-/// part of the partition (spec D28).
+/// [`total`][Self::total]. [`alive`][Self::alive], [`active`][Self::active],
+/// and [`reliable`][Self::reliable] are **orthogonal**: they are filters over
+/// the same rows and overlap any partition member, so they must never be
+/// drawn as part of the partition (spec D28). `alive` and `active` are
+/// disjoint bands.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AggregateCounts {
     /// Every endpoint in the scope.
     pub total: u64,
-    /// Seen within the TTL window — live (`rank_newest_seen`) for the global
-    /// group, the swept `band` for the view group.
+    /// Seen within the TTL window AND the newest real probe succeeded —
+    /// `rank_alive` live for the global group, `band = 0` for the view group.
     pub alive: u64,
+    /// Seen within the TTL window but NOT Alive — `rank_alive = 0` live for
+    /// the global group, `band = 1` for the view group.
+    pub active: u64,
     /// `rank_proven = 1` — any live unpurged link with a real success.
     pub proven: u64,
     /// The representative link's success rate ≥ 75% (`rank_stab <= 2`).
@@ -207,11 +206,12 @@ impl AggregateCounts {
         Ok(Self {
             total: field(0)?,
             alive: field(1)?,
-            proven: field(2)?,
-            reliable: field(3)?,
-            untested: field(4)?,
-            failed: field(5)?,
-            other: field(6)?,
+            active: field(2)?,
+            proven: field(3)?,
+            reliable: field(4)?,
+            untested: field(5)?,
+            failed: field(6)?,
+            other: field(7)?,
         })
     }
 }
@@ -567,10 +567,14 @@ fn aggregate_sql(req: &PageRequest, live_alive: bool) -> Sql {
     if live_alive {
         let threshold = sql.bind(req.active_threshold);
         sql.push(&format!(
-            ", SUM(CASE WHEN k.rank_newest_seen >= {threshold} THEN 1 ELSE 0 END)"
+            ", SUM(CASE WHEN k.rank_newest_seen >= {threshold} AND k.rank_alive = 1 THEN 1 ELSE 0 END)"
+        ));
+        sql.push(&format!(
+            ", SUM(CASE WHEN k.rank_newest_seen >= {threshold} AND k.rank_alive = 0 THEN 1 ELSE 0 END)"
         ));
     } else {
         sql.push(", SUM(CASE WHEN k.band = 0 THEN 1 ELSE 0 END)");
+        sql.push(", SUM(CASE WHEN k.band = 1 THEN 1 ELSE 0 END)");
     }
     sql.push(", SUM(CASE WHEN k.rank_proven = 1 THEN 1 ELSE 0 END)");
     sql.push(", SUM(CASE WHEN k.rank_stab <= 2 THEN 1 ELSE 0 END)");
@@ -594,10 +598,11 @@ fn view_predicate(sql: &mut Sql, req: &PageRequest) {
         PurgatoryView::All => sql.push("1 = 1"),
         // Membership is the materialized `band` — the SOLE Active predicate for
         // every sort, so switching sort column cannot flip the set mid-drift
-        // (the reband sweep, not a per-query threshold, moves a row 0→1). A
-        // not-yet-banded row (`NULL`) is treated as not-Active by `IS NOT 0`.
-        PurgatoryView::Active => sql.push("k.band = 0"),
-        PurgatoryView::Purgatory => sql.push("k.band IS NOT 0"),
+        // (the reband sweep, not a per-query threshold, moves a row 0/1→2).
+        // Bands 0 (`Alive`) and 1 (`Active`) are both inside the active window;
+        // band 2 is `Purgatory`.
+        PurgatoryView::Active => sql.push("k.band < 2"),
+        PurgatoryView::Purgatory => sql.push("k.band = 2"),
     }
 }
 

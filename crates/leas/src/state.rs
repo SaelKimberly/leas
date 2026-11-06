@@ -447,6 +447,7 @@ impl AppState {
             counts: AggregateCounts {
                 total: view.total,
                 alive: global.alive,
+                active: global.active,
                 proven: view.proven,
                 reliable: view.reliable,
                 untested: view.untested,

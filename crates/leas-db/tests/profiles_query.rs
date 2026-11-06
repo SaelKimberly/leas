@@ -564,6 +564,30 @@ async fn aggregate_view_total_matches_the_page_count() {
     );
 }
 
+#[tokio::test]
+async fn aggregate_alive_and_active_are_distinct_bands() {
+    let db = seed_fixture().await;
+    {
+        let mut conn = db.connection().await.expect("conn");
+        toasty::sql::statement(
+            "UPDATE endpoint_rank SET band = CASE WHEN endpoint_id = 1 THEN 0 ELSE 1 END",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("split the bands");
+    }
+
+    let req = request(PageSort::Test, true, 0, 100);
+    let swept = db.profiles_aggregate(&req, false).await.expect("aggregate");
+    assert_eq!(swept.alive, 1, "band 0 is Alive only");
+    assert_eq!(swept.active, 7, "band 1 is Active only");
+    assert_eq!(
+        swept.alive + swept.active,
+        8,
+        "the two bands partition the active window"
+    );
+}
+
 /// The global `alive` arm is LIVE: a row whose `band = 0` but whose
 /// `rank_newest_seen` has aged past the TTL is NOT alive.
 ///
@@ -596,6 +620,23 @@ async fn aggregate_alive_is_live_for_the_global_scope() {
         swept.alive, live.alive,
         "the live arm must not read the swept band"
     );
+
+    // A past bound makes freshness universal, so the live arm's split is
+    // `rank_alive`, not `band`: one alive row, seven active.
+    {
+        let mut conn = db.connection().await.expect("conn");
+        toasty::sql::statement(
+            "UPDATE endpoint_rank SET band = 0, rank_alive = CASE WHEN endpoint_id = 1 THEN 1 ELSE 0 END",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("split rank_alive");
+    }
+    let mut req = request(PageSort::Test, true, 0, 100);
+    req.active_threshold = 0;
+    let live = db.profiles_aggregate(&req, true).await.expect("aggregate");
+    assert_eq!(live.alive, 1, "rank_alive = 1 is Alive");
+    assert_eq!(live.active, 7, "rank_alive = 0 is Active");
 }
 
 /// The aggregate on the DIRECT turso reader must match the toasty path — the

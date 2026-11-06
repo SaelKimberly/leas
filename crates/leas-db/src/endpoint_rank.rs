@@ -301,7 +301,12 @@ const fn delay_bin(delay: i32) -> u8 {
 /// AND a measurement, and the old law filed it below every real-error band.
 /// A working server sorted below the failures: the ordering law inverted.
 /// Every stored `rank_bin` must re-derive.
-pub const STAB_VERSION: u32 = 3;
+///
+/// v4 (2026-11-06): `band` now has three values — 0 `Alive` (fresh and the
+/// newest real probe succeeded), 1 `Active` (fresh, not alive), 2
+/// `Purgatory` (stale). The stored `rank_alive` column is written by the same
+/// recompute, so every existing rank row must be refreshed once.
+pub const STAB_VERSION: u32 = 4;
 
 /// The version of every INPUT to the stored rank keys — the compiled weight
 /// tables *and* the stability thresholds. The stamp in `rank_weight_meta` holds
@@ -432,6 +437,26 @@ pub const fn stab_latest_ok(mask: u64, len: u8) -> Option<bool> {
     }
 }
 
+/// Consecutive successful samples at the newest end of the ring.
+///
+/// The Streak column's fact: 0 when the newest sample failed (or the ring is
+/// empty), otherwise the run of leading `1`s. `len` is clamped the same way the
+/// other ring readers clamp it.
+#[must_use]
+pub const fn stab_streak(mask: u64, len: u8) -> u8 {
+    let mut streak = 0;
+    let mut i = len;
+    while i > 0 {
+        i -= 1;
+        if mask >> i & 1 == 1 {
+            streak += 1;
+        } else {
+            break;
+        }
+    }
+    streak
+}
+
 /// The endpoint's own packed address key for the rank `addr` tiebreak (db-rewamp
 /// D10): an IP host's literal lives in `endpoint_ip`; a DNS host gets an empty key.
 fn endpoint_addr_key(row: &EndpointRow) -> Vec<u8> {
@@ -484,6 +509,10 @@ pub struct RankRow {
     /// The REPRESENTATIVE link's weight — the one the law picked, so the stored
     /// key and the stored weight always describe the same link.
     pub weight: ConfigWeight,
+    /// The endpoint's newest real probe succeeded (the `Alive` band's fact).
+    /// A raw column beside `band`, because the reband sweep must be able to
+    /// recompute a row's band from stored integers alone.
+    pub alive: bool,
 }
 
 /// The weight of a protocol row.
@@ -546,7 +575,15 @@ pub fn compute_rank(
     // `representative_index`. Its OWN stab is what the stored column reports —
     // the same link the bin/weight came from, so the stored stab and the
     // stored key cannot describe different links.
-    let (bin, stab, neg_weight, _, _) = representative_index(links, dns_unresolved)?.1;
+    let (representative, (bin, stab, neg_weight, _, _)) =
+        representative_index(links, dns_unresolved)?;
+    // `alive` is the representative's newest ring sample: the representative
+    // rule already prefers a live link, so "any live link's latest real probe
+    // succeeded" is the same question for the endpoint. Purged links never
+    // qualify — a verdict retired them.
+    let alive = links
+        .get(representative)
+        .is_some_and(|l| !l.purged && l.latest_ok == Some(true));
     // `proven` is ENDPOINT-level and NOT the representative's: a link that has
     // worked in its window keeps the endpoint in `Successful` even when a
     // sibling is the representative (an untested sibling outranks a failed
@@ -589,6 +626,7 @@ pub fn compute_rank(
             newest_seen,
         },
         weight,
+        alive,
     })
 }
 
@@ -640,7 +678,7 @@ const RANK_CHUNK: usize = 400;
 /// rather than merely mis-sort, because the anchor binds each term's value back
 /// into a comparison.
 const RANK_COLUMNS: &str = "endpoint_id, rank_bin, rank_stab, rank_proven, rank_weight, \
-     rank_domain, rank_sub_domain, rank_addr, rank_newest_seen";
+     rank_domain, rank_sub_domain, rank_addr, rank_newest_seen, rank_alive";
 
 /// Fill the ordering keys and heal stale ones. The table's DDL (and its
 /// indexes) now lives in `crate::schema::ddl`, run by the migration runner
@@ -722,8 +760,8 @@ async fn stamp_weight_version(conn: &mut impl toasty::Executor) -> crate::Result
 }
 
 /// Fill `band` for rows that predate the column (`band IS NULL`) — the
-/// non-destructive upgrade's one-time cost. Same derivation as `write`'s
-/// follow-up: the ttl membership.
+/// non-destructive upgrade's one-time cost. Same three-way derivation as
+/// `write`'s follow-up: stale → 2, alive → 0, otherwise 1.
 async fn backfill_bands(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     if scalar_i64(
         conn,
@@ -738,7 +776,8 @@ async fn backfill_bands(conn: &mut impl toasty::Executor) -> crate::Result<()> {
         - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
     toasty::sql::query(format!(
         "UPDATE endpoint_rank SET \
-         band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END \
+         band = CASE WHEN rank_newest_seen < {threshold} THEN 2 \
+                     WHEN rank_alive = 1 THEN 0 ELSE 1 END \
          WHERE band IS NULL"
     ))
     .exec(conn)
@@ -783,7 +822,7 @@ pub(crate) async fn write(
             .map(|row| {
                 let r = &row.rank;
                 format!(
-                    "({},{},{},{},{},{},{},{},{})",
+                    "({},{},{},{},{},{},{},{},{},{})",
                     r.endpoint_id.get(),
                     r.bin,
                     r.stab,
@@ -792,7 +831,8 @@ pub(crate) async fn write(
                     crate::database::sql_lit(&r.domain),
                     crate::database::sql_lit(&r.sub_domain),
                     blob_lit(&r.addr),
-                    r.newest_seen
+                    r.newest_seen,
+                    i64::from(row.alive)
                 )
             })
             .collect::<Vec<_>>()
@@ -815,7 +855,8 @@ pub(crate) async fn write(
             .join(",");
         toasty::sql::statement(format!(
             "UPDATE endpoint_rank SET \
-             band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END \
+             band = CASE WHEN rank_newest_seen < {threshold} THEN 2 \
+                         WHEN rank_alive = 1 THEN 0 ELSE 1 END \
              WHERE endpoint_id IN ({ids})"
         ))
         .exec(conn)
@@ -883,7 +924,7 @@ impl crate::Database {
     }
 
     /// Directional reband sweep: demote endpoints whose newest LIVE link has
-    /// aged past the Active threshold (`band` 0 → 1). Monotonic and
+    /// aged past the Active threshold (`band` 0/1 → 2). Monotonic and
     /// continuity-independent — it seeks exactly the drifted rows through the
     /// `(band, rank_newest_seen)` index, so an arbitrary downtime gap is
     /// corrected in one range scan (not a fixed window that a long gap could
@@ -898,7 +939,7 @@ impl crate::Database {
                     - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
                 let mut conn = db.connection().await?;
                 toasty::sql::query(format!(
-                    "UPDATE endpoint_rank SET band = 1 WHERE band = 0 AND rank_newest_seen < {threshold}"
+                    "UPDATE endpoint_rank SET band = 2 WHERE band < 2 AND rank_newest_seen < {threshold}"
                 ))
                 .exec(&mut conn)
                 .await?;
@@ -924,7 +965,8 @@ impl crate::Database {
                 let mut conn = db.connection().await?;
                 toasty::sql::query(format!(
                     "UPDATE endpoint_rank SET \
-                     band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END"
+                     band = CASE WHEN rank_newest_seen < {threshold} THEN 2 \
+                                 WHEN rank_alive = 1 THEN 0 ELSE 1 END"
                 ))
                 .exec(&mut conn)
                 .await?;
@@ -1459,6 +1501,59 @@ mod tests {
             sec_cost: 0,
             transport_cost: 0,
         }
+    }
+
+    #[test]
+    fn alive_is_the_representatives_newest_real_sample() {
+        let mut live = link(1, Some(true), 40, 10);
+        live.latest_ok = Some(true);
+        let row = compute_rank(
+            EndpointId::new(7),
+            "example.com",
+            "",
+            Vec::new(),
+            false,
+            &[live],
+        )
+        .expect("rank");
+        assert!(row.alive, "a successful newest sample is Alive");
+
+        let mut failed = link(1, Some(true), 40, 10);
+        failed.latest_ok = Some(false);
+        let row = compute_rank(
+            EndpointId::new(7),
+            "example.com",
+            "",
+            Vec::new(),
+            false,
+            &[failed],
+        )
+        .expect("rank");
+        assert!(!row.alive, "a failed newest sample is not Alive");
+
+        let mut purged = link(1, Some(true), 40, 10);
+        purged.latest_ok = Some(true);
+        purged.purged = true;
+        let row = compute_rank(
+            EndpointId::new(7),
+            "example.com",
+            "",
+            Vec::new(),
+            false,
+            &[purged],
+        )
+        .expect("rank");
+        assert!(!row.alive, "a purge verdict retires the Alive fact");
+    }
+
+    #[test]
+    fn streak_counts_only_trailing_successes() {
+        // Newest at the top: 1,1,1,0,1,1 (oldest → newest) — the trailing run
+        // stops at the zero, so the streak is 2.
+        assert_eq!(stab_streak(0b11_0111, 6), 2);
+        assert_eq!(stab_streak(0b1111, 4), 4);
+        assert_eq!(stab_streak(0b0111, 4), 0);
+        assert_eq!(stab_streak(0, 0), 0);
     }
 
     #[test]

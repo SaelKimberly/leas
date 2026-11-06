@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
 use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::data_table::{
-    Column, ColumnWidth, DataTable, DataTableRow, DataTableState, SortDirection,
+    Column, ColumnWidth, DataTable, DataTableRow, DataTableState,
 };
 use crate::{AppState, EndpointRow, format_relative_ts, format_ts, iso_to_flag};
 
@@ -78,8 +78,11 @@ impl Default for DisplayRowsCache {
 /// itself: its row was taller than the whole table).
 const PANEL_MAX_ROWS: usize = 8;
 
-/// Width of the single-row Protocol Info cell (`protocol/transport/security`).
-const PROTOCOL_INFO_WIDTH: usize = 24;
+/// Width of the single-row Protocol cell (the protocol kind).
+const PROTOCOL_WIDTH: usize = 10;
+
+/// Width of the single-row Config cell (`transport/security`).
+const CONFIG_WIDTH: usize = 14;
 
 /// Sub-table geometry inside an expanded panel: (offset within the panel
 /// interior, width, header label). One owner for both the header row and the
@@ -106,11 +109,6 @@ const PANEL_COLS: [(usize, usize, &str); 12] = [
 /// narrower, because the panel's columns are absolute offsets — a border sized
 /// to the grid clipped `Exit` and `Stab` off entirely.
 const PANEL_INNER_W: usize = 123;
-
-/// Column the fixed sort arrow points at (D13): the page request orders by
-/// `PageSort::Test`, which is column 7 in the §7 grid. Derived from the sort
-/// the page asks for — not a second magic number.
-const PROFILES_SORT_COLUMN: usize = 7;
 
 /// One row of the expanded per-protocol sub-table inside an endpoint panel.
 #[derive(Clone)]
@@ -146,10 +144,7 @@ struct PanelRow {
 pub struct DisplayRowData {
     indicator: String,
     indicator_fg: Style,
-    /// `{:08x}` of the representative link's protocol id; `*` when the row is
-    /// multi-selected (D9/D10 — the marker replaces the id, both padded to 8).
-    id_hex: String,
-    /// Inbound flag cell: `<flag>-<ISO>` or bare `<ISO>`, `—` unknown (D14).
+    /// Inbound flag cell: `<flag> <ISO>` or bare `<ISO>`, `—` unknown (D14).
     inbound_flag: String,
     /// Host only (elided when the subdomain overflows); the port moved to its
     /// own column (spec §7).
@@ -158,11 +153,12 @@ pub struct DisplayRowData {
     port_str: String,
     /// Whitelist tokens `SNI` / `CIDR` / `SNI+CIDR` / `—` (9 cells).
     white_str: String,
-    /// `protocol/transport/security` single-row cell (the braces around it
-    /// come from the neighbouring decoration columns).
-    protocol_info_str: String,
-    /// `[ 12 ]`-style Test cell: `[value]` where value is 4 cells wide,
-    /// or the red `[name]`/`[fast]`/`[real]` problem labels, or blank.
+    /// Protocol kind (`vless`, `vmess`, …) — left aligned.
+    protocol_str: String,
+    /// Transport/security pair (`tcp/reality`, …) — left aligned.
+    config_str: String,
+    /// The Test cell's value slot: a 4-cell number or the bracketed problem
+    /// labels.
     test_str: String,
     test_style: Style,
     /// The Fast column: the TRANSPORT measurement (spec D2).
@@ -177,12 +173,16 @@ pub struct DisplayRowData {
     /// row shows. `—` when the ring has no samples.
     stab_str: String,
     stab_style: Style,
+    /// The success streak of the representative link's ring; blank unless the
+    /// endpoint is currently Alive.
+    streak_str: String,
+    streak_style: Style,
     /// The Speed column: the representative link's peak download rate in
     /// MiB/s — the SAME link the Test/Stab cells describe.
     speed_str: String,
     speed_style: Style,
     outbound_addr: String,
-    /// Exit flag cell (D14): `<flag>-<ISO>` or bare `<ISO>`, `—` unknown.
+    /// Exit flag cell (D14): `<flag> <ISO>` or bare `<ISO>`, `—` unknown.
     outbound_flag: String,
     /// `+` collapsed / `-` expanded, drawn accent-bold one cell before the
     /// host (D11); `' '` when the endpoint has no variants. Carries the
@@ -191,11 +191,12 @@ pub struct DisplayRowData {
     expanded: bool,
     row_style: Style,
     /// Per-column colour map (spec D12): one style per styled column.
-    id_style: Style,
     address_style: Style,
     port_style: Style,
     white_style: Style,
     protocol_style: Style,
+    config_style: Style,
+    border_style: Style,
     prefix_style: Style,
     panel_selected_style: Style,
     /// Header role for the sub-table's column labels.
@@ -227,26 +228,28 @@ impl DataTableRow for DisplayRowData {
             let logical = col_order.get(i).copied().unwrap_or(i);
             let (text, style) = match logical {
                 0 => (self.indicator.as_str(), self.indicator_fg),
-                1 => (self.id_hex.as_str(), self.id_style),
-                2 => (self.inbound_flag.as_str(), self.row_style),
-                3 => (self.address_str.as_str(), self.address_style),
-                4 => (self.port_str.as_str(), self.port_style),
-                5 => (self.white_str.as_str(), self.white_style),
-                6 => (self.protocol_info_str.as_str(), self.protocol_style),
-                7 => (self.fast_str.as_str(), self.fast_style),
-                8 => (self.auth_str.as_str(), self.auth_style),
-                9 => (self.test_str.as_str(), self.test_style),
-                10 => (self.stab_str.as_str(), self.stab_style),
-                11 => (self.speed_str.as_str(), self.speed_style),
-                12 => (self.outbound_flag.as_str(), self.row_style),
-                13 => (self.outbound_addr.as_str(), self.address_style),
+                1 => (self.inbound_flag.as_str(), self.row_style),
+                2 => (self.address_str.as_str(), self.address_style),
+                3 => (self.port_str.as_str(), self.port_style),
+                4 => (self.white_str.as_str(), self.white_style),
+                5 | 8 | 15 => ("│", self.border_style),
+                6 => (self.protocol_str.as_str(), self.protocol_style),
+                7 => (self.config_str.as_str(), self.config_style),
+                9 => (self.fast_str.as_str(), self.fast_style),
+                10 => (self.auth_str.as_str(), self.auth_style),
+                11 => (self.test_str.as_str(), self.test_style),
+                12 => (self.stab_str.as_str(), self.stab_style),
+                13 => (self.streak_str.as_str(), self.streak_style),
+                14 => (self.speed_str.as_str(), self.speed_style),
+                16 => (self.outbound_flag.as_str(), self.row_style),
+                17 => (self.outbound_addr.as_str(), self.address_style),
                 _ => ("", self.row_style),
             };
             let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
             if logical == 0 {
                 // Column 0 is a 2-cell slot: the status glyph, then the gap
                 // cell. The expand chevron owns that gap, so it sits directly
-                // before the ID column and the host keeps its full width (it
+                // before the flag column and the host keeps its full width (it
                 // used to lose a cell to the `+`/`-` marker inside Address).
                 buf.set_stringn(x, y, text, max_w, style);
                 if self.expand_prefix != ' ' && max_w >= 2 {
@@ -258,7 +261,7 @@ impl DataTableRow for DisplayRowData {
                         self.prefix_style,
                     );
                 }
-            } else if logical == 3 {
+            } else if logical == 2 {
                 let host = truncate_host(text, max_w);
                 buf.set_stringn(x, y, &host, max_w, style);
             } else {
@@ -668,7 +671,7 @@ fn fast_cell_content(delay: Option<i32>, theme: &opaline::Theme) -> (String, Sty
     } else {
         ThemeStyles::test_delay_ok(theme)
     };
-    (format!("[{}]", center_cell(&d.to_string(), 4)), style)
+    (center_cell(&d.to_string(), 4), style)
 }
 
 /// Compute the Fast cell for one endpoint row: the TRANSPORT measurement.
@@ -862,7 +865,7 @@ fn test_cell_content(facts: &RealCellFacts<'_>, theme: &opaline::Theme) -> (Stri
             } else {
                 ThemeStyles::test_delay_ok(theme)
             };
-            (format!("[{}]", center_cell(&d.to_string(), 4)), style)
+            (center_cell(&d.to_string(), 4), style)
         }
         _ => (" ".repeat(6), Style::default()),
     }
@@ -959,32 +962,123 @@ fn format_speed_mibps(bps: u64) -> String {
     format!("{mib:.1}")
 }
 
-/// Row-number cell: a 6-cell right-aligned slot plus a trailing gap cell
-/// (carrying the multi-select `*`) — room for 100000+ profiles without the
-/// number bleeding into the next column.
-/// Row id cell (D9/D10): `{:08x}` of the representative link's protocol id —
-/// the same link the Test cell describes, so ID and Test never disagree.
-/// Multi-selected rows print `*` instead, mirroring `index_cell`'s old law
-/// (marker replaces the number, widths equal).
-fn link_id_cell(row: &EndpointRow, dns_unresolved: bool, is_multi: bool) -> String {
-    if is_multi {
-        // The marker replaces the id, both padded to 8 — the same equal-width
-        // law `index_cell` used for the number slot.
-        return format!("{:>8}", "*");
-    }
-    row.representative_link_index(dns_unresolved)
+/// Protocol cell: the representative link's protocol kind, right aligned in
+/// the fixed-width column (the header is padded to match in `GRID_COLUMNS`).
+fn protocol_cell(row: &EndpointRow, dns_unresolved: bool) -> String {
+    let kind = row
+        .representative_link_index(dns_unresolved)
         .and_then(|idx| row.links.get(idx))
-        .map_or_else(String::new, |l| {
-            format!("{:08x}", l.protocol_id.get() as u32)
-        })
+        .and_then(|l| row.protocols.get(&l.protocol_id))
+        .map_or_else(|| "—".to_string(), |p| p.proto_kind.to_string());
+    format!("{kind:>PROTOCOL_WIDTH$}")
 }
 
-/// Flag cell (D14): `<flag emoji>-<ISO>` (5 cells) when the terminal renders
+/// Config cell: the representative link's `transport/security` pair, left
+/// aligned, with the `~` provenance marker for a substituted `ClientHello`.
+fn config_cell(row: &EndpointRow, dns_unresolved: bool) -> String {
+    let Some(link) = row
+        .representative_link_index(dns_unresolved)
+        .and_then(|idx| row.links.get(idx))
+    else {
+        return "—".to_string();
+    };
+    let Some(proto) = row.protocols.get(&link.protocol_id) else {
+        return "—".to_string();
+    };
+    let approximated =
+        leas_native::security::fingerprint::resolve_fingerprint(proto.security.fp.as_deref()).1;
+    format!(
+        "{}/{}{}",
+        proto.transport.r#type,
+        proto.security.r#type,
+        if approximated { "~" } else { "" }
+    )
+}
+
+/// HTTPS-family mirror ports: TLS/reality and Cloudflare's HTTPS range.
+const HTTPS_MIMIC_PORTS: &[u16] = &[443, 8443, 2053, 2083, 2087, 2096];
+/// Either family — a transport that can carry both plain and TLS web traffic.
+const WEB_MIMIC_PORTS: &[u16] = &[
+    80, 443, 8080, 8443, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096,
+];
+
+/// Ports a transport usually carries when it mimics a mainstream protocol.
+///
+/// This is a display hint only: it never changes ordering, testing, or the
+/// stored endpoint. `tcp`/`ws`/`httpupgrade` are seen both plain and behind
+/// TLS, so they use the whole web set; `grpc`/`http`/`xhttp`/`quic`/`kcp` are
+/// TLS-first here (kcp is UDP-first but conventionally mirrors 443/8443).
+const fn default_mimic_ports(transport: leas_proto::proto_spec::TransportType) -> &'static [u16] {
+    use leas_proto::proto_spec::TransportType;
+    match transport {
+        TransportType::Tcp | TransportType::Ws | TransportType::HttpUpgrade => WEB_MIMIC_PORTS,
+        TransportType::Grpc
+        | TransportType::Http
+        | TransportType::XHttp
+        | TransportType::Quic
+        | TransportType::Kcp => HTTPS_MIMIC_PORTS,
+    }
+}
+
+/// Whether the endpoint's port is a conventional mimic port for its
+/// representative link's transport.
+fn is_default_mimic_port(row: &EndpointRow, dns_unresolved: bool) -> bool {
+    let Some(transport) = row
+        .representative_link_index(dns_unresolved)
+        .and_then(|idx| row.links.get(idx))
+        .and_then(|l| row.protocols.get(&l.protocol_id))
+        .map(|p| p.transport.r#type)
+    else {
+        return false;
+    };
+    default_mimic_ports(transport).contains(&row.endpoint.port)
+}
+
+/// Streak cell: consecutive successful real probes for a currently Alive
+/// endpoint's representative link. Any other endpoint, and any link carrying
+/// a real/name error, renders blank — the streak is a health claim, not a
+/// history.
+fn compute_streak_cell(
+    row: &EndpointRow,
+    resolved: bool,
+    state: &AppState,
+    theme: &opaline::Theme,
+) -> (String, Style) {
+    use leas_db::models::ProfileErr;
+    let Some(link) = row
+        .representative_link_index(!resolved)
+        .and_then(|idx| row.links.get(idx))
+    else {
+        return (String::new(), Style::default());
+    };
+    let real_error = link
+        .error
+        .as_ref()
+        .is_some_and(|e| matches!(e.kind, ProfileErr::Real | ProfileErr::Name));
+    let fresh =
+        link.last_seen_at >= leas_db::models::now_epoch().saturating_sub(state.purgatory_ttl_secs);
+    let len = u8::try_from(
+        link.stab_len
+            .clamp(0, i64::from(leas_db::endpoint_rank::STAB_WINDOW)),
+    )
+    .unwrap_or(0);
+    let mask = link.stab_mask.cast_unsigned();
+    if real_error || !fresh || leas_db::endpoint_rank::stab_latest_ok(mask, len) != Some(true) {
+        return (String::new(), Style::default());
+    }
+    let streak = leas_db::endpoint_rank::stab_streak(mask, len);
+    if streak == 0 {
+        return (String::new(), Style::default());
+    }
+    (streak.to_string(), ThemeStyles::test_delay_ok(theme))
+}
+
+/// Flag cell (D14): `<flag> <ISO>` (5 cells) when the terminal renders
 /// regional-indicator emoji, bare `<ISO>` (2) when it does not. Unknown
 /// country = `—`.
 fn flag_cell(iso: Option<&str>, flags_ok: bool) -> String {
     match iso {
-        Some(iso) if flags_ok => truncate_pad(&format!("{}-{iso}", iso_to_flag(iso)), 5),
+        Some(iso) if flags_ok => truncate_pad(&format!("{} {iso}", iso_to_flag(iso)), 5),
         Some(iso) => truncate_pad(iso, 5),
         None => "—".to_string(),
     }
@@ -1047,24 +1141,6 @@ fn flags_supported() -> bool {
             .filter_map(|k| std::env::var(k).ok())
             .any(|v| v.to_ascii_uppercase().contains("UTF-8"))
     })
-}
-
-/// Single-row Protocol Info cell: `protocol/transport/security` (e.g.
-/// `vless/tcp/reality`), centered in the fixed-width slot. A row without an
-/// active protocol renders the `-` placeholder.
-fn protocol_info_cell(row: &EndpointRow) -> String {
-    let info = row.active_protocol().map_or_else(
-        || "-".to_string(),
-        |(_, p)| {
-            format!(
-                "{}/{}/{}",
-                p.proto_kind,
-                p.transport.r#type.as_str(),
-                p.security.r#type.as_str()
-            )
-        },
-    );
-    center_pad(&info, PROTOCOL_INFO_WIDTH)
 }
 
 /// Recompute the selection-dependent fields of one cached display row.
@@ -1184,12 +1260,10 @@ fn build_display_rows(
             )
         };
 
-        let is_multi = state.multi_select.contains(&row.endpoint.id.get());
-
-        // Row id: the representative link's hex id, or `*` under multi-select
-        // (D9/D10).
+        // Row cells: protocol and config split, both left aligned.
         let dns_unresolved = crate::ops::profiles::endpoint_dns_unresolved(state, row);
-        let id_hex = link_id_cell(row, dns_unresolved, is_multi);
+        let protocol_str = protocol_cell(row, dns_unresolved);
+        let config_str = config_cell(row, dns_unresolved);
 
         let info = state.endpoint_info.get(&row.endpoint.id.get());
         // One resolution source: the loaded row's persisted addresses — the
@@ -1205,6 +1279,11 @@ fn build_display_rows(
         // hard-clipping through the domain.
         let address_str = row.endpoint.display_host(&row.resolved_ips);
         let port_str = format!("{:>6}", row.endpoint.port);
+        let port_style = if is_default_mimic_port(row, dns_unresolved) {
+            ThemeStyles::success(theme)
+        } else {
+            ThemeStyles::hint(theme)
+        };
         // Whitelist tokens (spec §7 col 6); the DNS-unresolved flag moved to
         // the Test cell's `[name]` marker, which already carried it.
         let white_str = white_cell(
@@ -1217,9 +1296,8 @@ fn build_display_rows(
         let (fast_str, fast_style) = compute_fast_cell(row, resolved, theme);
         let (auth_str, auth_style) = compute_auth_cell(row, resolved, theme);
         let (stab_str, stab_style) = compute_stab_cell(row, resolved, theme);
+        let (streak_str, streak_style) = compute_streak_cell(row, resolved, state, theme);
         let (speed_str, speed_style) = compute_speed_cell(row, resolved, theme);
-
-        let protocol_info_str = protocol_info_cell(row);
 
         // Exit IP: the ACTIVE link's persisted real-ping IP wins (survives
         // reruns); endpoint_info is the live-enrich fallback. Country comes
@@ -1367,12 +1445,12 @@ fn build_display_rows(
         result.push(DisplayRowData {
             indicator,
             indicator_fg,
-            id_hex,
             inbound_flag,
             address_str,
             port_str,
             white_str,
-            protocol_info_str,
+            protocol_str,
+            config_str,
             test_str,
             test_style,
             fast_str,
@@ -1381,6 +1459,8 @@ fn build_display_rows(
             auth_style,
             stab_str,
             stab_style,
+            streak_str,
+            streak_style,
             speed_str,
             speed_style,
             outbound_addr,
@@ -1396,11 +1476,12 @@ fn build_display_rows(
             },
             expanded: row.expanded,
             row_style: base_style,
-            id_style: ThemeStyles::hint(theme),
             address_style: ThemeStyles::footer_value(theme),
-            port_style: ThemeStyles::hint(theme),
+            port_style,
             white_style: ThemeStyles::hint(theme),
             protocol_style: ThemeStyles::footer_value(theme),
+            config_style: ThemeStyles::footer_value(theme),
+            border_style: ThemeStyles::container_border(theme),
             prefix_style: ThemeStyles::container_title(theme).add_modifier(Modifier::BOLD),
             panel_selected_style: ThemeStyles::panel_row_selected(theme),
             panel_header_style: ThemeStyles::table_header(theme),
@@ -1440,21 +1521,25 @@ fn build_display_rows(
 /// measurement and the auth flag are the two facts a row has BEFORE its
 /// verdict, so a reader sees "the server answered in 12 ms, the config was
 /// accepted, the real probe failed" left to right.
-const GRID_COLUMNS: [(usize, &str, u16); 14] = [
+const GRID_COLUMNS: [(usize, &str, u16); 18] = [
     (0, "", 2),         // status glyph + expand chevron in the gap cell
-    (1, "ID", 8),       // link id hex
-    (2, "Flag", 5),     // inbound flag
-    (3, "Address", 30), // host (full width; the chevron moved to column 0)
-    (4, "Port", 6),     // port
-    (5, "White", 9),    // whitelist tokens
-    (6, "Protocol", 24),
-    (7, "Fast", 7),   // the transport span (spec D2)
-    (8, "Auth", 4),   // the quad-state success flag (spec D3)
-    (9, "Real", 7),   // the real span, or the failure marker
-    (10, "Stab", 7),  // representative link's ring, successes/attempts
-    (11, "Speed", 7), // representative link's peak download rate
-    (12, "Out", 5),   // exit flag
-    (13, "Exit", 14), // exit IP
+    (1, "Flag", 5),     // inbound flag
+    (2, "Address", 30), // host (full width; the chevron moved to column 0)
+    (3, "Port", 6),     // port
+    (4, "White", 9),    // whitelist tokens
+    (5, "│", 1),        // separator: White │ Protocol
+    (6, "Protocol", PROTOCOL_WIDTH as u16),
+    (7, "Config", CONFIG_WIDTH as u16),
+    (8, "│", 1),     // separator: Config │ Fast
+    (9, "Fast", 6),  // the transport span (spec D2)
+    (10, "Auth", 4), // the quad-state success flag (spec D3)
+    (11, "Real", 7), // the real span, or the failure marker
+    (12, "Stab", 7), // representative link's ring, successes/attempts
+    (13, "Streak", 6),
+    (14, "Speed", 7), // representative link's peak download rate
+    (15, "│", 1),     // separator: Speed │ Out
+    (16, "Out", 5),   // exit flag
+    (17, "Exit", 14), // exit IP
 ];
 
 fn render_data_grid(
@@ -1471,19 +1556,15 @@ fn render_data_grid(
     let header_style = ThemeStyles::table_header(theme);
     // Width-aware drop (tui-polish D7, re-derived for the §7 grid): the inner
     // width decides which columns survive. `Real` is protected — a row without
-    // its verdict is useless. Drop order: Exit, Out, White, Stab, Auth, Fast;
-    // then Address shrinks toward a 12-cell floor. Surviving columns carry
+    // its verdict is useless. Drop order: Exit, Out, White, Streak, Stab,
+    // Auth, Fast, Speed; then Address shrinks toward a 12-cell floor. The
+    // three separator columns are structural and stay. Surviving columns carry
     // their LOGICAL id through `order`, so a drop never shifts another
     // column's meaning.
-    //
-    // The two NEW columns (Fast, Auth) drop BEFORE Stab: they carry the
-    // merged row's two new facts, while `Stab` is a ring the row already
-    // showed. Fast drops before Auth because a number is the more useful of
-    // the two when the pane is narrow.
-    let logical: &[(usize, &str, u16); 14] = &GRID_COLUMNS;
+    let logical: &[(usize, &str, u16); 18] = &GRID_COLUMNS;
     let mut widths: Vec<u16> = logical.iter().map(|(_, _, w)| *w).collect();
     let inner_w = area.width.saturating_sub(2); // frameless inset
-    for &drop in &[13usize, 12, 5, 10, 8, 7, 11] {
+    for &drop in &[17usize, 16, 4, 13, 12, 10, 9, 14] {
         if widths.iter().sum::<u16>() > inner_w {
             widths[drop] = 0;
         }
@@ -1491,8 +1572,8 @@ fn render_data_grid(
     let excess = widths.iter().sum::<u16>().saturating_sub(inner_w);
     if excess > 0 {
         // Address shrinks toward a 12-cell floor; anything still over clips.
-        let shrink = excess.min(widths[3].saturating_sub(12));
-        widths[3] -= shrink;
+        let shrink = excess.min(widths[2].saturating_sub(12));
+        widths[2] -= shrink;
     }
     let order: Vec<usize> = widths
         .iter()
@@ -1506,6 +1587,16 @@ fn render_data_grid(
             let (_, label, _) = logical[l];
             if label.is_empty() {
                 Column::new(Line::raw(""), ColumnWidth::Fixed(widths[l]))
+            } else if l == 6 {
+                // The Protocol column is right-aligned: pad the header the
+                // same way the row cell pads its kind.
+                Column::new(
+                    Line::from(Span::styled(
+                        format!("{label:>PROTOCOL_WIDTH$}"),
+                        header_style,
+                    )),
+                    ColumnWidth::Fixed(widths[l]),
+                )
             } else {
                 Column::new(
                     Line::from(Span::styled(label, header_style)),
@@ -1514,11 +1605,6 @@ fn render_data_grid(
             }
         })
         .collect();
-
-    // The arrow follows the Test column's POSITION in the visible grid — a
-    // width-aware drop moves it (e.g. `Test ↑` once White drops).
-    let sort_column = order.iter().position(|&l| l == PROFILES_SORT_COLUMN);
-    let sort_direction = SortDirection::Ascending;
 
     // Scroll offset: keep the selected row roughly centered, in line units —
     // expanded rows are taller than 1, so row-index math would strand the
@@ -1530,11 +1616,13 @@ fn render_data_grid(
     let data_offset = compute_scroll_offset(&heights, selected_display_idx, area.height);
     let scrollbar_total = usize::try_from(state.page_total).unwrap_or(usize::MAX);
     let scrollbar_offset = state.page_offset.saturating_add(data_offset);
+
+    // No sort indicator: the page order is fixed by the ordering law, and the
+    // header carries no arrow at all.
     let data_table = DataTable::new(columns, display_rows)
         .highlight_style(ThemeStyles::table_row_selected(theme))
         .column_spacing(1)
         .column_order(order)
-        .sort_column(sort_column, sort_direction)
         .total_rows(Some(scrollbar_total))
         .scrollbar_offset(Some(scrollbar_offset))
         .scrollbar(
@@ -1686,17 +1774,6 @@ fn center_cell(s: &str, width: usize) -> String {
         return truncate_pad(s, width);
     }
     let left = (width - w).div_ceil(2);
-    let right = width - w - left;
-    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
-}
-
-/// Center `s` inside a `width`-wide cell (unicode-aware); truncates when wider.
-fn center_pad(s: &str, width: usize) -> String {
-    let w = unicode_width::UnicodeWidthStr::width(s);
-    if w >= width {
-        return truncate_pad(s, width);
-    }
-    let left = (width - w) / 2;
     let right = width - w - left;
     format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
 }
@@ -1932,6 +2009,7 @@ mod page_window_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
     use rstest::rstest;
 
     /// The panel's stability cell (spec §8): a ratio when the link has samples,
@@ -2090,14 +2168,15 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "", "ID", "Flag", "Address", "Port", "White", "Protocol", "Fast", "Auth", "Real",
-                "Stab", "Speed", "Out", "Exit"
+                "", "Flag", "Address", "Port", "White", "│", "Protocol", "Config", "│", "Fast",
+                "Auth", "Real", "Stab", "Streak", "Speed", "│", "Out", "Exit"
             ],
-            "Fast and Auth sit before Real; Stab immediately after it, Speed after Stab"
         );
         let real_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Real");
         let stab_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Stab");
         assert_eq!(stab_pos, real_pos.map(|p| p + 1), "adjacency, numerically");
+        let streak_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Streak");
+        assert_eq!(streak_pos, stab_pos.map(|p| p + 1), "Streak follows Stab");
         // The Fast column precedes the Auth column, which precedes Real.
         let fast_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Fast");
         let auth_pos = GRID_COLUMNS.iter().position(|&(_, l, _)| l == "Auth");
@@ -2189,16 +2268,16 @@ mod tests {
         }
     }
 
-    fn sample_row(expanded: bool, panel_rows: Vec<PanelRow>, idx: &str) -> DisplayRowData {
+    fn sample_row(expanded: bool, panel_rows: Vec<PanelRow>) -> DisplayRowData {
         DisplayRowData {
             indicator: String::new(),
             indicator_fg: Style::default(),
-            id_hex: idx.to_string(),
             inbound_flag: String::new(),
             address_str: String::new(),
             port_str: String::new(),
             white_str: String::new(),
-            protocol_info_str: String::new(),
+            protocol_str: String::new(),
+            config_str: String::new(),
             test_str: String::new(),
             test_style: Style::default(),
             fast_str: String::new(),
@@ -2207,6 +2286,8 @@ mod tests {
             auth_style: Style::default(),
             stab_str: String::new(),
             stab_style: Style::default(),
+            streak_str: String::new(),
+            streak_style: Style::default(),
             speed_str: String::new(),
             speed_style: Style::default(),
             outbound_addr: String::new(),
@@ -2220,11 +2301,12 @@ mod tests {
             },
             expanded,
             row_style: Style::default(),
-            id_style: Style::default(),
             address_style: Style::default(),
             port_style: Style::default(),
             white_style: Style::default(),
             protocol_style: Style::default(),
+            config_style: Style::default(),
+            border_style: Style::default(),
             prefix_style: Style::default(),
             panel_selected_style: Style::default(),
             panel_header_style: Style::default(),
@@ -2362,7 +2444,7 @@ mod tests {
 
         let (text, _) = compute_test_cell(&row, true, &theme);
         assert_eq!(
-            text, "[ 20 ]",
+            text, " 20 ",
             "the endpoint's tier is 1, so its clean measurement shows"
         );
     }
@@ -2401,30 +2483,11 @@ mod tests {
 
     #[test]
     fn expanded_row_height_includes_gap() {
-        let row = sample_row(
-            true,
-            vec![sample_panel_row("●"), sample_panel_row("○")],
-            "00",
-        );
+        let row = sample_row(true, vec![sample_panel_row("●"), sample_panel_row("○")]);
         // 1 endpoint + panel (2 rows + 4 border/IPs/sep lines) + 1 gap
         assert_eq!(row.height(0), 8);
-        let collapsed = sample_row(false, vec![], "11");
+        let collapsed = sample_row(false, vec![]);
         assert_eq!(collapsed.height(0), 1);
-    }
-
-    #[test]
-    fn link_id_cell_prints_hex_or_marker() {
-        use crate::ops::profiles::test_support::fake_row;
-        let row = fake_row(42, "1.2.3.4", 1);
-        // The representative link's protocol id, 8 lowercase hex.
-        let expected = format!("{:08x}", row.links[0].protocol_id.get() as u32);
-        assert_eq!(link_id_cell(&row, false, false), expected);
-        // Multi-select: the marker replaces the id, both padded to 8 (D10).
-        assert_eq!(link_id_cell(&row, false, true), "       *");
-        assert_eq!(
-            link_id_cell(&row, false, true).len(),
-            link_id_cell(&row, false, false).len()
-        );
     }
 
     #[test]
@@ -2442,9 +2505,33 @@ mod tests {
     }
 
     #[test]
+    fn default_mimic_ports_follow_the_transport() {
+        use leas_proto::proto_spec::TransportType;
+        assert!(default_mimic_ports(TransportType::Tcp).contains(&443));
+        assert!(default_mimic_ports(TransportType::Tcp).contains(&8080));
+        assert!(default_mimic_ports(TransportType::Ws).contains(&8443));
+        assert!(default_mimic_ports(TransportType::Grpc).contains(&8443));
+        assert!(default_mimic_ports(TransportType::Grpc).contains(&443));
+        assert!(!default_mimic_ports(TransportType::Grpc).contains(&8080));
+        assert!(default_mimic_ports(TransportType::Kcp).contains(&443));
+    }
+
+    #[test]
+    fn default_mimic_port_reads_the_representative_transport() {
+        use crate::ops::profiles::test_support::fake_row;
+        let mut row = fake_row(1, "1.2.3.4", 1);
+        assert!(is_default_mimic_port(&row, true), "tcp/443 is a mimic port");
+        row.endpoint.port = 12345;
+        assert!(
+            !is_default_mimic_port(&row, true),
+            "an unusual port is not highlighted"
+        );
+    }
+
+    #[test]
     fn flag_cell_pins_both_capability_forms() {
-        // Emoji form: `<flag>-<ISO>`, 5 cells (D14). Fallback: bare ISO.
-        assert_eq!(flag_cell(Some("NL"), true), "🇳🇱-NL");
+        // Emoji form: `<flag> <ISO>`, 5 cells (D14). Fallback: bare ISO.
+        assert_eq!(flag_cell(Some("NL"), true), "🇳🇱 NL");
         assert_eq!(flag_cell(Some("NL"), false), "NL   ");
         // Unknown country is the neutral glyph in both forms.
         assert_eq!(flag_cell(None, true), "—");
@@ -2462,15 +2549,17 @@ mod tests {
     }
 
     #[test]
-    fn protocol_info_cell_merges_kind_transport_security() {
+    fn protocol_and_config_cells_split_kind_from_stack() {
         use crate::ops::profiles::test_support::fake_row;
         let row = fake_row(1, "1.2.3.4", 1);
         // The test row is a vless protocol over tcp with no security layer.
-        assert_eq!(protocol_info_cell(&row).trim(), "vless/tcp/none");
-        assert_eq!(protocol_info_cell(&row).len(), PROTOCOL_INFO_WIDTH);
+        assert_eq!(protocol_cell(&row, true), "     vless");
+        assert_eq!(protocol_cell(&row, true).len(), PROTOCOL_WIDTH);
+        assert_eq!(config_cell(&row, true), "tcp/none");
         // A row without an active protocol keeps the placeholder.
         let linkless = fake_row(2, "5.6.7.8", 0);
-        assert_eq!(protocol_info_cell(&linkless).trim(), "-");
+        assert_eq!(protocol_cell(&linkless, true).trim(), "—");
+        assert_eq!(config_cell(&linkless, true), "—");
     }
 
     #[test]
@@ -2488,12 +2577,12 @@ mod tests {
 
     #[test]
     fn panel_height_is_capped_at_eight_sub_rows() {
-        let capped = sample_row(true, (0..20).map(|_| sample_panel_row("○")).collect(), "00");
+        let capped = sample_row(true, (0..20).map(|_| sample_panel_row("○")).collect());
         // 1 + PANEL_MAX_ROWS + 4 + 1 — the row can no longer grow past the
         // viewport, which used to blank the table when expanded.
         assert_eq!(capped.height(0), 14);
         // Shorter lists keep their exact panel height.
-        let short = sample_row(true, (0..7).map(|_| sample_panel_row("○")).collect(), "00");
+        let short = sample_row(true, (0..7).map(|_| sample_panel_row("○")).collect());
         assert_eq!(short.height(0), 13);
     }
 
@@ -2506,7 +2595,7 @@ mod tests {
         // the clipped config.
         pr.config_type = "splithttp/reality".to_string();
         pr.delay = "1234ms".to_string();
-        let mut row = sample_row(true, vec![pr], "00");
+        let mut row = sample_row(true, vec![pr]);
         row.row_style = ThemeStyles::table_row_normal(&theme);
         let col_widths = vec![1u16, 2, 7, 1, 4, 34, 2, 4, 4, 24, 3, 7, 1, 16, 7, 1];
         let mut col_xs = Vec::with_capacity(col_widths.len());
@@ -2546,7 +2635,6 @@ mod tests {
                     pr
                 })
                 .collect(),
-            "00",
         );
         row.row_style = ThemeStyles::table_row_normal(&theme);
         row.panel_selected_style = ThemeStyles::panel_row_selected(&theme);
@@ -2604,16 +2692,12 @@ mod tests {
     #[test]
     fn selected_sub_row_reverse_highlights_full_width() {
         let theme = crate::ui::theme::load("tokyo-night").unwrap();
-        let mut row = sample_row(
-            true,
-            vec![sample_panel_row("●"), sample_panel_row("○")],
-            "00",
-        );
+        let mut row = sample_row(true, vec![sample_panel_row("●"), sample_panel_row("○")]);
         row.row_style = ThemeStyles::table_row_normal(&theme);
         row.panel_selected_style = ThemeStyles::panel_row_selected(&theme);
         row.panel_selected = Some(0);
-        let col_xs: Vec<u16> = (0..17).collect();
-        let col_widths = vec![1u16; 17];
+        let col_xs: Vec<u16> = (0..18).collect();
+        let col_widths = vec![1u16; 18];
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
 
         // Simulate the DataTable's endpoint-row highlight: the whole row
@@ -2659,14 +2743,12 @@ mod tests {
 
     #[test]
     fn panel_bottom_border_does_not_touch_next_row() {
-        let row0 = sample_row(
-            true,
-            vec![sample_panel_row("●"), sample_panel_row("○")],
-            "00",
-        );
-        let row1 = sample_row(false, vec![], "11");
-        let col_xs: Vec<u16> = (0..17).collect();
-        let col_widths = vec![1u16; 17];
+        let row0 = sample_row(true, vec![sample_panel_row("●"), sample_panel_row("○")]);
+        let row1 = sample_row(false, vec![]);
+        let mut row1 = row1;
+        row1.indicator = "1".to_string();
+        let col_xs: Vec<u16> = (0..18).collect();
+        let col_widths = vec![1u16; 18];
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
 
         row0.render(
@@ -2692,9 +2774,8 @@ mod tests {
         assert_eq!(buf[(0, 6)].symbol(), "\u{2570}"); // ╰
         // y=7 is the blank gap line — the next row must not start there.
         assert_eq!(buf[(0, 7)].symbol(), " ");
-        // Next row's content starts at y=8, untouched by the panel. The row id
-        // lives in column 1 now (the `#` slot was replaced by the hex id).
-        assert_eq!(buf[(1, 8)].symbol(), "1");
+        // Next row's content starts at y=8, untouched by the panel.
+        assert_eq!(buf[(0, 8)].symbol(), "1");
     }
 
     #[test]
@@ -2936,7 +3017,7 @@ mod tests {
             },
             &theme,
         );
-        assert_eq!(t, "[ 12 ]");
+        assert_eq!(t, " 12 ");
     }
 
     #[test]
@@ -2949,7 +3030,7 @@ mod tests {
             },
             &theme,
         );
-        assert_eq!(t, "[ 12 ]");
+        assert_eq!(t, " 12 ");
         assert_eq!(s.fg, Some(theme.color("success").into()));
         let (t, s) = test_cell_content(
             &RealCellFacts {
@@ -2958,7 +3039,7 @@ mod tests {
             },
             &theme,
         );
-        assert_eq!(t, "[ 612]");
+        assert_eq!(t, " 612");
         assert_eq!(s.fg, Some(theme.color("warning").into()));
         let (t, s) = test_cell_content(
             &RealCellFacts {
@@ -2967,7 +3048,7 @@ mod tests {
             },
             &theme,
         );
-        assert_eq!(t, "[1234]");
+        assert_eq!(t, "1234");
         assert_eq!(s.fg, Some(theme.color("error").into()));
     }
 
@@ -3006,7 +3087,7 @@ mod tests {
             },
             &theme,
         );
-        assert_eq!(t, "[ 12 ]");
+        assert_eq!(t, " 12 ");
     }
 
     #[test]
@@ -3088,7 +3169,7 @@ mod tests {
             },
             &theme,
         );
-        assert_eq!(t, "[ 30 ]");
+        assert_eq!(t, " 30 ");
     }
 
     #[test]
@@ -3141,24 +3222,23 @@ mod tests {
         assert_eq!(t, "[name]");
     }
 
-    /// The expand affordance is a `▸`/`▾` chevron in column 0's gap cell —
-    /// immediately before the ID column, mirroring settings' `{marker}{chevron}
-    /// {name}`. It used to be a `+`/`-` inside the Address cell, which both
-    /// read as a near-invisible hairline and stole a cell from the host.
+    /// The expand affordance is a `▸`/`▾` chevron in column 0's gap cell,
+    /// immediately before the Flag column. It used to be a `+`/`-` inside the
+    /// Address cell, which both read as a near-invisible hairline and stole a
+    /// cell from the host.
     #[rstest]
     #[case::collapsed('▸')]
     #[case::expanded('▾')]
-    fn expand_chevron_sits_before_the_id_column(#[case] glyph: char) {
+    fn expand_chevron_sits_before_the_flag_column(#[case] glyph: char) {
         let mut row = sample_row(
             glyph == '▾',
             vec![sample_panel_row("●"), sample_panel_row("○")],
-            "aabbccdd",
         );
         row.indicator = "●".to_string();
         row.address_str = "host.example.com".to_string();
 
-        // The real grid geometry: status 2, ID 8, Flag 5, Address 30.
-        let col_widths = vec![2u16, 8, 5, 30];
+        // The real grid geometry: status 2, Flag 5, Address 30.
+        let col_widths = vec![2u16, 5, 30];
         let mut col_xs = Vec::new();
         let mut x = 0u16;
         for (i, w) in col_widths.iter().enumerate() {
@@ -3172,7 +3252,7 @@ mod tests {
         row.render(
             &col_xs,
             &col_widths,
-            &(0..4).collect::<Vec<_>>(),
+            &(0..3).collect::<Vec<_>>(),
             &mut buf,
             0,
             4,
@@ -3200,5 +3280,82 @@ mod tests {
             !line.starts_with(" host.example.com"),
             "host is no longer inset by the marker cell: {line:?}"
         );
+    }
+
+    /// The table's separators are real columns: the header and every row carry
+    /// the three vertical rules, and no sort arrow is painted.
+    #[tokio::test]
+    async fn grid_renders_separators_without_a_sort_arrow() {
+        let state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        let mut row = sample_row(false, vec![]);
+        row.protocol_str = "vless".to_string();
+        row.config_str = "tcp/reality".to_string();
+        row.fast_str = " 12".to_string();
+        row.test_str = " 20 ".to_string();
+        let rows = vec![row];
+        let area = Rect::new(0, 0, 160, 4);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_data_grid(
+                    frame,
+                    area,
+                    &rows,
+                    state.selected_index,
+                    &state,
+                    state.theme(),
+                );
+            })
+            .unwrap();
+        let header: String = (0..area.width)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect();
+        assert!(header.contains("White"), "the header renders: {header:?}");
+        assert!(
+            header.contains("Protocol"),
+            "the header renders: {header:?}"
+        );
+        assert_eq!(
+            header.matches('│').count(),
+            3,
+            "three separators: {header:?}"
+        );
+        assert!(
+            !header.contains('↑') && !header.contains('↓'),
+            "no sort arrow"
+        );
+        let data: String = (0..area.width)
+            .map(|x| terminal.backend().buffer()[(x, 2)].symbol())
+            .collect();
+        assert_eq!(data.matches('│').count(), 3, "row separators: {data:?}");
+    }
+
+    /// The Streak cell: only a currently Alive link shows a run, and a real
+    /// error erases it.
+    #[tokio::test]
+    async fn streak_cell_is_blank_outside_alive_or_after_a_real_error() {
+        use crate::ops::profiles::test_support::fake_row;
+        use leas_db::models::{ErrorInfo, ProfileErr};
+        let state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let mut row = fake_row(1, "1.2.3.4", 1);
+        row.links[0].last_seen_at = leas_db::models::now_epoch();
+        row.links[0].stab_mask = 0b111;
+        row.links[0].stab_len = 3;
+        let (text, _) = compute_streak_cell(&row, true, &state, &theme);
+        assert_eq!(text, "3", "three trailing successes");
+
+        row.links[0].error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "probe failed".into(),
+        });
+        let (text, _) = compute_streak_cell(&row, true, &state, &theme);
+        assert_eq!(text, "", "a real error has no streak");
+
+        row.links[0].error = None;
+        row.links[0].stab_mask = 0b011;
+        let (text, _) = compute_streak_cell(&row, true, &state, &theme);
+        assert_eq!(text, "", "a failed newest sample has no streak");
     }
 }

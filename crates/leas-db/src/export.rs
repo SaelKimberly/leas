@@ -45,7 +45,7 @@ impl ExportScope {
                 // (empty domain, NO address row), which must not be emitted.
                 "EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id)"
             }
-            Self::Active => "er.band = 0 AND ps.purge_reason IS NULL",
+            Self::Active => "er.band < 2 AND ps.purge_reason IS NULL",
             Self::Full => "ps.purge_reason IS NULL",
         }
     }

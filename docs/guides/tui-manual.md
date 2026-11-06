@@ -59,25 +59,34 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | Column       | Width | Content                                     |
 | ------------ | ----- | ------------------------------------------- |
 | (status)     | 2     | Connection status or test indicator          |
-| `ID`         | 8     | Representative link's protocol id as 8 lowercase hex (`{:08x}`); `*` when multi-selected (the marker replaces the id, widths equal) |
-| `Flag`       | 5     | Inbound country: `<flag emoji>-<ISO>` (e.g. `🇳🇱-NL`) when the terminal renders flag emoji, bare `<ISO>` when it does not (`LEAS_NO_FLAGS`/`NO_EMOJI` force the fallback); `—` unknown |
-| `Address`    | 30    | Host, full width. Multi-variant endpoints carry the expand chevron `▸` (collapsed) / `▾` (expanded) in the status column's gap cell — directly before `ID`, the same glyph the settings sections use. A DNS name whose subdomain overflows elides the subdomain's tail, keeping the registrable domain: `jp-tyo-05….synthetic-node.example`. IP literals right-truncate with `…` |
-| `Port`       | 6     | Port, right-aligned                          |
+| `Flag`       | 5     | Inbound country: `<flag emoji> <ISO>` (e.g. `🇳🇱 NL`) when the terminal renders flag emoji, bare `<ISO>` when it does not (`LEAS_NO_FLAGS`/`NO_EMOJI` force the fallback); `—` unknown |
+| `Address`    | 30    | Host, full width. Multi-variant endpoints carry the expand chevron `▸` (collapsed) / `▾` (expanded) in the status column's gap cell. A DNS name whose subdomain overflows elides the subdomain's tail, keeping the registrable domain: `jp-tyo-05….synthetic-node.example`. IP literals right-truncate with `…` |
+| `Port`       | 6     | Port, right-aligned. Green when it is a conventional mimic port for the representative link's transport: `tcp`/`ws`/`httpupgrade` → any web port (`80`, `443`, `8080`, `8443`, `8880`, `2052`/`2053`, `2082`/`2083`, `2086`/`2087`, `2095`/`2096`); `grpc`/`http`/`xhttp`/`quic`/`kcp` → the TLS set (`443`, `8443`, `2053`, `2083`, `2087`, `2096`). Display hint only — never affects ordering or testing |
 | `White`      | 9     | Whitelist membership tokens: `SNI` / `CIDR` / `SNI+CIDR` / `—` (replaces the old flag glyphs; DNS-unresolved lives in the Test cell's `[name]`) |
-| `Protocol`   | 24    | `protocol/transport/security` (e.g. `vless/tcp/reality`), center-aligned |
-| `Fast`       | 7     | The TRANSPORT measurement `[ 12 ]` — the time to establish the endpoint's transport, colored (green <500ms, yellow ≥500ms, red ≥1000ms). It is INDEPENDENT of the `Real` cell: a row whose transport answered but whose config did not shows a number here BESIDE the `Real` cell's failure marker. A row with no transport measurement shows blanks (spec `2026-10-21-merged-test-pipeline-design` D2). A `[fast]` marker in the `Real` cell SUPPRESSES the number: the `Fast` column IS the transport measurement, and the marker says "the transport did not come up" — a number beside it would read as the opposite, so the row tells two stories at once |
+| `│`          | 1     | Single-line separator between `White` and `Protocol` |
+| `Protocol`   | 10    | Protocol kind (e.g. `vless`, `vmess`), right-aligned |
+| `Config`     | 14    | Transport/security pair (e.g. `tcp/reality`), left-aligned; `~` marks a substituted ClientHello |
+| `│`          | 1     | Single-line separator between `Config` and `Fast` |
+| `Fast`       | 6     | The TRANSPORT measurement (e.g. ` 12`), colored (green <500ms, yellow ≥500ms, red ≥1000ms). It is INDEPENDENT of the `Real` cell: a row whose transport answered but whose config did not shows a number here BESIDE the `Real` cell's failure marker. A row with no transport measurement shows blanks (spec `2026-10-21-merged-test-pipeline-design` D2). A `[fast]` marker in the `Real` cell SUPPRESSES the number: the `Fast` column IS the transport measurement, and the marker says "the transport did not come up" — a number beside it would read as the opposite, so the row tells two stories at once |
 | `Auth`       | 4     | The config's ACCEPTANCE flag: `✓` the server accepted it, `✗` positive rejection evidence (an EOF during the VLESS response-header peel, an auth error, a framing error), `·` the family has no server ack (Trojan, classic-AEAD SS) or the engine cannot serve the row, `?` the ack was possible but was not observed in time (a lazy sing-box server + a slow target). Blank = never observed, which is NOT the same fact as `?`. The flag is read by the probe's own protocol phase — the tunnel's read path reports what it saw — and is NOT a band term: it never changes the row's place in the order (spec D3) |
-| `Real`       | 7     | The real probe's delay `[ 12 ]`, colored as `Fast`; red problem labels `[name]` (DNS unresolved), `[n-a]` (the native engine cannot serve this row — no probe ran), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). `[name]` is suppressed when the row carries a TRANSPORT measurement: the probe dialed the name and the OS resolved it, so the two facts cannot both be true, and the measurement is the fresher one (the probe does not persist the resolution, so the endpoint's address set can be empty while the probe reached it). The cell describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index`, the argmin of the ordering key) — the same link the `ID`, `Fast` and `Auth` cells name, so the cells cannot disagree. Labels survive restarts; the Speed Test `error_ttl_hours` setting clears them. The header's `↑` arrow is the fixed sort (`PageSort::Test`, ascending): sorting is deliberately not user-changeable, to avoid database contention |
-| `Stab`       | 7     | The REPRESENTATIVE link's stability ring as `successes/attempts` (e.g. `14/16`; `—` no samples yet) — the same link the `Real`/`Fast`/`Auth`/`ID` cells describe. Colored by success rate (green ≥80%, yellow ≥50%, red below; dashed = no samples). A stable server keeps its position and a healthy Stab cell even when its latest real ping failed (spec `2026-10-20-stab-alive-design`) |
+| `Real`       | 7     | The real probe's delay (e.g. ` 12`), colored as `Fast`; red problem labels `[name]` (DNS unresolved), `[n-a]` (the native engine cannot serve this row — no probe ran), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). `[name]` is suppressed when the row carries a TRANSPORT measurement: the probe dialed the name and the OS resolved it, so the two facts cannot both be true, and the measurement is the fresher one (the probe does not persist the resolution, so the endpoint's address set can be empty while the probe reached it). The cell describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index`…
+| `Stab`       | 7     | The REPRESENTATIVE link's stability ring as `successes/attempts` (e.g. `14/16`; `—` no samples yet) — the same link the `Real`/`Fast`/`Auth` cells describe. Colored by success rate (green ≥80%, yellow ≥50%, red below; dashed = no samples). A stable server keeps its position and a healthy Stab cell even when its latest real ping failed (spec `2026-10-20-stab-alive-design`) |
+| `Streak`     | 6     | Consecutive successful real probes at the newest end of the representative link's ring. Shown only for currently `Alive` endpoints (newest real probe succeeded, inside the active window); blank otherwise, and always blank when the link carries a real/name error |
 | `Speed`      | 7     | The REPRESENTATIVE link's peak download rate in MiB/s (one decimal, e.g. `12.3`) from `Speed Test (Successful)`; blank when never measured. Neutral colour: a speed number says nothing about the link's health — the `Real`/`Fast` cells carry the verdicts. Same representative link as the other cells, so the number cannot disagree with the row's tier |
-| `Out`        | 5     | Exit country flag, same `<flag>-<ISO>` idiom as `Flag`; `—` unknown |
+| `│`          | 1     | Single-line separator between `Speed` and `Out` |
+| `Out`        | 5     | Exit country flag, same `<flag emoji> <ISO>` idiom as `Flag`; `—` unknown |
 | `Exit`       | 14    | Exit IP of the active link's persisted real ping (`—` none); survives reruns |
 
-Every label carries the header role; there are no decorative separator cells.
-Delay/Speed/Traffic/Outbound details live in the expanded panel (below).
+Every label carries the header role; the three `│` cells are the only
+decorative separators. Delay/Speed/Traffic/Outbound details live in the
+expanded panel (below).
+
+The table no longer shows a sort arrow: the page order is always the ordering
+law (`docs/reference/ordering-law.md`), and the `Alive` band (0) leads the
+`Active` band (1), which leads `Purgatory` (2).
 
 **Expandable endpoints**: Endpoints with multiple protocol variants carry a `▸`
-before the `ID` column (collapsed) or `▾` (expanded). Press `→` to expand: a
+before the `Flag` column (collapsed) or `▾` (expanded). Press `→` to expand: a
 rounded panel appears
 under the row with an `IPs:` line (resolved inbound addresses; `[?]` with an
 `(x resolve)` hint while the DNS name is unresolved) and a per-protocol
@@ -457,7 +466,7 @@ queue, in the Tasks pane.
 
 Open with `Ctrl+E` from Profiles. First choose scope, then destination:
 
-- `Only Alive` — links with current real/fast success (canonical rank tiers 0/1)
+- `Only Working` — links with current real/fast success (canonical rank tiers 0/1); distinct from the `Alive` band
 - `Only Resolved` — dialable endpoints; DNS endpoints emit one line per stored IP
 - `Only Active` — exact current Active view
 - `All Valid` — all non-purged links, including aged/stale Purgatory rows
@@ -489,7 +498,7 @@ produces two independent facts: the **transport span** (the time to establish
 the endpoint's transport — the `Fast` column) and the **real span** (the
 probe's own request time — the `Real` column). They do not overlap, and the
 transport span survives a failure: a row whose server answered but whose
-config did not shows `[ 12 ]` in `Fast` and `[real]` in `Real` — "the server
+config did not shows ` 12 ` in `Fast` and `[real]` in `Real` — "the server
 is up, the config is not". A row with a transport failure has neither
 measurement and shows the transport failure marker.
 
@@ -551,49 +560,63 @@ Logs, or Native Activity). `Esc` or `?` closes.
 The selected server's static fact sheet plus the database's own status. The
 selected server is the pane-1 cursor row (`filtered_profiles().nth(selected_index)`) — the same law the footer and Metrics use, so a search filter can never make three surfaces disagree.
 
-**Layout** — two columns: facts (left) and aggregates (right). Below ~100 cols
-they stack: facts first, then the aggregate block.
+**Layout** — three columns at 3:6:3, separated by single vertical rules:
+`Server` (left), `Link` (middle), `DB` (right). Below ~100 cols they stack:
+the server and link facts first, then the aggregate block.
 
 ```
-Server            │ DB 74,012
-  Address host:443│   proven    41,900
-  Protocol vless… │   untested  28,932
-  …               │   failed     2,996
-Link              │   other       184
-  Real Delay 120ms│
-  …               │ alive       3,180
-                  │ reliable   12,004
-                  │
-                  │ View: Active / <query>
-                  │   proven     2,900
+Server         │ Link                          │ DB 74,012
+  Address h:443│   Leas URL leas://1a2b/3c4d    │   proven    41,900
+  Country NL   │   Protocol vless              │   untested  28,932
+  Resolved IPs │   Transport tcp              │   failed     2,996
+  Whitelist —  │   Security reality            │   other       184
+               │   Last Seen …                 │
+               │   Real Delay 120ms            │ alive       3,180
+               │   …                           │ active      1,402
+               │   Exit IP 1.2.3.4             │ reliable   12,004
+               │   Last Error [real]           │
+               │   Error Text …                │ View: Active / <query>
 ```
 
-**The two blocks are not one list.** The four **partition** counts
+**The `Server` section** holds the inbound identity: address, country,
+resolved IPs, whitelist.
+
+**The `Link` section** holds everything the representative link can explain:
+its `Leas URL` (`leas://<endpoint hex>/<protocol hex>`, the same hex identity
+the Real Test log lines use), protocol config names (kind, transport,
+security, SNI, fingerprint — names only, no credentials or keys), timestamps,
+measurements, auth, speed, stability, traffic, exit IP/country, and the stored
+`Last Error` + `Error Text` when one exists. That error text is the explanation
+behind the grid's `[real]`/`[fast]`/`[name]` label.
+
+**The two blocks in `DB` are not one list.** The four **partition** counts
 (`proven`/`untested`/`failed`/`other`) are pairwise disjoint and sum to the
-group's total. `alive` and `reliable` are **orthogonal filters** over the same
-rows and overlap any partition member — they are drawn as a separate block so
-they cannot be added into the partition.
+group's total. `alive`, `active`, and `reliable` are **orthogonal filters**
+over the same rows and overlap any partition member — they are drawn as a
+separate block so they cannot be added into the partition.
 
 - `proven` — the endpoint has ≥1 live unpurged link with a real success.
 - `untested` — not proven AND never measured.
 - `failed` — not proven AND carrying a failure marker.
 - `other` — not proven and in no other bucket (measured, but the ring holds no success).
-- `alive` — seen within the TTL window. The **global** group computes this live
-  (`rank_newest_seen` vs the TTL); the **view** group uses the swept `band`, so
-  it describes the same set the table shows. The two can differ by up to the
-  10-minute reband interval.
+- `alive` — the newest real probe succeeded and the endpoint is inside the
+  TTL window (band 0). The **global** group computes this live
+  (`rank_newest_seen` + `rank_alive`); the **view** group uses the swept
+  `band`, so it describes the same set the table shows.
+- `active` — inside the TTL window but NOT alive (band 1). Distinct from
+  `alive`; the two never overlap.
 - `reliable` — the **representative link's** success rate ≥ 75% (≥4 samples).
 
-**Sources.** The `Server` group reads the loaded row's persisted addresses for
-resolution (the grid's own law); `endpoint_info` is a display cache that lags,
-so a missing entry renders `—` and the panel never triggers a background fill.
-The `Link` group reads the **representative link** — the same link the grid's
-Test/Stab cells describe.
+**Sources.** The `Server` section reads the loaded row's persisted addresses
+for resolution (the grid's own law); `endpoint_info` is a display cache that
+lags, so a missing entry renders `—` and the panel never triggers a background
+fill. The `Link` section reads the **representative link** — the same link the
+grid's Test/Stab cells describe.
 
 **Behavior:**
-- `↑↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the facts column (its own offset, not
-  the native ring's); the aggregate column is pinned and clipped from the
-  bottom, so the global numbers are never the ones a short pane eats.
+- `↑↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the `Link` column (its own offset,
+  not the native ring's); the `Server` and aggregate columns are pinned, so
+  the global numbers are never the ones a short pane eats.
 - `F1` collapses pane 2 to the one-line compact bar.
 - Pane 2's default height is uniform across tabs (16 rows) so switching never
   resizes; `Alt+↑`/`Alt+↓` adjusts it (clamped so pane 1 keeps ≥6 rows).

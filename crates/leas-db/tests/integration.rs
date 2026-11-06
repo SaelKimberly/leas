@@ -474,7 +474,7 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
     let mut conn = db.connection().await.expect("connection");
     let now = leas_db::models::now_epoch();
     let fresh = now; // within the 7d ttl -> Active
-    let old = now - 8 * 86_400; // beyond the ttl -> stale (band 1)
+    let old = now - 8 * 86_400; // beyond the ttl -> Purgatory (band 2)
     let threshold = now - 7 * 86_400; // advisory arg; membership is the band
 
     // 1: active — fresh link (>= active_threshold).
@@ -568,7 +568,8 @@ async fn reband_sweep_demotes_rows_that_drifted_during_downtime() {
     let mut conn = db.connection().await.expect("connection");
     let now = leas_db::models::now_epoch();
 
-    // Fresh endpoint -> band 0 once the ranks materialize.
+    // Fresh endpoint with no ring -> band 1 (fresh, not Alive) once the ranks
+    // materialize; the Active view includes both bands 0 and 1.
     seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, now).await;
     seed_ranks(&db).await;
 
@@ -674,10 +675,10 @@ async fn reband_all_promotes_rows_the_default_backfill_demoted() {
     let now = leas_db::models::now_epoch();
     seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, now).await;
     seed_ranks(&db).await;
-    // The wrong-backfill state: a fresh row banded 1, as the open-time 7d
-    // default leaves it when the configured ttl is larger. A directional demote
-    // sweep can NEVER undo this (it only moves 0→1); only the full reband can.
-    toasty::sql::query("UPDATE endpoint_rank SET band = 1 WHERE endpoint_id = 1")
+    // The wrong-backfill state: a fresh row banded 2 (Purgatory), as a stale
+    // row left by an older sweep. A directional demote sweep only moves rows
+    // INTO Purgatory, so it can never undo this; only the full reband can.
+    toasty::sql::query("UPDATE endpoint_rank SET band = 2 WHERE endpoint_id = 1")
         .exec(&mut conn)
         .await
         .expect("mis-band");
@@ -1597,9 +1598,9 @@ async fn subscription_upsert_flow_assembles_group_rows() {
     assert_eq!(active_link.protocol_id, ProtocolId::new(1001));
     assert_eq!(proto.proto_kind, ProtocolKind::Vless);
 
-    // A fresh link in the group is inside the Active window (band = 0). This
+    // A fresh link in the group is inside the Active window (bands 0/1). This
     // exercises the group∩active intersection on real membership, not a vacuous
-    // empty from every synthetic timestamp collapsing to band 1.
+    // empty from every synthetic timestamp collapsing to Purgatory.
     assert_eq!(
         page_ids(
             &db,
