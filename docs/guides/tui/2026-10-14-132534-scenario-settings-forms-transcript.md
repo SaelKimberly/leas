@@ -1,8 +1,38 @@
-# Transcript — settings-forms
+# Transcript: settings-forms (2026-10-14)
 
-Verbatim report returned by `run_scenario(script=2026-10-14-132534-scenario-settings-forms.md, session_id=settings-forms)`
-on 2026-10-14, executed in-process from the `/home/user/oss/mcp-tui-test` v0.3.0 checkout (Python 3.14.7, pyte 0.8.2).
-The runner patches pyte's `Screen.display` before the call (see the scenario document's *Tooling friction*); nothing else is changed.
+Verbatim report of one `run_scenario` call on 2026-10-14. The expectations, the script and the findings
+live in [the scenario document](2026-10-14-132534-scenario-settings-forms.md); this file holds only what
+the harness returned.
+
+## Purpose and scope
+
+Records the harness report for session `settings-forms`, unchanged: every step, its status, its duration,
+and every screen, line or cursor position it read. Use it to check a quote in the scenario document or
+the review; it contains no analysis of its own.
+
+## Environment and fixtures
+
+| Field | Value |
+|---|---|
+| Produced by | `run_scenario(script=2026-10-14-132534-scenario-settings-forms.md, session_id=settings-forms)` |
+| Date | 2026-10-14 |
+| Harness | mcp-tui-test 0.3.0, executed in-process from the `/home/user/oss/mcp-tui-test` checkout, Python 3.14.7, pyte 0.8.2 |
+| Session / mode / size | `settings-forms` / buffer / 120x40 |
+| App under test | leas 0.1.0 debug build `13e132f2…`, `/home/user/oss/xray-tui/target/debug/leas` |
+| Fixture | `fixtures/config.json` plus `fixtures/seeded/data.db`, copied to `/home/user/.cache/leas-tui/settings-forms` |
+
+The runner patches pyte's `Screen.display` before the call; nothing else is changed. Harness limits and
+that patch are documented once in [INDEX.md](INDEX.md).
+
+## Expected behaviour (written before the run)
+
+Ten expectations, E1–E10, in the scenario document's *Expected behaviour* table.
+
+## Scenario script
+
+The 27-step script is in [the scenario document](2026-10-14-132534-scenario-settings-forms.md).
+
+## Observed behaviour
 
 ```text
 Scenario document: settings-forms — leas Settings tab — the 20-node section tree, opening a section into the right pane, field focus and the cursor, and what q does inside a settings form
@@ -100,3 +130,13 @@ steps: 27 · errored: 0 · session closed
 ok: True | action: executed | session_alive: False
 rescue_files: []
 ```
+
+## Corrections to expectations
+
+None: a transcript reports what happened. The two wrong predictions (E2's row index, E10's
+return-to-Profiles assumption) are corrected in
+[the scenario document](2026-10-14-132534-scenario-settings-forms.md).
+
+## Verdict
+
+27 steps, 0 errored, session closed; `ok: True`, `rescue_files: []`.

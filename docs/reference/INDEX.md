@@ -1,15 +1,15 @@
 # reference/
 
-Factual specifications.
+Factual specifications of this repository. Each file owns one subject; the tables above the fold state scope.
 
-| File | Contents |
-| --- | --- |
-| `database.md` | Persistent state — tables, schema cursor, indexes, derived-state invariants, flows, query map |
-| `database-manual-sql.md` | Every hand-written SQL/DDL site, its cause, its measurement, and its pinning test |
-| `ordering-law.md` | The Profiles ordering law — link key vs endpoint key, bins, static weight, the covering index |
-| `crypto-dependencies.md` | Every non-default cryptographic site (with an independent oracle) and the dependency advisories |
-| `protocols.md` | Per-protocol share-URL/config reference and the backend coverage matrix |
-| `clash.md` | Clash/mihomo YAML format reference |
-| `native-core.md` | The native core and TLS/REALITY engine — status, capability tables, verification tiers |
-| `tls-fingerprint-roster.md` | JA4-fidelity verification of the TLS profile roster |
-| `glossary.md` | Domain glossary |
+| File | What it owns |
+|---|---|
+| `database.md` | Persistent state: tables, schema cursor, indexes, derived-state invariants, flows, query map, schema change procedure |
+| `database-manual-sql.md` | Every hand-written SQL and DDL site, the cause of each, its measurement and its pinning test |
+| `ordering-law.md` | The Profiles ordering law: link key versus endpoint key, bins, static weight, the covering index |
+| `crypto-dependencies.md` | Every non-default cryptographic site with its independent oracle, plus the dependency advisories and hazmat checklist |
+| `protocols.md` | Per-protocol share-URL and config reference, and the backend coverage matrix |
+| `clash.md` | Clash and mihomo YAML mapping |
+| `native-core.md` | The native core and TLS engine: capability, protocol and transport roadmaps, verification tiers |
+| `tls-fingerprint-roster.md` | JA4-fidelity evidence for the TLS profile roster |
+| `glossary.md` | Domain terms, one line each |

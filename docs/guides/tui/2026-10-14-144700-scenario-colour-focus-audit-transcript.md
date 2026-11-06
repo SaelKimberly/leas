@@ -1,8 +1,13 @@
-# Transcript — colour-focus-audit
+# Transcript: colour-focus-audit (2026-10-14)
 
 Verbatim report returned by `run_scenario(script=2026-10-14-144700-scenario-colour-focus-audit.md, session_id=colour-focus-audit)`
 on 2026-10-14, executed in-process from the `/home/user/oss/mcp-tui-test` v1.0.1 checkout (Python 3.14.7, pyte 0.8.2, Pillow).
 The runner no longer patches anything: 1.0.0 fixed the wide-char crash upstream and renders the cell grid itself.
+
+Nothing inside a fence has been edited. The `Command:` lines and screenshot paths in the captures show
+the checkout directory as it was named at run time, kept verbatim for provenance; the project and binary
+are `leas`, and authored commands in the scenario documents run `target/debug/leas` from the repository
+root.
 
 ```text
 Scenario document: colour-focus-audit — leas colour and focus audit with get_cell_style/screenshot — the Dracula palette as actually emitted (tabs, selection, failure marker, chrome), the hardcoded popup/status colours that ignore the theme, and the same cells under a light theme
@@ -109,10 +114,11 @@ steps: 28 · errored: 0 · session closed
 ok: True | action: executed | session_alive: False
 rescue_files: []
 ```
-# Appendix — colour-focus-audit attempt 1 (invalid light-theme part)
+
+## Appendix: attempt 1 (invalid light-theme part)
 
 The first run of the colour scenario failed to switch themes: the fixture copied `config-light.json` into the
-fixture directory **under that name**, so the second launch found no `config.json` and fell back to the default theme. echo The dark-theme samples below are valid; the light-theme ones all measured the Dracula palette again
+fixture directory **under that name**, so the second launch found no `config.json` and fell back to the default theme. The dark-theme samples below are valid; the light-theme ones all measured the Dracula palette again
 (`fg=bd93f9` on the tab, `bg=44475a` on the status bar). Attempt 2 fixed the copy to `config.json` and is the
 transcript beside this file. Kept per the skill's rule that a corrected script keeps its trace.
 

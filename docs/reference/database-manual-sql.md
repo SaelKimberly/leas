@@ -1,400 +1,264 @@
-# Hand-written SQL and DDL in the DB layer — why, where, and the rules
+# Hand-written SQL and DDL in the DB layer
 
-This file is the authority for every place `crates/leas-db` does **not** go
-through toasty, and for the reason each exception exists. If you are adding a
-query and wondering whether it may be raw SQL, the answer is: read this list
-first, and prefer the typed path unless your case matches one of the causes
-below. Every entry here is either (a) a capability `toasty` **0.11** does not
-have, or (b) a measured cost difference on this engine. Entries re-verified
-against the vendored `toasty-0.11.0` source are marked as such inline — currently
-**C1 and C2 only**; C3–C6 are unverified against 0.11 and are NOT carried forward
-on trust. See §7.
+This file answers one question: which statements in `crates/leas-db` bypass
+toasty, and why is each one allowed to. It gives the rule, the capability gaps
+that force an exception, one row per live site with its cause, measurement and
+pinning test, the toasty failures that justify the gaps, the manual paths already
+rejected, the checklist for adding a site, and the procedure for re-checking a
+blocker after a toasty bump. It does not own the schema, the flows, or the query
+map: those live in [`database.md`](database.md). Derived-state law lives in
+[`ordering-law.md`](ordering-law.md).
 
-Related records: `docs/reference/database.md` (schema, flows, query map),
-`docs/aegis/adr/0001-raw-sql-profiles-page-query.md` (the page query),
-`docs/aegis/adr/0002-write-behind-link-writer.md` (the link writers),
-`docs/aegis/adr/0003-stored-profile-ordering-keys.md` (the rank keys),
-`docs/aegis/specs/2026-09-16-db-claim-verification.md` (the measurements behind
-the engine facts cited here).
-
-> **Baseline note.** `AGENTS.md` decisions 4 and 21 describe raw SQL as
-> "confined to PRAGMAs, plus `profiles_query.rs`". That was already narrower than
-> the code when it was written, and the 2026-09-16 write-path change added one
-> more site. The exception list below is the accurate one; the decision text was
-> corrected to point here rather than restate the list.
+Related records: [`database.md`](database.md) (tables, indexes, flows, query
+map), [`../aegis/adr/0001-raw-sql-profiles-page-query.md`](../aegis/adr/0001-raw-sql-profiles-page-query.md)
+(the page query), [`../aegis/adr/0002-write-behind-link-writer.md`](../aegis/adr/0002-write-behind-link-writer.md)
+(the link writers), [`../aegis/adr/0003-stored-profile-ordering-keys.md`](../aegis/adr/0003-stored-profile-ordering-keys.md)
+(the rank keys), [`../aegis/adr/0012-owned-turso-driver-and-migrations.md`](../aegis/adr/0012-owned-turso-driver-and-migrations.md)
+(the driver fork and the migration cursor),
+[`../aegis/specs/2026-09-16-db-claim-verification.md`](../aegis/specs/2026-09-16-db-claim-verification.md)
+(the measurements behind the engine facts cited here).
 
 ## 1. The rule
 
 - **Typed path first.** Single-row reads and writes of a model (endpoints,
-  protocols, links, groups, endpoint↔group links, routing rules, DNS settings,
-  route probes) go through the typed API — `Model::filter…`, `upsert_by_*`,
-  `toasty::create!/update!` — so the enum/JSON/timestamp encodings and the
-  `CHECK` constraints stay the ORM's business.
-- **Raw SQL needs a cause from §2.** "It is easier to write" is not one. Neither
-  is "it is faster" without a number in the table below.
+  protocols, links, groups, endpoint to group links, routing rules, DNS
+  settings, route probes) go through the typed API (`Model::filter...`,
+  `upsert_by_*`, `toasty::create!/update!`), so enum, JSON and timestamp
+  encodings and the `CHECK` constraints stay the ORM's business.
+- **Raw SQL needs a cause from §2.** "It is easier to write" is not one.
+  Neither is "it is faster" without a number in §3.
 - **Never a second owner of a fact.** A hand-written statement may only write
-  columns its own group/owner owns, and may not create a second spelling of a
-  stored fact (this is why the `(family, addr)` split in §5 was rejected).
+  columns its own group owns, and may not create a second spelling of a stored
+  fact (the reason the `(family, addr)` split in §5 was rejected).
 - **Inlined literals, not binds, on bulk statements.** The engine charges
   ~0.8 ms per *bound* parameter (200 ids = 174 ms against 9.7 ms for the same
-  statement with literals, `endpoint_rank.rs`). Ids and keys that come from our
-  own rows are rendered as literals; user text still goes through `sql_lit`
-  (quotes doubled) or a bind.
+  statement with literals). Ids and keys produced by this database are rendered
+  as literals; user text goes through `sql_lit` (quotes doubled) or a bind.
 - **Every raw statement must be exercised by a test.** There is no single drift
-  guard: the statement-vs-schema test (`tests/profiles_query.rs`
-  `every_statement_runs_against_a_pushed_schema`) executes only the
-  **`profiles_query.rs`** paths (`profiles_page` for every sort/view,
-  `profiles_anchor`, `load_page_projection`). The other sites are pinned
-  indirectly, by the behavior tests that call them (§3, last column) — and a
-  **new** raw statement is covered by neither until a test actually runs it. That
-  is checklist item 5 in §6.
+  guard. `tests/profiles_query.rs`
+  `every_statement_runs_against_a_pushed_schema` executes only the
+  `profiles_query.rs` builders. Every other site is pinned indirectly by the
+  behaviour test named in §3, and a new statement is covered by neither until a
+  test runs it (checklist item 5 in §6).
+
+`write_behind.rs` contains no production SQL. Its only statements are test
+fixtures (`fake_state`) and an assertion, so the write-behind driver is a
+transaction and retry owner, not an exception.
+
+Statements that moved without being rewritten are recorded in §3's note on
+moved statements, not as new rows. Sites that no longer exist are in §8.
 
 ## 2. The causes
 
 | Cause | Consequence |
 | --- | --- |
-| **C1. No upsert / conflict clause.** `toasty` 0.11 **does** have a multi-row insert — `stmt::CreateMany` (`stmt/create_many.rs`, `lib.rs:124`) — but it builds a BARE `INSERT INTO … VALUES (…), (…)` from `item.into_insert()` and carries **no** `on_conflict` / `or replace` / upsert semantics (`grep -rl "on_conflict\|OnConflict" toasty-0.11.0/src/stmt` finds nothing). `upsert_by_*` **does** exist but is macro-generated and single-row: `toasty-macros-0.11.0/src/model/expand/upsert.rs:60-82` emits `upsert_by_{field}` + `{Model}UpsertBy{suffix}`/`…OrIgnore` (documented at `toasty-macros-0.11.0/src/lib.rs:52`), and the statement it builds is documented as "A typed **single-row** upsert statement" (`toasty-0.11.0/src/stmt/upsert.rs:5`). So it is absent from the hand-written `toasty-0.11.0/src/` by construction, not missing. The blocker is therefore the conflict clause, not the row count: an idempotent re-import needs `ON CONFLICT … DO UPDATE`, which a bare multi-row insert cannot express. *(Re-verified 2026-10-01; the previous "no multi-row insert" wording was true of 0.10 and false of 0.11.)* **The link-writer upserts are NOT thereby retired**: they also rest on C6 (10.0 ms/512-patch vs 29.0 ms measured) and on per-column-group `ON CONFLICT … DO UPDATE SET col = CASE …` bucketing (RESULT/TRAFFIC/PURGE), which the typed `upsert` cannot express — the engine compares ONE `UpsertAction` per statement (`toasty-0.11.0/src/engine/lower.rs:1226`, `engine/upsert.rs:61`), so there is no per-group action to set. Migrating them is a separate task with its own measurement.* | Bulk paths are hand-built multi-row statements. |
-| **C2. `#[index]` is per-field and single-column.** *(Re-verified against `toasty-macros-0.11.0/src/lib.rs:224` / `:1155` — still "Creates a non-unique index on the field / the field's flattened column", no composite, mixed-direction, partial or expression form.)* No composite, mixed-direction, partial, or expression index. | Indexes toasty cannot express are raw `CREATE INDEX IF NOT EXISTS` at open. |
-| **C3. No per-connection hook.** The driver creates pooled connections itself. | Every per-connection PRAGMA is re-issued in `Database::conn()`. |
-| **C4. No raw connection access.** `Db::driver()` yields `&dyn Driver`, not the turso connection. | UDFs, `turso::core`, statement-cache control, `set_query_timeout`, `interrupt`, and experimental driver flags beyond the `experimental_*` setters are unreachable. |
-| **C5. Engine shape.** No `UPDATE … FROM (VALUES …)` (parse error); unknown PRAGMAs are silently ignored; `array_agg` needs an experimental flag and returns text; `BIGINT`/`BOOLEAN` are illegal in a STRICT table; expression indexes are not used for `LIKE`. | Some statements cannot be expressed at all; some "obvious" tuning is a no-op. |
-| **C6. Measured cost.** Binding, per-row statements, and ORM-round-trips cost more than one hand-built statement on this engine. | The numbers in §3 are the justification. |
-| **C7. No aggregate projection.** Toasty's typed builders are per-model row reads — `all`, `filter`, `order_by`, `limit`, `first` — with no `COUNT`/`SUM`/`GROUP BY` constructor and no expression projection. A derived partition over stored columns (`SUM(CASE WHEN rank_bin = 12 …)`) is unreachable from the typed path. | Bucket/aggregate reads over a materialized table are raw SQL; the typed path can only re-read every row and count in Rust, which is the O(feed) cost the page query exists to avoid. |
+| **C1. No upsert or conflict clause.** `toasty` 0.11 **does** have a multi-row insert, `stmt::CreateMany` (`stmt/create_many.rs`, `lib.rs:124`), but it builds a bare `INSERT INTO ... VALUES (...), (...)` from `item.into_insert()` and carries **no** `on_conflict`, `or replace` or upsert semantics (`grep -rl "on_conflict\|OnConflict" toasty-0.11.0/src/stmt` finds nothing). `upsert_by_*` exists but is macro-generated and single-row: `toasty-macros-0.11.0/src/model/expand/upsert.rs:60-82` emits `upsert_by_{field}` plus `{Model}UpsertBy{suffix}` and `...OrIgnore` (documented at `toasty-macros-0.11.0/src/lib.rs:52`), and the statement it builds is documented as "A typed **single-row** upsert statement" (`toasty-0.11.0/src/stmt/upsert.rs:5`). The multi-row *conflict* clause is the missing capability. | Multi-row upserts are hand-built. |
+| **C2. `#[index]` is per-field and single-column.** Re-verified against `toasty-macros-0.11.0/src/lib.rs:224` and `:1155`: "Creates a non-unique index on the field / the field's flattened column", with no composite, mixed-direction, partial or expression form. | Indexes toasty cannot express are raw `CREATE INDEX IF NOT EXISTS`, applied at open by the migration runner. |
+| **C3. No per-connection hook.** The driver creates pooled connections itself. | `Database::conn()` re-issues the per-connection settings it can (`busy_timeout`, `synchronous`); `journal_mode` and `foreign_keys` are set once at open. |
+| **C4. No raw connection access.** `Db::driver()` yields `&dyn Driver`, not the turso connection. | UDFs, `turso::core`, statement-cache control, `set_query_timeout`, `interrupt`, and experimental driver flags beyond the `experimental_*` setters are unreachable through the trait. Raw SQL itself is reachable: `toasty::sql::query/statement` is the supported channel and is what every site below uses. |
+| **C5. Engine shape.** No `UPDATE ... FROM (VALUES ...)` (parse error); unknown PRAGMAs are silently ignored; `array_agg` needs an experimental flag and returns text; `BIGINT` and `BOOLEAN` are illegal in a STRICT table; expression indexes are not used for `LIKE`. | Some statements cannot be expressed at all; some "obvious" tuning is a no-op. |
+| **C6. Measured cost.** Binding, per-row statements and ORM round-trips cost more than one hand-built statement on this engine. | The numbers in §3 are the justification. |
+| **C7. No projection over aggregate expressions.** The typed builders are per-model row reads (`all`, `filter`, `order_by`, `limit`, `first`) plus `count()`; there is no `SUM`, conditional aggregate, `GROUP BY`, or expression projection. A partition such as `SUM(CASE WHEN rank_bin = 12 ...)` over stored columns is unreachable from the typed path. | Bucket and anchor reads are raw SQL. The typed path can only re-read every row and aggregate in Rust, which is the O(feed) cost the page query exists to avoid. |
+| **C8. Derived state outside the model.** `endpoint_rank`'s `band`, `rank_alive` and `rank_weight` columns sit on a derived table and are recomputed on every write; `rank_weight_meta` is a one-row stamp. Declaring them on a model would give a second owner of a derived fact. | Raw `ALTER TABLE ADD COLUMN` and `CREATE TABLE ... IF NOT EXISTS` in `schema/ddl.rs`. Not a toasty gap; a design choice. |
+| **C9. One-way data migration.** Copying a column, clearing it, renaming it and dropping the discriminator in one gated step cannot be expressed through the typed layer, and the statements are not idempotent. | Statements live in the migration step list (`schema/steps.rs`), gated by the `PRAGMA user_version` cursor in `schema/mod.rs`. |
+| **C10. Expressions the typed update builder cannot render.** There is no column self-reference, no `MAX`/`COALESCE` self-comparison, and no per-column conditional mix of copied and skipped fields. | Maintenance writes that must keep the larger of two timestamps are raw `UPDATE` statements. |
 
-## 3. The inventory (every site, with its cause and its number)
+C1 and C2 were re-verified against `toasty-0.11.0` on 2026-10-01. C3 to C7 are
+unverified against 0.11 and carry no re-verification date; see §7. C8 to C10 are design causes, not toasty gaps, and do not move with a toasty version.
 
-| Site | What it does | Cause | What the typed path costs | Pinned by |
-| --- | --- | --- | --- | --- |
-| `profiles_query.rs` (whole file) | The Profiles page: count + ordered ids + one-statement hydration, ids inlined; `profiles_walk_page` is the same ordered-id SELECT with NO count (the batch's plan walk asks for the feed-wide total once instead of once per page, which was `O(feed²/200)`); the plan-scope predicate (`rank_tier IN (…)`, bound, shared by the page, the walk and the count, so a scoped batch and its footer cannot drift) | C2 (covering-index ordering), C4 (the id-inlined projection runs on the raw `Database::direct` connection, whose uncached `prepare` dodges the driver's unbounded per-text statement cache — see the dated section below), C6 | 488 ms per page typed (`in_list`, ~600 binds) vs 49.6 ms inlined (ADR 0001); a `ROW_NUMBER()` window sort is 1757 ms vs 8.6 ms index-driven (ADR 0003); the scope predicate is an index range on the same covering index, so it costs no extra storage | `every_statement_runs_against_a_pushed_schema` — the only site with a direct statement-vs-schema guard — plus `walk_pages_match_the_page_ids_and_count_once` for the count-free variant and `plan_scopes_select_by_materialized_tier` for the scope |
-| `profiles_query.rs` `profiles_aggregate` | The Details panel's bucket counts: one `SELECT COUNT(*)` plus seven `SUM(CASE WHEN …)` arms over `endpoint_rank`, per scope. `alive` is `rank_newest_seen >= ? AND rank_alive = 1` (global) or `band = 0` (view); `active` is the same with `rank_alive = 0` / `band = 1`; the four partition arms are `PlanScope::predicate` verbatim, so a proven endpoint carrying bin 12 counts once. | C7 (no aggregate constructor), C6 | The typed path cannot express it: `SUM(CASE …)` over `rank_bin`/`rank_stab`/`rank_proven` is not a model read. The statement is index-served — `endpoint_rank_key_v2` carries `rank_bin`/`rank_stab`/`rank_proven`, `endpoint_rank_band_window` carries `rank_newest_seen` — and groups/sorts nothing | `aggregate_buckets_partition_the_total`, `aggregate_view_total_matches_the_page_count`, `aggregate_alive_is_live_for_the_global_scope` (integration) |
-| `database.rs` `LINK_UPSERT_PREFIX` + `link_values_sql` + `exec_link_upsert` | `apply_link_patches` and `upsert_links_bulk`: one multi-row `INSERT … VALUES (…),(…) ON CONFLICT(protocol_id, endpoint_id) DO UPDATE …` per (400-row chunk, group action — three groups, so eight bucket shapes) | C1, C4 (the inlined-literal writer runs through `Operation::RawSql`, which the crate's OWN driver fork routes to the UNCACHED `prepare` — the published driver would cache a compiled program per window, forever; see the 2026-10-08 section), C5 (`UPDATE … FROM (VALUES …)` is a parse error) | 29.0 ms → 10.0 ms per 512-patch window; 360 ms → 44.3 ms per 2,000 imported links (ADR 0002 amendment 4) | `apply_link_patches_writes_patched_groups_for_every_row`, `…isolates_column_groups`, `…survives_a_stale_snapshot_without_clobbering`, `…applies_a_window_wider_than_one_statement_chunk`, `…upserts_absent_and_near_miss_pairs_exactly`, `link_patch_inserts_a_missing_row_and_refreshes_its_key`; the import path by `subscription_upsert_flow_assembles_group_rows`; the RAW path by `raw_link_window_writes_like_the_pooled_path` |
-| `driver/` (the crate's own `toasty-driver-turso` fork) | `Connection::exec` routes `Operation::RawSql` to the UNCACHED `prepare`; `Insert`/`QuerySql` keep `prepare_cached` | C4 (the published driver's `prepare_cached` map is unbounded and keyed by text; an inlined-literal statement is a new text every call) | Replaces the retired `sql_exec.rs` `SqlConn`/`RawConn` seam: the SQL text is unchanged, only the executor routing is. The fork is vendored from toasty `main` (turso 0.8) | `contention_is_retryable_and_real_errors_are_not` (contention still reaches `retry_on_busy`), `file_db_link_window_writes_the_staged_values` (the pooled write path, on a real file db) |
-| `database.rs` `link_patch_conflict_sql` | The per-action `DO UPDATE SET` list — the column-group disjointness, in SQL, for FOUR groups (RESULT / PURGE / TRAFFIC / STAB) | C1 (the action is per-statement, so the groups must be bucketed) | n/a — this *is* the group contract; `contains`-decided, so an unknown bit cannot drop a group. `purge_reason` is its own group because this action writes a FIXED column set from each patch's snapshot, so riding RESULT would let a phase-1 fast half rewrite a verdict it never classified (ADR 0006); `stab_mask`/`stab_len` get their own bit for the same shape — a fast-only RESULT snapshot never sampled the ring (spec 2026-10-09-stab-bin-design) | `apply_link_patches_isolates_column_groups` (seeds a verdict, then proves a stale RESULT-only patch leaves it intact while a PURGE-only patch moves it and nothing else), `link_patches_leave_columns_outside_their_groups_alone`, `subscription_upsert_flow_assembles_group_rows` |
-| `database.rs` PRAGMAs (`user_version`, `journal_mode=WAL`, `busy_timeout`, `synchronous=NORMAL`, `foreign_keys=ON`) | Connection and durability settings, per connection | C3 | `busy_timeout`/`synchronous` never reach pool-created connections if set once at open — that was the "database is locked" storm | Every `Database::open`/`in_memory` call; the tag semantics by `open_wipes_a_file_with_a_mismatched_schema_tag`, `fresh_open_creates_schema_and_sets_user_version_tag`, `open_reopen_preserves_data` |
-| `database.rs` (`sql_lit`, `error_kind_str`, `purge_reason_str`) | Literal escaping and the `CHECK`-constrained storage spellings (the `purge_reason` spellings are toasty's own, verified by a column-shape probe) | C1 (a hand-built statement has no encoder) | A wrong spelling is rejected by the column `CHECK` or the test that runs it, never silently stored | Any test that round-trips an error through the writers — `apply_link_patches_writes_patched_groups_for_every_row`, `page_projection_matches_the_orm_rows` |
-| `schema/ddl.rs` (moved from `endpoint_rank.rs::ensure_in`, 2026-10-08) | `CREATE INDEX IF NOT EXISTS endpoint_rank_key_v2` (covering, mixed-direction, `rank_proven` TRAILING) + `DROP INDEX IF EXISTS endpoint_rank_key` + `endpoint_rank_band_window` | C2 | toasty's `#[index]` cannot express either; 1757 ms → 8.6 ms is the covering index. `rank_proven` trails so every scope filters inline; the name change is what makes an existing file pick the new column list up (`IF NOT EXISTS` makes an in-place edit a silent no-op) | Applied by the migration runner on every `Database::open`/`in_memory`; the index's *effect* by `page_order_matches_the_rust_oracle_for_every_sort` |
-| `endpoint_rank.rs` `write` | Bulk `INSERT OR REPLACE … VALUES` per 400 rows, then one `UPDATE … SET band …` per chunk | C1 | Per-row `upsert_by_endpoint_id` is ~1.2 ms per statement: a 400-endpoint window took ~470 ms and a 7.7k-endpoint import ~8 s; the bulk form is ~10× cheaper | `link_writes_keep_the_stored_keys_current`, `a_result_patch_that_inserts_a_link_still_moves_the_key`, `purging_endpoints_drops_their_keys` |
-| `endpoint_rank.rs` `refresh` / `load_raw_endpoints` / `backfill` / `repair` / `prune` | Id-inlined reads (`WHERE endpoint_id IN (…)`) and the raw facts behind the rank law | C6 | Binding costs ~0.8 ms per id | `resolving_a_dns_host_moves_its_stored_key`, `purging_endpoints_drops_their_keys`, `load_page_rows_preserves_page_and_link_order`, `seed_ranks` (integration) |
-| `merge.rs` `overwrite_link_fields` / `merge_memberships` | The Smart Endpoints Compact's collision writes: one `UPDATE profile_stats SET <measured fields…> WHERE protocol_id = ? AND endpoint_id = ?` (deliberately NOT `purge_reason` — the survivor's verdict is its own) and one `UPDATE endpoint_groups SET last_seen_at = MAX(…)` per collided membership | The typed `update()` builder is a partial-column setter (so no C1 here) but cannot express the column SELF-references the rule needs — `last_seen_at = MAX(last_seen_at, ?)` and `last_used_at = MAX(COALESCE(last_used_at, 0), ?)` — nor the conditional per-column mix of copied/skipped fields in one statement; same expression class as the `reband` statements above | n/a — maintenance-path, one statement per merge; the literals reuse `sql_lit`/`error_kind_str` | `merge_keeps_survivor_purge_verdict_over_absorbed_measured_link`, `merge_moves_group_membership_and_resolves_collision` (integration) |
-| `schema/ddl.rs` (moved from `endpoint_ip.rs::ensure`, 2026-10-08) | `CREATE INDEX IF NOT EXISTS endpoint_ip_by_key(ip_key, endpoint_id)` | C2 | The sort wants a two-column index; `#[index]` is single-column | Applied by the migration runner on every `Database::open`/`in_memory`; the index's *effect* by `page_order_matches_the_rust_oracle_for_every_sort` (`PageSort::Ip`) |
-| `endpoint_ip.rs` `load` | One id-inlined statement for a page's address sets, key-ordered | C6 | Same 0.8 ms per bound id | `page_rows_assemble_links_and_protocols` (through `load_endpoint_rows`), `large_page_loads_via_batched_in_list` |
-| `endpoint_ip.rs` `load_resolved` | The same id-inlined statement plus the `country` column (`load` maps it back to addresses) | C6 | Same 0.8 ms per bound id; one read serves both the page oracle and the enrichment seed | `page_rows_assemble_links_and_protocols`, `large_page_loads_via_batched_in_list`, `stored_country_reaches_the_ui_without_the_mmdb` |
-| `endpoint_ip.rs` `countries_of` | Id-inlined `SELECT … WHERE country IS NOT NULL` for the endpoint being rewritten | C6 | It runs once per resolution inside `replace`, and re-reading one endpoint's 1–3 rows is cheaper than re-walking the mmdb | `stored_country_survives_re_resolution` |
-| `endpoint_ip.rs` `replace` | Delete-then-insert the whole set, deduped by key (typed delete + typed create per row — the mix that is fine because the set is 1–3 rows and TTL-gated), plus one `countries_of` read to carry the surviving addresses' countries | — | The writes stay typed on purpose (the model for "small set, typed is fine"); only the country read is raw, for the id-inlining reason above | `resolving_a_dns_host_moves_its_stored_key`, `stored_country_survives_re_resolution` |
-| `schema/ddl.rs` (moved from `endpoint_rank.rs::ensure_in`, 2026-10-08) — `band`, `rank_alive` + `rank_weight` columns, with `backfill_bands` still in `endpoint_rank.rs` | `ALTER TABLE endpoint_rank ADD COLUMN band` / `… rank_alive INTEGER NOT NULL DEFAULT 0` / `… rank_weight BLOB NOT NULL DEFAULT …` / `… rank_stab INTEGER NOT NULL DEFAULT 4` / `… rank_proven INTEGER NOT NULL DEFAULT 0`, the `ALTER TABLE profile_stats ADD COLUMN stab_mask/stab_len`, the stability seed (`UPDATE profile_stats SET stab_mask=1, stab_len=1 WHERE latency_real_delay IS NOT NULL` — schema 19 renamed the predicate's column, since the `latency` discriminator is gone; it is now gated on a one-way `app_meta` stamp, `stability_seeded_v2`, written in the SAME transaction as the seed, plus a `DELETE FROM rank_weight_meta` so the rank keys recompute — all applied by the runner, which TOLERATES the duplicate-column error since this engine has no `ALTER … IF NOT EXISTS`), the `endpoint_rank_band_window` index, and `backfill_bands` (one-time `band IS NULL` fill) | C1/C2/C5 | A raw column on a DERIVED, rebuildable table avoids a toasty-model change → no `user_version` tag bump → **no file wipe** of a large enriched feed; `#[index]` cannot express the composite | `backfill_bands_fills_null_band_rows_on_reopen` (the NULL fill, via reopen), `active_and_stale_windows` (band membership through the page) |
-| `endpoint_rank.rs` `write` (band follow-up) | Per chunk after the `INSERT OR REPLACE`, one `UPDATE … SET band = CASE WHEN rank_newest_seen < ? THEN 2 WHEN rank_alive = 1 THEN 0 ELSE 1 END` — REPLACE nulls the raw column, so it is re-set each write | C1 | n/a — it maintains the raw columns the toasty model cannot carry; band is the three-way state from the just-written `rank_newest_seen`/`rank_alive` | `active_and_stale_windows`, the page-order parity tests |
-| `endpoint_rank.rs` `reband_expired` / `reband_all` | Directional demote `UPDATE … SET band=2 WHERE band<2 AND rank_newest_seen < ?` (retention tick) and the full-recompute `CASE` (startup) | C1/C6 | Membership is a stored `band`, maintained as `now` crosses the threshold; the directional form seeks only the drifted rows via `(band, rank_newest_seen)`, continuity-independent across downtime | `reband_sweep_demotes_rows_that_drifted_during_downtime` (demote), `reband_all_promotes_rows_the_default_backfill_demoted` (promote) |
-| `database.rs` `purge_expired` | `SELECT e.id FROM endpoints e WHERE NOT EXISTS (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id AND p.last_seen_at >= ?)` — all-links staleness, replacing toasty's `.all()` quantifier | C6 | toasty's `.all()` compiled to a whole-`endpoints` projection (145 ms); this is indexed on `profile_stats.last_seen_at`. Deliberately NOT the live-only `band` — a fresh-but-purged link must keep its endpoint (ADR 0006, view-band spec §3.5) | `purge_expired_matches_all_links_semantics` |
-| `export.rs` direct reader | Whole-feed export count + one-row-at-a-time projection, with WAL `BEGIN DEFERRED` / MVCC `BEGIN CONCURRENT`, joined `protocols.config`, and deterministic protocol/transport/security/address ordering | C4/C6: Toasty 0.11 public query/raw SQL returns `Vec`; Turso driver drains physical `Rows` before Toasty sees them, so typed/page APIs cannot provide the required bounded row stream. Direct read is file-only and separate from Toasty writes | Public Toasty `.exec` buffers values; no page API preserves physical row streaming. One direct row is decoded and dropped per iteration; feed-wide row/config vectors are forbidden | `export::tests::alive_uses_canonical_link_tier_and_dns_resolution`, `export::tests::resolved_emits_each_dns_address_and_one_ip_literal`; RSS/file-reader smoke in T6 |
+## 3. The inventory
+
+One row per site. The `Site` column names the file and the items that hold the
+statement, all paths relative to `crates/leas-db/`. Measurements are quoted from
+the run that produced them, with its date; "no number recorded" means exactly
+that, not "fast".
+
+| Site | Cause | Measurement | Pinned by |
+| --- | --- | --- | --- |
+| `src/schema/ddl.rs` `ENDPOINT_IP_BY_KEY`: `CREATE INDEX IF NOT EXISTS endpoint_ip_by_key ON endpoint_ip (ip_key, endpoint_id)` | C2 | No standalone number recorded. The index is what makes `PageSort::Ip` a two-column key order instead of a sort. | `page_order_matches_the_rust_oracle_for_every_sort` (`PageSort::Ip`); applied by the runner on every `Database::open` and `in_memory` |
+| `src/schema/ddl.rs` `ENDPOINT_RANK_KEY_V2` and `ENDPOINT_RANK_KEY_DROP`: covering index `(band, rank_bin, rank_stab, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id, rank_proven)`, plus `DROP INDEX IF EXISTS endpoint_rank_key` | C2 | Page fetch 1757 ms to 8.6 ms for the default Test sort (ADR 0003, 7,672 endpoints); Active Test page 1.52 ms at 50k scale, 8.6 ms at 7,672 endpoints (2026-10-01). A new name is mandatory: `IF NOT EXISTS` makes an edited column list a silent no-op on an existing file. `rank_proven` trails so every scope filters inline on the same index. | `page_order_matches_the_rust_oracle_for_every_sort`, `the_test_order_has_an_index_that_includes_the_weight` |
+| `src/schema/ddl.rs` `ENDPOINT_RANK_BAND_WINDOW`: `CREATE INDEX IF NOT EXISTS endpoint_rank_band_window ON endpoint_rank(band, rank_newest_seen)` | C2 | No number recorded. The directional sweep seeks `band < 2 AND rank_newest_seen < ?` through this index, so an arbitrary downtime gap is corrected in one range scan. | `reband_sweep_demotes_rows_that_drifted_during_downtime` |
+| `src/schema/ddl.rs` `RANK_WEIGHT_META`: `CREATE TABLE IF NOT EXISTS rank_weight_meta (id INTEGER PRIMARY KEY CHECK (id = 0), weight_version INTEGER NOT NULL)` | C8 | A mismatch between the stored version and `KEY_INPUTS_VERSION` recomputes every rank key at open. The stamp is the only trigger that can replace the all-zero default that `ADD COLUMN` materializes for pre-existing rows. | `a_stale_weight_version_is_recomputed_at_open` |
+| `src/schema/ddl.rs` `ENDPOINT_RANK_ADD_COLUMNS` (`band`, `rank_weight BLOB NOT NULL DEFAULT x'0000000000000000'`, `rank_stab`, `rank_proven`, `rank_alive`) and `STAB_ADD_COLUMNS` (`profile_stats.stab_mask`, `stab_len`) | C8 for the rank columns; the stab columns are typed model fields whose ALTER only backfills tables created before the fields were declared | `ALTER TABLE ADD COLUMN` is not idempotent on this engine. The runner attempts it on every open and tolerates exactly one error string, "duplicate column". `rank_weight` must be `NOT NULL DEFAULT`: `profiles_anchor` binds each ordering term's value back and the engine refuses to type a NULL there, so a NULL weight makes the anchor query error. | `fresh_open_creates_tables_and_raw_ddl`, `reopen_tolerates_duplicate_column_on_already_migrated_file`, `every_rank_row_carries_a_non_null_weight`, `anchoring_works_on_a_row_carrying_only_the_weight_default` |
+| `src/schema/ddl.rs` `V19_LATENCY_RESHAPE`, applied by `src/schema/steps.rs` `STEPS` | C9 | Schema 19. Order is load-bearing: add `latency_fast_delay`, copy a `'fast'` row's delay into it, clear that delay from `latency_delay`, rename `latency_delay` to `latency_real_delay`, then drop `latency`. `RENAME COLUMN` and `DROP COLUMN` fail with "no such column" on a second application, so the steps and the cursor advance in one `TransactionMode::Immediate` transaction. | `a_v18_database_migrates_and_keeps_its_numbers`, `reopening_a_migrated_file_does_not_re_run_the_non_idempotent_step`, `the_migrated_table_has_no_latency_discriminator` |
+| `src/schema/mod.rs` `cursor`, `migrate`, `ensure_raw_ddl`, `seed_stability_once`: `PRAGMA user_version` read and stamp, `app_meta` stamp upsert, `UPDATE profile_stats SET stab_mask = 1, stab_len = 1 WHERE latency_real_delay IS NOT NULL`, `DELETE FROM rank_weight_meta` | C4 (the cursor is below the typed layer) and C9 (the seed and its one-way stamp must share a transaction) | Schema constant is 19 (`database.rs:SCHEMA_VERSION`). The seed runs at most once per database; the stamp key is `stability_seeded_v2` (renamed from the v1 key because the old predicate named the `latency` discriminator that migration 19 drops). The `DELETE FROM rank_weight_meta` is best-effort: a very old file may lack the table, and the rank `ensure` recreates it. | `the_stability_seed_runs_once_and_is_stamped`, `the_stab_seed_marks_real_latency_links_as_proven`, `a_seed_lost_to_a_crash_is_rerun_on_the_next_open`, `unknown_cursor_is_recreated_not_migrated` |
+| `src/database.rs` `open_with_concurrent_writes`, `in_memory`, `conn`, `configure_journal_mode`, `open_direct_conn`: `PRAGMA journal_mode`, `busy_timeout=5000`, `synchronous=NORMAL`, `foreign_keys=ON` | C3 | Default `synchronous=FULL` costs ~4.2 ms per commit on this engine; a 30k-link ping batch issues ~90k commits and froze the UI task awaiting them (2026-09-11 investigation). `busy_timeout` is what turns instant "database is locked" failures into queuing (the 850-line dump class). `conn()` re-issues `busy_timeout` and `synchronous` only; `journal_mode` and `foreign_keys` are set at open. | `fresh_open_creates_schema_and_sets_user_version_tag`, `open_reopen_preserves_data`, `open_wipes_a_file_with_a_mismatched_schema_tag` |
+| `src/database.rs` `sql_lit`, `sql_opt_lit`, `sql_opt_num`, `error_kind_str`, `purge_reason_str`, `blob_lit` | C1 (a hand-built statement has no encoder) | `purge_reason` spellings are toasty's own `snake_case` rendering, verified by the column-shape probe of 2026-09-17. A wrong spelling is rejected by the column `CHECK`, never stored. `blob_lit` writes `ports` as the JSON text the typed upsert writes. | `multi_row_import_writers_round_trip_through_a_real_database`, `apply_link_patches_writes_patched_groups_for_every_row` |
+| `src/database.rs` `LINK_UPSERT_PREFIX`, `link_values_sql`, `exec_link_upsert` (used by `apply_link_patches_tx` and `upsert_links_bulk`): one multi-row `INSERT INTO profile_stats ... ON CONFLICT(protocol_id, endpoint_id) DO UPDATE` per 400-row chunk | C1, C4 (the `RawSql` route is uncached), C5 (`UPDATE ... FROM (VALUES ...)` is a parse error) | 512-patch window 29.0 ms to 10.0 ms including the rank refresh (ADR 0002). Chunk width is free: 400, 1,000 and 2,000 rows per statement measured 11.1, 10.6 and 10.6 ms (2026-09-16). Bound parameters cost ~0.8 ms each, so every value is inlined. | `apply_link_patches_writes_patched_groups_for_every_row`, `apply_link_patches_applies_a_window_wider_than_one_statement_chunk`, `link_writes_keep_the_stored_keys_current` |
+| `src/database.rs` `link_patch_conflict_sql` and the bucket loop in `apply_link_patches_tx`: the per-action `DO UPDATE SET` list | C1 (the action is per statement, so patches are bucketed by action) | Four groups (RESULT, PURGE, TRAFFIC, STAB), so sixteen 4-bit buckets; the empty bucket is `DO NOTHING` (a patch with no group only creates a missing row). `contains` decides the columns, so an unknown bit cannot drop a group. `purge_reason` is its own group because the action writes a FIXED column set from each patch's snapshot: riding RESULT would let a phase-1 fast half rewrite a verdict it never classified (ADR 0006). `stab_mask` and `stab_len` have their own bit for the same shape, because a fast-only RESULT snapshot never sampled the ring. | `apply_link_patches_isolates_column_groups`, `link_patches_leave_columns_outside_their_groups_alone`, `apply_link_patches_upserts_absent_and_near_miss_pairs_exactly` |
+| `src/database.rs` `LINK_SOURCE_CONFLICT_SQL` and `upsert_links_bulk`: SOURCE columns only on conflict (`last_seen_at`, `updated_at`) | C1 | Per-row typed upserts destroyed freshly measured latencies when an import refresh ran beside a Fast+Real batch (2026-09-15). The conflict action is deliberately narrow so RESULT, PURGE and TRAFFIC columns keep their owners. | `multi_row_import_writers_round_trip_through_a_real_database`, `link_writes_keep_the_stored_keys_current`, `a_result_patch_that_inserts_a_link_still_moves_the_key` |
+| `src/database.rs` `upsert_endpoints_bulk`: one multi-row `INSERT INTO endpoints ... ON CONFLICT(id) DO UPDATE` per 400 rows | C1 | The 2026-10-01 import issued 105,147 statements for this family; chunked at 400 it issues ~263 for the same rows (2026-10-02). The update list excludes `manual_protocol_override` and `resolved_at`, which the import does not own. | `multi_row_import_writers_round_trip_through_a_real_database`, `multi_row_endpoint_upsert_replaces_and_preserves` |
+| `src/database.rs` `upsert_endpoint_group_links_bulk`: one multi-row `INSERT INTO endpoint_groups ... ON CONFLICT(endpoint_id, group_id) DO UPDATE` per 400 rows | C1 | The single largest import family: 204,592 statements, half the total, because a 500-URL batch touches one endpoint once per protocol. Chunked at 400 it issues ~511 (2026-10-02). | `multi_row_import_writers_round_trip_through_a_real_database`, `streaming_import_splits_and_persists_in_batches` |
+| `src/database.rs` `upsert_protocols_bulk`: **typed, one `Protocol::upsert_by_id` per row**. Listed because the deferral is deliberate, not an omission | C1 is NOT used here | 99,728 statements, the remaining quarter of the import (2026-10-01). Conversion is blocked on a writer-side `as_db_label` for `TransportType`, `SecurityType` and `ProtocolKind` (the feed stores `shadowsocks2022`, `http_upgrade`, `x_http`, which are not the `as_str()`/`FromStr` spellings) plus the confirmed storage encoding of the `transport.data` and `security.data` JSON columns. Raw SQL without both would risk a row the connect path cannot read. | `multi_row_import_writers_round_trip_through_a_real_database` (round-trips the typed writer). No test asserts the deferred-config guard |
+| `src/database.rs` `purge_expired_once`: candidate `SELECT e.id FROM endpoints e WHERE NOT EXISTS (...)` outside the write transaction, plus an id-inlined re-check inside it | C6 (toasty's `.all()` quantifier compiles to a whole-table projection) | The scan measured 3,098 ms on 74,014 endpoints (2026-10-01), and it ran INSIDE the write transaction, so every other writer queued behind a three-second lock hold on the single database handle. The typed `.all()` form costs 145 ms but cannot express the all-links quantifier without a full projection. The predicate is all-links staleness, deliberately not the live-only `band`: a fresh-but-purged link must keep its endpoint (ADR 0006). | `purge_expired_matches_all_links_semantics` |
+| `src/endpoint_rank.rs` `ensure_in`, `stamp_weight_version`, `backfill_bands`: `SELECT weight_version FROM rank_weight_meta`, `INSERT ... ON CONFLICT(id) DO UPDATE`, `SELECT COUNT(*) FROM endpoint_rank`, `UPDATE ... SET band = CASE ... WHERE band IS NULL` | C1, C8 | The band backfill is the one-time cost for rows that predate the column (`repair_missing` fills only absent rows). The version check must sit on the populated branch: `ADD COLUMN ... NOT NULL DEFAULT` materializes the worst weight, so there are no NULLs to find. | `a_stale_weight_version_is_recomputed_at_open`, `link_writes_keep_the_stored_keys_current` |
+| `src/endpoint_rank.rs` `write`: `INSERT OR REPLACE INTO endpoint_rank (...) VALUES (...)` per 400 rows, then one `UPDATE ... SET band = CASE ... WHERE endpoint_id IN (...)` per chunk | C1, C8 | Per-row `upsert_by_endpoint_id` costs ~1.2 ms per statement: a 400-endpoint window took ~470 ms and a 7.7k-endpoint import ~8 s. The bulk form is ~10x cheaper (no separate number recorded). The follow-up `UPDATE` exists because `INSERT OR REPLACE` nulls the raw `band` column; `rank_weight` is Rust-computed and rides the VALUES tuple. | `link_writes_keep_the_stored_keys_current`, `a_result_patch_that_inserts_a_link_still_moves_the_key`, `purging_endpoints_drops_their_keys` |
+| `src/endpoint_rank.rs` `reband_expired` and `reband_all`: directional demote `UPDATE ... SET band = 2 WHERE band < 2 AND rank_newest_seen < ?`, and the full-recompute `CASE` | C1, C6 | Membership is a stored `band` maintained as `now` crosses the threshold. The directional form seeks only the drifted rows through `(band, rank_newest_seen)`, so an arbitrary downtime gap is corrected in one range scan. Full recompute runs at startup because a configured TTL larger than the default must promote rows the default demoted. | `reband_sweep_demotes_rows_that_drifted_during_downtime`, `reband_all_promotes_rows_the_default_backfill_demoted` |
+| `src/endpoint_rank.rs` `refresh`, `load_raw_endpoints`, `repair_missing`, `first_ip_keys`, `resolved_endpoint_ids`: id-inlined reads plus the `LEFT JOIN protocols` weight read (`backfill_all` reuses the two id reads and typed loads) | C6 | Binding costs ~0.8 ms per id, so ids are inlined. The join carries four discriminator columns (`transport_type`, `security_type`, `security_sni`, `security_fp`; `proto_kind` is deliberately not a weight dimension) at one indexed lookup per link, and leaves the deferred `config` JSON unloaded. `transport_type` is parsed with `TransportType::from_db_label`, not `FromStr`, because toasty's embed writes `http_upgrade` and `x_http` where the wire form says `httpupgrade` and `xhttp`; the wrong parser silently persists a zero weight for 314 of ~21k real protocol rows. A link whose protocol row is absent (LEFT join) sorts as worst. | `resolving_a_dns_host_moves_its_stored_key`, `purging_endpoints_drops_their_keys`, `load_page_rows_preserves_page_and_link_order` |
+| `src/endpoint_ip.rs` `insert_literals_bulk`: multi-row `INSERT INTO endpoint_ip (endpoint_id, ip_key) VALUES ... ON CONFLICT DO NOTHING` per 400 rows | C1 | Replaces the import path's reuse of the resolution writer for IP literals, which cost 3 statements each over ~56k IP-literal endpoints (db-rewamp D10). `DO NOTHING` is exact: an existing row means the same literal was imported before, and its `country` must survive. | `streaming_import_splits_and_persists_in_batches` |
+| `src/endpoint_ip.rs` `set_countries_bulk` (reached from `database.rs` `set_endpoint_ip_countries_once`, the `CountrySpec` write): multi-row `INSERT INTO endpoint_ip (endpoint_id, ip_key, country) VALUES ... ON CONFLICT DO UPDATE SET country = excluded.country` per 400 rows | C1, C6 | One statement removes the TOCTOU that two writers could hit under MVCC: the resulting `Constraint` is not a busy error, so `retry_on_busy` never retried it. The per-address writer it replaced cost 108 µs in isolation against a production p99 of 1,051 ms (2026-10-01): a ~9,700x multiplier produced by concurrent single-row transactions. The 2026-10-01 run recorded 933 lookups, 1,577 deferred halves (~788 distinct links) and 790 per-address invocations, so per-host batching would have been a no-op (`waiters.len()` ~ 1). The run also recorded 88 `country persist failed` aborts, which the write-behind driver's re-stage path removes. | `set_countries_bulk_keeps_the_last_value_for_a_duplicate_row`, `stored_country_survives_re_resolution` |
+| `src/endpoint_ip.rs` `load_resolved` (used by `load`), `countries_of`, `delete_for`: id-inlined `SELECT endpoint_id, ip_key, country FROM endpoint_ip WHERE endpoint_id IN (...)` and `DELETE ... WHERE endpoint_id IN (...)` | C6 | Same ~0.8 ms per bound id. `countries_of` runs once per resolution inside `replace`; re-reading one endpoint's 1 to 3 rows is cheaper than re-walking the mmdb. `delete_for` runs in the same transaction that removes the endpoint rows. | `page_rows_assemble_links_and_protocols`, `large_page_loads_via_batched_in_list`, `stored_country_reaches_the_ui_without_the_mmdb` |
+| `src/endpoint_ip.rs` `replace`: typed `EndpointIp` delete plus typed create per key, with one raw `countries_of` read | C6 for the read; the writes are typed on purpose | The write half is the model for "small set, typed is fine": the set is 1 to 3 rows and TTL-gated. The raw half carries the surviving addresses' countries so a re-resolution does not throw away a stored lookup. | `resolving_a_dns_host_moves_its_stored_key`, `stored_country_survives_re_resolution` |
+| `src/merge.rs` `overwrite_link_fields`: one `UPDATE profile_stats SET <measured fields> WHERE protocol_id = ? AND endpoint_id = ?` | C10: the typed `update()` builder cannot express the column self-references the rule needs (`last_seen_at = MAX(last_seen_at, ?)`, `last_used_at = MAX(COALESCE(last_used_at, 0), ?)`) nor the conditional per-column mix of copied and skipped fields in one statement | No number recorded; maintenance path, one statement per collision. `purge_reason` and the traffic counters are deliberately absent from the SET list: the survivor's verdict and counters are its own. | `merge_keeps_survivor_purge_verdict_over_absorbed_measured_link`, `merge_dns_survivor_absorbs_ip_literal_and_takes_better_evidence` |
+| `src/merge.rs` `merge_memberships`: `UPDATE endpoint_groups SET last_seen_at = ? WHERE endpoint_id = ? AND group_id = ?` | C10: the fresher confirmation wins, and the survivor's display order stays | No number recorded. | `merge_moves_group_membership_and_resolves_collision` |
+| `src/merge.rs` `merge_links`: `UPDATE profile_stats SET last_used_at = ? WHERE protocol_id = ? AND endpoint_id = ?` after the moved links are bulk-upserted | C1 | The bulk upsert's VALUES tuple writes `last_used_at` as literal `NULL` and its SOURCE conflict action never restores it; the column's owner (`update_last_used`) cannot run inside this transaction. | `merge_dns_survivor_absorbs_ip_literal_and_takes_better_evidence` |
+| `src/profiles_query.rs` `profiles_count_with` and `page_ids_direct` (`profiles_page`), `profiles_walk_page`: `SELECT COUNT(*)` plus the ordered id `SELECT` built by `base_select`/`order_by` (the page's id list carries no binds; hydration is the site that inlines ids) | C2 (ordering through the covering index), C4 (the direct connection's uncached `prepare` avoids the per-text statement cache), C6 | Page path 488 ms typed against 49.6 ms inlined for 200 rows; the same ADR 0001 comparison measured 1,027 ms to 49.6 ms. The walk asks for the feed-wide total once instead of once per page, which was `O(feed²/200)` (92 `COUNT(*)` calls for one 18,334-endpoint batch, 2026-09-17). `profiles_walk_page` has **no production caller since 2026-10-01** (the batch walk freezes its id set up front); it stays as the streaming baseline for `ops/ping/flow_cost.rs`. The plan-scope predicate (`PlanScope::predicate`) is shared by page, walk and count so a scoped batch and its footer cannot drift. | `every_statement_runs_against_a_pushed_schema`, `page_order_matches_the_rust_oracle_for_every_sort`, `count_narrows_with_search_and_group_filters`, `walk_pages_match_the_page_ids_and_count_once`, `paging_visits_every_endpoint_exactly_once`, `the_direct_page_matches_the_toasty_page` |
+| `src/profiles_query.rs` `profiles_anchor`: one key `SELECT` through the ordering expressions, then a lexicographic `SELECT COUNT(*)` over the same terms and directions | C2, C7 | No number recorded. Exact for every sort and direction because it reuses `order_terms`, with each earlier term compared for equality and the current one strictly before. | `anchor_and_page_agree_after_a_weight_change`, `anchor_returns_each_rows_position_for_every_sort_and_direction`, `anchoring_works_on_a_row_carrying_only_the_weight_default` |
+| `src/profiles_query.rs` `load_page_projection`: one statement over `PAGE_PROJECTION`, ids inlined, `group_concat(hex(ip_key), ',')` for the address set | C6 (binding), C4 (uncached `prepare` on the direct connection), C7 (the aggregate expression) | One inlined-id statement returns the same 200 rows in 29 ms; the typed path's three IN-list hydration reads were ~480 ms of the 488 ms page cost (ADR 0001). A 200-row page carries ~600 binds. The correlated address aggregate costs +3.3 to +4.6 ms on an unresolved page and +6.1 ms fully resolved, against 389 ms for a correlated derived table with its own `ORDER BY`; the address aggregate figures are from the 2026-09-15 address-storage spec. The deferred JSON carriers are omitted so no JSON is decoded. | `page_projection_matches_the_orm_rows`, `page_projection_raw_matches_toasty`, `page_projection_keeps_the_requested_order_and_skips_empty_pages` |
+| `src/profiles_query.rs` `profiles_aggregate` (`aggregate_sql`): one `SELECT COUNT(*)` plus seven `SUM(CASE WHEN ...)` arms over `endpoint_rank`, per scope | C7, C6 | `alive` is `rank_newest_seen >= ? AND rank_alive = 1` for the global scope (live, because the swept `band` can lag) or `band = 0` for a view; `active` is the same with `rank_alive = 0` or `band = 1`. Three partition arms are the crate's own `PlanScope::predicate` strings verbatim (Successful, New, Failed), plus a `rank_stab <= 2` reliability arm and an `other` remainder, so a proven endpoint carrying bin 12 counts once. The statement is index-served: `endpoint_rank_key_v2` carries `rank_bin`, `rank_stab` and `rank_proven`, and `endpoint_rank_band_window` carries `rank_newest_seen`. It groups and sorts nothing. | `aggregate_buckets_partition_the_total`, `aggregate_alive_and_active_are_distinct_bands`, `aggregate_alive_is_live_for_the_global_scope`, `aggregate_view_total_matches_the_page_count`, `the_direct_aggregate_matches_the_toasty_aggregate` |
+| `src/export.rs` `open_export_reader`, `projection_sql`, `query_count`: dedicated turso connection, `PRAGMA journal_mode`, `BEGIN DEFERRED` (WAL) or `BEGIN CONCURRENT` (MVCC), one count statement, one ordered projection streamed row by row | C4 (the trait exposes no raw connection), C6 (toasty's public query and raw SQL return `Vec`; the driver drains physical `Rows` before toasty sees them, so no bounded row stream is reachable) | No number recorded. The reader is file-only and separate from toasty writes; it holds the process export gate, decodes one physical row at a time, and never materializes a feed-wide row or config vector. Ordering is deterministic (protocol kind, transport, security, address rank, key, host, port, ids). | `export::tests::alive_uses_canonical_link_tier_and_dns_resolution`, `export::tests::resolved_emits_each_dns_address_and_one_ip_literal` |
+| `src/driver/mod.rs` `Connection::exec`: `Operation::RawSql` routed to `Prepare::Uncached`, `Insert` and `QuerySql` kept on `Prepare::Cached` | C4 (the cache policy belongs to the driver boundary) | The leak: `turso_sdk_kit/src/rsapi.rs` `TursoConnection.cached_statements` has no capacity and no eviction. Reproduced on a copy of a real feed (11,585 endpoints): 400 page hydrations with fresh ids grew RSS +123,580 KiB, linear, ~309 KiB per call; the same page twice grew nothing; `profiles_page` (bound `?N`) stayed flat. A/B on identical unique texts: toasty `exec` +34,884 KiB over 300 calls (~116 KiB per call) against +0 for raw `turso::Connection::query`. Fix measured after: the same 400 hydrations plateau at +8 MB. Write side, 20-link slice, 200 windows: an identical stamp saturates at +1,752 KiB, a varying stamp grew +26,088 KiB linear, and at 200 links the pre-fix growth was +188,684 KiB. | `tests/cache_routing.rs` (0 KiB uncached against 59,336 KiB with the routing flipped to `Cached`), `file_db_link_window_writes_the_staged_values`, `contention_is_retryable_and_real_errors_are_not` |
+| `src/driver/mod.rs` `applied_migrations`, `apply_migration`: `CREATE_MIGRATIONS_TABLE`, `SELECT id FROM __toasty_migrations ORDER BY applied_at`, parameterized `INSERT INTO __toasty_migrations` | C4 (the migration trait sits at the driver boundary, one layer below the typed API) | No number recorded. The migration batch is applied as one atomic transactional batch. The crate's own runner (`schema::migrate`) does not call this path, so nothing in this repository pins it. | none |
+
+### Notes on the table
+
+- **Moved statements.** The RowCache change (2026-10-05) added **zero**
+  statements. It moved `apply_link_patches_tx` out of
+  `apply_link_patches_once` and `set_endpoint_ip_countries_once` out of the
+  per-address retry closure, so both run on the transaction the write-behind
+  driver opened. The SQL text and the 400-row chunk size did not change.
+  `apply_link_patches_once` keeps its public signature and still owns the
+  post-commit `endpoint_rank::refresh`; the driver's `LinkSpec::refresh` does the
+  same on the driver's transaction.
+- **Span placement.** `apply_link_patches_tx` and
+  `set_endpoint_ip_countries_once` deliberately carry no
+  `#[tracing::instrument(target = "db_method")]`. `DbMonitor` attributes a write
+  to the span that produced it, and the driver flushes from a background task, so
+  a short inner span would win attribution over the wrapper's longer one. The
+  span sits on `WriteBehind::flush` as `write_behind_flush`, which carries the
+  write-behind statements and the retry count.
+- **Transaction count, not statement cost.** The 2026-10-05 change reduced the
+  number of transactions around unchanged statements. Measured in
+  `crates/leas/src/ops/ping/flow_cost.rs` (`flow_cost_contention`, ADR 0008 perf
+  lab): the driver-backed trickle row records 32 commits for 4,028 arrivals at
+  125.9 rows per flush, against the ~8 a bare size trigger gives and 1,167 before
+  the driver.
+- **The lab's mixed import and geo arm proves nothing.** Every import
+  transaction in that arm fails deterministically: `upsert_protocols_bulk`
+  rejects a `Protocol` whose deferred `config` was not loaded, because the lab
+  builds its slice from `load_page_rows` and `fcf2a5f` ("no toasty `.include()`
+  on the profiles read path") stopped issuing `.include()` there. `fcf2a5f`
+  predates the write-behind change, the diff touches no `upsert_*_bulk`, and
+  `ArmFailures` discards both import rows, so the arm emits no row at all. Read
+  the geo arms and the trickle row instead.
+- **Geo durability window.** `GEO_DRAIN_INTERVAL` is 5 s, `GEO_FLUSH_AT` is 256
+  rows, and a bare tick commits only once the row floor (64, i.e.
+  `flush_rows / TIMER_FLOOR_DIVISOR`) is staged. The staleness deadline is
+  pinned at `GEO_MAX_STAGED_AGE` (15 s) through `WriteBehind::new_with_deadline`,
+  not left at the driver's 75-tick default, which at a 5 s tick would be 375 s.
+  Results are delayed, not lost: `spawn_geo_drain` takes one final `flush()` when
+  the shutdown token is set, and the page seed persists its own rows.
 
 ## 4. Toasty blockers, with the exact failures
 
-1. **Bulk upsert** — no `insert_many`/`on_conflict` (absent from
-   `toasty-0.11.0/src/stmt/` — `CreateMany` exists there but has no conflict
-   clause, see C1); single-item `upsert_by_*(…)` only. Cost of the missing
-   upsert semantics: the hand-built statement above, plus the manual `CHECK`
+1. **Bulk upsert.** No multi-row insert WITH a conflict clause: `CreateMany`
+   exists in `toasty-0.11.0/src/stmt/` but carries none (see C1), and
+   `upsert_by_*` is single-row only. Cost of the
+   missing semantics: the hand-built statement in §3, plus the manual `CHECK`
    spellings. **Re-verified 2026-10-01 against the vendored 0.11.0 source.**
-2. **Composite/mixed-direction/partial/expression indexes** — `#[index]`
-   documents "creates a non-unique index on the field". Cost: three raw DDL
-   statements at open, invisible to toasty's schema (guarded by every
-   `Database::open`/`in_memory` call in the suite executing the DDL).
-3. **Per-connection settings** — the driver owns connection creation.
-4. **Connection access** — `Db::driver() -> &dyn Driver` exposes no turso
+2. **Composite, mixed-direction, partial and expression indexes.** `#[index]`
+   documents "creates a non-unique index on the field". Cost: raw DDL at open,
+   invisible to toasty's schema, guarded by every `Database::open` and
+   `in_memory` call in the suite executing the DDL.
+3. **Per-connection settings.** The driver owns connection creation.
+4. **Connection access.** `Db::driver() -> &dyn Driver` exposes no turso
    connection, so `register_external_scalar_function`, `set_query_timeout` and
-   `interrupt` are still out of reach from the APP's side (RAW SQL is not:
-   `toasty::sql::query/statement` is the supported channel and is what every
-   site above uses).
-   **The `prepare_cached` control and `experimental_mvcc_passive_checkpoint` used
-   to be on this list and no longer are — the crate owns its driver.** The fork
-   in `crates/leas-db/src/driver/` routes `Operation::RawSql` through the
-   UNCACHED `prepare` and `Insert`/`QuerySql` through `prepare_cached`
-   (ADR 0012), so the unbounded per-text cache the published driver accumulated
-   (measured ~116–310 KiB per distinct text) cannot grow on the inlined-literal
-   path; and `file_driver` enables the MVCC passive-checkpoint flag. The
-   `Database::direct` raw connection STAYS for the page's execution-layer bypass,
-   which is a read win unrelated to the cache.
-5. **Schema management** — `push_schema` still emits `CREATE TABLE` with no
-   `IF NOT EXISTS`, but it is no longer guarded by a wipe tag: `crate::schema`
-   is the migration runner (ADR 0012). `PRAGMA user_version` is a CURSOR seeded
-   at `SCHEMA_VERSION` (18); a current file is a no-op, a fresh file applies the
-   seed, a supported older version applies the pending steps, and only an
-   UNKNOWN cursor is `IncompatibleSchema` (which `open` answers with the
-   pre-alpha wipe). Hand-written DDL lives in `schema/ddl.rs`, not scattered
-   through `ensure*`. See decision 4 in AGENTS.md.
-6. **No STRICT tables, generated columns, or materialized views** — see §5.
-7. **No caller-supplied driver** — `Database::open` builds `Turso::file(path)`
+   `interrupt` are out of reach from the app's side. Raw SQL is not:
+   `toasty::sql::query/statement` is the supported channel and is what every site
+   in §3 uses. The `prepare_cached` control and
+   `experimental_mvcc_passive_checkpoint` used to be on this list and no longer
+   are, because the crate owns its driver: `crates/leas-db/src/driver/` routes
+   `Operation::RawSql` through the UNCACHED `prepare` and `Insert`/`QuerySql`
+   through `prepare_cached` (ADR 0012), and `file_driver` enables the MVCC
+   passive-checkpoint flag. The `Database::direct` raw connection stays for the
+   page's execution-layer bypass, a read win unrelated to the cache.
+5. **Schema management.** `push_schema` still emits `CREATE TABLE` with no
+   `IF NOT EXISTS`, but it is no longer guarded by a wipe tag: `crate::schema` is
+   the migration runner (ADR 0012). `PRAGMA user_version` is a cursor seeded at
+   `SCHEMA_VERSION` (19); a current file is a no-op, a fresh file applies the
+   seed, a supported older version applies the pending steps, and a cursor that
+   names a pre-migration or foreign schema is `IncompatibleSchema`, which `open`
+   answers with the pre-alpha wipe. A cursor of 0 over foreign tables is also
+   `IncompatibleSchema(0)`: `push_schema` fails on a table it did not create, and
+   that failure is reported as the named verdict. Hand-written DDL lives in
+   `schema/ddl.rs`, not scattered through `ensure*` functions.
+6. **No STRICT tables, generated columns or materialized views.** See §5.
+7. **No caller-supplied driver.** `Database::open` builds `Turso::file(path)`
    internally, so an experiment with a driver flag (`.concurrent_writes()`, any
-   `experimental_*`) cannot reuse `open`: a probe has to rebuild the driver *and*
-   the `toasty::models!(…)` list itself. A `#[cfg(test)]`/example hook taking a
-   driver would remove that duplication. Still true AFTER the driver fork: the
+   `experimental_*`) cannot reuse `open`: a probe has to rebuild the driver and
+   the `toasty::models!(...)` list itself. A `#[cfg(test)]` or example hook taking
+   a driver would remove that duplication. Still true after the driver fork: the
    fork changed who owns the driver, not `open`'s signature.
 
 ## 5. Rejected manual paths (so they are not re-proposed)
 
 | Proposal | Verdict | Why |
 | --- | --- | --- |
-| Enable MVCC **as the default** (`Turso::concurrent_writes()`) | rejected | The original reasons were: a measured reader tax (p50 56.5 → 85.9 µs, p95 66.8 → 97.0 µs) and a **checkpoint gap** (`PRAGMA wal_checkpoint(PASSIVE)` failed with "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"). The checkpoint half is now FIXED, though the ORIGINAL mechanism recorded here was wrong: MVCC already auto-checkpoints on the commit path at a ~4.12 MB logical-log threshold, so the log was never unbounded; `file_driver` setting that flag changes the auto-checkpoint's MODE from blocking `Truncate` to `Passive` and lets `ping.rs`'s batch-end checkpoint run under MVCC at all. What still makes it an opt-in, per ADR 0012 D-D — three costs, all still live: **(a) it needs the Turso project's own `tursodb` rather than stock `sqlite3` (which answers `file is not a database`), and there is no VERIFIED convert-back — a documented `tursodb .dump | sqlite3` path turned out to be a data-loss trap (no `user_version` in the dump → the app wipes the reimported file) and not reproducible; (c) MVCC is SINGLE-PROCESS (the engine rejects multiprocess access), so a second instance is a hard failure; (b) real-feed throughput is unresolved and mixed by path.** It also adds a `<db>-log` file the wipe paths do not delete |
-| Hand-create tables as STRICT | rejected (for now) | STRICT gives **no storage and no speed change** (4,000 rows: 83 pages / 339,968 bytes in both schemas; a full-surface scan 2.72 ms heap vs 2.76 ms STRICT) and its only unlocks are validation and custom types. Its type vocabulary is also **flag-dependent**: without the custom-types flag `BIGINT` and `BOOLEAN` are `Parse error: unknown datatype` in a STRICT table (those are what toasty's DDL emits), and they become legal only with `experimental_custom_types(true)`. So adopting STRICT means hand-owning the **entire** schema DDL *and* turning on an experimental engine flag, for validation alone. (Typed toasty access on a hand-created STRICT table does work: verified create + read.) Revisit only if type validation becomes a requirement |
-| Custom types (`CREATE TYPE … BASE blob OPERATOR '<'`) for the address column | rejected | Reachable only with `experimental_custom_types(true)`; the packed-BLOB column already orders and indexes correctly (byte order IS address order) and needs no experimental flag. The operator would buy expressiveness, not speed, and duplicate an existing fact |
-| Split `endpoint_ip.ip_key` into `(family, addr)` | rejected | Requires the experimental custom-types flag for `array_agg` (which the driver then returns as TEXT — `String("{\"X'040A0001'\",…}")`, not `Value::List` of blobs, so the cheap decode is unreachable); the split is not cheaper (`group_concat(hex(addr))` 806 µs vs the shipped 724 µs per 200-row page); and it makes `PageSort::Ip` worse (the correct `(family, addr)` term needs two correlated subqueries: 16.49 ms vs 9.97 ms packed; the single-subquery variant cannot produce a pair) |
-| One-blob wire via `unhex(string_agg(hex(x), ''))` (the flag-free rewrite of the idea above — `test_array_agg_result_deserialize_to_ips`) | rejected — **correct but not faster** | Not gated (`string_agg`/`hex`/`unhex`/`FILTER` all work with the custom-types flag OFF), and its decoded output is **identical** to the shipped carrier (277 == 277 addresses on a resolved page). But it is the same cost within noise (statement 747–836 µs shipped vs 758–776 µs one-blob; decode 4.7 µs vs 4.6–7.4 µs) while the shipped text parse it would remove costs 8–14 µs per page, i.e. ≤0.4 %. Adopting it would also not fix the mixed-family trap below. If it is ever wanted, the decoder must WALK the packed key (family byte then 4/16 octets), never slice a fixed width |
-| Slicing one concatenated blob by a fixed address width | rejected — **incorrect** | On a `(endpoint_id, family, addr)` table the `chunks::<4>()` decode returned **367** addresses where the packed key holds 277: one width cannot describe a mixed IPv4/IPv6 set, so the decoder silently invents addresses. Two `FILTER`ed aggregates (per family) would be required, which is more engine work than the comma list |
-| `ANALYZE`, `likely()`/`unlikely()`, `wal_autocheckpoint`, `max_wal_size`, `mmap_size`, `cache_size` tuning | rejected | Measured neutral or non-existent; unknown PRAGMAs are silently ignored, so the tuning would be invisible rather than effective (details in the verification spec §2) |
+| Enable MVCC **as the default** (`Turso::concurrent_writes()`) | rejected | The original reasons were a measured reader tax (p50 56.5 to 85.9 µs, p95 66.8 to 97.0 µs) and a checkpoint gap (`PRAGMA wal_checkpoint(PASSIVE)` failed with "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"). The checkpoint half is fixed, though the original mechanism recorded here was wrong: MVCC already auto-checkpoints on the commit path at a ~4.12 MB logical-log threshold, so the log was never unbounded. `file_driver` setting that flag changes the auto-checkpoint's mode from blocking `Truncate` to `Passive` and lets `ping.rs`'s batch-end checkpoint run under MVCC at all. What keeps MVCC an opt-in (ADR 0012 D-D) is the reader tax and the remaining costs recorded there. |
+| Hand-create tables as STRICT | rejected (for now) | STRICT gives **no storage and no speed change** (4,000 rows: 83 pages and 339,968 bytes in both schemas; a full-surface scan 2.72 ms heap against 2.76 ms STRICT), and its only unlocks are validation and custom types. Its type vocabulary is flag-dependent: without the custom-types flag, `BIGINT` and `BOOLEAN` are `Parse error: unknown datatype` in a STRICT table (those are what toasty's DDL emits), and they become legal only with `experimental_custom_types(true)`. Adopting STRICT means hand-owning the entire schema DDL and turning on an experimental engine flag, for validation alone. Typed toasty access on a hand-created STRICT table does work (create and read verified). Revisit only if type validation becomes a requirement. |
+| Custom types (`CREATE TYPE ... BASE blob OPERATOR '<'`) for the address column | rejected | Reachable only with `experimental_custom_types(true)`; the packed BLOB column already orders and indexes correctly (byte order is address order) and needs no experimental flag. The operator buys expressiveness, not speed, and would duplicate an existing fact. |
+| Split `endpoint_ip.ip_key` into `(family, addr)` | rejected | Requires the experimental custom-types flag for `array_agg`, which the driver then returns as TEXT (`String("{\"X'040A0001'\",...}")`, not `Value::List` of blobs), so the cheap decode is unreachable. The split is not cheaper: `group_concat(hex(addr))` 806 µs against the shipped 724 µs per 200-row page. It also makes `PageSort::Ip` worse: the correct `(family, addr)` term needs two correlated subqueries, 16.49 ms against 9.97 ms packed, and the single-subquery variant cannot produce a pair. |
+| One-blob wire via `unhex(string_agg(hex(x), ''))` (`test_array_agg_result_deserialize_to_ips`) | rejected: **correct but not faster** | Not gated (`string_agg`, `hex`, `unhex` and `FILTER` all work with the custom-types flag off), and its decoded output is identical to the shipped carrier (277 == 277 addresses on a resolved page). It is the same cost within noise (statement 747 to 836 µs shipped against 758 to 776 µs one-blob; decode 4.7 µs against 4.6 to 7.4 µs), while the shipped text parse it would remove costs 8 to 14 µs per page, at most 0.4 %. It would not fix the mixed-family trap below. If it is ever wanted, the decoder must walk the packed key (family byte, then 4 or 16 octets), never slice a fixed width. |
+| Slicing one concatenated blob by a fixed address width | rejected: **incorrect** | On a `(endpoint_id, family, addr)` table, the `chunks::<4>()` decode returned 367 addresses where the packed key holds 277: one width cannot describe a mixed IPv4/IPv6 set, so the decoder silently invents addresses. Two `FILTER`ed aggregates, one per family, would be required, which is more engine work than the comma list. |
+| `ANALYZE`, `likely()`/`unlikely()`, `wal_autocheckpoint`, `max_wal_size`, `mmap_size`, `cache_size` tuning | rejected | Measured neutral or non-existent; unknown PRAGMAs are silently ignored, so the tuning would be invisible rather than effective (details in the verification spec §2). |
 
-## 6. Adding a manual path — checklist
+## 6. Adding a manual path: checklist
 
 1. Name the cause from §2. If none applies, use the typed API.
-2. Prefer inlined integer literals for our own ids/keys; `sql_lit` for text.
+2. Prefer inlined integer literals for ids and keys produced by this database;
+   use `sql_lit` for text.
 3. Keep the write inside the transaction that owns the fact, and never write a
    column group another owner writes.
 4. Make it idempotent if it runs at open (`IF NOT EXISTS`, `INSERT OR REPLACE`).
+   If it cannot be idempotent, put it in `schema/steps.rs` so the cursor gates
+   it, and never in `ensure_raw_ddl`.
 5. **Make a test actually run the new statement.** No guard is automatic: the
-   statement-vs-schema test covers only `profiles_query.rs`. For a link-writer
-   statement that means an `apply_link_patches_*` / `subscription_upsert…` test
-   (or a new one) that executes it against the pushed schema; for
-   `endpoint_rank`/`endpoint_ip` statements, a test on the path that calls them
-   (`link_writes_keep_the_stored_keys_current`,
-   `page_rows_assemble_links_and_protocols`, …). A raw statement added without
-   such a test is verified by nothing.
-6. Record the measurement (probe → this file's table or the relevant ADR). A raw
+   statement-versus-schema test covers only `profiles_query.rs`. A link-writer
+   statement needs an `apply_link_patches_*` test (or a new one) that executes it
+   against the pushed schema; an `endpoint_rank` or `endpoint_ip` statement needs
+   a test on the path that calls it.
+6. Record the measurement in §3 or in the relevant ADR, with its date. A raw
    statement without a number is a guess, and the next reader will "simplify" it.
 
 ## 7. Re-verify a blocker against the vendored source before relabelling it
 
-The causes in §2 are pinned to a **toasty version**, and a version bump can retire
-them silently. Nothing detects that: the blocker is prose, so a `0.10 → 0.11`
-find-replace looks like a correction while actually *asserting* every absence still
-holds.
+The causes in §2 are pinned to a toasty version, and a version bump can retire
+one silently. Nothing detects that: the blocker is prose, so a `0.10` to `0.11`
+find-replace looks like a correction while asserting every absence still holds.
 
-This is not hypothetical — it happened on 2026-10-01. Blindly relabelling toasty
-0.10 → 0.11 would have kept C1's "no multi-row `insert().values([…])`" as fact,
-when `toasty-0.11.0/src/stmt/create_many.rs` now provides exactly that
-(`CreateMany`, announced at `lib.rs:124`). Re-reading the source showed C1 is
-now **half retired**: the multi-row insert exists, the *conflict clause* does not
-(`grep -rl "on_conflict\|OnConflict" …/toasty-0.11.0/src/stmt` → nothing). C1 was
-requalified to name the capability that is actually missing, which is the one that
-still forces the hand-built statement.
+This happened on 2026-10-01. Blindly relabelling 0.10 to 0.11 would have kept
+C1's "no multi-row `insert().values([...])`" as fact, when
+`toasty-0.11.0/src/stmt/create_many.rs` provides exactly that (`CreateMany`,
+announced at `lib.rs:124`). Re-reading the source showed C1 was half retired: the
+multi-row insert exists, the conflict clause does not
+(`grep -rl "on_conflict\|OnConflict" .../toasty-0.11.0/src/stmt` returns
+nothing). C1 was requalified to name the capability actually missing.
 
-So:
-
-1. Cite the vendored path **with its version** (`toasty-0.11.0/src/…`), never a
-   bare version number — a stale path is worse than a stale number because it
+1. Cite the vendored path with its version (`toasty-0.11.0/src/...`), never a
+   bare version number. A stale path is worse than a stale number because it
    reads like a citation that was checked.
-2. Before changing a blocker, **grep the vendored source for the missing symbol**
-   and read what is there. A capability that APPEARED is a **retirement trigger,
-   not a retirement**: record that the trigger fired and what now carries the
-   site, then treat the migration as its own task with its own measurement. A
+2. Before changing a blocker, grep the vendored source for the missing symbol
+   and read what is there. A capability that appeared is a retirement trigger,
+   not a retirement: record that the trigger fired and what now carries the site,
+   then treat the migration as its own task with its own measurement. A
    requalified blocker is a documentation change; rewriting the SQL that depends
    on it is a code change, and it does not ride along on a doc edit.
-3. Distinguish "renamed" from "re-verified" in the text, and only claim what was
-   checked. **C1 and C2 were re-verified against `toasty-0.11.0` on 2026-10-01;
-   C3, C4, C5 and C6 have NOT been and carry no such marker.** C4/C6 were spot
-   confirmed incidentally while checking C1 (`Load::Output` for `List<M>` is
-   still `Vec<M::Output>`), but their prose is otherwise unverified against 0.11 —
-   so a future bump must re-check them rather than trusting the absence of a
-   date. A rule that claims more coverage than the table delivers is the same
-   defect it was written to catch.
+3. Distinguish "renamed" from "re-verified" in the text, and claim only what was
+   checked. C1 and C2 were re-verified against `toasty-0.11.0` on 2026-10-01; C3
+   to C7 have not been and carry no such marker. C8 to C10 are design causes,
+   so a toasty bump does not invalidate them. C4 and C6 were spot-confirmed
+   incidentally while checking C1 (`Load::Output` for `List<M>` is still
+   `Vec<M::Output>`), but their prose is otherwise unverified against 0.11, so a
+   future bump must re-check them rather than trust the absence of a date.
 
-## Weight columns and indexes (2026-10-01)
+## 8. Retired sites
 
-| Site | Cause | Why raw |
+| Retired site | Retired on | Replaced by, or why not to revive it |
 | --- | --- | --- |
-| `ALTER TABLE endpoint_rank ADD COLUMN rank_weight BLOB NOT NULL DEFAULT x'0000000000000000'` (`schema/ddl.rs`; the runner tolerates the duplicate-column error) | The weight must be materialized where SQL can `ORDER BY` it. Declaring it on the toasty model would change the pushed schema, and the only lever for that is the schema cursor — where decision 4 would make an unexplained bump a wipe. The raw-column precedent (`band`) is the non-destructive path. | The model has no seat for a raw column, so the write path carries a `RankRow` instead. `NOT NULL DEFAULT` is required, not stylistic: `profiles_anchor` binds each ordering term's value back and the engine refuses to type a NULL there, so a NULL weight makes the anchor query ERROR. |
-| `CREATE INDEX IF NOT EXISTS endpoint_rank_key (band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id)` | Serves the `PageSort::Test` ORDER BY as an index scan (Active Test page **1.52 ms at 50k scale**; 8.6 ms at 7,672 endpoints) instead of a filesort. | toasty's `#[index]` is single-column and cannot express a mixed-direction composite. **A new name is mandatory**: `IF NOT EXISTS` makes an edited column list a silent no-op on every existing database, so the old index would keep serving the new ORDER BY. |
-| `CREATE TABLE IF NOT EXISTS rank_weight_meta (id INTEGER PRIMARY KEY CHECK (id = 0), weight_version INTEGER NOT NULL)` | The weight tables are compiled into the binary, so an app upgrade silently invalidates every stored weight. | A one-row stamp is the smallest thing that can say "these numbers came from a different build". A mismatch recomputes every rank key at open — the only trigger that can replace the all-zero default that `ADD COLUMN` materializes for pre-existing rows. |
-| `INSERT … SELECT`-free weight backfill (`backfill_all` reads `Protocol::all()`) | SQL cannot call the Rust `weight_of`. Duplicating the four tables as a SQL `CASE` expression would create a second owner of the law — exactly the drift ADR 0003 exists to prevent. | The weight is derived from `transport_type`/`security_type`/`security_sni`/`security_fp`, four small scalar columns the protocol row already stores. |
-| `refresh`'s `LEFT JOIN protocols pr ON pr.id = ps.protocol_id` | The link row carries no protocol, so the weight cannot be derived from `profile_stats` alone. | Four discriminator columns (`transport_type`, `security_type`, `security_sni`, `security_fp` — `proto_kind` is deliberately not a weight dimension) cost one indexed lookup per link inside a statement the refresh path already issues; the deferred `config` JSON stays unloaded. They are parsed with `TransportType::from_db_label`, NOT `FromStr`: toasty's embed writes `http_upgrade`/`x_http` where the wire form says `httpupgrade`/`xhttp`, and the wrong parser silently persists a zero weight for 314 of ~21k real protocol rows. |
-
-## Purge candidate scan moved out of the write transaction (2026-10-02)
-
-| Site | Cause | Why raw |
-| --- | --- | --- |
-| `purge_expired_once`'s candidate `SELECT e.id FROM endpoints e WHERE NOT EXISTS (…)` split into an **outside-transaction** scan plus an in-transaction **re-check** over the candidate ids only (`database.rs:1440+`) | The scan used to run INSIDE the write transaction, which turned a read-only full-table walk into a write-lock hold. The 2026-10-01 run measured that statement at **3,098 ms** on 74,014 endpoints — a three-second lock on the single database handle, from a statement that only reads. Every concurrent writer (import chunks, the enrichment geo flush, the link-writer window) queued behind it, and that queue is where the `snapshot is stale` aborts came from. | Unchanged as raw: toasty's `.all()` quantifier compiles to a whole-table projection (145 ms). What changed is **placement, not the statement**: the scan is now a plain read on `conn`, and the write transaction opens only for the re-check and the cascade. The re-check is what closes the race the split introduces — an endpoint that gained a link between the two statements must not be deleted with a live link — and it is bounded by the candidate set, so it is an index seek rather than a scan. Ids are inlined as literals in the re-check, the convention every other raw statement here uses (~0.8 ms per bound id). |
-
-**Measured effect:** the write transaction is now bounded by the DELETE count, not by the scan. `purge_expired`'s cost moves to a plain read that blocks no writer.
-
-## Import upserts: two of three families moved to multi-row (2026-10-02)
-
-| Site | Cause | Measured |
-| --- | --- | --- |
-| `upsert_endpoints_bulk` — one multi-row `INSERT … VALUES (…),(…) ON CONFLICT("id") DO UPDATE` per 400 rows, replacing one typed upsert per row | The typed builder cannot batch. The 2026-10-01 run issued **105,147 statements** for this family alone. | ~263 statements for the same rows. `AGENTS.md` decision 22 already carried the finding ("the import path's per-row typed upserts 360 ms per 2,000 links against 44.3 ms"); the fix had never been applied to this path. |
-| `upsert_endpoint_group_links_bulk` — same shape on `("endpoint_id","group_id")` | The largest single family: **204,592 statements**, half the import's total, because a 500-URL batch touches one endpoint once per protocol and each was its own statement. | ~511 statements. |
-
-**db-rewamp D10: the endpoints writer now writes `domain`/`sub_domain`, not `host`/`host_type`.**
-The `HostType::as_db_label()` round-trip this section used to require is gone with the columns: the
-stored TEXT is the psl2 split itself — `domain` (eTLD+1) plus `sub_domain` (the labels left of it),
-both empty for an IP-literal or exotic host — so a mistyped split, not a mistyped enum label, is the
-failure mode. `multi_row_import_writers_round_trip_through_a_real_database` reads the `domain` column
-back **as text** rather than through the typed loader (which would hide the error) and asserts the
-split's expected value per host kind; `multi_row_endpoint_upsert_replaces_and_preserves` proves the
-upsert replaces `domain`/`port` and leaves `manual_protocol_override` and `resolved_at` alone — the
-import does not own them. An IP-literal endpoint's address is written to `endpoint_ip` alongside its
-row (`state::persist_parsed`, `SourceSpec::write_window`), pinned by
-`streaming_import_splits_and_persists_in_batches` — the literal has no other home once `host` is
-dropped.
-
-### `upsert_protocols_bulk` is DELIBERATELY NOT converted
-
-99,728 statements, the remaining quarter. It needs three enum labels (`proto_kind`,
-`transport_type`, `security_type` — the feed stores `shadowsocks2022`, `http_upgrade`, `x_http`,
-which are **not** `as_str()`/`FromStr` spellings; see the same trap documented in
-`proto_spec/kinds.rs`) **and** the storage encoding of the `transport.data` / `security.data`
-JSON columns, which has not been verified here. Writing raw SQL against `protocols.config` without
-that would risk a row the connect path cannot read — a worse failure than a slow import. **Blocker:
-a writer-side `as_db_label` for `TransportType`/`SecurityType`/`ProtocolKind`, each with a
-DB round-trip test**, and the confirmed encoding of the two JSON blob columns. This entry is the
-record of that deferral, not an omission.
-
-## Enrichment country writes: one owner, one transaction per drain (2026-10-02)
-
-The resolution task no longer writes. It **stages** `(endpoint, address, country)` into the
-process-global `leas_db::WriteBehind<CountrySpec>` driver and returns without awaiting; the
-driver task started from `ui::run` writes the window with `set_endpoint_ip_countries_once` on the
-transaction IT opened — **one transaction**, no nested connection.
-
-**Why a cross-host buffer and not per-host batching.** `spawn_dns_resolve_host` already loops its
-`waiters`, so "collect the per-host rows and call `set_endpoint_ip_countries` once" only collapses
-transactions when a host has more than one waiter — and the 2026-10-01 run says it almost never
-does: **933 lookups, 1,577 deferred HALVES (≈788 distinct links), 790 per-address invocations**, so
-`waiters.len() ≈ 1`. Per-host batching would have been very nearly a no-op.
-
-**What the damage actually was.** The per-address writer's isolated cost is **108 µs**; production
-p99 was **1,051 ms** — a ~9,700× multiplier produced by *concurrent* single-row write transactions,
-not by cheap writes. So the transaction count is the thing to reduce, and only accumulation across
-hosts reduces it.
-
-**A failed flush RE-STAGES.** The old loop `break`ed on the first error and abandoned the host's
-remaining waiters — the source of the run's **88 `country persist failed` aborts**. The driver
-re-stages the failing window AND every later one, and a re-stage never clobbers a newer push for the
-same endpoint, so it cannot grow without bound.
-
-**Durability window:** the driver's tick is `GEO_DRAIN_INTERVAL = 5 s` and its window is
-`GEO_FLUSH_AT = 256` rows. A bare tick commits only once the row floor (`flush_rows / 4`, i.e. 64)
-is staged — that is what buys transaction size, per the `TIMER_FLOOR_DIVISOR` table — with the
-staleness DEADLINE as the net for a trickle too slow to reach it. The deadline is **pinned at
-`GEO_MAX_STAGED_AGE = 15 s`** through `WriteBehind::new_with_deadline`, not left at the driver's
-`75`-tick default, which at a 5 s tick would have been 375 s: sixty-odd times the hard ceiling the
-hand-rolled loop had. Results are delayed, not lost: `spawn_geo_drain` takes one final `flush()`
-when `shutdown_token` is set, and the page seed persists its own rows. This is the same trade the link writer's
-`max_staged_age` makes, and it is recorded here for the same reason.
-
-## RowCache write-behind: the same statements, a caller-owned transaction (2026-10-05)
-
-**No new raw SQL.** The RowCache migration replaced three bespoke writers (`LinkWriter`,
-`GeoQueue`, the per-chunk import commits) with the generic `WriteBehind<Spec>` driver
-(`crates/leas-db/src/write_behind.rs`, added in this change). It added **zero** statements to
-this inventory: `write_behind.rs` contains no production SQL at all — only test fixtures
-(`fake_state`) and an assertion statement. Every site below is a **move**, recorded here so a
-reader diffing the file does not mistake a relocated statement for a new exception.
-
-| Site | Change | Why |
-| --- | --- | --- |
-| `database.rs` `apply_link_patches_tx` | **MOVED.** The upsert loop was extracted out of `apply_link_patches_once` and now takes `(&mut impl toasty::Executor, &[LinkPatch], now)` instead of opening and committing its own transaction. The SQL text, the eight group buckets, and `LINK_STATEMENT_ROWS = 400` are unchanged; so is the wrapper's post-commit `endpoint_rank::refresh` on a second connection. | `LinkSpec` must run the write inside the transaction the DRIVER opened, so the retry and the commit belong to one owner. The wrapper `apply_link_patches_once` keeps its old signature and still calls it, so **nothing moved out of a transaction**. The one deliberate behaviour change is the driver's: `LinkSpec::refresh` calls `endpoint_rank::refresh` on the transaction it is about to commit, making the rank keys atomic with the write that invalidated them instead of a post-commit repair whose failure was only logged. |
-| `database.rs` `set_endpoint_ip_countries_once` (`pub`) | **MOVED.** The per-row loop that was inlined in `set_endpoint_ip_countries`'s retry closure became a free `pub async fn` over `&mut impl Executor`. The statement is still `endpoint_ip::set_country` per row; no statement was rewritten. | `CountrySpec` opens its own transaction. A call that opened a *second* connection inside the driver's tx would deadlock on itself, and a second `retry_on_busy` inside the driver's retry would double the retry budget. |
-| `upsert_endpoints_bulk`, `upsert_endpoint_group_links_bulk`, `upsert_protocols_bulk`, `upsert_links_bulk` | **UNCHANGED**, but their callers moved: `stream_import` now hands whole batches to `WriteBehind<SourceSpec>`, which commits once per window instead of once per chunk. | Same statements, fewer commits around them. |
-
-**The transaction count is the thing that changed, so it is the thing to measure.** §3's numbers
-are per-statement costs and are unaffected; what the migration removes is the *number of
-transactions* around them. The measurement lives in
-`crates/leas/src/ops/ping/flow_cost.rs` (`flow_cost_contention`, the ADR-0008 perf lab), in
-the AFTER-NUMBERS block inside that function: the **driver-backed trickle row** is the direct
-evidence (32 commits for 4,028 arrivals, 125.9 rows/flush, against the ~8 a bare size trigger
-gives and 1,167 pre-driver).
-
-**Its mixed import+geo fan-in arm is currently unusable and proves nothing.** Every import
-transaction in that arm fails deterministically — `upsert_protocols_bulk` rejects a `Protocol`
-whose deferred `config` was not loaded, because the lab builds its slice from `load_page_rows`
-and `fcf2a5f` ("no toasty .include() on the profiles read path") stopped issuing `.include()`
-there. `fcf2a5f` is an ancestor of this migration's base, the diff touches no `upsert_*_bulk`,
-and `ArmFailures` correctly DISCARDs both import rows, so **the arm emits no row at all** — read
-the geo arms and the trickle row instead, and do not read a before/after into a number that was
-never recorded.
-
-**No `db_method` span on the tx-scoped pair; one on the flush instead.** `apply_link_patches_tx`
-and `set_endpoint_ip_countries_once` deliberately carry no
-`#[tracing::instrument(target = "db_method")]` while their public wrappers do. A span is an
-attribution, and `DbMonitor` attributes a write to the span that produced it — the driver flushes
-from a background task, so a short inner span on a tx-scoped callee would win the attribution over
-the wrapper's longer one and make the write look cheaper and shorter than the transaction it is
-actually inside.
-
-So the span sits one level UP, on `WriteBehind::flush` itself, named `write_behind_flush`: it is
-the span that owns the transaction the driver opened, and it is what carries the write-behind
-statements and the `retries` count. Without it the tx-scoped callees' deliberate silence left every
-write-behind `toasty::query` event with no enclosing `db_method` span, so they all landed in the
-`unattributed` bucket and the public `apply_link_patches` / `set_endpoint_ip_countries` rows read
-zero in production even though those methods were being called.
-
-## The driver's statement cache is unbounded — hydrate on the raw connection (2026-10-08)
-
-**Symptom.** A long session (imports + tests + a feed-wide batch) reached ~1.5 GB RSS on a
-13 MB database. Reproduced headlessly against a copy of a real feed (11,585 endpoints):
-400 page hydrations with fresh ids grew RSS **+123,580 KiB, linear** (~309 KiB/call); the
-same page twice over grew nothing (text-keyed, saturates); `profiles_page` (bound `?N`)
-stayed flat.
-
-**Cause (C4, measured).** `turso_sdk_kit/src/rsapi.rs` —
-`TursoConnection.cached_statements: HashMap<String, Arc<CachedStatement>>`: no capacity, no
-eviction. `prepare_cached` inserts one entry per SQL **text**, each holding a compiled
-`Arc<turso_core::PreparedProgram>`. The PUBLISHED `toasty-driver-turso-0.11.0/src/lib.rs:1254`
-routed **every** statement through it (`exec_sql_inner`). An inlined-literal statement is a
-new text on every call, so the page hydration (ids inlined for the C6 perf win) compiled and
-retained a program per page — forever. An A/B on identical unique texts: toasty `exec`
-**+34,884 KiB / 300 calls** (~116 KiB/call) against the raw `turso::Connection::query`
-**+0 KiB**.
-
-**Fix (2026-10-08 — supersedes the earlier `Database::direct`-as-escape-hatch account).** The
-crate now OWNS its driver (`crates/leas-db/src/driver/`, ADR 0012), and the fix is at the
-boundary the leak lives on: `Connection::exec` routes `Operation::RawSql` — the hand-built,
-literal-inlined statements that `toasty::sql::query`/`statement` produce — through the
-UNCACHED `prepare`, and keeps `prepare_cached` for the engine-generated `Insert`/`QuerySql`
-(stable text, compile-once). No LRU, no counter, no second connection. The old `sql_exec.rs`
-`SqlConn` seam and `Database::write_conn` are RETIRED; `Database::direct` STAYS only because
-it serves the page's execution-layer bypass (a read win, unrelated to the cache) and its
-`exec_raw` reads still decode with the fork's `from_turso_infer`. A file db takes the raw
-path; an in-memory db keeps the toasty path, which is the oracle the raw path is pinned to
-(`page_projection_raw_matches_toasty`).
-
-**Measured after:** the same 400 fresh-id hydrations plateau at **+8 MB** (was +123 MB), and
-the routing itself is pinned by `tests/cache_routing.rs` (0 KiB uncached vs 59,336 KiB when
-the routing is flipped to `Cached`).
-
-**The write side, same owner (2026-10-08).** The leak is not read-only. `WriteBehind<LinkSpec>`
-(and the same `apply_link_patches_tx` / `exec_link_upsert` / `upsert_endpoints_bulk` /
-`upsert_endpoint_group_links_bulk` / `endpoint_rank::write` bodies) INLINE their literals, so a
-flush window's SQL text varies on every call. Measured on a file db, 20-link slice, 200
-windows: an IDENTICAL stamp **saturates at +1,752 KiB**, a varying stamp **grows +26,088 KiB
-linear** — and at 200 links the pre-fix linear growth was **+188,684 KiB**. The typed writers
-(`upsert_protocols_bulk`, `endpoint_ip::set_country`) bind their values, so their text is
-stable and they do NOT leak.
-
-**Fix — the crate owns its driver (2026-10-08).** Rather than dodge the cache from a SECOND
-connection, the crate now VENDORS a local-only fork of `toasty-driver-turso`
-(`crates/leas-db/src/driver/`, from toasty `main` at its `turso = "0.8"` bump) and fixes the
-cache at its boundary: `Connection::exec` routes `Operation::RawSql` — the hand-built,
-literal-inlined statements — through the UNCACHED `prepare`, and `Insert`/`QuerySql` (stable,
-engine-generated text) through `prepare_cached`. That is the same boundary the leak lives on, so
-no LRU, counter, or flush threshold is needed. The old `sql_exec.rs` `SqlConn`/`RawConn` seam,
-`CacheSpec::RAW`, `write_window_raw`/`refresh_raw`, the manual `BEGIN`/`COMMIT`, and
-`Database::write_conn` are RETIRED; the bulk writers run on the POOLED driver and keep their
-literal-inlining win. (`Database::direct` stays — it serves the page's execution-layer bypass, a
-~80x read win unrelated to the cache.)
-
-**Busy classification is load-bearing.** `export::turso_error` flattens every turso error to
-`DatabaseError::Generic`, which `is_busy_error` rejects — so an MVCC commit conflict or a WAL wait
-would be a PERMANENT failure that re-stages the window instead of retrying, the one class
-`retry_on_busy` exists for. The fork's `driver::error::classify_turso_error` keeps
-`Busy`/`BusySnapshot`/`"conflict"` retryable (a toasty serialization failure), pinned by
-`contention_is_retryable_and_real_errors_are_not`.
-
-**Measured after:** the write-side leak is fixed AT THE SOURCE (the `RawSql` arm no longer
-touches the per-text cache), so no raw-connection workaround remains. The write path is pinned by
-`file_db_link_window_writes_the_staged_values` (a real file db) plus the existing write-behind
-suite.
-
-**Resolved by the driver fork (2026-10-08).** `SourceSpec::write_window` used to mix the raw
-families with the TYPED `upsert_protocols_bulk` in one transaction across two sessions. That
-split is GONE: every helper now takes `&mut impl toasty::Executor`, so the whole window — raw
-families and the typed protocols writer alike — runs on ONE pooled transaction, and the
-inlined-literal statements are served by the fork's uncached `RawSql` route. No raw protocols
-INSERT or two-tx split is needed.
+| `sql_exec.rs` `SqlConn`/`RawConn`, `CacheSpec::RAW`, `Database::write_conn`, `write_window_raw`, `refresh_raw`, the manual `BEGIN`/`COMMIT` around them | 2026-10-08 | The driver fork's uncached `RawSql` route (`driver/mod.rs`). The SQL text is unchanged; only the executor routing is. Reintroducing a second connection would re-create the transaction split the fork removed. |
+| `Database::direct` used as the statement-cache escape hatch | 2026-10-08 | The connection stays, but only as the page's execution-layer bypass (a read win). The leak it used to dodge is fixed at the driver boundary; do not route new bulk SQL through it for cache reasons. |
+| `endpoint_rank_key` (v1 column list without `rank_stab`) | 2026-10-09 | `endpoint_rank_key_v2`, with `rank_stab` in the order and `rank_proven` trailing. The old index is dropped by `ENDPOINT_RANK_KEY_DROP`. |
+| The DDL inside `endpoint_rank.rs::ensure_in` | 2026-10-08 | `schema/ddl.rs`, run by the migration runner before `ensure_in`. `ensure_in` now owns DATA only. |
+| The per-address country writer inside `set_endpoint_ip_countries` (one transaction per address, then one `endpoint_ip::set_country` per row) | 2026-10-02 | First replaced by the write-behind driver, which commits once per drain instead of once per address; the per-row statement inside it is now `endpoint_ip::set_countries_bulk`, one multi-row upsert per 400 rows. The measurements in §3 are the evidence for batching, not a reason to return. |
+| `profiles_walk_page` as a production path | 2026-10-01 | The batch walk freezes its id set up front (`PlanWalk::next_page`). The method stays as the streaming baseline for `ops/ping/flow_cost.rs`; do not add a UI caller. |
+| Separate statements for `endpoint_ip` import (delete then insert per endpoint) | db-rewamp D10 | `endpoint_ip::insert_literals_bulk`, with `DO NOTHING` so a stored country survives a re-import. |

@@ -1,8 +1,38 @@
-# Transcript — tiny-80x14
+# Transcript: tiny-80x14 (2026-10-14)
 
-Verbatim report returned by `run_scenario(script=2026-10-14-132534-scenario-tiny-80x14.md, session_id=tiny-80x14)`
-on 2026-10-14, executed in-process from the `/home/user/oss/mcp-tui-test` v0.3.0 checkout (Python 3.14.7, pyte 0.8.2).
-The runner patches pyte's `Screen.display` before the call (see the scenario document's *Tooling friction*); nothing else is changed.
+Verbatim report of one `run_scenario` call on 2026-10-14. The expectations, the script and the findings
+live in [the scenario document](2026-10-14-132534-scenario-tiny-80x14.md); this file holds only what the
+harness returned.
+
+## Purpose and scope
+
+Records the harness report for session `tiny-80x14`, unchanged: every step, its status, its duration, and
+every screen or line it read. Use it to check a quote in the scenario document or the review; it contains
+no analysis of its own.
+
+## Environment and fixtures
+
+| Field | Value |
+|---|---|
+| Produced by | `run_scenario(script=2026-10-14-132534-scenario-tiny-80x14.md, session_id=tiny-80x14)` |
+| Date | 2026-10-14 |
+| Harness | mcp-tui-test 0.3.0, executed in-process from the `/home/user/oss/mcp-tui-test` checkout, Python 3.14.7, pyte 0.8.2 |
+| Session / mode / size | `tiny-80x14` / buffer / 80x14 |
+| App under test | leas 0.1.0 debug build `13e132f2…`, `/home/user/oss/xray-tui/target/debug/leas` |
+| Fixture | `fixtures/config.json` plus `fixtures/seeded/data.db`, copied to `/home/user/.cache/leas-tui/tiny-80x14` |
+
+The runner patches pyte's `Screen.display` before the call; nothing else is changed. Harness limits and
+that patch are documented once in [INDEX.md](INDEX.md).
+
+## Expected behaviour (written before the run)
+
+Five expectations, E1–E5, in the scenario document's *Expected behaviour* table.
+
+## Scenario script
+
+The 12-step script is in [the scenario document](2026-10-14-132534-scenario-tiny-80x14.md).
+
+## Observed behaviour
 
 ```text
 Scenario document: tiny-80x14 — leas at 80x14 — the compact one-line actions bar the <20-row layout selects, a table viewport that clips one endpoint, and F1's overlay that replaces the content area
@@ -119,3 +149,13 @@ steps: 12 · errored: 0 · session closed
 ok: True | action: executed | session_alive: False
 rescue_files: []
 ```
+
+## Corrections to expectations
+
+Recorded in [the scenario document](2026-10-14-132534-scenario-tiny-80x14.md): E1 was PARTIAL because the
+compact bar mirrors the newest log line, which read `| startup: …` at step 4 and `| Whitelist loaded` at
+step 11. A transcript itself reports what happened.
+
+## Verdict
+
+12 steps, 0 errored, session closed; `ok: True`, `rescue_files: []`.

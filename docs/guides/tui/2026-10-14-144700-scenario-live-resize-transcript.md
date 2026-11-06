@@ -1,8 +1,12 @@
-# Transcript — live-resize
+# Transcript: live-resize (2026-10-14)
 
 Verbatim report returned by `run_scenario(script=2026-10-14-144700-scenario-live-resize.md, session_id=live-resize)`
 on 2026-10-14, executed in-process from the `/home/user/oss/mcp-tui-test` v1.0.1 checkout (Python 3.14.7, pyte 0.8.2, Pillow).
 The runner no longer patches anything: 1.0.0 fixed the wide-char crash upstream and renders the cell grid itself.
+
+Nothing inside a fence has been edited. The `Command:` line and screenshot path in the captures show the
+checkout directory as it was named at run time, kept verbatim for provenance; the project and binary are
+`leas`.
 
 ```text
 Scenario document: live-resize — leas driven through live resizes with the resize tool — 120x40 to 80x24 to 80x19 (the overlay branch a fresh small launch never reaches) back to 120x40, checking the layout and any residue

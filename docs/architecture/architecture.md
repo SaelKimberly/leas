@@ -1,864 +1,300 @@
-# leas Architecture
+# leas architecture
 
-## Crate Dependency Graph
+How the workspace is put together: which crates exist, what each one owns, where the process boundaries are, what `AppState` and `CoreEvent` carry, which screens exist, and how a batch ping runs end to end. It does not cover keybindings and workflows (see [`../guides/tui-manual.md`](../guides/tui-manual.md)), the reasons behind a choice (see [`decisions.md`](decisions.md)), or the database schema (see [`../reference/database.md`](../reference/database.md)).
 
-```
-leas (bin)
-  ├── leas-core     (Protocol, CoreType, resolve_core, config_builder, process, log_heed)
-  │     └── leas-proto  (ProtocolConfig types, per-kind binary identity, URL parsing, Clash YAML)
-  ├── leas-native   (in-process runtime backend — VLESS/VMess/Trojan/Hysteria2 tunnels, SOCKS5 + HTTP CONNECT inbounds, capability gate, telemetry)
-  │     ├── leas-tls   (ring TLS 1.3 + TLS 1.2-fallback client, browser fingerprints, REALITY client)
-  │     ├── leas-route (first-match routing engine for the local inbounds — TLS/HTTP/QUIC sniffing)
-  │     └── leas-proto (typed ProtocolConfig/EndpointEssentials — config source of truth)
-  ├── leas-db       (toasty ORM + direct Turso streaming export reader)
-  ├── leas-config   (AppConfig load/save, import_export, forms, permissive_json)
-  │     └── leas-proto  (ProtocolConfig types + EndpointEssentials for import/export round-trip)
-  ├── leas-dns      (DNSCrypt-stamp DNS resolution — enrichment pipeline)
-  ├── leas-geoip    (GeoLite2-City country/city lookup — enrichment pipeline)
-  └── leas-host-features  (SNI/IP/CIDR whitelist membership — enrichment pipeline)
-```
+## Workspace layout
 
-`leas → leas-native` is an unconditional path dependency (no feature
-flag, `crates/leas/Cargo.toml`): the native core is a **runtime backend**
-chosen per connect alongside the two subprocess backends, not a library-only
-tunnel implementation. Nothing native is persisted — the decision is recomputed
-on every connect (see "Data Flow: Connect to Proxy"), so no DB row, no
-generated core config and no share link ever names it. Design brief:
-`docs/architecture/native-core-integration.md`; per-protocol status: `docs/reference/native-core.md`.
+`Cargo.toml` declares `members = ["crates/*"]`, resolver 3, edition 2024, rust-version `1.99.1`, workspace version `0.1.0`. Twelve crates exist:
 
-	Build tooling: `leas-hakari` (crates/leas-hakari/) is a cargo-hakari
-	generated feature-unification crate — every workspace member depends on it,
-	its dependencies exist only to unify feature flags and are never referenced
-	from code. Regenerate after any Cargo.lock change (`cargo hakari generate`).
-	The `hakari-check` gate runs `cargo hakari generate --diff`,
-	`cargo hakari manage-deps --dry-run` and `cargo hakari verify`;
-	`--dry-run` is what catches a member missing the workspace-hack dependency,
-	and `verify` alone does not.
+`leas`, `leas-config`, `leas-core`, `leas-db`, `leas-dns`, `leas-geoip`, `leas-hakari`, `leas-host-features`, `leas-native`, `leas-proto`, `leas-route`, `leas-tls`.
 
-## Crate Responsibilities
+## Crate dependency graph
 
-### leas (binary crate)
+Edges are runtime dependencies from each `crates/*/Cargo.toml`. `leas-hakari` is omitted: every member depends on it (see below).
 
-Entry point at `crates/leas/src/main.rs`. Creates the tokio async runtime, initializes all subsystems, enters the ratatui event loop.
-### Whole-database export
-
-`leas-db/src/export.rs` owns the file-backed direct Turso read path. Toasty 0.11 public/raw APIs buffer values, so export opens a fresh dedicated Turso connection, applies the existing WAL/MVCC journal-mode authority, begins the matching read transaction, and drains ordered rows before commit/rollback. `leas/src/ops/export.rs` owns scope policy, Resolved host transformation, and bounded clipboard/file sinks; `ui/export.rs` owns popup interaction. Export never uses a second fallback serializer.
-
-The clipboard sink is not a direct `arboard` call. `arboard::Clipboard` on Linux *is* the X11 selection owner, so `ops/clipboard.rs` keeps one process-lifetime handle (`LazyLock<Mutex<Option<Clipboard>>>`) and every copy/paste site goes through it — export, the three logs-copy paths, and the paste/copy-URL keys. A per-call handle destroys the serving window in `Drop`, leaving the payload readable only if a clipboard manager wins a 100 ms handover race; without one (headless, SSH, bare X) the app logs a successful export and the clipboard never changes.
-
-**Shared state** (`crates/leas/src/state.rs`):
-
-```rust
-pub struct AppState {
-    pub db: Arc<Database>,
-    pub config: AppConfig,
-    /// Currently selected theme name.
-    pub theme_name: ratatui_themes::ThemeName,
-    pub current_tab: Tab,
-    pub endpoints: Vec<EndpointRow>,
-    pub cached_filtered_indices: RefCell<Vec<usize>>,
-    pub filter_cache_valid: Cell<bool>,
-    pub endpoints_gen: u64,
-    pub groups: Vec<Group>,
-    pub purgatory_view: PurgatoryView,
-    pub purgatory_ttl_secs: i64,
-    pub purgatory_retention_secs: i64,
-    pub selected_index: usize,
-    pub selected_sub: Option<usize>,
-    pub log_scroll: usize,
-    pub log_select_anchor: Option<usize>,
-    pub sort_column: SortColumn,
-    pub sort_ascending: bool,
-    pub search_query: String,
-    pub search_focused: bool,
-    pub connected_core: Option<CoreType>,
-    pub connecting: bool,
-    pub system_stats: Option<grpc_client::SysStats>,
-    pub native_activity: NativeActivityLog, // session-scoped native trace ring (2000 rows)
-    pub sniffer: SnifferState, // session-scoped per-host accounting (1 s snapshots, 60-sample rate ring)
-    pub log_cache: VecDeque<LogLine>,
-    pub log_has_older: bool,
-    pub log_seek_home: bool,
-    pub connection_error: Option<String>,
-    pub core_event_rx: Option<mpsc::Receiver<CoreEvent>>,
-    pub core_event_tx: Option<mpsc::Sender<CoreEvent>>,
-    pub disconnect_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    pub should_quit: bool,
-    pub mode: AppMode,
-    pub previous_mode: Option<Box<AppMode>>,
-    pub multi_select: HashSet<i64>,
-    pub clipboard: Option<String>,
-    pub confirmation: Option<ConfirmAction>,
-    pub updating_groups: HashSet<String>,
-    pub testing_profiles: HashSet<i64>,
-    pub testing_details: HashMap<i64, TestType>,
-    pub update_status: HashMap<CoreType, BackendUpdateStatus>,
-    pub actions_compact: bool,
-    pub connected_protocol_id: Option<i64>,
-    pub speed_test_stop: Arc<AtomicBool>,
-    pub last_test_tcp: Option<u64>,
-    pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,
-    pub last_test_real: Option<u64>,
-    pub last_test_speed: Option<u64>,
-    pub current_traffic_up: i64,
-    pub current_traffic_down: i64,
-    pub current_memory: u64,
-    pub term_height: Cell<u16>,
-    pub routing_rules: Vec<RoutingRule>,
-    pub geo_ip: Option<Arc<leas_geoip::GeoIp>>,
-    pub dns_resolver: Option<Arc<leas_dns::DnsResolver>>,
-    pub host_features: Option<Arc<leas_host_features::HostFeaturesChecker>>,
-    pub endpoint_info: HashMap<i64, EndpointInfo>, // enrichment cache, survives reload_profiles
-    pub ping_status: HashMap<i64, EndpointPingStatus>, // per-endpoint ping rounds (fast/real), session-only; drives Test column [fast]/[real] labels
-    pub dns_cache_ttl_secs: i64,                   // TTL for DNS-resolution cache; default 300
-    pub shutdown_token: Arc<AtomicBool>,
-    pub core_task_handle: Option<JoinHandle<()>>, // running session task; disconnect() swaps in a bounded teardown waiter
-    pub heed_storage: Option<Arc<HeedLogStorage>>,
-    pub last_seen_log_ns: u64,
-    pub known_targets: Vec<String>,
-    pub selected_targets: Vec<String>,
-    pub last_heed_poll: std::time::Instant,
-    pub log_sender_tx: Option<std::sync::mpsc::Sender<leas_core::log_heed::LogMessage>>,
-    pub logs_loaded: bool,
-}
-
-### CoreEvent Channel
-
-```rust
-pub enum CoreEvent {
-    Connected(CoreType),
-    Disconnected,
-    Error(String),
-    StatsError(String),
-    StatsUpdate {
-        protocol_id: i64,
-        today_up: i64,
-        today_down: i64,
-        total_up: i64,
-        total_down: i64,
-    },
-    SysStatsUpdate(grpc_client::SysStats),
-    NativeTrace(leas_native::telemetry::TraceEvent),
-    /// Resolve one DNS endpoint's inbound host. The batch sends this for the DNS
-    /// endpoints it plans, carrying the endpoint facts (host/host_type/sni)
-    /// because the handler can only look an endpoint up in the LOADED PAGE.
-    DnsResolveRequest {
-        endpoint_id: i64,
-        host: String,
-        host_type: HostType,
-        sni: Option<String>,
-    },
-    LogLine {
-        level: String,
-        target: String,
-        message: String,
-        timestamp_nanos: i64,
-    },
-    TuiLog {
-        target: String,
-        level: String,
-        message: String,
-    },
-    SubscriptionsUpdated {
-        group_id: String,
-        count: usize,
-        error: Option<String>,
-        summary: ValidationSummary,
-    },
-    SpeedTestResult {
-        protocol_id: i64,
-        test_type: TestType,
-        latency_ms: Option<u64>,
-        speed_bps: Option<u64>,
-        ip_info: Option<String>,
-        error: Option<String>,
-    },
-    TestTypeUpdate {
-        protocol_id: i64,
-        test_type: TestType,
-    },
-    UpdateCheckResult {
-        core_type: CoreType,
-        current_version: Option<String>,
-        latest_version: Option<String>,
-        error: Option<String>,
-    },
-    UpdateDownloadProgress {
-        core_type: CoreType,
-        downloaded: u64,
-        total: u64,
-    },
-    UpdateCompleted {
-        core_type: CoreType,
-        old_version: Option<String>,
-        new_version: Option<String>,
-        success: bool,
-        error: Option<String>,
-    },
-    HostFeaturesLoaded(Arc<leas_host_features::HostFeaturesChecker>),
-    EndpointInfoUpdated {
-        endpoint_id: i64,
-        info: EndpointInfo,
-    },
-}
-spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
-draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
-The `disconnect_tx` oneshot channel signals the running core task to stop gracefully.
-
-Methods previously in `lib.rs` extracted to `ops/` modules:
-- `ops/connect.rs` — connect_to_profile, disconnect, `resolve_runtime_core` (per-connect native-vs-subprocess decision)
-- `ops/native_connect.rs` — `run_native_session`: the in-process arm of connect_to_profile (binds the native server, forwards its telemetry as `CoreEvent`s, graceful `shutdown().await`)
-- `ops/ping.rs` — start_batch_ping, start_batch_then_real_ping, stop_speed_test
-- `ops/events.rs` — poll_core_events
-- `ops/subscriptions.rs` — update_group_subscriptions, do_update_subscription
-- `ops/updates.rs` — spawn_update_check, spawn_update_download
-- `ops/settings.rs` — confirm_add_server, confirm_edit_server
-- `ops/profiles.rs` — delete_profile, clone_profile, import_url, nav_protocol_up/down, toggle_expand, set_active, set_protocol_default (DB override write + in-memory row patch — `endpoints_gen` is write-only, rows only reload on subscription events)
-- `ops/enrich.rs` — background enrichment: spawn_dns_resolve (TTL-gated, `x` force), spawn_enrich_ip_hosts (startup seed), spawn_whitelist_pass (on HostFeaturesLoaded), spawn_outbound_enrich (real-ping exit IP), extract_sni, protocol_row_to_profile; `ResolveTrigger` (Routine/Maintenance/Forced) picks the TTL gate, RESOLVE_SEM permit, and per-host waiter dedup
-- `ops/compact.rs` — maintenance commands (Speed Test menu): Mass DNS retry (`spawn_dns_retry` — re-resolves every DNS host with an empty address set, TTL bypassed, permit-bounded; lookups dispatch on the loop from `CoreEvent::DnsRetryTargets`) and Smart Endpoints Compact (`spawn_compact` — merges provably-same-server endpoints: same port + shared protocol_id + `endpoint_ip` overlap, connected components, survivor law in `leas-db/src/merge.rs`). Both run off the event loop; progress via `AppState::maint_progress` (`MaintMeters`: status bar + Actions-Log bars, labels `Name`/`Comp`); reports through `CoreEvent::CompactFinished`/`MaintenanceDone`. Before any endpoint delete it flushes and drains `LinkSpec` + `CountrySpec` staged patches for the absorbed ids (no FKs — a stale patch re-creates an orphan row)
-
-**TUI Screens (modules under `crates/leas/src/ui/`):**
-
-- `profiles.rs` — 18-column endpoint rows (status, flag, address, port, white, separators, protocol, config, fast, auth, real, stab, streak, speed, out, exit) over a DataTable. `Protocol` (right-aligned) and `Config` split the old merged protocol/transport/security cell into a kind (`vless`) and a stack (`tcp/reality`); the Port cell is green when it is a conventional mimic port for the representative transport; no sort arrow is drawn. The Test column (the real-probe delay) describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index` — the argmin of the decision-16 key, the same link `compute_rank` stores `rank_tier` from), so its content IS the row's tier band: tier 0/1 → that link's delay colored by threshold (green <500ms, yellow ≥500ms, red ≥1000ms), 2 → blank, 3/4 → `[real]`/`[fast]` (a marker on the representative link outranks its own stored delay), 5 → `[name]`, 6 → the purge label. It does not follow `selected_protocol`/`manual_protocol_override` and reads no session round — the labels come from the persisted `error_kind`. Expanding an endpoint renders a rounded panel in the row's own height (IPs line + 11-col per-protocol sub-table: marker, hex id, last seen, last used, protocol type, config type, delay, speed, traffic, outbound, country; capped at 8 visible sub-rows and window-scrolled (the window follows the selected variant, the separator carries the `n-m/total` range). Sub-table rows sorted by test priority (real-ok > fast/udp-ok > untested > real-err > fast-err > DNS-unresolved; latency only within success tiers)); the selected sub-row renders as a REVERSE highlight (`ThemeStyles::panel_row_selected`: fg foreground + `bg Color::Reset` + bold — drops the panel's `surface` highlight back to the common background; explicit Reset bg required because ratatui `Cell::set_style` merges). Height-aware scroll offset (`compute_scroll_offset`) keeps expanded rows reachable; `panel_w` is viewport-capped so narrow terminals don't panic. Footer/overlays use `host:port` (remarks r…
-  The scrollbar spans the SQL-filtered feed: `page_total` sizes the thumb, and `page_offset + first_visible_row` positions it; expanded panels still use a row-index local offset.
-- `settings.rs` — Split-pane settings panel. Left: collapsible tree (SPLIT_SETTINGS_TREE) navigating by SettingsSection. Right: Form (SplitRightPane::Form), UpdateForm, GroupList, or GroupForm. 14 sections: Core, GUI, Protocol Core, Inbound, Routing Rules, DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates, Speed Test, Logging, Subscriptions. Ctrl+W switches focus between tree and form panels. Routes/DNS persist to DB; all others to AppConfig JSON. Replaced per-section SettingsMode variants with unified Split { tree, focus, right } architecture. Subscription-group management lives here (`g` from Profiles jumps to the Subscriptions section).
-- `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs, v toggles validation/subscription logs)
-- `native_activity.rs` — Native Activity tab (`Tab::NativeActivity`): session totals plus one line per traced native-core connection from `AppState.native_activity`. Window-then-format render (only the visible slice of the ring is turned into `Line`s), scroll offset in a module-level atomic clamped to the ring length every frame, `reset_scroll()` on each new native session; Up/Down/PageUp/PageDown/Home/End only.
-- `sniffer.rs` — pane-1 `Sniffer` tab: per-host traffic for the native session from `AppState.sniffer` (1 s `CoreEvent::SnifferSample` snapshots). Two header lines (rates, summary), two MIRRORED 60 s sparklines on a shared scale (down grows downward, up upward; custom half-block renderer — no widget draws both directions), then the host table `host · ↓ · ↑ · conns · failed` sorted by total. Table scroll offset is a module-level atomic; Up/Down/PageUp/PageDown/Home/End only; empty state when the core is not native.
-- `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
-- `theme.rs` — ThemeStyles struct with static methods returning Style from a &Palette (container_border, container_title, hint, warning, error, success, tab_selected, etc.)
-- `palette_bridge.rs` — Maps ratatui-themes ThemePalette (10 colors) to ratatui-cheese Palette (11 roles)
-- `widgets/data_table.rs` — Reusable DataTable widget: sortable columns, multi-select, virtual-scrolled with themed scrollbar, DataTableRow trait (render takes `clip_bottom` so tall rows clip instead of overflowing)
-
-**`speed_test.rs`** — Async speed test engine:
-```rust
-pub enum TestType { TcpPing, RealPing, SpeedTest, UdpTest }
-pub struct RealPingResult { pub latency_ms: u64, pub ip_info: Option<String> }
-pub enum SpeedTestError { Io, Timeout, Proxy, Http, InvalidAddress }
-pub async fn tcp_ping(addr: &str, port: u16, test_timeout: Duration) -> Result<Duration, SpeedTestError>;
-pub async fn real_ping(proxy: &str, port: u16, url: &str, retries: u32, test_timeout: Duration) -> Result<RealPingResult, SpeedTestError>;
-pub async fn speed_test(proxy: &str, port: u16, url: &str, min_duration: Duration, max_duration: Duration) -> Result<u64, SpeedTestError>;
-pub async fn udp_test(proxy: &str, port: u16, test_timeout: Duration) -> Result<Duration, SpeedTestError>;
-```
-tcp_ping connects directly to the target address. real_ping, speed_test, and udp_test route through the active SOCKS5 proxy.
-`real_ping` sends up to `retries` HTTP GETs through SOCKS5, takes the fastest 2xx response, and optionally
-fetches IP info (ISP/location) from the selected `IpProvider` through the same proxy (its URL first, then the remaining family-agnostic providers as an automatic fallback chain; retried once per provider, spaced 250 ms; the default provider is ip-api's working free endpoint — its HTTPS form answers 403 on the free tier, which made every real OK persist no exit IP). Returns `RealPingResult`
-with both latency and IP metadata.
-Results are sent via CoreEvent::SpeedTestResult (with optional `ip_info` field) and handled in poll_core_events(),
-which writes the link's typed columns (`latency` — the Real/Fast variant carrying `latency_ip` — plus `error`/`error_kind`) in memory and stages them through `LinkWriter` (error events keep any stored measurement and set only the marker), then — for a result whose row is on the loaded PAGE — re-sorts the owning endpoint's
-protocols by test priority (TcpPing/RealPing results; `selected_sub` remapped by protocol id) and invalidates
-the main-table sort cache. While a batch runs the invalidation is throttled to one refetch per
-`RESULT_RELOAD_THROTTLE` (500 ms, `ops/events.rs`) and `CoreEvent::BatchEnded` forces the final one: the
-refetch is one `profiles_page` + `load_page_projection` on the UI task (22–25 ms against a 16 ms tick on the
-7,486-endpoint reference feed), and a feed-wide run's results are ~98% off-page (ADR 0008 §3).
-
-**Fast Test (start_batch_ping)**: the transport measurement on its own. Uses `FastPingManager` to dispatch to the appropriate adapter (TCP, UDP, or QUIC) based on protocol. TcpPingAdapter supports all TCP-based protocols; UdpPingAdapter supports WireGuard and ShadowsocksR; QuicPingAdapter (optional feature) supports QUIC-enabled protocols. Falls through to RealPingManager for protocols without a matching adapter. The Fast Test pings a page concurrently via `run_page_pings` — ONE TCP ping per unique (address, port) in the page (`buffer_unordered`), in-page owner/follower dedup plus a cross-page `fast_cache` keyed by (address, port). It takes no semaphore permit of its own: the fast half is a TCP handshake, and the one limit that matters (`real_ping_concurrency`) bounds the native handshakes. Fast ping probes inbound reachability only (every protocol of an endpoint shares its address:port), so results are all-or-none per endpoint: inbound unreachable → all protocols fast-fail (`[fast]` label), reachable → all fast-succeed and become real-ping candidates. Progress is a shared `Arc<BatchMeters>` (walk page count + two level meters); the per-(protocol, endpoint) task gate is `ops/scheduler.rs::TaskScheduler`. Supports cancellation via the `speed_test_stop` flag.
-
-**Real Test (start_batch_then_real_ping)**: ONE probe per link on the `TaskScheduler` — the merged pipeline (spec `2026-10-21-merged-test-pipeline-design`). The probe has TWO stages with INDEPENDENT budgets: the TRANSPORT stage is the dial alone (bounded by `tcp_timeout_secs`) and its span is the Fast metric; the PROTOCOL + PROBE stage runs the security handshake, the transport upgrade, the protocol handshake, the target TLS and the request (bounded by `real_ping_timeout_secs`). There is no separate TCP ping in a real-phase batch — the probe's transport stage IS that measurement, so a link costs ONE connection instead of two.
-
-The transport span rides on the FAILURE too (`probe::ProbeError`), so a row whose server answered but whose config did not reports the transport span beside its failure marker. Whether the transport itself failed is an explicit flag (`ProbeFailure::transport_failed`), never the class: the stage-1 and the stage-2+ deadlines share the class `Timeout`, and a class test would retire a working server whose protocol stage merely hung. A transport failure retires the row (the endpoint's other links are skipped) and writes the `[fast]` marker — not a config verdict.
-
-The GROUP-ENTRY barrier (`ops/ping.rs`): the walk's order is unchanged (`PageSort::Test`) and an endpoint's links are CONTIGUOUS in it, so the group's first protocol is dispatched and its siblings wait for that verdict — dropped when the endpoint succeeded, released when it did not. There is no second barrier check and no cancel-on-winner: a sibling in flight completes and records its full result. The barrier is a plain `HashMap` (no bloom filter: the set is tiny and a membership test must be exact). Results are staged write-behind (`LinkWriter`, decision 22), and every result event is keyed by `(endpoint_id, protocol_id)`.
-
-**Test-priority sorting**: One comparator drives both the expandable sub-table order and the main-table Test column sort, defined in the db crate (owns `EndpointRow`):
-
-- `EndpointRow::sort_links_by_test_priority(dns_unresolved)` — re-sorts the row's links in place. Ascending key `(tier, latency, -last_seen_at, id)`: tier 0 real-ok (a `latency_real_delay`), 1 fast/udp-ok (a `latency_fast_delay`), 2 untested, 3 real/name-err, 4 fast-err, 5 DNS-unresolved (a `dns` host with no `endpoint_ip` row — `dns_unresolved_endpoint(host_type, has_address)`), 6 purged. Fresh failures dominate stored successes (the marker is checked before the stored delay). Latency only orders tiers 0-1.
-- `EndpointRow::best_test_priority_key(...)` — min protocol key; the main-table sort representative (best protocol, user decision).
-- `EndpointRow::representative_link_index(...)` — the argmin's INDEX, the link the Test cell renders, so the cell and the row's tier band cannot disagree.
-- The batch's `PlanScope` (`All` / `Successful` / `SuccessfulAndNew` / `Failed`) is a predicate over the endpoint's stored `rank_tier` in `profiles_query::base_from_where` (bound; shared by the page, the walk and the count). Because `rank_tier` is derived state the batch itself mutates, a SCOPED walk reads its endpoint ids ONCE before the first probe (`PlanWalk::Feed.frozen`) and serves pages from that list; `All` streams page by page in `PageSort::Id` order — endpoint ids, which no write can move, and 3.0 ms per page against 12.1 ms for the host order the walk used before (ADR 0008 §1).
-- Runs at DB load (`load_page_projection` / the typed `load_page_rows`, rounds = None, the DNS tier read from the endpoint's empty address set), live in `poll_core_events` (`SpeedTestResult` for TcpPing/RealPing success or failure; `EndpointInfoUpdated` on unresolved→resolved flip), and — for the tab itself — in SQL: ordering is the page query's job (`PageSort`, the sort cycle's `SortColumn::Test` maps to it), with this comparator kept as the oracle the SQL order is pinned against (`page_order_matches_the_rust_oracle_for_every_sort`). `endpoint_dns_unresolved` in `ops/profiles.rs` delegates to `endpoint_rank::dns_unresolved`.
-- Provenance: the link's own `profile_stats` columns — `latency_real_delay` / `latency_fast_delay` / `latency_ip` / `latency_auth` (a struct embed; the `latency` discriminator column was DROPPED in schema 19), and the failure marker `error` + `error_kind` + `error_text` (kind `real`/`fast`/`name`). A row's provenance is carried by WHICH delay column is populated: a real delay outranks a fast one of any delay. Writers: the `SpeedTestResult` handler and the batch (one shared mapping, `ops::events::apply_test_result`), staged through `LinkWriter` (decision 22).
-- Invariant: **error events mutate nothing** — the `SpeedTestResult` handler gates the whole ext mutation + upsert behind `error.is_none()`, so a cancelled/failed test can never rank an untested protocol as real-ok or write a `delay = 0` row.
-
-**Stop testing**: `speed_test_stop: Arc<AtomicBool>` on AppState. Set via menu ("Stop Testing" at index 10)
-or hotkey `'s'`. Auto-resets when `testing_profiles` empties. `tested_pids`/`tcp_completed` sets prevent
-double-emission of "Cancelled" for already-tested profiles. Status bar shows "■ Stopping..." in red while
-stop flag is active. Stopped sessions emit `error: "Cancelled"`, which the `SpeedTestResult` handler does
-not count as a round failure — stopping a batch never paints spurious `[fast]`/`[real]` labels.
-
-**Configuration**: SpeedTestConfig in `AppConfig` includes `real_ping_concurrency` (default 100) and
-`real_ping_test_all_protocols` (default false = skip remaining protocols of an endpoint after one succeeds),
-editable via Settings > Speed Test form. `fast_ping_concurrency` is RETIRED (spec D14): the one limit
-that matters is the one that bounds native handshakes, and the fast half (a TCP handshake) takes no permit
-of its own.
-
-### leas-core (library crate)
-
-`crates/leas-core/src/lib.rs` — Facade + re-exports. Modules:
-
----
-
-**`core_type.rs`** — Core type definitions
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CoreType {
-    Xray,
-    SingBox,
-    Auto,
-    Native,   // runtime-only: the in-process core. Never persisted, never in a core config.
-}
-```
-`Display`/`as_str`/`FromStr` round-trip `Native` as `"native"`, so a
-`protocol_core_overrides` entry can ask for it. This is the RUNTIME enum; the
-persisted stamp is `leas_proto::proto_spec::CoreType`, which stays
-`{Xray, SingBox}` — `resolve_core` still returns only those two. The split is
-load-bearing: the persisted enum is rendered by toasty as
-`TEXT ... CHECK ("core_type" IN ('xray','sing_box'))` frozen into every existing
-DB (a `PRAGMA user_version` mismatch makes `Database::open` delete the file, it
-is not a migration), and `core_type` is part of the identity-hashed
-`ProtocolEssentials`, so a third persisted value would re-key every
-`ProtocolId`.
-
-**`process.rs`** — Dual-backend subprocess lifecycle
-```rust
-pub struct CoreProcess {
-    child: Option<Child>,
-    config_path: PathBuf,
-    pub core_type: CoreType,
-}
-
-/// Abstract interface for core process lifecycle.
-#[async_trait]
-pub trait CoreManager: Send + Sync {
-    async fn start(
-        &mut self,
-        core_type: CoreType,
-        config: &BackendConfig,
-        binary_path: &Path,
-        clash_mixin: Option<&serde_json::Value>,
-    ) -> Result<(), ProcessError>;
-    async fn stop(&mut self) -> Result<(), ProcessError>;
-    fn is_running(&self) -> bool;
-    fn running_core_type(&self) -> Option<CoreType>;
-    fn sighup_reload(&self) -> Result<u32, ProcessError>;
-    async fn rewrite_config(&self, config: &BackendConfig, clash_mixin: Option<&serde_json::Value>) -> Result<(), ProcessError>;
-}
-
-/// Real subprocess-backed implementation. `log_tx: Sender<String>` is required —
-/// callers without a log consumer must pass a drained channel.
-pub struct RealCoreManager {
-    current: Option<CoreProcess>,
-    config_dir: tempfile::TempDir,
-    log_tx: Sender<String>,
-}
-
-/// Test double implementing the same trait (Option<String> error fields).
-pub struct MockCoreManager { /* start_error, stop_error, is_running, ... */ }
+```text
+leas (binary)
+  ├── leas-core            config builders, subprocess lifecycle, gRPC stats, ping adapters, heed logs
+  │     ├── leas-db        config builders read the typed model rows
+  │     └── leas-proto     CoreType mapping, per-kind binary identity
+  ├── leas-native          in-process backend: tunnels, inbounds, telemetry
+  │     ├── leas-proto     typed ProtocolConfig / EndpointEssentials
+  │     ├── leas-tls       TLS 1.3 + 1.2-fallback client engine, REALITY
+  │     └── leas-route     first-match routing engine for the local inbound
+  ├── leas-db              toasty models, schema cursor, page query, write-behind, export
+  │     └── leas-proto     typed configs embedded in model rows
+  ├── leas-config          AppConfig, import/export, forms, subscription decoding
+  │     └── leas-proto     share-URL parsing and protocol types
+  ├── leas-proto            protocol configs, share URLs, Clash YAML, identity hashing
+  ├── leas-route            routing engine primitives and codecs
+  │     ├── leas-dns       optional, feature `dns`
+  │     └── leas-geoip     optional, feature `geoip`
+  ├── leas-dns              DNSCrypt-stamp resolver
+  ├── leas-geoip            GeoLite2-City lookup
+  └── leas-host-features    SNI / exact-IP / CIDR whitelist membership
 ```
 
-`CoreManager::start` flow:
-1. Resolve core binary path via `find_binary()`
-2. Build config via `ConfigBuilder::build()`
-3. Write JSON config to temp file in config_dir
-4. Spawn `xray run -c <path>` or `sing-box run -c <path>`
-8. Poll for readiness (check process hasn't exited early, max 10s)
-9. Send `CoreEvent::Connected` on the event channel
-10. Create `StatsProvider` via `grpc_client::create_stats_provider(core_type)`
-11. Enter stats polling + wait loop: every 3s call `provider.query_stats()` for traffic deltas;
-    every 3rd tick (~9s) also call `provider.get_sys_stats()`. Send `StatsUpdate`/`SysStatsUpdate`
-    events. Loop exits when `stop_rx` receives the disconnect signal.
-12. Kill child process + remove config file
-13. Send `CoreEvent::Disconnected`
+Notes that the manifests enforce:
 
+- `leas-route`'s `dns` and `geoip` dependencies are optional and `default = []`; no member enables either feature today, so the adapters in `dns_adapter.rs` are not part of a default build. `leas-route`'s `leas-tls` edge is a dev-dependency for benches and tests.
+- `leas-native` does not depend on `leas-core`; it takes typed configs straight from `leas-proto` and returns `leas-native` types.
+- `leas-core` depends on `leas-db` only for the model types its config builders read (`Endpoint`, `Protocol`, `RoutingRule`, `DnsSetting`).
+- `leas` depends on `leas-proto` and `leas-route` directly, in addition to the crates listed above.
 
-**`bin_manager.rs`** — Binary discovery and archive extraction
-```rust
-pub struct CoreBinInfo {
-    pub exe_names: &'static [&'static str],
-    pub args_template: &'static str,
-}
+`leas-hakari` is a cargo-hakari generated feature-unification crate. Every member depends on it; its own dependencies are never referenced from code and exist only to unify feature flags. Regenerate after a `Cargo.lock` change with `cargo hakari generate`; the `hakari-check` gate runs `cargo hakari generate --diff`, `cargo hakari manage-deps --dry-run` and `cargo hakari verify`, and `--dry-run` is what catches a member missing the dependency.
 
-pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf>;
-pub const fn get_core_info(core_type: CoreType) -> Option<CoreBinInfo>;
-pub fn exe_names(core_type: CoreType) -> Option<Vec<String>>;
-pub fn find_and_extract_archives(bin_dir: &Path) -> Result<(), BinError>;
-```
-`find_binary` checks `bin_dir`/`core_type` first (managed install), then falls back
-to the platform's PATH lookup (`where` on Windows, `which` elsewhere).
-`get_core_info` returns the extensionless base names (xray: `["xray"]`; sing-box:
-`["sing-box-client", "sing-box"]`); `exe_names` appends the platform's
-`EXE_SUFFIX` and is the single owner of that spelling (`xray.exe` on Windows),
-used by `find_binary` and by `updater`'s post-extraction search. `Auto` and
-`Native` have no binary: `get_core_info` answers `None` and every `updater.rs`
-entry point (`get_current_version`, `get_latest_version`, `release_asset_url`,
-`install_binary`) refuses them — the in-process core is built into the binary, so
-there is nothing to discover, download or update. `find_and_extract_archives`
-extracts upstream archives dropped into the working directory, recognising the
-platform-specific packagings (`Xray-<os>-<arch>.zip`, and for sing-box
-`-linux-<arch>.tar.gz` or `-windows-<arch>.zip`); it has no in-tree caller today.
+## Crate responsibilities
 
----
+### leas (binary and library)
 
-**`config_builder/`** — Config builder module
-- `mod.rs` — Dispatches to xray or sing-box builder based on core type
-- `xray.rs` — Builds xray-core format JSON. Validates emitted stream settings:
-  `security: "reality"` requires `realitySettings.publicKey` + `serverName` —
-  legacy VLESS blobs with `security=reality` and no realitySettings previously
-  killed the core at startup (`REALITY: Empty "realitySettings"`). Shadowsocks
-  methods are validated against `XRAY_SS_METHODS`.
-- `singbox.rs` — Builds sing-box format JSON. Reality emits only
-  `enabled`/`public_key`/`short_id` (sing-box's `OutboundRealityOptions` has no
-  `spider_x`; the URL's `spx` is dropped).
+Entry point `crates/leas/src/main.rs` and the TUI library (`src/lib.rs` exports `ops`, `route_compile`, `state`, `types`, `ui`, `AppState`).
 
+Startup order in `main`:
 
-pub enum BackendConfig {
-    Xray(XrayConfig),
-    SingBox(SingBoxConfig),
-}
+1. `install_tls_provider()` installs the ring `CryptoProvider` process-wide, before any TLS consumer (reqwest, QUIC ping, hickory DoH).
+2. `AppConfig::load()` reads `~/.config/leas/config.json`.
+3. `Database::open()` opens `~/.config/leas/data.db`; the directory is tightened to `0700` and the database plus `-wal`/`-shm` sidecars to `0600` on Unix, because the file holds cleartext proxy credentials.
+4. `HeedLogStorage::new()` opens `~/.config/leas/logs.lmdb`; a `spawn_blocking` writer drains a bounded 4096-message channel in batches of up to 100 per heed transaction, polling every 200 ms so it can notice `shutdown_token` at quit.
+5. `AppState::new()` builds the shared state, then `ui::run(&mut state)` owns the terminal and the event loop.
 
-pub struct BuildParams {
-    log_level: String,
-    socks_port: u16,
-    http_port: Option<u16>,
-    mixed_port: Option<u16>,
-    listen: String,
-    sniffing: bool,
-}
+Module layout beyond the UI: `state.rs` (`AppState`), `types.rs` (`CoreEvent`, `AppMode`, pane enums, view types), `route_compile.rs` (routing-rule compilation into the native engine), `ops/` (every asynchronous action), `ui/` (rendering and key handling).
 
-pub struct ConfigBuilder;
-impl ConfigBuilder {
-    pub fn build(
-        profile: &Profile,
-        core_type: CoreType,
-        params: &BuildParams,
-        routing: &[RoutingRule],
-        dns: &DnsSetting,
-    ) -> Result<BackendConfig, BuildError>;
-}
-  "inbounds": [
-    { "tag": "socks-in", "protocol": "socks", "listen": "127.0.0.1", "port": 10808 },
-    { "tag": "api", "protocol": "dokodemo-door", "listen": "127.0.0.1", "port": 62789 }
-  ],
-  "outbounds": [
-    { "tag": "proxy", "protocol": "vmess", "settings": { ... },
-      "streamSettings": { ... }, "mux": { ... } },
-    { "tag": "direct", "protocol": "freedom" },
-    { "tag": "block", "protocol": "blackhole" }
-  ],
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [...],
-    "balancers": [...]
-  },
-  "dns": { "servers": [...], "hosts": {...} },
-  "stats": {},
-  "api": { "tag": "api", "services": ["HandlerService", "LoggerService", "StatsService"] },
-  "policy": {
-    "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } },
-    "system": { "statsInboundUplink": true, "statsOutboundUplink": true }
-  }
-}
-```
+`ops/` modules:
 
-**Config builder — singbox.rs** produces the sing-box JSON format:
-```json
-{
-  "log": { "level": "warn" },
-  "dns": { ... },
-  "inbounds": [{ "tag": "socks-in", "type": "socks", ... }],
-  "outbounds": [
-    { "tag": "proxy", "type": "tuic", "server": "...", "server_port": ...,
-      "tls": { "enabled": true, ... } },
-    { "tag": "direct", "type": "direct" },
-    { "tag": "block", "type": "block" }
-  ],
-  "route": {
-    "rules": [...],
-    "final": "proxy"
-  },
-  "experimental": {
-    "v2ray_api": {
-      "listen": "127.0.0.1:62789",
-      "stats": { "enabled": true, "outbounds": ["proxy", "direct"] }
-    }
-  }
-}
-```
+| Module | Owns |
+| --- | --- |
+| `connect.rs` | `connect_to_profile`, `disconnect`, `resolve_runtime_core`, the subprocess session and its stats loops |
+| `native_connect.rs` | `run_native_session`, the in-process arm of `connect_to_profile` |
+| `ping.rs`, `ping/` | single and batch probes, the batch walk, plan scopes, fill-exit-IPs |
+| `ping_native.rs` | the native probe runner, `ProbeClass`, failure classification |
+| `events.rs` | `poll_core_events`, result application, throttled page reload |
+| `scheduler.rs` | `TaskScheduler`, the per-link gate and DNS deferral |
+| `job_scheduler.rs` | the user-visible task queue, `TaskKind`, terminal events |
+| `enrich.rs` | background DNS, mmdb, whitelist and exit-IP enrichment |
+| `profiles.rs`, `subscriptions.rs`, `settings.rs`, `settings` writes | profile mutations, subscription updates, settings persistence |
+| `compact.rs`, `purge.rs`, `updates.rs`, `export.rs`, `stream_import.rs`, `db_monitor.rs`, `speed_test.rs` | maintenance commands, retention, binary updates, export, import streaming, DB monitoring, single-link speed tests |
+| `clipboard.rs` | one process-lifetime `arboard::Clipboard` handle behind `LazyLock<Mutex<Option<Clipboard>>>` for every copy and paste site |
 
-Key differences from xray-core JSON:
-- Protocol `type` field instead of `protocol` in xray-core outbound/inbound entries
-- `route` key instead of `routing`
-- `experimental.v2ray_api` block for stats (vs xray-core's `stats` + `api` + `policy`)
-- Transport/TLS config differs: sing-box uses per-protocol `tls` sub-key vs xray-core's `streamSettings.security`
-- No separate `policy` section (stats config lives under `experimental.v2ray_api`)
+Export splits across three owners: `leas-db/src/export.rs` opens a dedicated Turso read connection and drains ordered rows, `ops/export.rs` owns scope policy and the clipboard/file sinks, `ui/export.rs` owns the popup. The single clipboard handle matters because `arboard::Clipboard` is the X11 selection owner on Linux; a per-call handle drops the serving window and the payload is lost without a clipboard manager.
 
-**`config_builder/clash_mixin.rs`** — Clash YAML overlay injection
-```rust
-pub fn parse_clash_mixin(path: &str) -> Result<serde_json::Value, MixinError>;
-pub fn merge_mixin(config: &mut serde_json::Value, mixin: &serde_json::Value);
-```
-Reads Clash-compatible YAML, parses to JSON, and merges into sing-box config before writing. Supports JSON and YAML input formats (auto-detected by extension). 5 unit tests.
+### leas-core (library)
 
----
+Facade for everything that talks to an external core binary: `bin_manager`, `config_builder`, `core_type`, `dns`, `grpc_client`, `log_heed`, `ping`, `process`, `speed_test`, `updater`. Its top-level re-exports are the crate's public surface.
 
-**`protocol_core_mapping.rs`** — Protocol → Core auto-resolution
-```rust
-pub const XRAY_SS_METHODS: &[&str];      // AEAD + 2022-blake3 + aead_* aliases
-pub const SINGBOX_SS_METHODS: &[&str];  // modern + legacy (cfb/ctr/rc4-md5/none/...)
-fn resolve_core(protocol, profile_override: Option<CoreType>, ss_method: Option<&str>) -> CoreType {
-    match profile_override {
-        Some(CoreType::Auto) | None => core_for_protocol(protocol, ss_method),
-        Some(core_type) => core_type,   // forced override wins; builders validate
-    }
-```
-Shadowsocks/Shadowsocks-2022 resolution is cipher-aware: xray-core's `CipherType` enum
-covers only AEAD + 2022-blake3, so legacy ciphers (`aes-*-cfb`, `aes-*-ctr`, `rc4-md5`,
-`chacha20-ietf`, `xchacha20`, `none`) auto-route to sing-box — that is the SUBPROCESS
-fallback stamp only. All ten are served natively too (`protocol/ss/stream_legacy.rs`,
-primitives in `crypto/legacy_stream.rs`), so connect-time resolution asks native whenever
-`capability::supported` passes on the loaded config and falls back to the stamp on a
-refusal; an `Xray` stamp is no longer required for the fast path. Both config builders
-validate the method against their whitelist and return `BuildError::InvalidProfile`
-for ciphers neither core supports — an invalid config is never written. `ss_method`
-is extracted from the profile row via `config_builder::shadowsocks_method`.
-**`grpc_client.rs`** — gRPC StatsService abstraction
+- `CoreType` is the runtime enum `{Xray, SingBox, Auto, Native}`. The persisted stamp is `leas_proto::proto_spec::CoreType`, which stays `{Xray, SingBox}`; `Native` and `Auto` are never written to the database or a core config. `resolve_core` returns only the persisted two.
+- `CoreManager` abstracts subprocess lifecycle (`start`, `stop`, `is_running`, `running_core_type`, `sighup_reload`, `rewrite_config`) with `RealCoreManager` and `MockCoreManager` implementations. `RealCoreManager::start` writes the built config to a temporary directory, spawns `xray run -c <path>` or `sing-box run -c <path>`, and polls for early exit with a 5 s readiness deadline. The stats loops live in `ops/connect.rs`, not in this crate.
+- `ConfigBuilder::build` dispatches to the xray or sing-box emitter and returns `BackendConfig`; both emitters validate Shadowsocks methods against their own whitelists and refuse to write an invalid config. Format details belong to [`../reference/protocols.md`](../reference/protocols.md); the Clash overlay is [`../reference/clash.md`](../reference/clash.md).
+- `grpc_client` speaks the vendored `v2ray.core.app.stats.command` proto (`GetStats`, `QueryStats`, `GetSysStats`) at `http://127.0.0.1:62789`. `create_stats_provider()` returns the shared `StatsProvider` implementation; both backends expose the same V2Ray-compatible API, and `format_bytes`/`format_uptime` are the display helpers.
+- `ping` exports the fast adapters (`TcpPingAdapter`, `UdpPingAdapter`, optional `QuicPingAdapter` behind the `quic-ping` feature, `FastPingManager`).
+- `log_heed` owns the LMDB-backed log store and its `LogMessage` type.
+- `updater` handles release lookup, download and binary installation for the two subprocess cores. `Auto` and `Native` have no binary, so every updater entry point refuses them.
 
-Proto definition in `crates/leas-core/proto/stats.proto` (vendored sing-box stats proto), compiled
-via `build.rs` using `tonic_build`. Package `experimental.v2rayapi`, 3 RPCs: `GetStats`, `QueryStats`,
-`GetSysStats`.
+Share-URL parsing and client-config export live in `leas-config`, not here.
 
-```rust
-pub const API_ENDPOINT: &str = "http://127.0.0.1:62789";
+### leas-config (library)
 
-#[async_trait]
-pub trait StatsProvider: Send + Sync {
-    async fn query_stats(&self, pattern: &str, reset: bool) -> Result<Vec<Stat>, GrpcError>;
-    async fn get_sys_stats(&self) -> Result<SysStats, GrpcError>;
-    fn api_endpoint(&self) -> &str;
-}
-```
+`AppConfig` load/save (serde JSON), `import_export` (share-URL parse/export and per-batch `ValidationSummary`), `forms`, `permissive_json`, `duration_or_secs`, `base64_util`, `fast_perc`, `ip_provider`.
 
-Two implementations — `XrayGrpcClient` and `SingBoxGrpcClient` — both connect to the same endpoint
-(`127.0.0.1:62789`) and use the same `StatsServiceClient<Channel>`. They are separate types for
-type-level distinction only; both backends expose the same V2Ray-compatible gRPC API.
+`subscription.rs` owns the streaming decoder: bytes to base64 or raw text, to lines, to share URLs. The pipeline is chunking-invariant: output depends only on the input bytes, never on how `StreamingDecoder::feed()` splits them. Encoding detection buffers a head until the decision is safe, base64 is normalized to one alphabet with whitespace dropped, line assembly runs on bytes so a multi-byte codepoint split across feeds is never replaced with `U+FFFD`, and a single line is capped at 256 KiB (an over-long line is cut at the last scheme start and an over-long URL is dropped and counted).
 
-Factory function:
-```rust
-pub async fn create_stats_provider(core_type: CoreType) -> Result<Box<dyn StatsProvider>, GrpcError>
-```
+### leas-proto (library)
 
-Helpers: `format_bytes(i64) -> String`, `format_uptime(u32) -> String`.
+Single source of truth for protocol data: `proto_spec` (typed `ProtocolConfig`, `ProtocolKind`, `EndpointEssentials`, per-kind binary identity, `core_mapping` with `resolve_core`), `urlx` (share-URL schemes), `clash` (mihomo YAML), `domain`, `utils`.
 
+Identity is a frozen binary wire format (`uid = sig ^ cred_hash`) over non-default fields only; changing its coverage re-keys stored rows. Share-URL and config semantics: [`../reference/protocols.md`](../reference/protocols.md).
 
-**`updater.rs`** — Backend binary auto-update
-Functions: `get_current_version()` (run `{core} version`, parse output), `get_latest_version()` (GitHub releases API), `download_release()` (streaming download via reqwest, progress tracking), `install_binary()` (extract archive → verify binary runs → .bak existing → copy all files → remove .bak on success, restore from .bak on failure).
+### leas-db (library)
 
-**`speedtest.rs`** — Speed testing logic (same as single-core design)
+Typed persistence: `database.rs`, `models_toasty.rs`, `profiles_query.rs`, `endpoint_rank.rs`, `endpoint_ip.rs`, `write_behind.rs`, `export.rs`, `merge.rs`, `retry.rs`, `schema/`, and a local-only Turso driver fork in `driver/`.
 
-**`import_export.rs`** — Share URL parsing and config export
-```rust
-pub fn parse_share_url(url: &str) -> Result<Profile>;
-pub fn format_share_url(profile: &Profile) -> String;
-pub fn export_client_config(profile: &Profile) -> Result<String>;
-```
-Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI formats.
+- `SCHEMA_VERSION` is 19 and `schema::LATEST` re-exports it. `PRAGMA user_version` is a migration cursor, not a wipe tag: current is a no-op, a fresh file applies the seed, a supported older cursor applies steps, and only an unknown cursor is `IncompatibleSchema`. Hand-written DDL lives in `schema/ddl.rs`; the schema change procedure belongs to [`../reference/database.md`](../reference/database.md).
+- Eleven typed tables: `endpoints`, `endpoint_ip`, `protocols`, `profile_stats`, `endpoint_groups`, `groups`, `routing_rules`, `dns_settings`, `route_probes`, `endpoint_rank`, `app_meta`.
+- The driver fork routes each `Operation` by statement stability: inlined-literal bulk SQL goes to uncached `prepare`, engine-generated statements to `prepare_cached`. This is why the published driver's unbounded SQL-text statement cache is not in the build.
+- `WriteBehind<T>` is the staged-write seam. `LinkSpec` covers `profile_stats` mutations and `CountrySpec` covers exit-country writes; `AppState` holds both drivers.
+- Ordering keys are materialized in `endpoint_rank` and implemented once in Rust. Law: [`../reference/ordering-law.md`](../reference/ordering-law.md). Manual SQL inventory: [`../reference/database-manual-sql.md`](../reference/database-manual-sql.md).
 
----
+### leas-native (library)
 
-### leas-config (library crate)
+In-process backend: client tunnels, the local inbound, the session server, capability gate and telemetry. It defines no config model and never touches the database; `leas` passes resolved values in as `NativeConnectParams` (typed `ProtocolConfig` plus `EndpointEssentials`).
 
-`crates/leas-config/src/lib.rs` — configuration and parsing: `AppConfig`
-load/save (serde JSON on disk), `import_export` (share-URL parse/export, per-batch
-`ValidationSummary`), `forms`, `permissive_json`, `duration_or_secs`, `base64_util`.
-It owns the URL-parsing half of the import path; the DB half is `leas-db`.
+Composition order per link is `dial -> security -> transport upgrade -> protocol -> tunnel`, folded by `chain.rs`: TLS or REALITY wraps the stream outermost, ws/grpc/xhttp framing runs inside it, then the protocol speaks, then the tunnel is handed back. QUIC-family protocols replace dial plus security plus upgrade with one QUIC dial and must be the last link.
 
-**`subscription.rs`** — subscription decoding: `StreamingDecoder` (bytes →
-base64|raw → lines → share URLs) feeding `subscription_url_chunks` /
-`parse_subscription_data` / `parse_url_batch`.
+- `transport/` covers the TCP dial, ws/grpc/httpupgrade/xhttp/v2rayhttp framing, mKCP, QUIC, and the plugin framing under `transport/v2ray/`.
+- `protocol/` holds 20 kind modules. `NATIVE_KINDS` is `[Vless, Vmess, Trojan, Hysteria2, Shadowsocks, Shadowsocks2022]`; the other modules either implement a narrower path or return `NativeError::NotImplemented` by name. `capability::kind_supported` is the config-blind gate, `capability::supported(kind, config)` the config-aware one used at connect time; both fail closed.
+- `inbound/` binds the local server side: `Socks5Inbound`, `HttpInbound` and `MixedInbound`. The session server uses one `MixedInbound` listener for SOCKS5 and HTTP CONNECT, selected by the first byte; there are no separate socks and http listeners.
+- `server/` holds `NativeCoreServer` and `ServerConfig`. `start()` compiles a proxy-all routing engine, binds that one mixed listener and spawns its accept loop. Teardown is cooperative over one `watch` channel: `stop()` closes live sockets, `shutdown()` also awaits the accept loops and is the only teardown that guarantees the ports are free when it returns; `Drop` signals and aborts but cannot await. Neither protocol face authenticates a client, so a non-loopback bind warns once.
+- `telemetry.rs` is the event seam to the TUI: `Telemetry::new(cap)` returns the sink plus `NativeEvents`, with separate bounded log and trace queues so a log burst cannot starve trace rows. `TraceGuard` emits a `Closed` row on drop, so a cancelled leg still ends its row. Byte counters live in shared atomics, which is what makes traffic live rather than per-connection-final.
+- `e2e/` (feature `native-e2e`) runs real xray-core and sing-box servers against the native client. Case counts and the verification tiers belong to [`../reference/native-core.md`](../reference/native-core.md).
 
-The decoding pipeline is **chunking-invariant**: its output depends only on the
-input bytes, never on how the caller splits them across
-`StreamingDecoder::feed()`. Encoding detection buffers a head until 16 significant
-base64-only bytes make it decisive, so plain-text bodies (whose scheme carries `:`)
-are never misread as base64; base64 is normalized to the standard alphabet with
-whitespace dropped, so MIME-wrapped and URL-safe input decode alike. Line assembly
-runs on bytes, so a line ends only at its `\n` and a multi-byte codepoint
-straddling a feed boundary is never replaced with `U+FFFD`. A single line is capped
-at 256 KiB; a longer one is cut at the last scheme start, and a single over-long URL
-is dropped and counted (`overlong_lines()`), surfaced by the import run rather than
-silently lost.
+Why the backend is in-process, its seams and open work: [`native-core-integration.md`](native-core-integration.md).
 
-### leas-native (library crate)
+### leas-route (library)
 
-`crates/leas-native/src/lib.rs` — in-process proxy core: client-side protocol
-implementations, the local inbounds in front of them, and the session lifecycle
-that lets the whole thing stand in for a spawned xray-core / sing-box. Built
-on the same `leas-proto` typed configs (`NativeConnectParams` wraps
-`ProtocolConfig` + `EndpointEssentials`); no config model is defined here, and
-nothing here touches the DB or the app config — `leas` passes the already
-resolved values in.
+First-match routing engine used by the native inbound: `Engine::decide_async` maps a connection (optionally after TLS/HTTP/QUIC sniffing) to `Decision::Direct`, `Block` or a tagged outbound. Also owns the address primitives, the sing-box and xray rule compilers, the DNS sink seam and probe tracking. The `dns` and `geoip` adapters are feature-gated and currently off by default.
 
-Layering follows Xray composition order, folded by `connect_chain`:
-`dial → transport → security → protocol → tunnel`. Each phase consumes the
-previous phase's `BoxStream` (the `Stream` seam: AsyncRead+AsyncWrite+Unpin+Send)
-and returns the next.
+### leas-tls (library)
 
-- `transport/` — TCP dial (socket options through `sockopt.rs`, the SAFE `socket2` surface only), ws/grpc/httpupgrade/xhttp/v2rayhttp upgrade framing (ws `?ed=N` early data defers the upgrade to the first write so those bytes ride `Sec-WebSocket-Protocol`; the h2 client seeds its windows from `leas_tls::Http2Profile` resolved from the same fingerprint the hello used), fresh-UDP mKCP dial, and the QUIC dial (`connect_quic` — quinn/rustls internal to QUIC, shared by the xhttp h3 arm and the hysteria2 client).
-- `transport/v2ray/` — SIP003 plugin framing over an established stream:
-  `http_obfs.rs` (`obfs=http`), `tls_obfs.rs` (`obfs=tls` — a SYNTHETIC
-  TLS-1.0 record writer with the payload hidden in `session_ticket`, not a
-  handshake; its record layouts are pinned against real `sizeof`/`offsetof`),
-  `ws.rs` (v2ray-plugin WebSocket, early data OFF because the plugin path never
-  populates `maxEarlyData`), and `mod.rs`'s `upgrade` dispatch. The layer is
-  **framing-only**: the wire order is `TCP → TLS → WebSocket → mux → SS`, TLS
-  outermost, so it reuses `security::wrap` and no chain phase is skipped.
-  `mode=quic` has no arm here and none is promised — it is refused at
-  `capability` before any dial (see the unpinnable-wire note).
-- `transport/mux.rs` — the v1.mux.cool frame codec, EXTRACTED from
-  `protocol/vless/mux.rs` so VLESS and the plugin mux share ONE implementation
-  rather than growing a second; the moved vless tests are the pin.
-- `mux_session.rs` + `protocol/ss/mux.rs` — the plugin mux's SS arm. Mux is a
-  **protocol-phase** return type, not a transport one: `SsMux` opens sessions
-  over the shared codec, each with its OWN salt/subkey/counter stream, and
-  `mux_session::open_session` hands the session ownership of the tunnel.
-  `MuxTunnel` is deliberately not `Clone` and is taken **by value**, so a session
-  id can never be duplicated.
-- `security/` — `wrap()` builds an engine `TlsConfig` from the profile's
-  security config and runs `leas_tls::client::connect` (`TlsMode::Plain` |
-  `TlsMode::Reality`) — the rustls client path is gone; rustls remains only
-  as the server-side test double + quinn's internal QUIC TLS. Trust:
-  `insecure` / `pin_sha256` (pin replaces chain walk + SAN but never the
-  CertificateVerify signature). REALITY additionally verifies the optional
-  ML-DSA-65 certificate extension (`RealityOpts.mldsa65_verify`, share-link
-  `pqv`): `HMAC-SHA512(auth_key, ed25519_pub ‖ ClientHello.Raw ‖
-  ServerHello.Raw)` against the certificate's FIRST extension.
-- `protocol/` — 20 protocol modules; `vless`, `vmess`, `trojan` + `hysteria2` are implemented
-  (trojan = TCP-stream family via the uniform pipeline; hysteria2 = `ConnectShape::Quic`
-  fresh quinn dial), plus the `socks` CLIENT handshake (RFC 1928/1929 greeting →
-  method → CONNECT over the `BoxStream` seam; its UDP side stays
-  `NotImplemented` — SOCKS5 datagrams need a raw UDP socket, not this stream).
-  Every other kind returns `NativeError::NotImplemented` naming the feature.
-  `shape.rs` `ConnectShape` marks the divergent paths (device tunnels:
-  WireGuard/Tailscale; own-handshake: SSH; outbound-only kinds: Redirect/TProxy/
-  Mixed).
-  VMess speaks two wires from the same module: AEAD (option `0x0c`, SHAKE128
-  size mask + per-record cleartext padding) and the legacy `alterId > 0` one
-  (`legacy.rs` — CFB-128 header, four-byte response peel), the latter still
-  accepted by v2ray-core 4.x and sing-box. VLESS `encryption` composes with
-  `flow`: vision frames the decrypted stream and its Direct handoff targets the
-  sealing layer, never the outer TLS.
-  `PacketTunnel` (the UDP datagram tunnel) additionally exposes
-  `split() -> (PacketReader, PacketWriter)`: every carrier separates its
-  per-direction framing state from the transport, so a reader task and a writer
-  run concurrently. This is mandatory for any bidirectional relay — a stream
-  carrier's `recv` spans several awaits, so racing it in a `select!` would drop
-  a partial frame and desynchronise the tunnel. VLESS XUDP refuses to split
-  (its datagrams ride a shared mux tunnel, not a stream).
-- `inbound/` — the local server side: `Socks5Inbound` (`inbound/socks5.rs`),
-  `HttpInbound` (`inbound/http.rs`), and `MixedInbound` (`inbound/mixed.rs` —
-  one listener for both, first byte selects the protocol; the native session
-  uses this one), all `accept → leas-route Engine`
-  (`decide_async`) `→ tagged Outbound` (Direct / Block / Proxy, the proxy
-  reusing `crate::connect`). Shared in `inbound/mod.rs`: `TraceCtx` (telemetry
-  sink + the per-leg protocol/transport/security labels), `traced_relay`,
-  `warn_if_open_relay`, `absorb_accept_error`, and the
-  `shutdown: Option<watch::Receiver<bool>>` the inbound configs carry — once the sender
-  marks shutdown the accept loop stops and in-flight connections abort.
-  - SOCKS5: TCP CONNECT plus UDP ASSOCIATE (`Socks5InboundConfig::udp`, default
-    on): one relay task per association routes EVERY datagram through the engine
-    (`NetworkMask::UDP`, whole-payload sniffing gated on `Engine::needs_sniff`),
-    so a single association can reach direct and proxy outbounds at once. Direct
-    traffic uses per-family upstream sockets; proxy traffic goes to a leg task
-    that owns the split tunnel. The association pins to the control connection's
-    peer, expires if no datagram arrives, and ends on control-TCP EOF. BIND is
-    refused `0x07`; `HijackDns` drops the datagram (TCP: `0x02`).
-  - HTTP: `CONNECT host:port` only. The head is scanned under a 16 KiB cap
-    (`MAX_HEAD_BYTES`) with a 3-byte overlap so a `\r\n\r\n` split across reads
-    is still found, and bytes the client pipelined behind the head (a
-    `ClientHello` in the same `write`) are replayed into the tunnel — through the
-    byte counters on the traced path, so they are attributed `up`. Every refusal
-    is framed (`Content-Length` + `Connection: close`) with a one-line reason, so
-    a client can tell a PROXY refusal from a destination failure: `400` (no
-    `host:port`), `403` (blocked route), `407` (missing/wrong credential, with a
-    `Proxy-Authenticate: Basic` challenge), `431` (over-long head), `501` (any
-    other method — absolute-form requests are not forwarded), `502` (failed
-    outbound dial); success is `200 Connection Established` then a raw
-    bidirectional relay. `Proxy-Authorization: Basic` is optional
-    (`HttpInboundConfig::with_auth`) and transient accept errors are absorbed.
-- `capability.rs` — the predicate that decides whether native may serve a row at
-  all. `NATIVE_KINDS` = `[Vless, Vmess, Trojan, Hysteria2, Shadowsocks,
-  Shadowsocks2022]`; `kind_supported(kind)` is the cheap config-blind gate
-  (display/sort paths), `supported(kind, config)` the config-aware one (connect).
-  It mirrors the native dispatch arms, not xray's feature set, and fails CLOSED —
-  a row native serves *worse* than the subprocess defers. Deferred: VLESS account
-  `encryption` the connect path cannot dial — `mlkem_encryption_supported` runs
-  the codec's OWN parser (`parse_mlkem_encryption` →
-  `EncryptionConfig::try_from_parsed`), so only an unknown or malformed scheme
-  defers and never `mlkem768x25519plus` itself (which native serves; the
-  `pq-enc` row is green) — and any flow outside the vision pair, legacy VMess
-  payload ciphers, a non-zero `alter_id`, and mKCP `seed`/`header_type` (wire
-  format, not pacing — including the share-link `path` seed carrier). A TLS
-  fingerprint id is NOT a refusal: an id with no roster row is dialled with the
-  engine default and marked approximated (`security::fingerprint`). The
-  transport match is a POSITIVE, wildcard-free match: a new `TransportConfig`
-  variant breaks it at compile time instead of inheriting `true`.
-- `server/` — `NativeCoreServer`, the in-process equivalent of a spawned core.
-  `ServerConfig { listen, proxy: ProxyOutbound, telemetry, udp }`; `start()`
-  compiles a proxy-all engine (no rules, `DefaultRoute::Route { tag: "proxy" }`),
-  binds ONE mixed (SOCKS5 + HTTP CONNECT) listener, and spawns its accept loop.
-  The native session is always mixed: there are no separate socks/http
-  listeners. Teardown is cooperative through one `watch` channel: `stop()` fires
-  the signal every listener and in-flight connection selects on (closing live
-  sockets exactly like killing a subprocess would); `shutdown()` additionally
-  awaits the accept loops and is the ONLY teardown that guarantees the ports are
-  free when it returns; `Drop` signals and aborts the loops but cannot await
-  them. Neither protocol face authenticates a client, so a non-loopback bind
-  warns once at `start`.
-- `telemetry.rs` — the event seam to the TUI. `Telemetry::new(cap)` returns the
-  sink plus `NativeEvents`, with SEPARATE bounded log and trace queues (a log
-  burst can never starve trace rows; `recv` takes traces first). `NativeEvent` is
-  `Log` / `Trace` / `Traffic`; `TraceEvent` is `Opened(TraceOpened)` /
-  `Closed(TraceClosed)` keyed by `conn_id`. `Telemetry::guard` hands out a
-  `TraceGuard` that emits the `Closed` row on drop, so a cancelled leg (shutdown,
-  task abort) still ends its row instead of rendering live forever. `Counted<S>`
-  wraps a stream and counts into shared atomics as bytes move, which is what
-  makes traffic live rather than per-connection-final; `drain_traffic()` swaps the
-  totals out for the 3 s poll. A full queue drops the event and counts the drop —
-  drops are folded into one summary line per window, never per-event spam.
-- `e2e/` (feature `native-e2e`) — real-core scenarios: spawns xray-core
-  26.3.27 / sing-box 1.13.16 server inbounds, dials with the native client,
-  probes HTTP through the tunnel. Transport matrix (VLESS/VMess ×
-  TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP/QUIC × TLS variants) + Trojan +
-  Hysteria2 + Shadowsocks axes; 185 test fns = 177 green + 8 ignored
-  (vless 85+7, vmess 53, trojan 14, hysteria2 3, shadowsocks 31 entries
-  over 21 cases — 10 legacy rows are sing-box-only, probe_e2e 0+1).
-  Version-pinned: a core binary version mismatch is a hard fail, not a skip.
+Ring-only TLS client engine: TLS 1.3 with a TLS 1.2 ECDHE+AEAD client path reached on a 1.2 ServerHello, declarative browser hello profiles, GREASE, JA3/JA4 codecs, ML-KEM-768, REALITY client provisioning, record framing and post-handshake policy (`KeyUpdate`, ticket drop). Verification modes are WebPKI roots, CA DER, `insecure` and `pin_sha256`. Roster fidelity: [`../reference/tls-fingerprint-roster.md`](../reference/tls-fingerprint-roster.md); crypto sites: [`../reference/crypto-dependencies.md`](../reference/crypto-dependencies.md).
 
-Per-protocol roadmap and capability tables: `docs/reference/native-core.md`. Session wiring and
-the decision rules: `docs/architecture/native-core-integration.md`.
+### leas-dns, leas-geoip, leas-host-features (enrichment libraries)
 
-### leas-tls (library crate)
+These three are consumers of network data, not owners of state.
 
-`crates/leas-tls/src/lib.rs` — ring-based TLS client (TLS 1.3, plus a
-TLS 1.2 ECDHE+AEAD client path reached on a 1.2 ServerHello) with browser
-fingerprint mimicry + a REALITY client (REALITY stays 1.3-only). ring-only
-(no aws-lc-rs/rand/unsafe);
-CSPRNG via the crate-local `SecureRandom` seam (blanket impl for
-`ring::rand::SecureRandom`). One documented exception: x25519-dalek for the
-REALITY keypair, because ring's `EphemeralPrivateKey` is single-use and cannot
-serialize — REALITY must agree twice with the same scalar.
+- `leas-dns` resolves through DNSCrypt stamps (DoH, DoT, DoQ) with hickory-resolver. `DnsResolver` performs the lookup; caching and TTL policy belong to the caller (`ops/enrich.rs`, `dns_cache_ttl_secs`).
+- `leas-geoip` looks up country and city from a GeoLite2-City database with `maxminddb` and a small per-IP cache.
+- `leas-host-features` answers SNI, exact-IP and CIDR whitelist membership with `fastbloom`, downloading the whitelist files when missing.
 
-- `spec/` — declarative `ClientHelloSpec`/`ExtensionSpec`/`SessionIdSpec` +
-  exact RFC 6066/8446 wire encodings; GREASE per RFC 8701.
-- `profiles/` — two-tier roster: hand tier (`hand_selected.rs`, `spec!`-declared)
-  = 2 wire-exact profiles (`chrome_130`, `edge_106`); generated tier
-  (`generated/`, emitted by `gen_specs.py --emit`) = 69 JA4-faithful entries —
-  the deterministic `select_roster` kept subset of the 1825-entry ja4db manifest.
-  The generator carries an **era axis** (`PQ_ERA`): the hybrid key share is
-  offered only where the browser major shipped it (Chromium `>= 131`), so a
-  Chrome-93 row no longer advertises a 2024 algorithm. GREASE is emitted for the
-  Chromium families only, and era gating filters what the family template lists —
-  it never adds a group.
-- `hello/` — `build_hello`/`to_record` (GREASE pairing — one `grease_a` across
-  the extension-body slots, a separate `grease_b` for standalone extensions,
-  distinct draws within a namespace with a hard error instead of a duplicate;
-  512-byte record padding), `build_hello_ordered` (family/era-scoped
-  extension-order permutation for Chromium `>= 108`; padding and
-  `pre_shared_key` stay last), `parse_hello`.
-- `crypto/` — TLS 1.3 key schedule (RFC 8448-verified) + TLS 1.2 key block, AEAD record keys
-  (IV XOR seq), `X25519KeyPair`, JA3/JA4 codecs (`Ja4Variant::Foxio` is the
-  default — padding stays in `hash2`, sig-algs GREASE-filtered, A-part derived
-  from `supported_versions`/SNI; `Ja4Variant::PeetWs` reproduces the older
-  tls.peet.ws rendering), and ML-KEM-768 (`mlkem.rs`, RustCrypto
-  `ml-kem`, FIPS 203 — liboqs was removed 2026-09-18 because its vendored build added CMake +
-  a C/C++ toolchain; the seed→ek bytes are pinned by a KAT captured before the swap). Every
-  secret-producing entry point returns
-  `Zeroizing<…>` (`hkdf_extract`/`hkdf_expand_label`/`derive_secret`/`master_secret`/
-  `finished_key`, the `TrafficSecrets` pair alias, `X25519KeyPair::agree`, the whole
-  `tls12` PRF chain), `mlkem::SharedSecret` is `ZeroizeOnDrop` with length-only `Debug`, and
-  `mlkem::SecretKey` holds the RustCrypto `DecapsulationKey` (self-wiping, serialized as the
-  64-byte FIPS 203 keygen seed). Wire-visible outputs stay plain `Vec<u8>` (`transcript_hash`,
-  `finished_mac`), and the key bytes ring holds inside `LessSafeKey`/`Prk` are
-  unwipeable — the wipeable surface is the derivation buffers on either side. Every
-  non-default crypto site (this engine, xray's AES-CTR mask, the binary-context BLAKE3, the
-  legacy KDFs, QUIC header protection) is inventoried in `docs/reference/crypto-dependencies.md`; both
-  crypto crates carry `#![forbid(unsafe_code)]`.
-- `record/` — record framing, `read_record`, `TlsStream<S>`.
-- `handshake/` — client handshake (one HelloRetryRequest retry, plain TLS only; `server_hello.rs` parses ServerHello/HRR, `flight.rs` the encrypted flight; `ServerVerifier` seam,
-  multi-record flight reassembly); TLS 1.2 fallback driver in `handshake/tls12.rs`
-  reached on a 1.2 ServerHello.
-- `verify/` — `WebPkiVerifier` (roots / CA DER / `insecure` / `pin_sha256`).
-- `reality/` — `HelloProvisioner` + 9-step wire contract, `FixedChrome130Hybrid`,
-  `RandomEligible` (uniform pick over the REALITY-eligible roster — TLS 1.3 AEAD,
-  32-byte session id, real X25519 share; PQ is not required), auth-key/session-seal/server-auth.
-  The session-id transform is fingerprint-neutral (JA4-proven) and the fallback
-  spider's UA family follows the same identity.
-- `http2_profile/` — `Http2Profile`: one SETTINGS + navigation-header table per
-  browser family, so the TLS hello, the h2 layer and the REALITY spider cannot
-  name different browsers.
-- `http2/` — minimal h2 layer for the tls.peet.ws grader (not a client).
+## Runtime boundaries
 
-Tier-2 verification: `examples/grader.rs` + ignored `tests/tls_peet_ws.rs`
-(tls.peet.ws). Interop proof: unit tests handshake against a real rustls server
-(dev-dep).
+One process, one tokio multi-thread runtime (`#[tokio::main]`). The TUI event loop (`ui::run`) owns the main task; every slow action runs in a spawned task and reports back through the `CoreEvent` channel. The log writer is the only `spawn_blocking` loop. Subprocess cores are child processes; the native core is a set of listeners and tasks inside this process.
 
-Secrets are wiped in the native crate the same way (VMess `Session`/`cmd_key`/KDF
-buffers, VLESS `mlkem768x25519plus` `nfs_key`/`united`, trojan auth token,
-`Salamander.psk`, the SOCKS5 credential frame). Both crates also carry the
-`zeroize` FEATURE on their crypto deps — it is off by default in the RustCrypto
-ciphers and stripped from `x25519-dalek` by `default-features = false`.
+Three runtime backends, two persisted:
 
-### leas-db (library crate)
+| Backend | Runs | Started by | Data path |
+| --- | --- | --- | --- |
+| xray-core | child process | `RealCoreManager` | config file plus gRPC `StatsService` at `127.0.0.1:62789` |
+| sing-box | child process | `RealCoreManager` | config file plus Clash API `/traffic` stream |
+| native | in-process | `run_native_session` | `NativeCoreServer` listener plus `Telemetry` |
 
-`crates/leas-db/src/lib.rs` — toasty ORM database layer. `retry.rs` adds
-`retry_on_busy`/`is_busy_error` — SQLite write contention (`is_serialization_failure`
-or "database is locked") retries with 20ms-doubling backoff (1.28s cap). MVCC
-statement-level conflicts are included because the driver classifies `BusySnapshot`
-and conflict text as serialization failures. Public DB mutators and rank maintenance
-retry whole transaction bodies; `LinkWriter` re-stages failed drained windows.
-`Database::conn()` sets `PRAGMA busy_timeout=5000` on every pooled connection
-acquisition; the pragma in `open()` is per-connection and never reaches
-pool-created conns (the raw `direct` connection applies the same
-per-connection pragmas at open). Rank DDL uses `TransactionMode::Immediate` so MVCC data
-transactions do not own schema initialization.
+`resolve_runtime_core` in `ops/connect.rs` makes the per-connect choice: an explicit `Xray` or `SingBox` override wins; a kind outside `NATIVE_KINDS` keeps the link's stamped core; blocked proxy-all, an unloaded config or a capability refusal keeps the stamped core and records a reason; otherwise the link runs native. Nothing native is persisted, so the decision is recomputed on every connect.
 
-**The statement cache is routed at its boundary — the crate owns its driver (2026-10-08).**
-The published `toasty-driver-turso` routes EVERY statement through
-`turso_sdk_kit`'s `prepare_cached`, whose per-connection map is **unbounded and
-keyed by SQL text**: each distinct statement is compiled and retained for the
-connection's life. Our bulk writers INLINE their literals (ids, values,
-timestamps) for the engine's ~0.8 ms/bind cost, so every call is a new text —
-a leak measured at ~116-310 KiB per distinct text. The crate now vendors a
-LOCAL-ONLY fork of that driver (`crates/leas-db/src/driver/`, from toasty
-`main` at its `turso = "0.8"` bump) and routes each `Operation` by whether its
-text is stable: `RawSql` (the inlined-literal bulk statements) → the UNCACHED
-`prepare`; `Insert`/`QuerySql` (engine-generated) → `prepare_cached`. That
-boundary IS the fix, with no LRU or counter. So the retired `SqlConn`/`RawConn`
-seam and `Database::write_conn` are gone: the bulk writers run on the POOLED
-driver and keep their literal-inlining win. `Database::direct` (the page's
-execution-layer bypass, ~80x read win) stays. Contention classification
-(`driver::error::classify_turso_error`) keeps `Busy`/`BusySnapshot`/`conflict`
-errors RETRYABLE, or `retry_on_busy` would re-stage a window that should have
-been retried. See `docs/reference/database-manual-sql.md`.
+One backend runs at a time. `disconnect` signals the running session over a oneshot and waits at most `DISCONNECT_TEARDOWN` (3 s); starting a new session first waits for the previous one for at most `PREV_SESSION_TEARDOWN` (5 s).
 
-**Journal mode:** fresh/recreated file DBs default to WAL. **WAL is deliberate** (2026-10-02): an A/B on synthetic feeds found MVCC **1.2-4.8x slower** than WAL at 32 concurrent writers, so MVCC stays opt-in behind `LEAS_TURSO_CONCURRENT_WRITES=1`.
+Stats cadence: the xray arm polls `query_stats` every 3 s and `get_sys_stats` every third tick (about 9 s); the native arm uses the same 3 s and 9 s cadence plus a 1 s sniffer snapshot; sing-box streams `/traffic` lines. All of them emit the same `StatsUpdate` and `SysStatsUpdate` events, so screens and persistence do not branch on the backend.
 
-**Micro-batch MVCC write-behind (2026-10-20, ADR 0014):** on an MVCC handle the write-behind driver shrinks its window to 32 rows (`DEFAULT_FLUSH_ROWS_MVCC`) and skips the in-transaction `endpoint_rank::refresh` for link patches — the touched endpoints go into an in-memory `Database::dirty_ranks` set that `profiles_page` and each flush drain (`drain_dirty_ranks`). Measured (`micro_batch_mvcc_probe`, 16 writers, 8,192-endpoint feed): MVCC p99 7–67 ms against WAL's 179–835 ms at every batch size; the 75–95× verdict of the 100-row geo shape stands for that writer. The dirty set is volatile: a crash between commit and drain leaves stale keys until the endpoint is next written (`endpoint_rank::ensure` does not detect them). A failed window re-stages from its patch (`CacheSpec::restage_patch`); `Coalesced<K, P>` no longer carries a duplicate source row. Partitioned N-channel drain was deferred — zero conflicts at every measured batch size.
+## AppState
 
-**Import upserts:** `upsert_endpoints_bulk` and `upsert_endpoint_group_links_bulk` are multi-row (chunked at `IMPORT_STATEMENT_ROWS` = `LINK_STATEMENT_ROWS` = 400); `upsert_protocols_bulk` is still one typed upsert per row and is the largest surviving import cost at a measured 117 us/row. Raw SQL writers that touch an embed-enum column must go through a tested `as_db_label` (`HostType::as_db_label`) — the stored spelling is the derive's `snake_case` ident, which is neither `Debug` nor the wire form, and a wrong one fails silently.
-`LEAS_TURSO_CONCURRENT_WRITES=1` opts them into Turso MVCC; existing WAL
-files remain WAL, existing MVCC files retain MVCC, and intentional schema wipes
-remove `-wal`, `-shm`, and `-log` sidecars before recreation. The engine cannot
-convert a WAL-header file in place. `Database::uses_concurrent_writes()` is the
-per-handle authority; batch completion skips the incompatible WAL passive
-checkpoint for MVCC handles. Real-feed contention evidence remains a benchmark
-gate, not a default-enable claim.
+`crates/leas/src/state.rs`. One struct, owned by the event loop and borrowed immutably by every render pass. Async work gets clones of the individual handles it needs, never `&mut AppState`.
 
-Schema, indexes, invariants and flows are documented in **`docs/reference/database.md`**
-(with diagrams); this section is the crate-level summary. The rule for — and the
-complete inventory of — the hand-written SQL the typed path cannot express is
-**`docs/reference/database-manual-sql.md`** (typed path first; every exception has a
-recorded cause and measurement there).
+| Concern | Fields | Notes |
+| --- | --- | --- |
+| Persistence | `db: Arc<Database>`, `link_stage: Arc<WriteBehind<LinkSpec>>` | staged link writes, one flush task |
+| Config and theme | `config: AppConfig`, `theme: opaline::Theme`, `settings_form_snapshot` | `config.theme_name` is the slug the theme was loaded from |
+| Shell | `focused_pane`, `pane1_tab`, `pane2_tab`, `pane2_height` | replaces the old single tab cycle; `pane2_height` 0 means the 16-row default |
+| Profiles page | `endpoints`, `page_total`, `page_offset`, `filter_cache_valid`, `endpoints_gen`, `reload_gen`, `selected_index`, `selected_sub`, `multi_select` | `selected_index` indexes the loaded page, never the whole feed |
+| Filters and view | `search_query`, `search_focused`, `purgatory_view`, `purgatory_ttl_secs`, `purgatory_retention_secs` | |
+| Logs | `log_cache`, `log_scroll`, `log_select_anchor`, `log_viewport_rows`, `log_has_older`, `known_targets`, `selected_targets`, `heed_storage`, `last_seen_log_ns`, `log_sender_tx`, `core_log_tx` | watermark reconciles pushed lines with the heed poll |
+| Connection | `connected_core`, `connected_protocol_id`, `connecting`, `connection_error`, `live_proxy`, `disconnect_tx`, `core_task_handle` | |
+| Events | `core_event_rx`, `core_event_tx` | the `CoreEvent` channel |
+| Testing | `scheduler: Arc<TaskScheduler>`, `testing_profiles`, `testing_details`, `speed_test_stop`, `batch_progress`, `maint_progress`, `fill_progress`, `batch` | keys are `(endpoint_id, protocol_id)` |
+| Task queue | `task_queue`, `running_task`, `scheduler_paused`, `task_history`, `tasks_cursor` | process lifetime, never persisted |
+| Live metrics | `system_stats`, `current_traffic_up`, `current_traffic_down`, `current_memory`, `native_activity`, `sniffer`, `last_test_tcp`, `last_test_real`, `last_test_speed` | |
+| Enrichment | `endpoint_info`, `outbound_country_cache`, `geo_ip`, `dns_resolver`, `host_features`, `dns_cache_ttl_secs` | `endpoint_info` survives `reload_profiles`; country cache is a 512-entry LRU |
+| Aggregates | `aggregates`, `aggregates_dirty`, `details_scroll` | Details panel counts, keyed by the current filter |
+| Layout and mode | `mode`, `previous_mode`, `confirmation`, `clipboard`, `actions_compact`, `term_height`, `should_quit` | |
+| Display cache | `display_rows_cache` | display rows rebuilt only when a fingerprint changes |
+| Subscriptions, updates | `groups`, `updating_groups`, `update_status` | |
+| Shutdown | `shutdown_token: Arc<AtomicBool>` | the one flag every background loop polls |
 
-**Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`, 10 tables):
-- `Endpoint` — server config; dedup key `stable_hash(host, port)` or `stable_hash("undefined", config_uid)`; `resolved_at` is the DNS-attempt stamp the resolution TTL gates on (the addresses themselves are `EndpointIp`'s)
-- `EndpointIp` — one row per resolved address of a DNS endpoint, PK `(endpoint_id, ip_key)`; `ip_key` is the address in a sortable packed encoding (family byte then big-endian octets), so B-tree byte order IS address order (ADR 0005)
-- `Protocol` — `#key id` = the identity uid (host/port excluded), plus `sig` for the grouping key; transport/security embeds; `config: Deferred<Json<ProtocolConfig>>`
-- `ProfileStats` — per `(protocol_id, endpoint_id)` pair: latency/speed/error/traffic; `last_seen_at` indexed (retention + staleness windows)
-- `EndpointRank` — the materialized ordering keys the Profiles page is ordered by (ADR 0003); `rank_weight` (a raw `BLOB NOT NULL`, added by `ALTER TABLE` so no schema-tag bump) holds the static config weight, and `endpoint_rank_test_v2` is the covering index that carries it
-- `EndpointGroup` — many-to-many Endpoint↔Group membership
-- `Group`, `RoutingRule`, `DnsSetting`, `RouteProbes`
+Session-only state stays in memory by design: `native_activity` is a ring of 2000 rows, `sniffer` holds the latest snapshot plus a 60-sample rate ring, `batches` and the task queue die with the process, and `scheduler` task ids are meaningful only inside the process that allocated them.
 
-All timestamps are epoch-SECOND integers (`to_epoch`/`from_epoch`/`now_epoch` are the conversion points); `#[auto]` is deliberately absent from them, because on an integer column toasty's auto strategy is `Increment`, not "now". Scheduler task state is NOT a column: it is runtime-only (see "Task gate" below).
+## CoreEvent
 
-**Schema management**: `crate::schema` is the migration runner (ADR 0012). `PRAGMA user_version` is a CURSOR seeded at `SCHEMA_VERSION`; a current file is a no-op, a fresh file applies the seed, a supported older version applies the pending steps, and only an UNKNOWN cursor is `IncompatibleSchema` (which `open` answers with the pre-alpha wipe). `push_schema` still emits `CREATE TABLE` without `IF NOT EXISTS`, but it runs ONLY on the fresh path now. Hand-written DDL lives in `schema/ddl.rs`; the migration list is its single owner.
+`crates/leas/src/types.rs`. One `tokio::sync::mpsc` channel carries work results from spawned tasks to the UI. The event loop drains it once per frame in `ops::events::poll_core_events`.
+
+| Variants | Purpose |
+| --- | --- |
+| `Connected(CoreType)`, `Disconnected`, `Error(String)` | session lifecycle |
+| `StatsError(String)` | non-fatal stats failure; keeps `connected_core` |
+| `StatsUpdate {...}`, `SysStatsUpdate(SysStats)` | traffic deltas and system counters |
+| `NativeTrace(TraceEvent)`, `SnifferSample(Box<SnifferSnapshot>)` | native per-connection trace and 1 s per-host snapshot |
+| `LogLine {...}`, `TuiLog {...}` | core stderr lines and TUI tracing lines; `TuiLog` carries the event time and `persisted` so only persisted lines advance the heed watermark |
+| `SubscriptionsUpdated {...}`, `ProfilesRowsReady {...}`, `RetentionPurged` | profile feed changes; `ProfilesRowsReady` carries a `generation` so a stale page is dropped |
+| `SpeedTestResult {...}`, `TestTypeUpdate {...}`, `BatchEnded` | probe results, per-link running type, batch completion |
+| `DnsResolveRequest {...}`, `EndpointInfoUpdated {...}`, `HostFeaturesLoaded(Arc<...>)` | enrichment requests and results |
+| `DnsRetryTargets {...}`, `CompactFinished {...}`, `MaintenanceDone`, `ExportFinished {...}` | maintenance and export commands |
+| `UpdateCheckResult`, `UpdateDownloadProgress`, `UpdateCompleted` | subprocess-core updates |
+| `Route(RouteEvent)` | routing engine events from the native inbound |
+
+`SnifferSample` is boxed because an inline `SmallVec` snapshot would dominate every event. Every result event that mutates a link is keyed by `(endpoint_id, protocol_id)`; `protocol_id` alone collides across endpoints that share a `Protocol` row.
+
+## TUI screen map
+
+`crates/leas/src/ui/`. The shell, verified in `ui/mod.rs::render` and `types.rs`:
+
+- Pane 1 (top, `Min(6)` rows): tabs `Profiles`, `Sniffer`, `Logs`.
+- Pane 2 (bottom, `pane2_height` rows, default 16): tabs `Details`, `Metrics`, `Tasks`. At one row or fewer it renders as a single borderless summary line.
+- A one-line newest-log row between pane 2 and the status bar, dropped when pane 2 is compact.
+- Status bar on the last row.
+- A terminal under 20 rows always collapses pane 2 to the one-line bar. `actions_compact` holds the same collapse for the session.
+
+Screen modes (`AddServer`, `EditServer`, `ImportUrl`, `BatchImport`, `Settings`) take the whole content area until they close; overlays (help, confirmation, speed-test menu, export popups, target picker) stack above whichever base is active.
+
+| Module | Tab or mode | Content |
+| --- | --- | --- |
+| `profiles.rs` | Pane 1 `Profiles` | the 18-column endpoint grid, expansion into per-link rows, page scrollbar |
+| `sniffer.rs` | Pane 1 `Sniffer` | per-host traffic for the live native session: two header lines, two mirrored sparklines on a shared scale, then the host table sorted by total |
+| `logs.rs` | Pane 1 `Logs` | log viewer with source and target filters, selection and copy |
+| `details.rs` | Pane 2 `Details` | selected server facts, selected link facts, database status; the link section scrolls with its own offset |
+| `metrics.rs` | Pane 2 `Metrics` | session traffic, core system stats, and the native connection ring re-exported from `native_activity.rs` |
+| `tasks.rs` | Pane 2 `Tasks` | running task progress bar, then the queued tasks earliest first |
+| `settings.rs` | `Settings` mode | split pane: section tree and search on the left, form or group list on the right; 15 sections |
+| `add_server.rs` | `AddServer`, `EditServer`, `ImportUrl`, `BatchImport` | protocol picker, typed form, import popups |
+| `export.rs` | export modes | scope, destination and path popups |
+| `status_bar.rs`, `theme.rs`, `widgets/` | shell | status line, theme role resolution, the reusable `DataTable` |
+
+The Profiles grid, `GRID_COLUMNS` in `profiles.rs`, is 18 columns in this order: status glyph, Flag, Address, Port, White, separator, Protocol, Config, separator, Fast, Auth, Real, Stab, Streak, Speed, separator, Out, Exit. Fast and Auth sit before Real because they are the two facts known before a verdict. Stab and Streak sit after Real because they describe the same representative link. Width-aware dropping removes Exit, Out, White, Streak, Stab, Auth, Fast and Speed first, then shrinks Address toward a 12-cell floor; separators never drop. The scrollbar spans the SQL-filtered feed: `page_total` sizes the thumb and `page_offset + first_visible_row` positions it.
+
+Rows come from the loaded page, hydrated by one `profiles_page` call. The Test cell renders the endpoint's representative link, the same link the ordering law stores its tier from, so cell and row band cannot disagree.
+
+Keybindings, column semantics and workflows: [`../guides/tui-manual.md`](../guides/tui-manual.md).
+
+## Batch ping flow
+
+Two layers cooperate: `ops::job_scheduler` is the user-visible queue, and `ops::ping` is the probe pipeline.
+
+### Queue
+
+`job_scheduler::TaskSpec` freezes a `TaskKind`, a `PlanScope`, an optional selected `(endpoint_id, protocol_id)` and a label. `identity()` is `(kind, scope, endpoint)`, so the queue never holds the same task twice and a running task is never re-armed. `enqueue` appends; `drain` starts the head only when nothing is running and the queue is not paused; `stop` cancels the running task and pauses rather than clearing; `resume` continues; `discard_queue_on_quit` flushes history.
+
+`TaskKind` values: `FastTest`, `RealTest`, `SpeedTest`, `UdpTest`, `SpeedTestBatch`, `FillExitIps`, `DnsRetry`, `Compact`, `MultiFastTest`, `MultiRealTest`. `dispatch` maps each to exactly one entry point, and `started` reads the progress slot the entry point sets to confirm the spawn took effect, so a silent refusal cannot wedge the queue.
+
+A scoped batch checks `scope_is_empty` first with a one-row `profiles_page` over `PlanScope`; an unreadable scope counts as non-empty.
+
+### Pipeline
+
+Entry points in `ops/ping.rs`: `start_batch_ping` (fast only, whole feed), `start_batch_then_real_ping` and `start_batch_then_real_ping_scoped` (merged fast plus real), `start_endpoint_batch_ping` and `start_endpoint_batch_real_ping` (selected endpoint), `start_speed_test_batch`, `start_fill_exit_ips`. Every one funnels into `start_batch`, which refuses a second concurrent batch, clears `speed_test_stop`, resets the scheduler, and spawns `run_batch`.
+
+`BatchParams` fixes the budgets before the walk starts: `fast_timeout` and `transport_timeout` both from `speed_test.tcp_timeout_secs`, `real_timeout` from `real_ping_timeout_secs`, retries from `real_ping_retries`, `real_concurrency` from `real_ping_concurrency` (default 100), page size `PROFILES_PAGE_SIZE` (200), the DNS deferral window from `TaskScheduler::dns_defer_secs`, and the DNS cache TTL.
+
+`run_batch`:
+
+1. Builds `BatchShared` and publishes it into `AppState` before the first probe, so an interrupted run can still report its classification through `interrupted_summary_line`.
+2. Walks the plan as a page stream (`PlanWalk`). An explicit plan is one page; a feed walk pages through the tab's own query. Endpoint ids are frozen before any probe for every scope, including `All`, because the scope predicate reads `rank_bin`, which the batch itself changes as results land; offset paging over the live predicate would skip rows.
+3. Dispatches each page as it loads. This is the difference between the first probe starting within one page and waiting for the whole plan: resolving every page first cost about 5.8 s of dead air on the 2026-09-17 reference feed (18,334 endpoints, about 92 pages at a measured 63 ms per page).
+4. Waits for the fast, real and deferred counters to reach zero, joins every tracked task, then calls `finish_batch`, which flushes staged writes, applies the error sweep (`error_ttl_hours`) and emits `BatchEnded`.
+
+`dispatch_page` does, per link: caches the protocol kind and the endpoint, sends at most one `DnsResolveRequest` per DNS endpoint and marks the lookup in flight in the same critical section, applies the config-blind `capability::kind_supported` gate and records an untestable marker, counts the link into the plan denominator, then schedules the fast half.
+
+`dispatch_fast_link` passes `TaskScheduler::schedule`: `Started` spawns `run_task_chain`, `Queued` counts the link, `DnsDeferred` returns false and the caller owns a retry task, `QueueFull` skips the link and counts it. The batch never queues behind itself; the gate exists to keep one live task per link across concurrent producers.
+
+The group-entry barrier applies to the deduplicating real phase: the plan keeps an endpoint's links contiguous, so the endpoint's first protocol is dispatched and its siblings are held until that verdict lands. An endpoint that succeeded drops the held siblings; an endpoint that did not releases them. There is no second check and no cancel-on-winner, so a sibling already in flight finishes and records its full result.
+
+The fast half deduplicates by `(address, port)`: one TCP handshake per unique pair within a page, plus a batch-wide cache. It takes no concurrency permit of its own.
+
+`after_fast_settle` is where a fast-only batch ends and a merged batch continues. The untestable marker is emitted first and outranks a measurement. A hard fast failure retires the link and writes the `[fast]` marker, except for a QUIC-plugin row whose TCP handshake cannot measure a QUIC server; that marker is retracted. With `real_phase` off, the method returns. With it on, `dispatch_real_probe` takes a `real_concurrency` permit, then consults `completed_endpoints` for the dedup setting, then schedules the real task.
+
+The real probe is one connection with two independently budgeted stages: the transport stage (the dial, bounded by `transport_timeout`, and its span is the Fast metric) and the protocol plus probe stage (security handshake, transport upgrade, protocol handshake, target TLS, request, bounded by `real_timeout`). `ProbeError` carries `transport_span: Option<Duration>` and `auth_ack: AuthAck`, so a transport failure is distinguishable from a protocol failure by the field, not by the error class: both stages can report `ProbeClass::Timeout`, and a class test would retire a working server whose protocol stage hung.
+
+### Results
+
+Every result is a `CoreEvent::SpeedTestResult` carrying `endpoint_id`, `protocol_id`, `test_type`, `latency_ms`, `transport_ms`, `speed_bps`, `ip_info`, `error`, `purge`, `marker_kind` and `auth_ack`. `ops::events::apply_test_result` is the one mapping from result to row: it patches the link's typed columns in memory and stages the same patch through the write-behind driver. A `Cancelled` error persists nothing. Any other error writes the failure marker, keeps a stored real measurement, and clears the Fast span only when the transport stage itself failed, because a transport-stage failure contradicts that column.
+
+When the affected row is on the loaded page, the handler re-sorts the owning endpoint's links by test priority and invalidates the page. During a batch the invalidation is throttled to one refetch per `RESULT_RELOAD_THROTTLE` (500 ms) and `BatchEnded` forces the final one. A refetch is one `profiles_page` plus page hydration on the UI task, measured at 23 ms against a 16 ms tick on the 7,486-endpoint reference feed.
+
+Test priority is defined once, in the db crate: ascending `(tier, latency, -last_seen_at, id)` with tier 0 real-ok, 1 fast or UDP-ok, 2 untested, 3 real or name failure, 4 fast failure, 5 DNS unresolved, 6 purged. Fresh failures dominate stored successes because the marker is checked before the stored delay. `EndpointRow::representative_link_index` is the argmin the Test cell renders.
+
+`speed_test_stop: Arc<AtomicBool>` is the shared stop flag. Setting it stops dispatch at the page boundary and cancels running probes; the batch still flushes and emits its terminal event, so a stopped run never leaves unpainted progress behind.
+
+### Progress surfaces
+
+`batch_progress` holds `BatchMeters`: plan pages plus the fast and real levels. `maint_progress` holds `MaintMeters` for DNS retry and Compact, and `fill_progress` holds `FillMeters` for the exit-IP fill. The status bar and the Details/Metrics/Tasks panes read the same slots, so their numbers cannot disagree. Each task kind sets exactly one slot, which is how `job_scheduler::started` detects a spawn.
+
+## Connect path
+
+`connect_to_profile(state, endpoint_id)` finds the row on the loaded page, takes its active link, resolves the runtime core, and starts the matching arm:
+
+- Native: `run_native_session` verifies the config is loaded, derives the effective mixed port, builds `ServerConfig`, starts `NativeCoreServer`, emits `Connected`, forwards telemetry as `CoreEvent`s (traffic deltas, system stats, logs, per-connection traces, sniffer samples), then shuts down and emits `Disconnected` on the stop signal.
+- Subprocess: `CoreManager::start` writes the config and spawns the binary, then the session task runs the backend-specific stats loop until `stop_rx` fires, kills the child and emits `Disconnected`.
+
+Both arms end in the same `CoreEvent` shapes, so the UI, persistence and screens never branch on which backend served the session. Design rationale and seams: [`native-core-integration.md`](native-core-integration.md). Per-protocol capability: [`../reference/native-core.md`](../reference/native-core.md).

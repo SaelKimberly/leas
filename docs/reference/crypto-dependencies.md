@@ -1,141 +1,83 @@
-# Cryptography: where we are not on a crate default, why, and the rules
+# Cryptography: non-default sites, causes, and advisory state
 
-This file is the authority for every place `leas` produces a cryptographic
-byte through something other than a maintained crate's public API — a
-hand-rolled construction, a hazmat-labelled crate, or a documented exception —
-and for the dependency advisories we have triaged instead of fixed. If you are
-adding a primitive and wondering whether hand-rolling is allowed, the answer is:
-read §2 first and prefer a crate.
-
-Related records: `AGENTS.md` decisions 17 (TLS engine) and 19 (secret wiping),
-`docs/reference/native-core.md` (the native/TLS crates), `docs/aegis/specs/2026-09-18-crypto-dependency-hardening-design.md`
-(why liboqs left and what the sweeps found), `docs/aegis/adr/0007-*.md` (the
-accepted posture).
-
-> **Scope note.** Wiping of key material is governed by `AGENTS.md` decision 19,
-> not by this file. This file covers *production* of cryptographic bytes and the
-> advisory state of the crates that do it. A site that appears here is not
-> automatically a defect: each has a cause, an independent oracle, and a
-> retirement trigger.
+This page is the authority for every place `leas` produces a cryptographic byte through something other than a maintained crate's public API (a hand-rolled construction, a hazmat-labelled crate, or a documented exception), and for the dependency advisories triaged instead of fixed. It answers three questions: which sites are not crate defaults, why each exists, and what keeps each honest. It does not list the TLS capability surface; that belongs to [`native-core.md`](native-core.md). Key wiping is a separate rule: every owned key buffer is zeroized, and the `zeroize` feature stays listed on every crypto dependency that touches keys ([`decisions.md`](../architecture/decisions.md)).
 
 ## 1. The rule
 
-- **Crate default first.** Primitives come from ring (the workspace TLS
-  standard) or RustCrypto. `crates/leas-tls` and `crates/leas-native`
-  both carry `#![forbid(unsafe_code)]`, so no hand-written unsafe can creep into
-  the crypto core.
-- **A non-default site needs a cause from §2**, a comment at the site, and an
-  entry in §3. "It was easier" is not a cause.
-- **Every site needs an independent oracle.** A test that runs our
-  implementation against itself — our own client against our own server double,
-  our own encoder against our own decoder — passes with the same bug on both
-  ends and is therefore not evidence. The oracle is an RFC/NIST vector, the
-  peer's own implementation (Go/xray, or the reference crate), or a real peer.
-- **Every dependency exception has a recorded advisory state** in §4,
-  whether fixed, unreachable, or accepted.
+- **Crate default first.** Primitives come from ring (the workspace TLS standard) or RustCrypto. `crates/leas-tls` and `crates/leas-native` both carry `#![forbid(unsafe_code)]`, so hand-written unsafe cannot enter the crypto core.
+- **A non-default site needs a cause from §2**, a comment at the site, and a row in §3. "It was easier" is not a cause.
+- **Every site needs an independent oracle.** A test that runs the implementation against itself (own client against own server double, own encoder against own decoder) passes with the same bug on both ends and is not evidence. The oracle is an RFC or NIST vector, the peer's own implementation (Go/xray, or the reference crate), or a real peer.
+- **Every dependency exception has a recorded advisory state** in §4, whether fixed, unreachable, or accepted.
 
 ## 2. The causes
 
 | Cause | Consequence |
 | --- | --- |
-| **C1. Wire-format mandate.** The peer's bytes fix the construction: xray's VLESS encryption, legacy Shadowsocks/VMess KDFs, TLS 1.2's PRF, RFC 9001's QUIC Initial. | We implement the mandated construction; a "better" primitive would change the wire. |
-| **C2. Upstream API gap.** The primitive exists upstream, but not the mode, context, or parameter we need. | A narrow hand-rolled layer over the crate's own primitives, or a hazmat-labelled crate that is the only implementation of that mode. |
+| **C1. Wire-format mandate.** The peer's bytes fix the construction: xray's VLESS encryption, legacy Shadowsocks/VMess KDFs, TLS 1.2's PRF, RFC 9001's QUIC Initial. | The mandated construction is implemented here; a "better" primitive would change the wire. |
+| **C2. Upstream API gap.** The primitive exists upstream, but not the mode, context, or parameter required. | A narrow hand-rolled layer over the crate's own primitives, or a hazmat-labelled crate that is the only implementation of that mode. |
 | **C3. Build constraint.** A dependency's build needs a toolchain or generator the target cannot assume. | Replaced, or the site is not adopted in the first place. |
-| **C4. Accepted risk.** A reachable advisory with no in-range fix from this workspace, or a transitive pin we do not own. | Recorded in §4 with reachability and a re-evaluation trigger; never silently ignored. |
+| **C4. Accepted risk.** A reachable advisory with no in-range fix from this workspace, or a transitive pin the workspace does not own. | Recorded in §4 with reachability and a re-evaluation trigger; never silently ignored. |
 
-## 3. The inventory (every site, its cause, its oracle, its retirement)
+## 3. The inventory
+
+Every site below is a non-default production of cryptographic bytes, with its cause, its independent oracle, and the upstream change that retires it.
 
 | Site | What it is | Cause | Independent oracle | Retire when |
 | --- | --- | --- | --- | --- |
-| `leas-native/src/protocol/vless/encryption/b3.rs` | Hand-rolled BLAKE3 derive-key mode (481 lines: compression, chunk tree, the `DERIVE_KEY_CONTEXT`/`DERIVE_KEY_MATERIAL` flag pair) | C2 — xray derives keys with `blake3.DeriveKey(k, ctx, key)` over **binary** contexts (the 16-byte client IV, a 1216-byte PFS public key, record bytes); the `blake3` crate exposes `derive_key`/`hash_derive_key_context` for `&str` contexts only, and `guts` is deprecated with a hash-mode-only `ChunkState`/`parent_cv` | `derive_key_matches_reference_crate` (byte-equal to the `blake3` crate for string contexts, including multi-chunk), `derive_key_binary_context_go_vectors` (Go `lukechampine.com/blake3` v1.3.0 — xray's own dependency — for binary contexts), `hash32_matches_reference_crate`, `ss2022_subkey_matches_hand_rolled_derive_key` | An upstream byte-context derive-key API exists (then this file shrinks by 481 lines) |
-| `leas-native/src/protocol/vless/encryption/mlkem.rs` — `new_ctr` (`ctr 0.10`, hazmat-labelled) | xray `XorConn`: AES-256-CTR keystream, keyed by `blake3.DeriveKey("VLESS", key)`, masking relay blocks (`xorpub`/`random`) and the 5-byte record headers (`random`) | C1 (that is what the peer unmasks) + C2 (no RustCrypto API for raw AES-CTR other than this crate) | `nist_sp800_38a_aes256_ctr_matches_the_published_vector` (counter-mode semantics), `xray_new_ctr_keystream_matches_go` (composition, Go `crypto/aes` + `cipher.NewCTR`), `xray_relay_chain_masking_matches_go` (the continuing-keystream offset across the `hash32` region), `random_mode_masks_headers_only` (structure: headers only, +5 B per record) | Never, while xray's `mlkem768x25519plus` wire format stands |
-| `leas-tls/src/{crypto,handshake,record}/` | The TLS 1.3 client: key schedule, transcript, record layer, HelloRetryRequest, certificate handling — hand-rolled over ring primitives | C1 — the crate exists to send a *browser-fingerprint* ClientHello, which rustls cannot produce | `hkdf_expand_label_matches_rfc8448`, `finished_matches_rfc8448`, `expand_label_known_answer`, `x25519_rfc7748_alice_vector`, plus peer tests: a real rustls server, and `tests/strict_peer_presets.rs` against a BoringSSL front (which catches bodies this crate's own parser accepts) | Never — this is the crate's purpose (`docs/reference/native-core.md`) |
-| `leas-native/src/crypto/legacy_stream.rs` | The two legacy primitives RustCrypto does not ship: **AES-CFB-128** (generic over 128/192/256-bit keys — VMess's pre-AEAD header and `aes-*-cfb`) and **RC4** (`rc4-md5`'s keystream, keyed by a session key rather than by the master key) | C1 — that is the wire v2ray-core 4.x/sing-box and the legacy Shadowsocks methods speak; C2 — `RustCrypto` ships no CFB mode and no RC4, and both are five-line constructions over primitives already present. AES-CTR and ChaCha20/XChaCha20 are **not** re-implemented: their codecs stay in `ctr`/`chacha20` and the protocol layer composes them | `cfb128_aes128_matches_nist_sp800_38a` + `cfb128_aes256_matches_nist_sp800_38a` (published F.3.13/F.3.17) + `cfb_is_chunking_invariant`; `rc4_matches_rfc_6229_vectors` + `rc4_round_trips_only_with_continuing_state`; VMess keeps its `id_hash`/IV goldens | When no deployed server needs `alterId > 0`, `aes-*-cfb`, or `rc4-md5` |
-| `leas-tls/src/crypto/hpke.rs` — HPKE base mode | Encrypted ClientHello's payload encryption: DHKEM(X25519, HKDF-SHA256) + HKDF-SHA256 + AES-128-GCM, one-shot base mode | C1 — RFC 9180 §5.1/§4 with the KEM-scoped `"KEM"` suite id; composed from `ring` (X25519 via `x25519-dalek`, HMAC-SHA256/384, AES-128-GCM) with HKDF spilled out by hand because the RFC pins the raw Extract output, which `ring::hkdf::Prk` does not expose; no `hpke` crate (it would duplicate the key ladder for one consumer) | `crypto::hpke::tests::rfc9180_a1_base_vectors` (key schedule, six ciphertexts across sequence numbers, exporter) and `seal_open_round_trip`; end to end, `ech::tests::built_hellos_round_trip_through_a_server_style_decode` plus interop runs against uTLS's ECH server and `crypto.cloudflare.com` | Never while ECH is served |
-| `leas-native/src/transport/kcp/mask.rs` — `mkcp-aes128gcm` | mKCP's seed envelope (`finalmask` `mkcp-aes128gcm`): AES-128-GCM with `key = SHA-256(seed)[..16]`, a random 12-byte nonce ahead of the ciphertext and a 16-byte tag behind it | C1 — the peer's own scheme (`Xray-core` `finalmask/mkcp/aes128gcm`), and the wire is what a panel-configured server reads | `seed_uses_aes_gcm_envelope` (shape, nonce freshness, wrong-seed rejection) and the `kcp_mask_*` e2e rows against xray 26.3.27 | Never while `seed=` links exist |
-| `leas-tls/src/reality/verify.rs` — ML-DSA-65 extension | REALITY's optional post-quantum certificate check: `ML-DSA-65(pk = pqv, msg = HMAC-SHA512(auth_key, ed25519_pub ‖ ClientHello.Raw ‖ ServerHello.Raw), sig = cert.extension[0], ctx = empty)` | C1 — the peer's own scheme (`Xray-core/transport/internet/reality/reality.go:111-127`); verify-only, so no signing key exists here | `crypto::mldsa::tests` — a key/message/signature vector generated by Go 1.27 `crypto/mldsa` (FIPS 204), plus `mldsa65_extension_binds_the_hello_transcript` over a synthetic cert | Never while REALITY servers may set `mldsa65Verify` |
-| `leas-tls/src/crypto/tls12.rs` | TLS 1.2 PRF (ECDHE + AEAD suites) for a server that answers with a 1.2 ServerHello | C1 — ring exposes no TLS 1.2 PRF. CBC suites are **refused**, not hand-rolled: HMAC-then-encrypt is exactly the construction that must not be written here | `prf_sha256_golden_vector` | A server population that never negotiates 1.2 for these profiles |
-| `leas-route/src/sniff.rs` | QUIC Initial decryption (RFC 9001 §5.2 key schedule + header-protection removal) to route on the ClientHello SNI | C1 — routing decisions need the SNI before the tunnel exists | The `quic_*` sniff tests, driven by a test-side Initial encryptor built independently from RFC 9001 (`sniff/tests.rs`), plus multi-datagram `ClientHello` reassembly cases | A routing engine that does not need pre-tunnel SNI |
-| `leas-native/src/crypto/kdf.rs`, `protocol/vmess/*` | Protocol-mandated legacy KDFs: `EVP_BytesToKey`-MD5 password keys, classic-AEAD `HKDF-SHA1(psk, salt, b"ss-subkey")`, 2022-blake3 session subkeys, VMess `KDF64`/`KDF16` (the AES-CFB header lives in its own row above) | C1 — the ciphers are fixed by servers in the wild | `evp_bytes_to_key_md5_vectors`, `hkdf_sha1_matches_independent_vectors`, `ss_subkey_matches_independent_vector`, `blake3_helper_uses_the_spec_context`, the VMess protocol suites | Never for legacy methods; new ciphers are not added to this set |
-| `leas-native/src/protocol/vmess/pad.rs` | VMess chunk obfuscation: a SHAKE128 keystream over the direction's body IV masks the 2-byte record size field and yields the per-record cleartext padding length (`next() % 64`) | C1 — the transform is the protocol (`proxy/vmess/encoding/auth.go:35-70`); the `shake` crate supplies the XOF, the composition is ours | `keystream_matches_an_independent_shake128` (pinned against `hashlib.shake_128`, i.e. OpenSSL, for the first two draws and their order), `the_stream_advances_two_bytes_per_draw`, plus the Go-oracle header golden in `protocol/vmess/header.rs` | Never while VMess is supported; a swap to `0x01`-era framing is a protocol change, not a library one |
-| `leas-native/src/crypto/salamander.rs` | Hysteria2 Salamander packet obfuscation: `payload XOR blake2b256(psk ‖ salt)` with an 8-byte per-packet salt | C1 — the transform is the protocol | `keystream_matches_reference_blake2b`, plus `roundtrip`/`roundtrip_spanning_blocks`/`different_salt_gives_different_wire` | Never while hysteria2's `obfs: salamander` is supported |
-| `leas-tls/src/handshake/mod.rs` — RFC 8879 decompression (`zstd` via `zstd-sys`) | The one decompressor fed **server-supplied** bytes (a `CompressedCertificate` with algorithm 0x0003) | C4-ish tradeoff: bundled libzstd is heavily fuzzed (OSS-Fuzz) while pure-Rust `ruzstd` is young; the decode is bounded by `decompress_bounded` + `MAX_CERT_BYTES`, and the client never encodes | `decompression_bomb_is_bounded` and the `CompressedCertificate` decode tests | A `ruzstd` with comparable fuzzing coverage — and note the adoption cost: the current test's encoder call (`zstd::stream::encode_all`) must become a pinned compressed fixture, because a `zstd` *dev*-dependency would still build `zstd-sys`. Switching would **not** remove a C toolchain from the graph: `zstd-sys` also arrives via `turso_core → tantivy-sstable → zstd` |
+| `crates/leas-native/src/protocol/vless/encryption/b3.rs` | Hand-rolled BLAKE3 derive-key mode (481 lines: compression, chunk tree, the `DERIVE_KEY_CONTEXT`/`DERIVE_KEY_MATERIAL` flag pair) | C2: xray derives keys with `blake3.DeriveKey(k, ctx, key)` over **binary** contexts (the 16-byte client IV, a 1216-byte PFS public key, record bytes). The `blake3` crate exposes `derive_key`/`hash_derive_key_context` for `&str` contexts only, and `guts` is deprecated with a hash-mode-only `ChunkState`/`parent_cv` | `derive_key_matches_reference_crate` (byte-equal to the `blake3` crate for string contexts, including multi-chunk), `derive_key_binary_context_go_vectors` (Go `lukechampine.com/blake3` v1.3.0, xray's own dependency, for binary contexts), `hash32_matches_reference_crate`, `ss2022_subkey_matches_hand_rolled_derive_key` | An upstream byte-context derive-key API exists; the file then shrinks by 481 lines |
+| `crates/leas-native/src/protocol/vless/encryption/mlkem.rs`, `new_ctr` (`ctr` 0.10.1) | xray `XorConn`: AES-256-CTR keystream, keyed by `blake3.DeriveKey("VLESS", key)`, masking relay blocks (`xorpub`/`random`) and the 5-byte record headers (`random`) | C1 (the peer unmasks it) plus C2 (no RustCrypto API for raw AES-CTR other than this crate); the crate is not AEAD, so counter-mode ciphertext carries no tag by design | `nist_sp800_38a_aes256_ctr_matches_the_published_vector` (counter-mode semantics), `xray_new_ctr_keystream_matches_go` (composition, Go `crypto/aes` + `cipher.NewCTR`), `xray_relay_chain_masking_matches_go` (the continuing-keystream offset across the `hash32` region), `random_mode_masks_headers_only` (structure: headers only, +5 B per record) | Never, while xray's `mlkem768x25519plus` wire format stands |
+| `crates/leas-tls/src/crypto/`, `crates/leas-tls/src/handshake/`, `crates/leas-tls/src/record/` | The TLS 1.3 client: key schedule, transcript, record layer, HelloRetryRequest, certificate handling, hand-rolled over ring primitives | C1: the crate exists to send a browser-fingerprint ClientHello, which rustls cannot produce | `hkdf_expand_label_matches_rfc8448`, `finished_matches_rfc8448`, `expand_label_known_answer`, `x25519_rfc7748_alice_vector`, plus peer tests: a real rustls server, and `crates/leas-tls/tests/strict_peer_presets.rs` against a BoringSSL front (which catches bodies this crate's own parser accepts) | Never; this is the crate's purpose ([`native-core.md`](native-core.md)) |
+| `crates/leas-native/src/crypto/legacy_stream.rs` | The two legacy primitives RustCrypto does not ship: **AES-CFB-128** (generic over 128/192/256-bit keys, for VMess's pre-AEAD header and `aes-*-cfb`) and **RC4** (`rc4-md5`'s keystream, keyed by a session key rather than by the master key) | C1 (the wire spoken by v2ray-core 4.x/sing-box and the legacy Shadowsocks methods) plus C2 (RustCrypto ships no CFB mode and no RC4; both are five-line constructions over primitives already present). AES-CTR and ChaCha20/XChaCha20 are **not** re-implemented: their codecs stay in `ctr`/`chacha20` and the protocol layer composes them | `cfb128_aes128_matches_nist_sp800_38a` + `cfb128_aes256_matches_nist_sp800_38a` (published F.3.13/F.3.17) + `cfb_is_chunking_invariant`; `rc4_matches_rfc_6229_vectors` + `rc4_round_trips_only_with_continuing_state`; VMess keeps its `id_hash`/IV goldens | When no deployed server needs `alterId > 0`, `aes-*-cfb`, or `rc4-md5` |
+| `crates/leas-tls/src/crypto/hpke.rs`, HPKE base mode | Encrypted ClientHello's payload encryption: DHKEM(X25519, HKDF-SHA256) + HKDF-SHA256 + AES-128-GCM, one-shot base mode | C1: RFC 9180 §5.1/§4 with the KEM-scoped `"KEM"` suite id, composed from `ring` (X25519 via `x25519-dalek`, HMAC-SHA256/384, AES-128-GCM) with HKDF spelled out by hand because the RFC pins the raw Extract output, which `ring::hkdf::Prk` does not expose. No `hpke` crate: it would duplicate the key ladder for one consumer | `crypto::hpke::tests::rfc9180_a1_base_vectors` (key schedule, six ciphertexts across sequence numbers, exporter) and `seal_open_round_trip`; end to end, `ech::tests::built_hellos_round_trip_through_a_server_style_decode`, plus interop runs against uTLS's ECH server and `crypto.cloudflare.com` | Never while ECH is served |
+| `crates/leas-native/src/transport/kcp/mask.rs`, `mkcp-aes128gcm` | mKCP's seed envelope (`finalmask` `mkcp-aes128gcm`): AES-128-GCM with `key = SHA-256(seed)[..16]`, a random 12-byte nonce ahead of the ciphertext and a 16-byte tag behind it | C1: the peer's own scheme (`thirdparty/Xray-core` `transport/internet/finalmask/mkcp`), and the wire is what a panel-configured server reads | `seed_uses_aes_gcm_envelope` (shape, nonce freshness, wrong-seed rejection) and the `kcp_mask_*` e2e rows in `crates/leas-native/tests/vless.rs` against xray 26.3.27 | Never while `seed=` links exist |
+| `crates/leas-tls/src/crypto/mldsa.rs`, called from `crates/leas-tls/src/reality/verify.rs`, ML-DSA-65 extension | REALITY's optional post-quantum certificate check: `ML-DSA-65(pk = pqv, msg = HMAC-SHA512(auth_key, ed25519_pub ‖ ClientHello.Raw ‖ ServerHello.Raw), sig = cert.extension[0], ctx = empty)` | C1: the peer's own scheme (`thirdparty/Xray-core/transport/internet/reality/reality.go:111-127`). Verify-only, so no signing key exists here | `crypto::mldsa::tests`, a key/message/signature vector generated by Go 1.27 `crypto/mldsa` (FIPS 204), plus `mldsa65_extension_binds_the_hello_transcript` over a synthetic cert | Never while REALITY servers may set `mldsa65Verify` |
+| `crates/leas-tls/src/crypto/tls12.rs` | TLS 1.2 PRF (ECDHE + AEAD suites) for a server that answers with a 1.2 ServerHello | C1: ring exposes no TLS 1.2 PRF. CBC suites are **refused**, not hand-rolled: HMAC-then-encrypt is exactly the construction that must not be written here | `prf_sha256_golden_vector` | A server population that never negotiates 1.2 for these profiles |
+| `crates/leas-route/src/sniff.rs` | QUIC Initial decryption (RFC 9001 §5.2 key schedule + header-protection removal) to route on the ClientHello SNI | C1: routing decisions need the SNI before the tunnel exists | The `quic_*` sniff tests in `crates/leas-route/src/sniff/tests.rs`, driven by a test-side Initial encryptor built independently from RFC 9001, plus multi-datagram ClientHello reassembly cases | A routing engine that does not need pre-tunnel SNI |
+| `crates/leas-native/src/crypto/kdf.rs`, `crates/leas-native/src/protocol/vmess/` | Protocol-mandated legacy KDFs: `EVP_BytesToKey`-MD5 password keys, classic-AEAD `HKDF-SHA1(psk, salt, b"ss-subkey")`, 2022-blake3 session subkeys, VMess `KDF64`/`KDF16` (the AES-CFB header lives in its own row above) | C1: the ciphers are fixed by servers in the wild | `evp_bytes_to_key_md5_vectors`, `hkdf_sha1_matches_independent_vectors`, `ss_subkey_matches_independent_vector`, `blake3_helper_uses_the_spec_context`, the VMess protocol suites | Never for legacy methods; new ciphers are not added to this set |
+| `crates/leas-native/src/protocol/vmess/pad.rs` | VMess chunk obfuscation: a SHAKE128 keystream over the direction's body IV masks the 2-byte record size field and yields the per-record cleartext padding length (`next() % 64`) | C1: the transform is the protocol (`proxy/vmess/encoding/auth.go:35-70`). The `shake` crate supplies the XOF; the composition is in-repo | `keystream_matches_an_independent_shake128` (pinned against `hashlib.shake_128`, i.e. OpenSSL, for the first two draws and their order), `the_stream_advances_two_bytes_per_draw`, plus the Go-oracle header golden in `crates/leas-native/src/protocol/vmess/header.rs` | Never while VMess is supported; a swap to `0x01`-era framing is a protocol change, not a library one |
+| `crates/leas-native/src/crypto/salamander.rs` | Hysteria2 Salamander packet obfuscation: `payload XOR blake2b256(psk ‖ salt)` with an 8-byte per-packet salt | C1: the transform is the protocol | `keystream_matches_reference_blake2b`, plus `roundtrip`/`roundtrip_spanning_blocks`/`different_salt_gives_different_wire` | Never while hysteria2's `obfs: salamander` is supported |
+| `crates/leas-tls/src/handshake/flight.rs`, `decompress_certificate_message` (RFC 8879) | The one decoder fed **server-supplied** bytes: a `CompressedCertificate` with algorithm 0x0001 (zlib via flate2), 0x0002 (brotli) or 0x0003 (zstd via `zstd-sys`) | Accepted risk: bundled libzstd is heavily fuzzed (OSS-Fuzz) while pure-Rust `ruzstd` is young. The decode is bounded by `decompress_bounded` + `MAX_CERT_BYTES` (1 MiB), the offered algorithm list is enforced, and the client never encodes | `decompression_bomb_is_bounded` and the `CompressedCertificate` decode tests in `crates/leas-tls/src/handshake/mod.rs` | A `ruzstd` with comparable fuzzing coverage. Adoption cost: the current test's encoder call (`zstd::stream::encode_all`) must become a pinned compressed fixture, because a `zstd` dev-dependency would still build `zstd-sys`. Switching would **not** remove a C toolchain: `zstd-sys` also arrives through `leas-core` → `zip` 9.1.3 |
 
 ## 4. Accepted advisories (`cargo audit`, `.cargo/audit.toml`)
 
-Fixed by the 2026-09-18 sweep: `chacha20 0.10.1` (**yanked** upstream) bumped to
-0.10.2; `smartstring` (unmaintained, RUSTSEC-2026-0249) replaced by
-`compact_str`; `heapless 0.7`/`atomic-polyfill` removed by turning off
-`postcard`'s default `heapless-cas` feature. `liboqs` (`oqs`) left the tree for
-`ml-kem` (C3).
+Fixed by the 2026-09-18 sweep: `chacha20` 0.10.1 (**yanked** upstream) bumped to 0.10.2; `smartstring` (unmaintained, RUSTSEC-2026-0249) replaced by `compact_str`; `heapless` 0.7/`atomic-polyfill` removed by turning off `postcard`'s default `heapless-cas` feature; `liboqs` (`oqs`) left the tree for `ml-kem` (C3).
 
-Fixed since the last entry: `bincode 1.3.3` (RUSTSEC-2025-0141, unmaintained)
-left the graph with `heed`'s default features off (the LMDB store uses heed's
-native `U64`/`Bytes`/`Str`/`Unit` codecs and hand-rolled postcard encoding, so
-it needs no serde codecs at all); the yanked `yoke-derive 0.8.3` resolved with
-the `yoke` 0.8.4 bump in the 2026-10-22 dependency pass.
+Fixed since: `bincode` 1.3.3 (RUSTSEC-2025-0141, unmaintained) left the graph with heed's default features off (`crates/leas-core` opens heed's native `U64`/`Bytes`/`Str`/`Unit` codecs and encodes with postcard by hand, so it needs no serde codec); the yanked `yoke-derive` 0.8.3 resolved with the `yoke` 0.8.4 bump in the 2026-10-22 dependency pass; `zstd` 0.13.3 / `zstd-safe` 7.3.0 resolved to 0.14.3 / 8.2.0 (RUSTSEC-2026-0391, -0398, -0403) after `crates/leas-db` disabled turso's `fts` feature, the only path to tantivy and its `zstd ^0.26.2`-era pin.
 
-Still visible and triaged (rationale lives in `.cargo/audit.toml` next to each
-entry; they are deliberately **not** in `ignore` so they keep showing up):
+`RUSTSEC-2026-0253` (`lru` 0.16.4, `LruCache::pop` panic safety) left the graph with the same change: the chain ran `turso` `fts` → `tantivy` → `lru` 0.16, and `turso` is pinned without default features. The lock now carries `lru` 0.18.5 and 0.19.0 only, and every crate in this workspace uses 0.19. Provenance, as `lru` is no longer visible in `cargo audit` output: until 2026-10-08 the 0.16 pin also arrived through the published `toasty-driver-turso`; that crate is no longer a dependency (ADR 0012), so the chain was the `fts` feature alone.
+
+Still visible and triaged (rationale lives in `.cargo/audit.toml` next to each entry; they are deliberately **not** in `ignore`, so they keep showing up):
 
 | Advisory | Reachability | Why not fixed here |
 | --- | --- | --- |
-| RUSTSEC-2023-0071 (`rsa`, Marvin attack) | `toasty-driver-mysql → sqlx-mysql`, a driver no workspace member enables (SQLite/turso only) | ignored as unreachable; no fixed release |
-| RUSTSEC-2026-0253 (`lru 0.16.4`, unsound: `LruCache::pop` panic safety) | `leas-db/src/driver/ (the crate's own turso driver fork) → turso_core 0.9.0-pre.2 → tantivy 0.26.2 → lru` | 0.16.4 is the newest 0.16.x and tantivy pins `^0.16.3`; we never call `pop`, and the UB needs a panic inside tantivy's cache (the FTS path this app does not populate). **Provenance updated 2026-10-08**: the chain used to run through the published `toasty-driver-turso`; that crate is no longer a dependency (ADR 0012), so the same `turso_core` arrives via our own `driver/` fork. Our own crates use `lru 0.19`, so the advisory never touches a type we call |
-| RUSTSEC-2025-0134 (`rustls-pemfile`, unmaintained) | `toasty-driver-postgresql → tokio-postgres`, an unactivated optional driver chain | disappears with the driver chain |
+| RUSTSEC-2023-0071 (`rsa` 0.10.0-rc.19, Marvin attack) | `toasty-driver-mysql` → `sqlx-mysql`, a driver no workspace member enables (SQLite/turso only) | ignored as unreachable in `.cargo/audit.toml`; no fixed release exists |
+| RUSTSEC-2025-0134 (`rustls-pemfile` 2.2.0, unmaintained) | `toasty-driver-postgresql` → `tokio-postgres`, an unactivated optional driver chain | disappears with the driver chain |
 
-## 5. Rejected alternatives (so they are not re-proposed)
+## 5. Rejected alternatives
 
-- **Hand-rolling AES-CTR over `aes` to drop the hazmat-labelled `ctr`.** The
-  banner warns that ciphertexts are unauthenticated; this site is a keystream
-  *mask* whose integrity comes from the NFS AEAD and the `hash32` chain, and
-  hand-rolling counter mode trades a maintained crate for in-repo mode code.
-  Kept, with the Go-pinned oracles above (user decision, 2026-09-18).
-- **Replacing ring.** rustls (ring backend), quinn (`rustls-ring`), hickory and
-  reqwest (`rustls-no-provider` with ring installed in code) all land on it; a
-  RustCrypto route means a custom rustls `CryptoProvider` plus X.509 signature
-  verification (RSA/ECDSA/EdDSA, which `rustls-webpki` provides only through
-  ring/aws-lc-rs). That is a TLS-provider migration, i.e. a separate epic.
-- **`aws-lc-rs` as the workspace provider.** C/asm build, worse for the declared
-  Windows target (`x86_64-pc-windows-msvc`), no security win at this threat model.
-- **Keeping liboqs for ML-KEM.** Its build needed CMake, libclang (bindgen) and
-  a C/C++ toolchain; RustCrypto `ml-kem` 0.3.3 is pure Rust with
-  `unsafe_code = "deny"`, and the FIPS 203 bytes are unchanged
-  (`mlkem768_seed_derivation_matches_liboqs_and_go_stdlib`). What that does
-  **not** claim: `bindgen`/`clang-sys` still resolve as `turso_sdk_kit`'s
-  non-optional build-dependency, and `cc` is still needed for
-  `zstd-sys`/`lmdb-master-sys`/`libsqlite3-sys`/ring. The bindgen pair is
-  compiled but never invoked — turso_sdk_kit ships pre-generated
-  `src/bindings.rs` (regenerated by hand via its `bindgen.sh`) and its
-  `build.rs` never calls bindgen, while `clang-sys` resolves with the `runtime`
-  feature (libclang is dlopen'd only on use). Only `cmake` actually left the
-  graph.
-- **Forking `blake3` to expose a byte-context derive-key.** Maintaining a fork
-  of a security crate is a larger liability than the vector-pinned
-  implementation it would replace.
-- **`ruzstd` today.** See the `zstd` row in §3: it is a real hardening direction,
-  but not obviously a net win yet, and it does not remove a C toolchain.
+- **Hand-rolling AES-CTR over `aes` to drop the `ctr` crate.** Counter-mode ciphertext is unauthenticated; this site is a keystream *mask* whose integrity comes from the NFS AEAD and the `hash32` chain, and hand-rolling counter mode trades a maintained crate for in-repo mode code. Kept, with the Go-pinned oracles above (user decision, 2026-09-18).
+- **Replacing ring.** rustls (ring backend), quinn (`rustls-ring`), hickory and reqwest (`rustls-no-provider` with ring installed in code) all land on it. A RustCrypto route means a custom rustls `CryptoProvider` plus X.509 signature verification (RSA/ECDSA/EdDSA, which `rustls-webpki` provides only through ring/aws-lc-rs). That is a TLS-provider migration, a separate epic.
+- **`aws-lc-rs` as the workspace provider.** C/asm build, worse for the declared Windows target (`x86_64-pc-windows-msvc`), no security win at this threat model.
+- **Keeping liboqs for ML-KEM.** Its build needed CMake, libclang (bindgen) and a C/C++ toolchain; RustCrypto `ml-kem` 0.3.3 is pure Rust with `unsafe_code = "deny"`, and the FIPS 203 bytes are unchanged (`mlkem768_seed_derivation_matches_liboqs_and_go_stdlib`). What that does **not** claim: `bindgen`/`clang-sys` still resolve as `turso_sdk_kit`'s non-optional build-dependency, and `cc` is still needed for `zstd-sys`/`lmdb-master-sys`/`libsqlite3-sys`/ring. The bindgen pair is compiled but never invoked: `turso_sdk_kit` ships pre-generated `src/bindings.rs` **inside the crate** (regenerated by hand with its `bindgen.sh`), and its `build.rs` never calls bindgen, while `clang-sys` resolves with the `runtime` feature (libclang is dlopen'd only on use). Only CMake left the graph.
+- **Forking `blake3` to expose a byte-context derive-key.** Maintaining a fork of a security crate is a larger liability than the vector-pinned implementation it would replace.
+- **`ruzstd` today.** See the RFC 8879 row in §3: a real hardening direction, not obviously a net win yet, and it does not remove a C toolchain.
 
-## 6. Adding a hazmat site — checklist
+## 6. Adding a hazmat site
 
-1. Name the cause from §2 in a comment at the site (what the peer/crate constraint
-   is, and what the alternative was).
-2. Add an **independent** oracle: an RFC/NIST vector, the peer implementation's
-   own output, or a reference crate. A self-consistent round-trip is not one.
-3. State the wire/format compatibility boundary: what a peer sees if this
-   changes.
-4. State the retirement trigger (what upstream change deletes this site).
+Follow these steps in order. A site that skips one is not ready.
+
+1. Name the cause from §2 in a comment at the site: the peer or crate constraint, and the alternative that was rejected.
+2. Add an **independent** oracle: an RFC or NIST vector, the peer implementation's own output, or a reference crate. A self-consistent round-trip is not an oracle.
+3. State the wire-format boundary: what a peer sees if the construction changes.
+4. State the retirement trigger: the upstream change that deletes this site.
 5. Add the row to §3.
-6. If a dependency is involved, comment the manifest and record the advisory
-   state in §4 after `cargo audit` + `cargo tree` checks.
+6. If a dependency is involved, comment the manifest, then run `cargo audit` and `cargo tree -i <crate>` and record the advisory state in §4.
 
-## 7. Vector generators (so the oracles can be regenerated)
+## 7. Vector generators
 
-Both programs run with Go 1.27.1 (`lukechampine.com/blake3` is in the module
-cache; the mask program needs no network).
+Both programs run with Go 1.27.1 (`lukechampine.com/blake3` is in the module cache; the mask program needs no network).
 
-**ML-KEM seed → encapsulation key** (`crypto/mlkem.rs` KAT). Seeds: A = 64 zero
-bytes, B = bytes `0..=63`:
+**ML-KEM seed to encapsulation key** (`crates/leas-tls/src/crypto/mlkem.rs` KAT, `KAT_SEED_A`/`KAT_SEED_B`). Seeds: A = 64 zero bytes, B = bytes `0..=63`:
 
 ```go
 package main
@@ -154,12 +96,9 @@ func main() {
 }
 ```
 
-The retired liboqs implementation produced byte-identical output for both seeds
-(`cargo run -p leas-tls --example kat_dump` before the swap), which is what
-makes the constant a *migration* pin and not just a Go pin.
+The retired liboqs implementation produced byte-identical output for both seeds (before the swap, via the since-removed `kat_dump` example), which makes the constant a migration pin and not only a Go pin.
 
-**VLESS XOR mask** (`encryption/mlkem.rs` KATs). Inputs: `iv = 0..15`, and keys
-`[base + 0..31]` for `base` 0x40 (`k0`), 0x80 (`k1`), 0xa0 (`s0`):
+**VLESS XOR mask** (`crates/leas-native/src/protocol/vless/encryption/mlkem.rs` KATs). Inputs: `iv = 0..15`, and keys `[base + 0..31]` for `base` 0x40 (`k0`), 0x80 (`k1`), 0xa0 (`s0`):
 
 ```go
 package main

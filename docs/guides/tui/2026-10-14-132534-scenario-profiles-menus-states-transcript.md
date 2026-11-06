@@ -1,8 +1,39 @@
-# Transcript — profiles-menus-states
+# Transcript: profiles-menus-states (2026-10-14)
 
-Verbatim report returned by `run_scenario(script=2026-10-14-132534-scenario-profiles-menus-states.md, session_id=profiles-menus-states)`
-on 2026-10-14, executed in-process from the `/home/user/oss/mcp-tui-test` v0.3.0 checkout (Python 3.14.7, pyte 0.8.2).
-The runner patches pyte's `Screen.display` before the call (see the scenario document's *Tooling friction*); nothing else is changed.
+Verbatim report of one `run_scenario` call on 2026-10-14. The expectations, the script and the findings
+live in [the scenario document](2026-10-14-132534-scenario-profiles-menus-states.md); this file holds
+only what the harness returned.
+
+## Purpose and scope
+
+Records the harness report for session `profiles-menus-states`, unchanged: every step, its status, its
+duration, and every screen or line it read. Use it to check a quote in the scenario document or the
+review; it contains no analysis of its own.
+
+## Environment and fixtures
+
+| Field | Value |
+|---|---|
+| Produced by | `run_scenario(script=2026-10-14-132534-scenario-profiles-menus-states.md, session_id=profiles-menus-states)` |
+| Date | 2026-10-14 |
+| Harness | mcp-tui-test 0.3.0, executed in-process from the `/home/user/oss/mcp-tui-test` checkout, Python 3.14.7, pyte 0.8.2 |
+| Session / mode / size | `profiles-menus-states` / buffer / 120x40 |
+| App under test | leas 0.1.0 debug build `13e132f2…`, `/home/user/oss/xray-tui/target/debug/leas` |
+| Fixture | `fixtures/config.json` plus `fixtures/seeded/data.db`, copied to `/home/user/.cache/leas-tui/profiles-menus` |
+
+The runner patches pyte's `Screen.display` before the call; nothing else is changed. Harness limits and
+that patch are documented once in [INDEX.md](INDEX.md).
+
+## Expected behaviour (written before the run)
+
+Ten expectations, E1–E10, in the scenario document's *Expected behaviour* table.
+
+## Scenario script
+
+The 35-step script is in
+[the scenario document](2026-10-14-132534-scenario-profiles-menus-states.md).
+
+## Observed behaviour
 
 ```text
 Scenario document: profiles-menus-states — leas Profiles tab overlays and modal states — help, speed-test menu, export scope, delete confirmation, and the prefix-search filter including its filtered-empty state
@@ -220,3 +251,12 @@ steps: 35 · errored: 0 · session closed
 ok: True | action: executed | session_alive: False
 rescue_files: []
 ```
+
+## Corrections to expectations
+
+None: a transcript reports what happened. The four wrong predictions (E2, E4, E6, E7) are corrected in
+[the scenario document](2026-10-14-132534-scenario-profiles-menus-states.md).
+
+## Verdict
+
+35 steps, 0 errored, session closed; `ok: True`, `rescue_files: []`.

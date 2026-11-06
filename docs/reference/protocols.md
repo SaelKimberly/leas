@@ -1,1095 +1,927 @@
 # Protocol Configuration Reference
 
-> **Audience**: Developers working on import/export, config generation, or adding new protocols.
-> **Status**: Living document — update when adding protocol fields or fixing precision gaps.
+This page answers three questions: what share-URL shape each protocol accepts, which typed config fields that shape fills, and which backend can build or serve the row. Every path, field and capability below is checked against `crates/leas-proto`, `crates/leas-config` and `crates/leas-native`. It does not cover wire formats, TLS engine internals or verification tiers (owned by [`native-core.md`](native-core.md)), Clash YAML key mapping (owned by [`clash.md`](clash.md)), or ordering (owned by [`ordering-law.md`](ordering-law.md)).
+
+## 1. Coverage
+
+### 1.1 Backends
+
+| Backend | What it does | Code |
+|---|---|---|
+| `xray-core` | Subprocess, JSON config built by `inject_to(CoreType::Xray)` | `crates/leas-proto/src/proto_spec/*.rs`, `crates/leas-core/src/config_builder/xray.rs` |
+| `sing-box` | Subprocess, JSON config built by `inject_to(CoreType::SingBox)` | `crates/leas-core/src/config_builder/singbox.rs` |
+| Clash / mihomo | YAML import and export of a proxy entry | `crates/leas-proto/src/clash/mod.rs` |
+| native | In-process engine, `leas-native` | `crates/leas-native/src/protocol/` |
+
+Core selection is `core_mapping::resolve_core`: `SINGBOX_ONLY_KINDS` forces sing-box, Shadowsocks resolves on its cipher, everything else defaults to xray-core. A per-profile override wins, and the builder then validates against that core.
+
+### 1.2 Matrix
+
+Legend: build = the backend can produce a valid outbound for the config; Clash = YAML import and export both exist; native = the connect-time gate `capability::supported` admits the kind.
+
+| # | Protocol | Kind string | Typed config | xray-core build | sing-box build | Clash | native | Share URL |
+|---|---|---|---|---|---|---|---|---|
+| 1 | VMess | `vmess` | `VmessConfig` | yes | yes | yes | yes | `vmess://base64(JSON)` |
+| 2 | VLESS | `vless` | `VlessConfig` | yes | yes | yes | yes | `vless://uuid@host:port?query` |
+| 3 | Trojan | `trojan` | `TrojanConfig` | yes | yes | yes | yes | `trojan://pass@host:port?query` |
+| 4 | Shadowsocks | `ss` | `SsConfig` | AEAD only | yes | yes | yes | `ss://base64(method:pass)@host:port?plugin=` |
+| 5 | Shadowsocks-2022 | `ss-2022` | `SsConfig` | yes | yes | yes | yes | same `ss://` shape |
+| 6 | ShadowsocksR | `ssr` | `SsrConfig` | no | yes | yes | no | `ssr://base64(host:port:proto:method:obfs:base64(pass)/?params)` |
+| 7 | SOCKS5 | `socks` | `Socks5Config` | yes | yes | yes | no (see 7) | `socks://user:pass@host:port` |
+| 8 | HTTP | `http` | `HttpClientConfig` | yes | yes | yes | no | `http://user:pass@host:port?security=tls` |
+| 9 | TUIC | `tuic` | `TuicConfig` | no | yes | yes | no | `tuic://uuid:pass@host:port?query` |
+| 10 | Hysteria2 | `hy2` | `Hysteria2Config` | yes | yes | yes | yes | `hysteria2://auth@host:port?query` |
+| 11 | Hysteria v1 | `hy` | `Hysteria1Config` | no | yes | yes | no | `hysteria://host:port?query` |
+| 12 | WireGuard | `wireguard` | `WireguardConfig` | yes | yes | yes | no | `wireguard://key@host:port?query` |
+| 13 | Naïve | `naive` | `NaiveConfig` | no | yes | yes | no | `naive+https://user:pass@host:port` |
+| 14 | AnyTLS | `any-tls` | `AnyTlsConfig` | no | yes | yes | no | `anytls://host:port?password=` |
+| 15 | ShadowTLS | `shadow-tls` | `ShadowTlsConfig` | no | yes | yes | no | `shadowtls://host:port?password=` |
+| 16 | Tor | `tor` | `TorConfig` | no | yes | yes | no | none, JSON or Clash only |
+| 17 | SSH | `ssh` | `SshConfig` | no | yes | yes | no | none, JSON or Clash only |
+| 18 | Tailscale | `tailscale` | `TailscaleConfig` | no | yes | yes | no | none, JSON or Clash only |
+| 19 | Redirect | `redirect` | `PlaceholderConfig` | no | no | no | no | inbound form, not a destination |
+| 20 | TProxy | `t-proxy` | `PlaceholderConfig` | no | no | no | no | inbound form, not a destination |
+| 21 | Mixed | `mixed` | `PlaceholderConfig` | no | no | no | no | inbound form, not a destination |
+
+The three placeholder kinds are refused by both builders (`SupportError::UnsupportedProtocol`): sing-box has no redirect/tproxy/mixed outbound type, and a raw legacy body is never a valid outbound. They exist so a feed containing such a row stays importable.
+
+Kind strings and the DB/wire dialect are owned by `ProtocolKind` in `crates/leas-proto/src/proto_spec/kinds.rs`; `FromStr` also accepts the legacy hyphen-less aliases (`hysteria`, `hysteria2`, `anytls`, `shadowtls`, `tproxy`, `hysteria1`).
+
+### 1.3 Endpoint split
+
+Since the host-free parse mandate, no config struct carries host or port. A parse returns `ParsedProto { endpoints, protocol }`: `EndpointEssentials` holds host, host type, primary port and the flattened port list; `ProtocolEssentials::config` holds only endpoint-free parameters. This is why one config pointed at many servers dedups to one `Protocol` row. Reconstruction functions (`reconstruct_proto`) take the endpoint back as an argument.
 
 ---
 
-## Table of Contents
+## 2. VMess
 
-1. [Protocol Coverage](#1-protocol-coverage)
-2. [VMess (`vmess://`)](#2-vmess-vmess)
-3. [VLESS (`vless://`)](#3-vless-vless)
-4. [Trojan (`trojan://`)](#4-trojan-trojan)
-5. [Shadowsocks (`ss://`)](#5-shadowsocks-ss)
-6. [ShadowsocksR (`ssr://`)](#6-shadowsocksr-ssr)
-7. [SOCKS5 (`socks://`)](#7-socks5-socks)
-8. [HTTP (`http://`)](#8-http-http)
-9. [TUIC (`tuic://`)](#9-tuic-tuic)
-10. [Hysteria2 (`hysteria2://` / `hy2://`)](#10-hysteria2-hysteria2--hy2)
-11. [Hysteria v1 (`hysteria://` / `hy://`)](#11-hysteria-v1-hysteria--hy)
-12. [WireGuard (`wireguard://`)](#12-wireguard-wireguard)
-13. [Naïve (`naive+https://`)](#13-naïve-naivehttps)
-14. [AnyTLS (`anytls://`)](#14-anytls-anytls)
-15. [ShadowTLS (`shadowtls://`)](#15-shadowtls-shadowtls)
-16. [Tor](#16-tor)
-17. [SSH](#17-ssh)
-18. [Tailscale](#18-tailscale)
-19. [Inbound-Only Protocols](#19-inbound-only-protocols-redirect-tproxy-mixed)
-20. [Transport Configuration](#20-transport-configuration)
-21. [TLS / Security Configuration](#21-tls--security-configuration)
-22. [Internal / Infrastructure Protocols](#22-internal--infrastructure-protocols)
-23. [Precision Notes & Known Gaps](#23-precision-notes--known-gaps)
+- **Scheme**: `vmess://` (base64 of a v2rayN `VmessQRCode` JSON object).
+- **Source**: `crates/leas-proto/src/proto_spec/vmess.rs`: `VmessConfig`.
+- **Example**: `vmess://eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==`
 
----
+### Fields
 
-## 1. Protocol Coverage
+| Field | JSON key | Type | Required | Default | Notes |
+|---|---|---|---|---|---|
+| `uuid` | `id` | `String` | yes | - | Not validated as a UUID |
+| host | `add` | `EndpointEssentials.host` | yes | - | Endpoint, not config |
+| port | `port` | `EndpointEssentials.port` | yes | - | String or number (`coerce_u16`) |
+| `transport` | `net` | `TransportConfig` | no | `Tcp` | Empty, absent or `"null"` means TCP |
+| `path` | `path` | `Option<TinyText>` | no | `None` | WS path, gRPC service name mirror, KCP seed |
+| transport host | `host` | `WebSocketConfig.host` etc. | no | `None` | Stored only when explicit; never the endpoint host |
+| `security.tls` | `tls` | `Option<TlsConfig>` | no | `None` | Any non-empty value means TLS |
+| SNI | `sni` | `TlsOpts.sni` | no | `None` | |
+| ALPN | `alpn` | `TlsOpts.alpn` | no | `None` | |
+| fingerprint | `fp` | `TlsOpts.fp` | no | `None` | |
+| `security.enc` | `scy` | `Option<TinyText>` | no | `auto` | Always stored, defaults to `auto` |
+| `alter_id` | `aid` | `Option<TinyText>` | no | `None` | Value `"0"`, empty or absent is not stored |
+| `insecure` | `insecure` | `TlsOpts.insecure` | no | `None` | `1`/`true`, `0`/`false` |
+| `remarks` | `ps` | `Option<TinyText>` | no | `None` | Wrapping quotes stripped |
+| - | `type` | `XHttpConfig.mode` | no | `None` | Read only for XHttp |
+| - | `v` | not stored | - |: | Version marker, dropped |
 
-### Legend
+### Parser quirks
 
-| Symbol | Meaning |
-|--------|---------|
-| ✅ | Full config type in `proto_spec`, share URL parse/reconstruct |
-| ⚠️ | Placeholder (blob-only, no typed struct) |
-| ❌ | Not implemented |
-| — | Not applicable (inbound-only / infra) |
+- Base64 decoding tolerates trailing annotation text and stray backticks (`decode_base64`).
+- JSON is parsed permissively (single-quoted keys, trailing commas).
+- A missing `id` fails with `MissingConf`; a missing `add` fails with `MissingHost`.
+- `net` values `tcp`, `raw`, `auto` and `none` all yield `Tcp`; the last two are generator mistakes that mihomo also accepts.
 
-### Matrix
+### Backend coverage
 
-| # | Protocol | proto_spec | xray-core | sing-box | mihomo | quirktiva | Share URL | URL Format |
-|---|----------|-----------|-----------|----------|--------|-----------|-----------|------------|
-| 1 | VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `vmess://base64(JSON)` |
-| 2 | VLESS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `vless://uuid@host:port?query` |
-| 3 | Trojan | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `trojan://pass@host:port?query` |
-| 4 | Shadowsocks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `ss://base64(method:pass)@host:port?query` |
-| 5 | ShadowsocksR | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | `ssr://base64(host:port:proto:method:obfs:pass/?params)` |
-| 6 | SOCKS5 | ⚠️ Placeholder | ✅ | ✅ | ✅ | ✅ | ✅ | `socks://user:pass@host:port` |
-| 7 | HTTP | ⚠️ Placeholder | ✅ | ✅ | ✅ | ✅ | ✅ | `http://user:pass@host:port` |
-| 8 | TUIC | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | `tuic://uuid:pass@host:port?query` |
-| 9 | Hysteria2 | ✅ | ⚠️ h2 only | ✅ | ✅ | ✅ | ✅ | `hysteria2://auth@host:port?query` |
-| 10 | Hysteria v1 | ⚠️ Placeholder | ✅ | ✅ | ✅ | ❌ | ✅ | `hysteria://host:port?query` |
-| 11 | WireGuard | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `wireguard://key@host:port?query` |
-| 12 | Naïve | ⚠️ Placeholder | ❌ | ✅ | ❌ | ❌ | ✅ | `naive+https://user:pass@host:port` |
-| 13 | AnyTLS | ⚠️ Placeholder | ❌ | ✅ | ✅ | ✅ | ✅ | `anytls://host:port?query` |
-| 14 | ShadowTLS | ⚠️ Placeholder | ❌ | ✅ | ❌ | ❌ | ✅ | `shadowtls://host:port?query` |
-| 15 | Tor | ⚠️ Placeholder | ❌ | ✅ | ❌ | ❌ | ❌ | JSON only |
-| 16 | SSH | ⚠️ Placeholder | ❌ | ✅ | ✅ | ❌ | ❌ | JSON only |
-| 17 | Tailscale | ⚠️ Placeholder | ❌ | ✅ | ✅ | ❌ | ❌ | JSON only |
-| 18 | Redirect | ⚠️ Placeholder | ✅ | ✅ | ❌ | ❌ | ❌ | Inbound only |
-| 19 | TProxy | ⚠️ Placeholder | ✅ | ✅ | ❌ | ❌ | ❌ | Inbound only |
-| 20 | Mixed | ⚠️ Placeholder | ✅ | ✅ | ❌ | ❌ | ❌ | Inbound only |
+xray-core, sing-box, Clash and native all build. Native transport support is the shared set in §20.
 
 ---
 
-## 2. VMess (`vmess://`)
+## 3. VLESS
 
-**Source**: `crates/leas-proto/src/proto_spec/vmess.rs` — `VmessConfig` struct
+- **Scheme**: `vless://<uuid>@<host>:<port>?<query>#<remarks>`.
+- **Source**: `crates/leas-proto/src/proto_spec/vless.rs`: `VlessConfig`.
+- **Example**: `vless://6202b230-417c-4d8e-b624-0f71afa9c75d@159.223.24.65:443?path=/?ed=2560&security=tls&encryption=none&sni=test.ir&type=ws`
 
-**Share URL format**: `vmess://<base64url_no_pad(JSON)>`
+### Fields
 
-The base64-decoded payload is a JSON object with abbreviated 2–3 char v2rayN `VmessQRCode` keys.
+| Field | Key | Type | Default | Notes |
+|---|---|---|---|---|
+| `uuid` | userinfo | `String` | - | Required |
+| `uuid_origin` | userinfo | `Option<TinyText>` | `None` | Non-UUID userinfo, mapped to a v5 UUID |
+| `security` | `security` | `SecurityConfig` | `none` | `none`, `tls`, `reality` |
+| `encryption` | `encryption` | `Option<TinyText>` | `None` | Stored unless empty; also the ML-KEM form, see below |
+| `flow` | `flow` | `Option<TinyText>` | `None` | `xtls-rprx-vision`, `xtls-rprx-vision-udp443` |
+| `transport` | `type` | `TransportConfig` | `tcp` | |
+| `path` | `path` | `Option<TinyText>` | `None` | Mirrored from the transport |
+| `mux` | `mux`, `muxtype` | `Option<VlessMux>` | `None` | `Limited(n)`, `Unlimited` (`-1`), `Invalid` |
+| `splice` | `splice` | `Option<bool>` | `None` | `1`/`0`, `true`/`false` |
+| `remarks` | `#` | `Option<TinyText>` | `None` | |
 
-### Parameters
+TLS query keys: `sni`, `alpn`, `fp`, and the four verification aliases `allowInsecure`, `allow_insecure`, `allowinsecure`, `skipVerify`. REALITY adds `pbk`, `sid`, `spx`, `pqv` (`RealityOpts.mldsa65_verify`).
 
-| Field | URL Key | Type | Required | Default | Description |
-|-------|---------|------|----------|---------|-------------|
-| `uuid` | `id` | `String` | ✅ | — | User UUID v4 |
-| `host` | `add` | `HostSpec` | ✅ | — | Server address (IP or domain) |
-| `port` | `port` | `u16` | ✅ | — | Server port (string or number) |
-| `security.tls` | `tls` | `Option<TlsConfig>` | ❌ | `None` | TLS config: `"tls"` or absent |
-| `security.enc` | `scy` | `Option<TinyText>` | ❌ | `"auto"` | Encryption: `auto`, `aes-128-gcm`, `chacha20-poly1305`, `none`, `zero` |
-| `transport` | `net` | `TransportConfig` | ❌ | `Tcp` | Transport: `tcp`, `ws`, `kcp`, `grpc`, `http`/`h2`, `quic`, `httpupgrade`, `splithttp`/`xhttp` |
-| `alter_id` | `aid` | `Option<TinyText>` | ❌ | `None` | Additional IDs (must be 0 for AEAD-only) |
-| `path` | `path` | `Option<TinyText>` | ❌ | `None` | WS path / gRPC serviceName / KCP seed |
-| `host` (transport) | `host` | `Option<String>` | ❌ | `None` | WS/HTTP host header / gRPC authority |
-| — | `type` | — | ❌ | — | XHttp/SplitHTTP mode (stored in `transport.xhttp.mode`) |
-| — | `v` | — | ❌ | — | Config version (not stored, always `"2"`) |
+The `encryption` value may be an xray `mlkem768x25519plus` string:
 
-### TLS sub-parameters (in `security.tls` = `TlsConfig::Tls`)
+```text
+mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<padding>.<keys>
+```
 
-| Field | URL Key | Type | Description |
-|-------|---------|------|-------------|
-| `sni` | `sni` | `Option<TinyText>` | TLS SNI override |
-| `alpn` | `alpn` | `Option<TinyText>` | ALPN (comma-separated) |
-| `fp` | `fp` | `Option<TinyText>` | uTLS Client Hello fingerprint |
-| `insecure` | `insecure` | `Option<bool>` | Skip TLS cert verification (`1`/`true`) |
+`parse_mlkem_encryption` returns `None` for any other prefix, and errors on an unknown mode, unknown RTT token, bad base64url, or a key segment that is not 32 or 1184 bytes.
 
-### Notes
+### Parser quirks
 
-- The `host` field serves dual role: server address (`add`) and transport host header (`host`)
-- `host` starting with `/` is treated as path when `path` is empty (v2rayN compat)
-- `type` field is only used for XHttp mode; ignored for other transports
-- Fields not stored but round-tripped via base64 JSON: `v` (version, always "2")
+- Mux presence is the decision, not magnitude: `mux=-1` is `Unlimited`, `mux=0` is inactive, an unparseable value or `muxtype=smux` becomes `Invalid { key, value }` and stays exportable.
+- `security` defaults to `none`, unlike Trojan.
+- `type` accepts `raw`, `auto` and `none` as TCP. For `type=grpc`, the service name arrives through `path`; no `serviceName` query key is read, though the module header claims one.
+- An XHttp `mode` outside `auto`, `packet-up`, `stream-up`, `stream-one` is first passed through `recover_xhttp_mode`; if that fails the parse errors. A non-JSON `extra` errors.
 
-### Upstream References
+### Backend coverage
 
-- Xray-core: `proxy/vmess/account.proto`, `proxy/vmess/outbound/config.proto`
-- v2rayN: `ServiceLib/Models/Dto/VmessQRCode.cs`
-- sing-box: `option/vmess.go` — `VMessOutboundOptions`
-- mihomo: `adapter/outbound/vmess.go` — `VmessOption`
-
-### Round-Trip Precision
-
-| Check | Status |
-|-------|--------|
-| parse → reconstruct → parse | ✅ Tested |
-| JSON serde round-trip | ✅ Tested |
-| Full field round-trip | ✅ All fields preserved |
-| Legacy bridge precision | ✅ `convert_spec_blob` maps all fields |
+xray-core, sing-box, Clash, native.
 
 ---
 
-## 3. VLESS (`vless://`)
+## 4. Trojan
 
-**Source**: `crates/leas-proto/src/proto_spec/vless.rs` — `VlessConfig` struct
+- **Scheme**: `trojan://<password>@<host>:<port>?<query>#<remarks>`.
+- **Source**: `crates/leas-proto/src/proto_spec/trojan.rs`: `TrojanConfig`.
+- **Example**: `trojan://humanity@172.64.152.23:443?security=tls&type=ws&path=/assignment&sni=www.creationlong.org`
 
-**Share URL format**: `vless://<uuid>@<host>:<port>?<query_params>#<remarks>`
+### Fields
 
-### Parameters
+| Field | Key | Type | Default | Notes |
+|---|---|---|---|---|
+| `password` | userinfo | `String` | - | Required; `#` in a password is handled by the splitter |
+| `security` | `security` | `SecurityConfig` | `tls` | `tls`, `none`, `reality` |
+| `transport` | `type` | `TransportConfig` | `tcp` | |
+| `path` | `path` | `Option<TinyText>` | `None` | Mirrored from the transport |
+| `remarks` | `#` | `Option<TinyText>` | `None` | |
 
-| Field | URL Key | Type | Required | Default | Description |
-|-------|---------|------|----------|---------|-------------|
-| `uuid` | (userinfo) | `String` | ✅ | — | User UUID v4 |
-| `uuid_origin` | (userinfo) | `Option<TinyText>` | ❌ | `None` | Original non-UUID string (v5-derived UUID) |
-| `host` | (host) | `HostSpec` | ✅ | — | Server address |
-| `port` | (port) | `u16` | ✅ | — | Server port |
-| `security` | `security` | `SecurityConfig` | ❌ | `none` | TLS mode: `none`, `tls`, `reality` |
-| `encryption` | `encryption` | `Option<TinyText>` | ❌ | `none` | Payload encryption (typically `none`) |
-| `flow` | `flow` | `Option<TinyText>` | ❌ | `None` | XTLS flow: `xtls-rprx-vision`, `xtls-rprx-vision-udp443` |
-| `transport` | `type` | `TransportConfig` | ❌ | `tcp` | Transport type |
-| `path` | `path` | `Option<TinyText>` | ❌ | `None` | WS/gRPC path |
-| `splice` | `splice` | `Option<bool>` | ❌ | `None` | Splice mode (`1`/`0`, `true`/`false`) |
-| `remarks` | `#` fragment | `Option<TinyText>` | ❌ | `None` | Display name |
+TLS keys match VLESS. REALITY accepts `pbk`, `sid`, `spx`, `pqv`.
 
-### TLS sub-parameters
+### Parser quirks
 
-| Mode | URL Key | Type | Description |
-|------|---------|------|-------------|
-| `tls` | `sni` | `Option<TinyText>` | TLS SNI override |
-| `tls` | `alpn` | `Option<TinyText>` | ALPN list |
-| `tls` | `fp` | `Option<TinyText>` | uTLS fingerprint |
-| `tls` | `allowInsecure` / `allow_insecure` / `allowinsecure` / `skipVerify` | `Option<bool>` | Skip verification |
-| `reality` | `sni` | `Option<TinyText>` | REALITY SNI |
-| `reality` | `fp` | `Option<TinyText>` | uTLS fingerprint |
-| `reality` | `pbk` | `Option<String>` | REALITY public key |
-| `reality` | `sid` | `Option<TinyText>` | REALITY short ID |
-| `reality` | `spx` | `Option<TinyText>` | REALITY spider X |
+- `security` absent means `tls`; `security=none` must be explicit.
+- The parser reads `sni` only. Export defaults fill an absent SNI with the resolved host (`set_export_defaults`); the config stores only explicit values. The module header mentions a `peer` fallback, but no code reads a `peer` key.
+- Only `type` and `path` are read; the module header's `ws=1` + `wspath=` legacy form is not implemented.
 
-### Transport sub-parameters
+### Backend coverage
 
-| Transport | URL Keys | Notes |
-|-----------|----------|-------|
-| `xhttp` | `mode`, `extra` | Mode: `auto`, `packet-up`, `stream-up`, `stream-one`; extra: JSON blob |
-| `httpupgrade` | `host` | HTTP Host header |
-| Any non-TCP | `host` | Transport host header |
-| Any | `path` | Shared path field |
-
-### Notes
-
-- Userinfo may be a short string (not a UUID) → v5-generated from nil namespace, stored in `uuid_origin`
-- REALITY is VLESS-only (not supported by VMess)
-- `security` defaults to `"none"` (unlike Trojan which defaults to `"tls"`)
-- For `type=grpc`, path is also accepted as `serviceName` query param
-
-### Upstream References
-
-- Xray-core: `proxy/vless/account.proto`, `proxy/vless/outbound/config.proto`
-- sing-box: `option/vless.go` — `VLESSOutboundOptions`
-- v2rayN: `VLESSFmt.cs`
-- mihomo: `adapter/outbound/vless.go` — `VlessOption`
-
-### Round-Trip Precision
-
-| Check | Status |
-|-------|--------|
-| parse → reconstruct → parse | ✅ Tested (multiple variants) |
-| JSON serde round-trip | ✅ Tested |
-| `uuid_origin` preservation | ✅ Tested |
-| XHttp mode recovery | ✅ Tested |
-| Reality config | ✅ Tested |
+xray-core, sing-box, Clash, native.
 
 ---
 
-## 4. Trojan (`trojan://`)
+## 5. Shadowsocks and Shadowsocks-2022
 
-**Source**: `crates/leas-proto/src/proto_spec/trojan.rs` — `TrojanConfig` struct
+- **Scheme**: `ss://`. Three accepted shapes:
+  - SIP002: `ss://base64url_no_pad(method:password)@host:port?plugin=...#remarks`
+  - Legacy QR: `ss://base64(method:password@host:port)`
+  - Plain: `ss://method:password@host:port`
+- **Source**: `crates/leas-proto/src/proto_spec/ss.rs`: `SsConfig`, plugin in `proto_spec/ss_plugin.rs`.
+- **Example**: `ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388` (`aes-256-gcm:pass`).
 
-**Share URL format**: `trojan://<password>@<host>:<port>?<query_params>#<remarks>`
+### Fields
 
-### Parameters
+| Field | Source | Type | Required | Notes |
+|---|---|---|---|---|
+| `method` | userinfo | `TinyText` | yes | Cipher; decides the kind |
+| `password` | userinfo | `String` | yes | |
+| host, port | hostport | `EndpointEssentials` | yes | No implicit port: `parse_hostport` requires one |
+| `plugin` | `plugin` query | `Option<PluginSpec>` | no | Typed, lossless |
+| `security` | - | `SecurityConfig` | empty | Only `none` (no URL key) |
+| `remarks` | `#` | `Option<TinyText>` | no | |
 
-| Field | URL Key | Type | Required | Default | Description |
-|-------|---------|------|----------|---------|-------------|
-| `password` | (userinfo) | `String` | ✅ | — | Trojan password |
-| `host` | (host) | `HostSpec` | ✅ | — | Server address |
-| `port` | (port) | `u16` | ✅ | — | Server port |
-| `security` | `security` | `SecurityConfig` | ❌ | `tls` | TLS mode: `tls`, `none`, `reality` |
-| `transport` | `type` | `TransportConfig` | ❌ | `tcp` | Transport type |
-| `path` | `path` | `Option<TinyText>` | ❌ | `None` | WS/gRPC path |
-| `remarks` | `#` fragment | `Option<TinyText>` | ❌ | `None` | Display name |
+### Ciphers
 
-### TLS sub-parameters
+The native roster (`leas-native/src/protocol/ss/method.rs`, case-insensitive, aliases included):
 
-Same as VLESS TLS (`sni`, `alpn`, `fp`, `allowInsecure` aliases, plus `reality` mode).
+| Family | Methods |
+|---|---|
+| AEAD-2017 | `aes-128-gcm`, `aes-192-gcm`, `aes-256-gcm`, `chacha20-poly1305` (= `chacha20-ietf-poly1305`), `xchacha20-poly1305` (= `xchacha20-ietf-poly1305`), plus `aead_*` aliases |
+| 2022-blake3 | `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-poly1305` |
+| Legacy stream | `aes-128-cfb`, `aes-192-cfb`, `aes-256-cfb`, `aes-128-ctr`, `aes-192-ctr`, `aes-256-ctr`, `rc4-md5`, `chacha20-ietf`, `xchacha20`, `none` |
 
-### Notes
+The three families dispatch to three codecs: `stream.rs` (AEAD-2017), `stream2022.rs` (BLAKE3), `stream_legacy.rs` (IV-prefixed stream cipher, no chunk framing).
 
-- Security defaults to `"tls"` (not `"none"` — Trojan always uses TLS by default)
-- `allowInsecure` accepts 4 aliases: `allowInsecure`, `allow_insecure`, `allowinsecure`, `skipVerify`
-- `sni` fallback chain: `peer` query param → `sni` → URL hostname
-- Legacy format: `ws=1` + `wspath=` instead of `type=ws` + `path=`
-- Wire protocol uses SHA-224(password) → 56-byte hex for auth
+Builder gates (`proto_spec/core_mapping.rs`):
 
-### Upstream References
+- `XRAY_SS_METHODS`: AEAD-2017 plus 2022-blake3, with the `aead_*`, `chacha20-poly1305` and `xchacha20-poly1305` aliases. A legacy cipher against xray-core is a build error.
+- `SINGBOX_SS_METHODS`: the whole list above, including `aes-192-gcm` and `none`.
+- `resolve_core` sends a method xray accepts to xray-core and anything else to sing-box, then the builder validates.
 
-- trojan-gfw C++: `src/core/config.h`
-- Xray-core: `proxy/trojan/protocol.go`, `proxy/trojan/config.proto`
-- sing-box: `option/trojan.go` — `TrojanOutboundOptions`
-- mihomo: `adapter/outbound/trojan.go` — `TrojanOption`
+### Kind and core
 
-### Round-Trip Precision
+`proto_kind_for_method` returns `Shadowsocks2022` (`ss-2022`) for `2022-blake3-*` and `Shadowsocks` (`ss`) otherwise. Both share `SsConfig`. This is the only kind whose core depends on a field.
 
-| Check | Status |
-|-------|--------|
-| parse → reconstruct → parse | ✅ Tested |
-| `security=none` | ✅ Tested |
-| TLS + WS transport | ✅ Tested |
-| JSON serde round-trip | ✅ Tested |
+### Plugin
 
----
+`PluginSpec` is total by construction: `name` (verbatim, may be empty), `family` (`Obfs`, `V2Ray`, `Unknown`), `mode` (`Unset`, `Http`, `Tls`, `Websocket`, `Quic`, `Invalid`), `host`, `port`, `path`, `tls` (`Unset`/`On`), `mux` (`Unset`, `Off`, `On(n)`, `Invalid`), and a sorted `extra` map for keys it preserves but does not interpret (`obfs-uri`, unknown keys).
 
-## 5. Shadowsocks (`ss://`)
+- `obfs=tls` is the obfs transport's synthetic hello, not encryption.
+- There is no `obfs=plain`; that spelling belongs to ShadowsocksR.
+- sing-box receives `plugin` (name) plus `render_opts()` (sorted canonical option string).
+- xray-core has no SIP003 support at all, so a plugin row against xray-core is a build error rather than a config that dials the bare server.
 
-**Source**: `crates/leas-proto/src/proto_spec/ss.rs` — `SsConfig` struct
+### Import admission rules
 
-**Share URL format (SIP002)**: `ss://<base64url_no_pad(method:password)>@<host>:<port>#<remarks>?plugin=...`
+`validate_ss_config` in `crates/leas-config/src/import_export.rs` runs inside `parse_share_url` and in the form path. A row that fails is dropped, never stored:
 
-Also accepts:
-- Legacy QR: `ss://<base64(method:password@host:port)>`
-- Plain: `ss://method:password@host:port`
+1. Malformed 2022 PSK: `ss2022_password_usable` requires base64 or the exact raw key length. A `:`-separated multi-user key is valid and passes.
+2. `none` on a cleartext wire: refused unless the row carries a real TLS layer (`security` tls/reality, or plugin `tls=1`). `obfs=tls` does not count.
+3. `mode=quic`: refused. The peer speaks QUIC draft-29/32/34 (v2ray-plugin 1.3.2 embeds v2ray-core 4.38.3 / quic-go 0.20.1) and every QUIC stack here speaks RFC 9000 v1.
 
-### Parameters
+### Parser quirks
 
-| Field | Source | Type | Required | Default | Description |
-|-------|--------|------|----------|---------|-------------|
-| `method` | userinfo | `TinyText` | ✅ | — | Encryption cipher |
-| `password` | userinfo | `String` | ✅ | — | Shared secret |
-| `host` | hostport | `HostSpec` | ✅ | — | Server address |
-| `port` | hostport | `u16` | ✅ | `8388` | Server port |
-| `plugin` | query `plugin` | `Option<PluginSpec>` | ❌ | `None` | SIP003 plugin, total-lossless (`proto_spec/ss_plugin.rs`) |
-| `plugin_opts` | wrapped into `plugin` | `PluginSpec` fields | ❌ | — | options are typed fields + `extra`, never a second string |
-| `remarks` | `#` fragment | `Option<TinyText>` | ❌ | `None` | Display name |
+- A userinfo that does not decode to `method:password` is treated as the plain form.
+- Missing `:` in the decoded userinfo is `InvalidUserInfo`.
+- IPv6 hosts must be bracketed; reconstruction re-brackets them.
 
-### Valid Ciphers
+### Backend coverage
 
-- **Legacy (native)**: `aes-{128,192,256}-cfb`, `aes-{128,192,256}-ctr`, `rc4-md5`, `chacha20-ietf`, `xchacha20`, `none`
-- **AEAD**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`, `xchacha20-ietf-poly1305`
-- **AEAD-2022**: `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`
-
-### Plugin storage
-
-`SsConfig` carries `plugin: Option<PluginSpec>` — the lossless typed form (name, family, mode, host, port, path, `tls`, `mux`, plus a sorted `extra` map for keys we preserve but do not interpret). Parsing is the one splitter the URL, Clash and form paths share, and `reconstruct_proto` writes every non-default field back, so a plugin row round-trips byte-stably.
-
-### Upstream References
-
-- shadowsocks-rust: `src/config.rs` SIP002 `from_url()`/`to_url()`
-- SIP002 spec: <https://github.com/shadowsocks/shadowsocks-org/issues/27>
-- sing-box: `option/shadowsocks.go` — `ShadowsocksOutboundOptions` (has `Plugin`/`PluginOptions`)
-- mihomo: `adapter/outbound/shadowsocks.go` — `ShadowSocksOption` (has `Plugin`/`PluginOpts`)
-
-### Round-Trip Precision
-
-| Check | Status |
-|-------|--------|
-| Basic parse → reconstruct | ✅ Tested |
-| Remarks preservation | ✅ Tested |
-| **Plugin round-trip** | ✅ Tested (`corpus_plugin_rows_parse_and_round_trip`) |
-| AEAD-2022 ciphers | ✅ Handled (method string only) |
-| Legacy QR format | ✅ Accepted |
-| JSON serde round-trip | ✅ Tested |
+xray-core builds only AEAD and 2022 ciphers and refuses any plugin. sing-box builds every method and the plugin fields. Clash imports and exports. Native serves all three cipher families over TCP; the UDP leg refuses a non-empty `security` and is not reachable through the proxy outbound (see `capability.rs`).
 
 ---
 
-## 6. ShadowsocksR (`ssr://`)
+## 6. ShadowsocksR
 
-**Source**: `crates/leas-proto/src/proto_spec/ssr.rs` — `SsrConfig` struct
+- **Scheme**: `ssr://<base64url(host:port:protocol:method:obfs:base64(password)/?params)>`.
+- **Source**: `crates/leas-proto/src/proto_spec/ssr.rs`: `SsrConfig`.
+- **Example**: `ssr://ZXhhbXBsZS5jb206NDQzOm9yaWdpbjpyYzQtbWQ1OnBsYWluOmNHRnpjM2R2Y21RLz9ncm91cD1WR1Z6ZEVkeWIzVncmcmVtYXJrcz1WR1Z6ZEZObGNuWmxjZw`
 
-**Share URL format**: `ssr://<base64url(host:port:protocol:method:obfs:base64(password)/?params)>`
+### Fields
 
-### Parameters
+| Field | Position | Type | Required |
+|---|---|---|---|
+| `protocol` | 4th from end | `TinyText` | yes |
+| `method` | 3rd from end | `TinyText` | yes |
+| `obfs` | 2nd from end | `TinyText` | yes |
+| `password` | last (base64) | `String` | yes |
+| host | everything before the last 5 fields | endpoint | yes |
+| port | 5th from end | endpoint | yes |
 
-| Field | Position | Type | Required | Description |
-|-------|----------|------|----------|-------------|
-| `host` | 1 | `HostSpec` | ✅ | Server address |
-| `port` | 2 | `u16` | ✅ | Server port |
-| `protocol` | 3 | `TinyText` | ✅ | Protocol plugin (`origin`, `auth_aes128_md5`, etc.) |
-| `method` | 4 | `TinyText` | ✅ | Encryption cipher |
-| `obfs` | 5 | `TinyText` | ✅ | Obfuscation plugin (`plain`, `http_simple`, etc.) |
-| `password` | 6 (base64) | `String` | ✅ | Shared secret |
+The struct also stores `params: HashMap<String, String>`, seeded with `protocol` and `obfs` and then every `&`-separated query pair.
 
-### Query Parameters (stored in `params` HashMap)
+### Parser quirks
 
-| Key | Encoding | Type | Description |
-|-----|----------|------|-------------|
-| `group` | base64 | `String` | Provider/group name |
-| `remarks` | base64 | `String` | Node name (mapped to `self.remarks`) |
-| `obfsparam` | base64 | `String` | Obfuscation parameter |
-| `protoparam` | base64 | `String` | Protocol parameter |
+- Splitting counts from the end, so an IPv6 host with colons works.
+- The last field may carry `/?` or `?` before the query; password is everything before it.
+- `remarks` is removed from `params` and decoded into `self.remarks`; `group`, `obfsparam`, `protoparam` stay in the map.
+- `clean_ssr_userinfo` strips trailing non-base64 annotation before decoding.
+- Fewer than six colon-separated fields is `InvalidStructure`.
 
-### Notes
+### Backend coverage
 
-- Port is last-5th colon-delimited field (handles IPv6 with multiple colons)
-- Password may contain `/?` or `?` split for query params
-- Trailing non-base64 garbage (Telegram annotation) is stripped before decode
-- `obfsparam` and `protoparam` stored in generic `HashMap` — strongly-typed access lost but round-trip preserved
-
-### Upstream References
-
-- sing-box: `option/shadowsocksr.go` — `ShadowsocksROutboundOptions` (typed `ObfsParam`/`ProtocolParam`)
-- subconverter: `subparser.cpp` `explodeSSR()`
-- mihomo: `adapter/outbound/shadowsocksr.go` — `ShadowSocksROption`
-
-### Round-Trip Precision
-
-| Check | Status |
-|-------|--------|
-| parse → reconstruct → parse | ✅ Tested |
-| Generic params round-trip | ✅ (HashMap preserves key ordering) |
+sing-box only; Clash imports and exports; native has a placeholder module and the gate refuses the kind.
 
 ---
 
-## 7. SOCKS5 (`socks://`)
+## 7. SOCKS5
 
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
+- **Scheme**: `socks://[user:pass@]host:port#remarks`.
+- **Source**: `crates/leas-proto/src/proto_spec/socks.rs`: `Socks5Config`.
+- **Example**: `socks://user:pass@1.2.3.4:1080`
 
-**Share URL format**: `socks://<user:pass@><host>:<port>#<remarks>`
+### Fields
 
-### Parameters
+| Field | Source | Type | Required |
+|---|---|---|---|
+| `username` | userinfo | `Option<String>` | no |
+| `password` | userinfo | `Option<String>` | no |
+| `security` | - | `SecurityConfig` | empty (no URL key) |
+| `remarks` | `#` | `Option<TinyText>` | no |
+| host, port | hostport | endpoint | yes |
 
-| Field | Source | Type | Required | Default | Description |
-|-------|--------|------|----------|---------|-------------|
-| `host` | hostport | `String` | ✅ | — | Server address |
-| `port` | hostport | `u16` | ❌ | `1080` | Server port |
-| `username` | userinfo | `String` | ❌ | — | SOCKS5 username |
-| `password` | userinfo | `String` | ❌ | — | SOCKS5 password |
-| `remarks` | `#` fragment | `Option<String>` | ❌ | `None` | Display name |
+### Parser quirks
 
-### Precision Status
+- A userinfo without `:` is a username with no password.
+- `userinfo == hostport` means the URL had no `@`; both fields stay `None`.
+- A URL with no `@` and no `hostport` splits the collapsed userinfo at the first `@`.
+- No default port; `1080` is the upstream convention, not applied here.
 
-**⚠️ Placeholder** — no typed struct. Round-trips through legacy JSON blob only. All fields preserved via legacy bridge.
+### Backend coverage
 
-### Upstream References
-
-- sing-box: `option/simple.go` — `SOCKSOutboundOptions` (adds `Version`, `Network`, `UDPOverTCP`)
-- mihomo: `adapter/outbound/socks5.go` — `Socks5Option`
-- Xray-core: `proxy/socks/config.proto`
-
----
-
-## 8. HTTP (`http://`)
-
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
-
-**Share URL format**: `http://<user:pass@><host>:<port>#<remarks>`
-
-### Parameters
-
-| Field | Source | Type | Required | Default | Description |
-|-------|--------|------|----------|---------|-------------|
-| `host` | hostport | `String` | ✅ | — | Server address |
-| `port` | hostport | `u16` | ❌ | `80` | Server port |
-| `username` | userinfo | `String` | ❌ | — | HTTP basic auth username |
-| `password` | userinfo | `String` | ❌ | — | HTTP basic auth password |
-| `remarks` | `#` fragment | `Option<String>` | ❌ | `None` | Display name |
-
-### Precision Status
-
-**⚠️ Placeholder** — no typed struct. Round-trips through legacy JSON blob only.
-
-### Upstream References
-
-- sing-box: `option/simple.go` — `HTTPOutboundOptions` (adds TLS, Path, Headers)
-- mihomo: `adapter/outbound/http.go` — `HttpOption`
-- Xray-core: `proxy/http/config.proto`
+xray-core and sing-box build. Clash imports and exports. Native has a working SOCKS5 client codec (`protocol/socks/mod.rs`) but `NATIVE_KINDS` does not include `Socks`, so the connect gate refuses the row.
 
 ---
 
-## 9. TUIC (`tuic://`)
+## 8. HTTP
 
-**Source**: `crates/leas-proto/src/proto_spec/tuic.rs` — `TuicConfig` struct
+- **Scheme**: `http://[user:pass@]host[:port][?security=tls&sni=...]`.
+- **Source**: `crates/leas-proto/src/proto_spec/http_client.rs`: `HttpClientConfig`.
+- **Example**: `http://user:pass@1.2.3.4:8080`
 
-**Share URL format**: `tuic://<uuid:password>@<host>:<port>?<query_params>#<remarks>`
+### Fields
 
-### Parameters
+| Field | Source | Type | Required | Notes |
+|---|---|---|---|---|
+| `username`, `password` | userinfo | `Option<String>` | no | Basic auth |
+| `security` | `security=tls` | `SecurityConfig` | empty | Plain HTTP unless `security=tls` |
+| `remarks` | `#` | `Option<TinyText>` | no | |
+| host | hostport | endpoint | yes | |
+| port | hostport | endpoint | no in-shape | Defaults to 80 when the hostport has no colon |
 
-| Field | URL Key | Type | Required | Default | Description |
-|-------|---------|------|----------|---------|-------------|
-| `uuid` | userinfo | `String` | ✅ | — | User UUID |
-| `password` | userinfo | `String` | ✅ | — | Authentication password |
-| `host` | hostport | `HostSpec` | ✅ | — | Server address |
-| `port` | hostport | `u16` | ✅ | — | Server port |
-| `congestion_control` | `congestion_control` | `Option<TinyText>` | ❌ | `bbr` | CC: `cubic`, `bbr`, `new_reno`, `bbr3` |
-| `udp_relay_mode` | `udp_relay_mode` | `Option<TinyText>` | ❌ | `native` | UDP: `native`, `quic` |
-| `security` | TLS params | `SecurityConfig` | ❌ | TLS always | Always TLS-based |
-| `remarks` | `#` fragment | `Option<TinyText>` | ❌ | `None` | Display name |
+TLS keys when `security=tls`: `sni`, `alpn`, `fp`, and the four verification aliases.
 
-### TLS sub-parameters
+### Parser quirks
 
-| URL Key | Type | Description |
-|---------|------|-------------|
-| `sni` | `Option<TinyText>` | TLS SNI override |
-| `alpn` | `Option<TinyText>` | ALPN (typically `h3`) |
-| `allow_insecure` / `insecure` / `allowInsecure` | `Option<bool>` | Skip verification |
+- A URL with no `@` has `userinfo == hostport` and yields no credentials.
+- Only `security=tls` enables TLS; any other value means plain.
 
-### Notes
+### Backend coverage
 
-- TUIC always uses TLS (QUIC-based)
-- Default congestion control is `bbr` (sing-box) / `cubic` (mihomo)
-- sing-box also supports `udp_over_stream`, `zero_rtt_handshake`, `heartbeat` — not in standard share URLs
-
-### Upstream References
-
-- sing-box: `option/tuic.go` — `TUICOutboundOptions` (adds `ZeroRTTHandshake`, `UDPOverStream`, `Heartbeat`)
-- mihomo: `adapter/outbound/tuic.go` — `TuicOption` (adds extensive QUIC tuning params)
-
-### Round-Trip Precision
-
-| Check | Status |
-|-------|--------|
-| parse → reconstruct → parse | ✅ Tested |
-| Congestion control | ✅ Preserved |
-| Allow-insecure | ✅ Preserved |
-| Remarks | ✅ Preserved |
-| JSON serde round-trip | ✅ Tested |
+xray-core and sing-box build. Clash imports and exports. Native has a placeholder module (`protocol/http/mod.rs`), and the gate refuses the kind.
 
 ---
 
-## 10. Hysteria2 (`hysteria2://` / `hy2://`)
+## 9. TUIC
 
-**Source**: `crates/leas-proto/src/proto_spec/hysteria2.rs` — `Hysteria2Config` struct
+- **Scheme**: `tuic://<uuid>:<password>@<host>:<port>?<query>#<remarks>`.
+- **Source**: `crates/leas-proto/src/proto_spec/tuic.rs`: `TuicConfig`.
+- **Example**: `tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3`
 
-**Share URL format**: `hysteria2://<auth>@<host>:<port>/?<query_params>#<remarks>`
+### Fields
 
-Accepts both `hysteria2://` and `hy2://` schemes.
+| Field | Key | Type | Notes |
+|---|---|---|---|
+| `uuid` | userinfo | `String` | Parsed and validated as a UUID |
+| `password` | userinfo | `String` | Everything after the first `:` |
+| `congestion_control` | `congestion_control` | `Option<TinyText>` | No default applied at parse |
+| `udp_relay_mode` | `udp_relay_mode` | `Option<TinyText>` | |
+| `security` | `sni`, `alpn`, verification aliases | `SecurityConfig` | TLS is always present |
 
-### Parameters
+### Parser quirks
 
-| Field | URL Key | Type | Required | Default | Description |
-|-------|---------|------|----------|---------|-------------|
-| `auth` | userinfo | `String` | ✅ | — | Authentication token/password |
-| `host` | hostport | `HostSpec` | ✅ | — | Server address |
-| `port` | hostport | `PortSpec` | ✅ | `443` | Port (supports `:443,7788-8899` hopping) |
-| `obfs` | `obfs` | `Option<TinyText>` | ❌ | `None` | Obfuscation type (e.g., `salamander`) |
-| `obfs_password` | `obfs-password` | `Option<TinyText>` | ❌ | `None` | Obfuscation pre-shared key |
-| `up` | `up` | `Option<TinyText>` | ❌ | `None` | Upload bandwidth limit (string Mbps) |
-| `down` | `down` | `Option<TinyText>` | ❌ | `None` | Download bandwidth limit (string Mbps) |
-| `security` | TLS params | `SecurityConfig` | ❌ | TLS always | Always TLS-based (QUIC) |
-| `remarks` | `#` fragment | `Option<TinyText>` | ❌ | `None` | Display name |
+- An invalid UUID is `InvalidUserInfo`.
+- The userinfo must be `uuid:password`.
 
-### TLS sub-parameters
+### Backend coverage
 
-| URL Key | Type | Description |
-|---------|------|-------------|
-| `sni` | `Option<TinyText>` | TLS SNI override |
-| `insecure` | `Option<bool>` | Skip verification (`1`/`true`/`yes`) |
-
-### Notes
-
-- Port supports extended syntax: single (`:443`), list (`:443,7788,9999`), range (`:8888-9999`), mixed
-- Auth can be single token or `user:pass` pair (concatenated)
-- Default port is 443
-- Salamander obfuscation uses BLAKE2b-256 with 8-byte random salt
-- `up`/`down` stored as raw string — config builder must parse to Mbps int for sing-box JSON
-
-### Upstream References
-
-- Hysteria2: `app/cmd/client.go` `parseURI()`, `app/internal/url/url.go`
-- sing-box: `option/hysteria2.go` — `Hysteria2OutboundOptions` (adds `ServerPorts`, `HopInterval`, `BrutalDebug`, bandwidth as `int` Mbps)
-- mihomo: `adapter/outbound/hysteria2.go` — `Hysteria2Option` (adds extensive QUIC tuning)
-
-### Round-Trip Precision
-
-| Check | Status |
-|-------|--------|
-| parse → reconstruct → parse | ✅ Tested |
-| Obfs + obfs-password | ✅ Preserved |
-| Port hopping | ✅ Preserved (PortSpec) |
-| JSON serde round-trip | ✅ Tested |
+sing-box only (`SINGBOX_ONLY_KINDS`, and the xray arm returns `UnsupportedProtocol`). Clash imports and exports. Native has a placeholder module and the gate refuses the kind. QUIC dialing in the native engine exists only for Hysteria2.
 
 ---
 
-## 11. Hysteria v1 (`hysteria://` / `hy://`)
+## 10. Hysteria2
 
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
+- **Scheme**: `hysteria2://` and `hy2://`.
+- **Source**: `crates/leas-proto/src/proto_spec/hysteria2.rs`: `Hysteria2Config`.
+- **Example**: `hy2://linux.do@[2a01:4f9:4b:f378::1]:13599?security=tls&insecure=1&sni=www.bing.com`
 
-**Share URL format**: `hysteria://<host>:<port>?<query_params>#<remarks>`
+### Fields
 
-### Parameters
+| Field | Key | Type | Notes |
+|---|---|---|---|
+| `auth` | userinfo | `String` | Single token or `user:pass`, kept verbatim |
+| port | hostport | `EndpointEssentials` | `PortSpec`: single, list, range, mixed, capped at `MAX_PORTS` = 4096 |
+| `obfs` | `obfs` | `Option<TinyText>` | e.g. `salamander` |
+| `obfs_password` | `obfs-password` | `Option<TinyText>` | |
+| `up` | `up` | `Option<TinyText>` | Raw string |
+| `down` | `down` | `Option<TinyText>` | Raw string |
+| `hop_interval` | `mportHopInt`, `hop_interval` | `Option<u32>` | Seconds |
+| `pin_sha256` | `pinSHA256`, `pin_sha256` | `Option<TinyText>` | Certificate pin |
+| `security` | `sni`, `insecure` | `SecurityConfig` | TLS always present |
+| `remarks` | `#` | `Option<TinyText>` | |
 
-| Field | URL Key | Type | Required | Default | Description |
-|-------|---------|------|----------|---------|-------------|
-| `host` | hostport | `String` | ✅ | — | Server address |
-| `port` | hostport | `u16` | ❌ | `443` | Server port |
-| `protocol` | `protocol` / `type` | `String` | ❌ | — | Protocol variant |
-| `auth` | `auth` | `String` | ❌ | — | Authentication token |
-| `obfs` | `obfs` | `String` | ❌ | — | Obfuscation (`faketcp`) |
-| `up_mbps` | `upmbps` / `up_mbps` | `i64` | ❌ | `100` | Upload bandwidth limit (Mbps) |
-| `down_mbps` | `downmbps` / `down_mbps` | `i64` | ❌ | `100` | Download bandwidth limit (Mbps) |
-| `sni` | `sni` | `String` | ❌ | — | TLS SNI |
-| `insecure` | `insecure` | `bool` | ❌ | `false` | Skip TLS verification |
-| `remarks` | `#` fragment | `Option<String>` | ❌ | `None` | Display name |
+### Parser quirks
 
-### Precision Status
+- `insecure` accepts `1`/`true`/`yes` and `0`/`false`/`no`.
+- `obfs-password` uses a hyphen, not an underscore.
+- A multi-port hostport fills `endpoint.ports` with the flattened list.
+- A URL with no `@` splits the collapsed userinfo at the first `@`.
 
-**⚠️ Placeholder** — no typed struct. Round-trips through legacy JSON blob only.
+### Backend coverage
 
-### Upstream References
-
-- sing-box: `option/hysteria.go` — `HysteriaOutboundOptions` (adds `ReceiveWindowConn`, `ReceiveWindow`, `DisableMTUDiscovery`)
-
----
-
-## 12. WireGuard (`wireguard://`)
-
-**Source**: `crates/leas-proto/src/proto_spec/wireguard.rs` — `WireguardConfig` struct
-
-**Share URL format**: `wireguard://<percent-encoded(private_key)>@<host>:<port>?<query_params>#<remarks>`
-
-### Parameters
-
-| Field | URL Key | Type | Required | Default | Description |
-|-------|---------|------|----------|---------|-------------|
-| `private_key` | userinfo | `String` | ✅ | — | Private key (percent-encoded) |
-| `host` | hostport | `HostSpec` | ✅ | — | Endpoint address |
-| `port` | hostport | `u16` | ✅ | `2408` | Endpoint port |
-| `address` | `address` | `TinyText` | ✅ | — | Interface address (CIDR, e.g. `10.0.0.2/32`) |
-| `public_key` | `publickey` / `public_key` | `String` | ✅ | — | Peer's public key (base64) |
-| `preshared_key` | `presharedkey` / `psk` | `Option<String>` | ❌ | — | Pre-shared key (base64) |
-| `reserved` | `reserved` | `Option<TinyText>` | ❌ | — | Reserved bytes (3 comma-separated or base64) |
-| `mtu` | `mtu` | `Option<TinyText>` | ❌ | `1420` | Interface MTU |
-| `remarks` | `#` fragment | `Option<TinyText>` | ❌ | `None` | Display name |
-
-### Notes
-
-- Default MTU: 1420 (Xray-core), 1280 (WireGuard-go)
-- Default port: 2408 (v2rayN), 51820 (WireGuard native)
-- Single-peer model — sing-box supports multi-peer (`Peers[]` with `AllowedIPs`, `PersistentKeepaliveInterval`)
-- `reserved` accepts both comma-separated decimals and base64-encoded bytes
-
-### Upstream References
-
-- sing-box: `option/wireguard.go` — `WireGuardEndpointOptions` + `WireGuardPeer` (multi-peer)
-- Xray-core: `proxy/wireguard/config.proto` — `DeviceConfig`
-- mihomo: `adapter/outbound/wireguard.go` — `WireGuardOption`
-
-### Round-Trip Precision
-
-| Check | Status |
-|-------|--------|
-| parse → reconstruct → parse | ✅ Tested |
-| Full params (mtu, reserved, preshared) | ✅ Tested |
-| Remarks with `@` prefix | ✅ Tested |
-| JSON serde round-trip | ✅ Tested |
+Both subprocesses build. Clash imports and exports. Native serves it as a QUIC dial (`protocol/hysteria2/quic.rs`); it is not a stream protocol, so a stream chain refuses it. Salamander obfuscation is implemented in `leas-native/src/crypto/salamander.rs`.
 
 ---
 
-## 13. Naïve (`naive+https://`)
+## 11. Hysteria v1
 
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
+- **Scheme**: `hysteria://` and `hy://`.
+- **Source**: `crates/leas-proto/src/proto_spec/hysteria1.rs`: `Hysteria1Config`.
+- **Example**: `hysteria://example.com:443?protocol=udp&obfs=xplus&up_mbps=200&down_mbps=200&insecure=1&sni=real.example.com`
 
-**Share URL format**: `naive+https://<user:pass@><host>:<port>#<remarks>`
+### Fields
 
-### Parameters
+| Field | Key | Type | Default | Notes |
+|---|---|---|---|---|
+| `auth` | userinfo | `Option<String>` | `None` | Absent when `userinfo == hostport` |
+| `protocol` | `protocol`, `type` | `Option<TinyText>` | `None` | `udp`, `wechat-video`, `faketcp` |
+| `obfs` | `obfs` | `Option<TinyText>` | `None` | `xplus`, `salamander` |
+| `up_mbps` | `up_mbps`, `upmbps` | `Option<u32>` | `None` | Value `100` is not stored |
+| `down_mbps` | `down_mbps`, `downmbps` | `Option<u32>` | `None` | Value `100` is not stored |
+| `security` | `sni`, verification aliases | `SecurityConfig` | TLS always present | |
+| port | hostport | endpoint | 443 | Bare host accepted |
 
-| Field | Source | Type | Required | Default | Description |
-|-------|--------|------|----------|---------|-------------|
-| `host` | hostport | `String` | ✅ | — | Server address |
-| `port` | hostport | `u16` | ❌ | `443` | Server port |
-| `username` | userinfo | `String` | ❌ | — | Basic auth username |
-| `password` | userinfo | `String` | ❌ | — | Basic auth password |
-| `remarks` | `#` fragment | `Option<String>` | ❌ | `None` | Display name |
+### Parser quirks
 
-### Precision Status
+- No port means 443; a bare host is valid.
+- `insecure` accepts `1`/`true`/`yes` and `0`/`false`/`no`.
+- The 100 Mbps defaults are the upstream defaults and are elided from storage.
 
-**⚠️ Placeholder** — no typed struct. Round-trips through legacy JSON blob only.
+### Backend coverage
 
-### Upstream References
-
-- sing-box: `option/naive.go` — `NaiveOutboundOptions` (adds `InsecureConcurrency`, `ExtraHeaders`, QUIC tuning, `UDPOverTCP`)
-
----
-
-## 14. AnyTLS (`anytls://`)
-
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
-
-**Share URL format**: `anytls://<host>:<port>?<query_params>#<remarks>`
-
-### Parameters
-
-| Field | URL Key | Type | Required | Default | Description |
-|-------|---------|------|----------|---------|-------------|
-| `host` | hostport | `String` | ✅ | — | Server address |
-| `port` | hostport | `u16` | ❌ | `443` | Server port |
-| `password` | `password` / `auth` | `String` | ❌ | — | Authentication password |
-| `sni` | `sni` | `String` | ❌ | — | TLS SNI |
-| `alpn` | `alpn` | `String` | ❌ | — | ALPN |
-| `insecure` | `insecure` / `allow_insecure` | `bool` | ❌ | `false` | Skip verification |
-| `remarks` | `#` fragment | `Option<String>` | ❌ | `None` | Display name |
-
-### Precision Status
-
-**⚠️ Placeholder** — no typed struct. Round-trips through legacy JSON blob only.
-
-### Upstream References
-
-- sing-box: `option/anytls.go` — `AnyTLSOutboundOptions` (adds `IdleSessionCheckInterval`, `IdleSessionTimeout`, `MinIdleSession`)
-- mihomo: `adapter/outbound/anytls.go` — `AnyTLSOption`
-- quirktiva: `adapter/outbound/anytls.go` — `AnyTLSOption`
+sing-box only. Clash imports and exports. Native has a placeholder and the gate refuses the kind.
 
 ---
 
-## 15. ShadowTLS (`shadowtls://`)
+## 12. WireGuard
 
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
+- **Scheme**: `wireguard://<percent-encoded private key>@<host>:<port>?<query>#<remarks>`.
+- **Source**: `crates/leas-proto/src/proto_spec/wireguard.rs`: `WireguardConfig`.
+- **Example**: `wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=&reserved=236%2C163%2C162&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280`
 
-**Share URL format**: `shadowtls://<host>:<port>?<query_params>#<remarks>`
+### Fields
 
-### Parameters
+| Field | Key | Type | Required |
+|---|---|---|---|
+| `private_key` | userinfo (percent-decoded) | `String` | yes |
+| `address` | `address` | `TinyText` | yes |
+| `public_key` | `publickey`, `public_key` | `String` | yes |
+| `preshared_key` | `presharedkey`, `psk` | `Option<String>` | no |
+| `reserved` | `reserved` | `Option<TinyText>` | no |
+| `mtu` | `mtu` | `Option<TinyText>` | no |
+| `persistent_keepalive` | `persistent_keepalive`, `keepalive` | `Option<u32>` | no |
+| `dns` | `dns` | `Option<Vec<String>>` | no |
+| `remote_dns_resolve` | `remote_dns_resolve`, `remote_dns` | `Option<bool>` | no |
 
-| Field | URL Key | Type | Required | Default | Description |
-|-------|---------|------|----------|---------|-------------|
-| `host` | hostport | `String` | ✅ | — | Server address |
-| `port` | hostport | `u16` | ❌ | `443` | Server port |
-| `password` | `password` | `String` | ❌ | — | ShadowTLS password |
-| `version` | `version` | `String` | ❌ | — | Protocol version |
-| `sni` | `sni` | `String` | ❌ | — | TLS SNI |
-| `remarks` | `#` fragment | `Option<String>` | ❌ | `None` | Display name |
+### Parser quirks
 
-### Precision Status
+- The private key is percent-decoded, so `+`, `/` and `=` must be escaped.
+- `reserved` accepts comma-separated decimals or base64 bytes and is stored verbatim.
+- No default port; `2408` is the v2rayN convention and `51820` the WireGuard one, neither applied by this parser.
+- `mtu` is stored as text, not parsed to `u16`.
 
-**⚠️ Placeholder** — no typed struct. Round-trips through legacy JSON blob only.
+### Backend coverage
 
-### Upstream References
+xray-core and sing-box build. Clash imports and exports. Native has a placeholder module; the gate refuses the kind.
 
-- sing-box: `option/shadowtls.go` — `ShadowTLSOutboundOptions` (adds `Version`, `Password`)
-- `thirdparty/sing-box/docs/configuration/outbound/shadowtls.md`
+---
+
+## 13. Naïve
+
+- **Scheme**: `naive+https://<user>:<password>@<host>:<port>#<remarks>`.
+- **Source**: `crates/leas-proto/src/proto_spec/naive.rs`: `NaiveConfig`.
+- **Example**: `naive+https://user:pass@example.com:443`
+
+### Fields
+
+| Field | Source | Type | Required |
+|---|---|---|---|
+| `username` | userinfo | `String` | yes |
+| `password` | userinfo | `String` | yes |
+| `security` | - | `SecurityConfig` | TLS always present |
+| `remarks` | `#` | `Option<TinyText>` | no |
+
+### Parser quirks
+
+- The userinfo must contain `:`; otherwise `InvalidUserInfo`.
+- `naive+https://` and `naive+quic://` both route to this parser, and the config records neither, so reconstruction always writes `naive+https://`.
+
+### Backend coverage
+
+sing-box only. Clash imports and exports. Native has a placeholder.
+
+---
+
+## 14. AnyTLS
+
+- **Scheme**: `anytls://<host>:<port>?password=<pw>&sni=<sni>#<remarks>`.
+- **Source**: `crates/leas-proto/src/proto_spec/anytls.rs`: `AnyTlsConfig`.
+- **Example**: `anytls://1.2.3.4:8080?password=secret`
+
+### Fields
+
+| Field | Key | Type | Required |
+|---|---|---|---|
+| `password` | `password`, `auth` | `Option<String>` | no |
+| `security` | `sni`, `alpn`, `insecure`/`allow_insecure`/`allowinsecure`/`skipVerify` | `SecurityConfig` | empty unless a TLS key is present |
+| `remarks` | `#` | `Option<TinyText>` | no |
+
+### Parser quirks
+
+- TLS is implied by the protocol, but `SecurityConfig` stays empty when the URL carries no TLS key; the builder supplies TLS.
+- No `fp` key is read.
+
+### Backend coverage
+
+sing-box only. Clash imports and exports (mihomo and quirktiva carry the same option shape). Native has a placeholder.
+
+---
+
+## 15. ShadowTLS
+
+- **Scheme**: `shadowtls://<host>:<port>?password=<pw>&version=<n>&sni=<sni>#<remarks>`.
+- **Source**: `crates/leas-proto/src/proto_spec/shadowtls.rs`: `ShadowTlsConfig`.
+- **Example**: `shadowtls://1.2.3.4:443?password=pass123&version=1&sni=example.com`
+
+### Fields
+
+| Field | Key | Type | Required |
+|---|---|---|---|
+| `password` | `password` | `Option<String>` | no |
+| `version` | `version` | `Option<TinyText>` | no |
+| `security` | `sni` | `SecurityConfig` | empty unless `sni` is present |
+| `remarks` | `#` | `Option<TinyText>` | no |
+
+### Parser quirks
+
+- Only `sni` reaches the security block; `alpn`, `fp` and the verification keys are not read.
+
+### Backend coverage
+
+sing-box only. Clash imports and exports. Native has a placeholder.
 
 ---
 
 ## 16. Tor
 
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
+- **Scheme**: none. There is no share URL.
+- **Source**: `crates/leas-proto/src/proto_spec/tor.rs`: `TorConfig`.
+- **Example**: Clash entry or JSON only.
 
-**Share URL format**: None — JSON config only.
+### Fields
 
-### Parameters (sing-box `TorOutboundOptions`)
+| Field | Type | Notes |
+|---|---|---|
+| `executable_path` | `Option<String>` | Tor binary path |
+| `extra_args` | `Option<Vec<String>>` | Extra CLI arguments |
+| `data_directory` | `Option<String>` | |
+| `torrc` | `Option<HashMap<String, String>>` | Additional torrc options |
+| `security` | `SecurityConfig` | |
+| `remarks` | `Option<TinyText>` | |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `executable_path` | `string` | Tor binary path |
-| `extra_args` | `[]string` | Extra CLI arguments |
-| `data_directory` | `string` | Tor data directory |
-| `torrc` | `map[string]string` | Additional torrc options |
+### Parser quirks
 
-### Precision Status
+`try_parse_proto` and `reconstruct_proto` both return an error naming the missing URL format. Import comes from Clash (`ClashTor`) or the form.
 
-**⚠️ Placeholder** — no share URL format exists in any upstream. Only configurable via JSON config file or UI form.
+### Backend coverage
+
+sing-box only. Clash imports and exports. Native has a placeholder.
 
 ---
 
 ## 17. SSH
 
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
+- **Scheme**: none. There is no share URL.
+- **Source**: `crates/leas-proto/src/proto_spec/ssh.rs`: `SshConfig`.
 
-**Share URL format**: None — JSON config only.
+### Fields
 
-### Parameters (sing-box `SSHOutboundOptions`)
+| Field | Type | Notes |
+|---|---|---|
+| `user` | `Option<String>` | |
+| `password` | `Option<String>` | |
+| `private_key` | `Option<String>` | Single key body |
+| `private_key_path` | `Option<String>` | |
+| `private_key_passphrase` | `Option<String>` | |
+| `host_key` | `Option<Vec<String>>` | Accepted host keys |
+| `host_key_algorithms` | `Option<Vec<String>>` | |
+| `client_version` | `Option<String>` | |
+| `security` | `SecurityConfig` | |
+| `remarks` | `Option<TinyText>` | |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `user` | `string` | SSH username |
-| `password` | `string` | SSH password |
-| `private_key` | `listable[string]` | SSH private key(s) |
-| `private_key_path` | `string` | SSH private key path |
-| `private_key_passphrase` | `string` | SSH private key passphrase |
-| `host_key` | `listable[string]` | Accepted host keys |
-| `host_key_algorithms` | `listable[string]` | Host key algorithms |
-| `client_version` | `string` | SSH client version string |
+### Parser quirks
 
-### Precision Status
+Both URL functions return an error naming the missing URL format. Import from Clash (`ClashSsh`) or the form.
 
-**⚠️ Placeholder** — no standard share URL format. Configurable via JSON or UI form.
+### Backend coverage
+
+sing-box only. Clash imports and exports. Native has a placeholder.
 
 ---
 
 ## 18. Tailscale
 
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
+- **Scheme**: none. There is no share URL.
+- **Source**: `crates/leas-proto/src/proto_spec/tailscale.rs`: `TailscaleConfig`.
 
-**Share URL format**: None — JSON config only.
+### Fields
 
-### Parameters (sing-box `TailscaleEndpointOptions`)
+| Field | Type | Notes |
+|---|---|---|
+| `hostname` | `Option<String>` | |
+| `auth_key` | `Option<String>` | |
+| `control_url` | `Option<String>` | |
+| `state_directory` | `Option<String>` | |
+| `ephemeral` | `Option<bool>` | |
+| `accept_routes` | `Option<bool>` | |
+| `exit_node` | `Option<String>` | |
+| `exit_node_allow_lan_access` | `Option<bool>` | |
+| `advertise_routes` | `Option<Vec<String>>` | Stored as text, not parsed prefixes |
+| `security` | `SecurityConfig` | |
+| `remarks` | `Option<TinyText>` | |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `state_directory` | `string` | Tailscale state directory |
-| `auth_key` | `string` | Auth key for node registration |
-| `control_url` | `string` | Control server URL |
-| `ephemeral` | `bool` | Ephemeral node |
-| `hostname` | `string` | Node hostname |
-| `accept_routes` | `bool` | Accept advertised routes |
-| `exit_node` | `string` | Exit node |
-| `exit_node_allow_lan_access` | `bool` | Allow LAN while using exit node |
-| `advertise_routes` | `[]netip.Prefix` | Routes to advertise |
-| `advertise_exit_node` | `bool` | Advertise as exit node |
-| `advertise_tags` | `[]string` | Tags for the node |
-| `relay_server_port` | `*uint16` | DERP relay server port |
-| `system_interface` | `bool` | Use system interface |
-| `udp_timeout` | `Duration` | UDP session timeout |
+### Parser quirks
 
-### Precision Status
+Both URL functions return an error naming the missing URL format. Import from Clash (`ClashTailscale`) or the form.
 
-**⚠️ Placeholder** — no standard share URL format. Configurable via JSON or UI form.
+Upstream sing-box also models `advertise_exit_node`, `advertise_tags`, `relay_server_port`, `system_interface` and `udp_timeout`; none of those exist on this struct, so a Clash or JSON row carrying them loses them.
 
----
+### Backend coverage
 
-## 19. Inbound-Only Protocols (Redirect, TProxy, Mixed)
-
-**Source**: `crates/leas-proto/src/proto_spec/mod.rs` — `PlaceholderConfig` (stub)
-
-**Share URL format**: None — inbound/proxy types, not used as outbound destinations.
-
-| Protocol | xray-core | sing-box | mihomo | Description |
-|----------|-----------|----------|--------|-------------|
-| Redirect | ✅ Redirect outbound | ✅ `TypeRedirect` | ❌ | Redirect traffic to a port |
-| TProxy | ✅ TProxy outbound | ✅ `TypeTProxy` | ❌ | Transparent proxy |
-| Mixed | ✅ Mixed inbound | ✅ `TypeMixed` | ❌ | SOCKS + HTTP on one port |
-
-These are inbound/listener types in most architectures. The outbound versions exist in xray-core but are typically not used as share URL targets.
-
-### Precision Status
-
-**⚠️ Placeholder** — acceptable, these are rarely used as outbound proxy destinations.
+sing-box only. Clash imports and exports. Native has a placeholder.
 
 ---
 
-## 20. Transport Configuration
+## 19. Inbound forms: Redirect, TProxy, Mixed
 
-**Source**: `crates/leas-proto/src/proto_spec/common.rs` — `TransportConfig` enum
+- **Scheme**: none.
+- **Source**: `PlaceholderConfig` in `crates/leas-proto/src/proto_spec/mod.rs`.
 
-### Transport Types
+These three kinds share one type: an opaque legacy body (`proto_name` plus `settings_json`, holding `protocol_settings` and `stream_settings`) with no endpoint.
 
-| Variant | Type String | VMess `net=` | VLESS/Trojan `type=` | Description |
-|---------|-------------|--------------|----------------------|-------------|
-| `Tcp` | `tcp` | `tcp` | `tcp` | Raw TCP |
-| `Ws(WebSocketConfig)` | `ws` | `ws`/`websocket` | `ws`/`websocket` | WebSocket tunnel |
-| `Grpc(GrpcConfig)` | `grpc` | `grpc` | `grpc` | gRPC tunnel |
-| `Http(HttpConfig)` | `http` | `http`/`h2`/`https` | `http`/`h2`/`https` | HTTP/2 tunnel |
-| `Quic` | `quic` | `quic` | `quic` | QUIC tunnel |
-| `Kcp(KcpConfig)` | `kcp` | `kcp`/`mkcp` | `kcp`/`mkcp` | mKCP tunnel (Xray-only) |
-| `HttpUpgrade(HttpUpgradeConfig)` | `httpupgrade` | `httpupgrade` | `httpupgrade` | HTTPUpgrade (fake WS) |
-| `XHttp(XHttpConfig)` | `xhttp` | `splithttp`/`xhttp` | `splithttp`/`xhttp` | SplitHTTP/XHTTP |
+| Kind | ProtocolKind | Outbound build | Notes |
+|---|---|---|---|
+| Redirect | `Redirect` | refused on both cores | Listen-side form |
+| TProxy | `TProxy` | refused on both cores | Listen-side form |
+| Mixed | `Mixed` | refused on both cores | SOCKS and HTTP on one port |
 
-### WebSocketConfig (`Ws`)
+### Parser quirks
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `path` | `Option<TinyText>` | WebSocket path |
-| `host` | `Option<TinyText>` | HTTP Host header |
-| `headers` | `Option<HashMap<String, String>>` | Additional HTTP headers |
-| `max_early_data` | `Option<u32>` | Max early data size (v2fly feature) |
-| `early_data_header_name` | `Option<TinyText>` | Early data header name |
+- `try_parse_proto` derives the kind from `proto_name`; an unknown name falls back to `Mixed`.
+- `reconstruct_proto` and both Clash functions always error.
+- Identity hashes `proto_name` plus the whole body, including `remarks`, so renaming a profile changes its uid. That is the mandated whole-body hash for opaque configs, not a bug.
 
-### GrpcConfig (`Grpc`)
+### Backend coverage
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `path` | `Option<TinyText>` | gRPC service name (legacy compat) |
-| `authority` | `Option<TinyText>` | `:authority` header override |
-| `service_name` | `Option<TinyText>` | gRPC service name (preferred) |
-
-### HttpConfig (`Http` / h2)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `path` | `Option<TinyText>` | HTTP/2 path |
-| `host` | `Option<TinyText>` | HTTP Host header(s) |
-| `method` | `Option<TinyText>` | HTTP method |
-| `headers` | `Option<HashMap<String, String>>` | Additional HTTP headers |
-
-### KcpConfig (`Kcp`)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `mtu` | `Option<u32>` | KCP MTU |
-| `tti` | `Option<u32>` | KCP TTI (ms) |
-| `uplink_capacity` | `Option<u32>` | Uplink capacity |
-| `downlink_capacity` | `Option<u32>` | Downlink capacity |
-| `congestion` | `Option<bool>` | Congestion control |
-| `read_buffer` | `Option<u32>` | Read buffer size |
-| `write_buffer` | `Option<u32>` | Write buffer size |
-| `seed` | `Option<TinyText>` | KCP seed for obfuscation |
-
-### HttpUpgradeConfig (`HttpUpgrade`)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `path` | `Option<TinyText>` | Upgrade path |
-| `host` | `Option<TinyText>` | HTTP Host header |
-| `headers` | `Option<HashMap<String, String>>` | Additional headers |
-| `ed` | `Option<u32>` | Early data size |
-
-### XHttpConfig (`XHttp` / SplitHTTP)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `path` | `Option<TinyText>` | HTTP path |
-| `host` | `Option<TinyText>` | HTTP Host header |
-| `mode` | `Option<TinyText>` | Mode: `auto`, `packet-up`, `stream-up`, `stream-one` |
-| `headers` | `Option<HashMap<String, String>>` | Additional headers |
-| `extra` | `Option<Value>` | Extra JSON blob (advanced config) |
-
-### Upstream References
-
-- Xray-core: `transport/internet/*/config.proto` (per-transport protos)
-- sing-box: `option/v2ray_transport.go` — `V2RayTransportOptions`
-- mihomo: transport config structs in respective adapter files
+Neither subprocess builds an outbound: sing-box has no such outbound type, and a raw body without a `type` key is not a valid outbound. The native engine has placeholder modules for the three kinds; inbound side, see `leas-native/src/inbound/`.
 
 ---
 
-## 21. TLS / Security Configuration
+## 20. Transport configuration
 
-**Source**: `crates/leas-proto/src/proto_spec/common.rs` — `SecurityConfig`, `TlsConfig`, `TlsOpts`, `RealityOpts`
+**Source**: `crates/leas-proto/src/proto_spec/common.rs`: `TransportConfig`.
+
+| Variant | Wire string | VMess `net=` | VLESS/Trojan `type=` |
+|---|---|---|---|
+| `Tcp` | `tcp` | `tcp` | `tcp` |
+| `Ws(WebSocketConfig)` | `ws` | `ws`, `websocket` | `ws`, `websocket` |
+| `Grpc(GrpcConfig)` | `grpc` | `grpc` | `grpc` |
+| `Http(HttpConfig)` | `http` | `http`, `h2`, `https` | `http`, `h2`, `https` |
+| `Quic` | `quic` | `quic` | `quic` |
+| `Kcp(KcpConfig)` | `kcp` | `kcp`, `mkcp` | `kcp`, `mkcp` |
+| `HttpUpgrade(HttpUpgradeConfig)` | `httpupgrade` | `httpupgrade` | `httpupgrade` |
+| `XHttp(XHttpConfig)` | `xhttp` | `splithttp`, `xhttp` | `splithttp`, `xhttp` |
+
+Only VLESS, VMess and Trojan carry a transport. Every other config returns `None` from `transport_mut()`, including Shadowsocks, whose plugin row is dispatched first in the native upgrade step.
+
+### WebSocketConfig
+
+| Field | Type | Notes |
+|---|---|---|
+| `path` | `Option<TinyText>` | Canonicalized at build |
+| `host` | `Option<TinyText>` | Host header |
+| `headers` | `Option<HashMap<String, String>>` | |
+| `max_early_data` | `Option<u32>` | |
+| `early_data_header_name` | `Option<TinyText>` | |
+| `v2ray_http_upgrade` | `Option<bool>` | |
+| `v2ray_http_upgrade_fast_open` | `Option<bool>` | |
+
+### GrpcConfig
+
+| Field | Type | Notes |
+|---|---|---|
+| `path` | `Option<TinyText>` | Legacy service-name mirror |
+| `authority` | `Option<TinyText>` | `:authority` override |
+| `service_name` | `Option<TinyText>` | Preferred service name |
+| `mode` | `Option<TinyText>` | gRPC mode |
+| `user_agent` | `Option<TinyText>` | |
+| `ping_interval` | `Option<u32>` | |
+
+### HttpConfig
+
+| Field | Type |
+|---|---|
+| `path` | `Option<TinyText>` |
+| `host` | `Option<TinyText>` |
+| `method` | `Option<TinyText>` |
+| `headers` | `Option<HashMap<String, String>>` |
+| `idle_timeout` | `Option<u32>` |
+| `ping_timeout` | `Option<u32>` |
+
+### KcpConfig
+
+`mtu`, `tti`, `uplink_capacity`, `downlink_capacity`, `congestion` (`Option<bool>`), `read_buffer`, `write_buffer` are `Option<u32>`/`Option<bool>`; `seed` and `header_type` are `Option<TinyText>`.
+
+### HttpUpgradeConfig
+
+`path`, `host`, `headers`, and `ed` (`Option<u32>`, early-data size).
+
+### XHttpConfig
+
+`path`, `host`, `mode` (`auto`, `packet-up`, `stream-up`, `stream-one`), `headers`, and `extra` (raw `serde_json::Value`).
+
+### Quic
+
+`TransportConfig::Quic` is a unit variant; no option field is modelled. `QuicOpts` (`security`, `key`) exists in `common.rs` but has no user, so `quicSecurity` and `key` from a share URL are dropped.
+
+### Native transport support
+
+`leas-native/src/transport/mod.rs` dials `tcp`, `ws`, `grpc`, `http`, `httpupgrade`, `xhttp` (plus HTTP/3 when xhttp carries a single `h3` ALPN) and `kcp`. The `quic` transport returns `NotImplemented`; QUIC exists only as a protocol dial for Hysteria2.
+
+---
+
+## 21. TLS and security configuration
+
+**Source**: `crates/leas-proto/src/proto_spec/common.rs`: `SecurityConfig`, `TlsConfig`, `TlsOpts`, `RealityOpts`. The engine lives in `crates/leas-tls`, documented in [`native-core.md`](native-core.md).
 
 ### SecurityConfig
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `tls` | `Option<TlsConfig>` | TLS or REALITY config |
-| `enc` | `Option<TinyText>` | Encryption method (VMess `scy`) |
+| Field | Type | Notes |
+|---|---|---|
+| `tls` | `Option<TlsConfig>` | Flattened into the same JSON object |
+| `enc` | `Option<TinyText>` | VMess `scy` |
 
-### TlsConfig
-
-| Variant | Description |
-|---------|-------------|
-| `Tls(TlsOpts)` | Standard TLS configuration |
-| `Reality(RealityOpts)` | Xray-core REALITY (VLESS only) |
+`TlsConfig` is `Tls(TlsOpts)` or `Reality(RealityOpts)`.
 
 ### TlsOpts
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `sni` | `Option<TinyText>` | — | TLS SNI (Server Name Indication) |
-| `alpn` | `Option<TinyText>` | — | ALPN list (comma-separated, e.g. `h2,http/1.1`) |
-| `fp` | `Option<TinyText>` | — | uTLS Client Hello fingerprint (`chrome`, `firefox`, `safari`, `random`, `randomized`) |
-| `insecure` | `Option<bool>` | `None` | Skip TLS certificate verification |
+| Field | Type | Share-URL key |
+|---|---|---|
+| `sni` | `Option<TinyText>` | `sni` |
+| `alpn` | `Option<TinyText>` | `alpn` |
+| `curves` | `Option<TinyText>` | none; JSON `curvePreferences` only |
+| `fp` | `Option<TinyText>` | `fp` |
+| `insecure` | `Option<bool>` | four aliases |
+| `ech` | `Option<TinyText>` | none; JSON only |
+| `vcn` | `Option<bool>` | none; JSON only |
+| `pcs` | `Option<TinyText>` | none; JSON only |
+| `pin_sha256` | `Option<TinyText>` | `pinSHA256` on Hysteria2 only |
 
 ### RealityOpts
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `sni` | `Option<TinyText>` | REALITY server name |
-| `fp` | `Option<TinyText>` | uTLS fingerprint |
-| `pbk` | `Option<String>` | REALITY public key (base64) |
-| `sid` | `Option<TinyText>` | REALITY short ID (hex) |
-| `spx` | `Option<TinyText>` | REALITY spider X (path) |
+| Field | Type | Share-URL key |
+|---|---|---|
+| `sni` | `Option<TinyText>` | `sni` |
+| `fp` | `Option<TinyText>` | `fp` |
+| `pbk` | `Option<String>` | `pbk` |
+| `sid` | `Option<TinyText>` | `sid` |
+| `spx` | `Option<TinyText>` | `spx` |
+| `mldsa65_verify` | `Option<String>` | `pqv` (serde alias `pqv`) |
 
-### Precision Notes
+REALITY exists on VLESS and Trojan only; neither VMess nor any other config reads `pbk`.
 
-Our `TlsOpts` covers the essential share URL fields. Sing-box `OutboundTLSOptions` has ~25 fields total, but the additional ones (`min_version`, `max_version`, `cipher_suites`, `certificate`, `curve_preferences`, ECH, `utls` config) are **JSON config only** — they never appear in share URLs. No precision loss for URL round-trip.
+### Precision note
 
-For JSON config generation, the config builders currently use the legacy bridge and hardcoded TLS, so the extra TLS fields are a **nice-to-have** rather than a precision fix.
-
----
-
-## 22. Internal / Infrastructure Protocols
-
-These protocol types exist in the `Protocol` enum in `crates/leas-core/src/protocol.rs` but are **not** in `proto_spec` — they are internal routing types, not shareable proxy destinations.
-
-| Protocol | xray-core | sing-box | Description |
-|----------|-----------|----------|-------------|
-| `Freedom` | ✅ | — | Direct outbound (no proxy) |
-| `Blackhole` | ✅ | ✅ `TypeBlock` | Sink/block outbound |
-| `Dns` | ✅ | ✅ `TypeDNS` | DNS outbound |
-| `Loopback` | ✅ | — | Loopback to another inbound |
-| `Custom` | ✅ | — | Custom plugin outbound |
-| `Shadowsocks2022` | ✅ `shadowsocks_2022` | — | Separate proto in xray (handled as SS method) |
-| `DokodemoDoor` | ✅ | — | Door/redirect inbound |
-
-None of these have share URL formats. They are selected and configured internally by the TUI.
+The share-URL surface covers the fields a feed actually carries. The remaining sing-box `OutboundTLSOptions` fields (`min_version`, `max_version`, `cipher_suites`, `certificate`, ECH chain, uTLS config) are JSON-config only, so there is no URL round-trip loss. They are also not modelled as typed fields, so a JSON config that carries them does not round-trip through this type.
 
 ---
 
-## 23. Precision Notes & Known Gaps
+## 22. Internal kinds
 
-### Confirmed Precision Loss
+These are `ProtocolKind` variants with no share URL and no outbound build. The enum and its string dialect live in `crates/leas-proto/src/proto_spec/kinds.rs`.
 
-| # | Protocol | Field | Impact | Fix Priority |
-|---|----------|-------|--------|-------------|
-| 1 | ShadowsocksR | `obfsparam`, `protoparam` | Stored in generic HashMap, no typed access | LOW — round-trip preserved |
-| 2 | Hysteria2 | `up`/`down` as strings | Config builder must parse to Mbps int | LOW — string parse is safe |
-| 3 | All placeholder | Entire config | No typed fields, opaque JSON blob only | MEDIUM — no loss today but no validation |
+| Kind | String | Treatment |
+|---|---|---|
+| `Freedom` | `freedom` | Direct outbound; routing only |
+| `Blackhole` | `blackhole` | Block outbound; routing only |
+| `Dns` | `dns` | DNS outbound; routing only |
+| `Loopback` | `loopback` | Loopback to another inbound; routing only |
+| `Custom` | `custom` | Plugin outbound; routing only |
+| `DokodemoDoor` | `dokodemo` | Door inbound; routing only |
 
-### Missing Fields (JSON config only — not in share URLs)
+`Shadowsocks2022` is not in this list: it is a full protocol kind with its own string (`ss-2022`) and shares `SsConfig` with `ss`.
 
-These are fields present in upstream option structs that never appear in share URLs. They are not precision losses for URL round-trip but may be for JSON config round-trip:
-
-| Protocol | Missing Fields | Source |
-|----------|---------------|--------|
-| VMess | `global_padding`, `authenticated_length`, `packet_encoding`, `network`, `multiplex` | sing-box `VMessOutboundOptions` |
-| VLESS | `packet_encoding`, `network`, `multiplex` | sing-box `VLESSOutboundOptions` |
-| Trojan | `network`, `multiplex` | sing-box `TrojanOutboundOptions` |
-| TUIC | `udp_over_stream`, `zero_rtt_handshake`, `heartbeat`, `network` | sing-box `TUICOutboundOptions` |
-| Hysteria2 | `server_ports`, `hop_interval`, `brutal_debug` | sing-box `Hysteria2OutboundOptions` |
-| WireGuard | `allowed_ips`, `persistent_keepalive_interval`, `workers`, `listen_port` | sing-box `WireGuardPeer` + `WireGuardEndpointOptions` |
-| All TLS | `min_version`, `max_version`, `cipher_suites`, `certificate`, `curve_preferences`, ECH, utls | sing-box `OutboundTLSOptions` |
-| Transport: gRPC | `idle_timeout`, `ping_timeout`, `permit_without_stream` | sing-box `V2RayGRPCOptions` |
-| Transport: http | `idle_timeout`, `ping_timeout`, host as list | sing-box `V2RayHTTPOptions` |
-
-### Round-Trip Test Coverage
-
-| Test | Coverage | Notes |
-|------|----------|-------|
-| `check_roundtrip` parse→reconstruct→parse | All 8 real configs | Tests single example per protocol |
-| Multi-variant round-trip | VLESS only | VLESS tests 3 variants + XHttp + httpupgrade |
-| `security=none` | Trojan only | Trojan tests explicit no-TLS round-trip |
-| Serde round-trip | All 8 real configs | JSON serialize → deserialize → compare |
-| Plugin round-trip | ✅ `corpus_plugin_rows_parse_and_round_trip` | parse → export → re-import is identity-stable over the captured feed corpus |
-| All-fields round-trip | **NONE** | No test exercises every optional field |
-| JSON config round-trip | **NONE** | No `to_json_config` → parse → compare test |
-| Bridge precision | **NONE** | No `Profile` → `ProtocolConfig` → `Profile` test |
-
-### Source Map
-
-| Component | Path | Key Types |
-|-----------|------|-----------|
-| Config structs | `crates/leas-proto/src/proto_spec/*.rs` | VMess, VLESS, Trojan, SS, SSR, TUIC, H2, WG |
-| Common types | `crates/leas-proto/src/proto_spec/common.rs` | TransportConfig, SecurityConfig, TlsConfig, RealityOpts |
-| URL parsing | `crates/leas-proto/src/urlx/` | RawUrlX, SchemeX, HostSpec, PortSpec |
-| URL utilities | `crates/leas-proto/src/proto_spec/utils.rs` | Query parsing, base64, host/port |
-| Import/export | `crates/leas-config/src/import_export.rs` | All 14 protocol parsers + formatters |
-| Config builders | `crates/leas-core/src/config_builder/xray.rs` | Xray JSON generation |
-| Config builders | `crates/leas-core/src/config_builder/singbox.rs` | Sing-box JSON generation |
-| Protocol enum | `crates/leas-core/src/protocol.rs` | `Protocol` enum + `ParseProtocolError` |
-| Forms | `crates/leas-config/src/forms.rs` | TUI form field definitions |
-| Core routing | `crates/leas-core/src/config_builder/mod.rs` | CoreType determination |
-| Upstream: sing-box | `thirdparty/sing-box/option/*.go` | All outbound option structs |
-| Upstream: mihomo | `thirdparty/mihomo/adapter/outbound/*.go` | All proxy option structs |
-| Upstream: Xray-core | `thirdparty/Xray-core/proxy/*/config.proto` | All outbound config protos |
-| Upstream: quirktiva | `thirdparty/quirktiva/adapter/outbound/*.go` | All proxy option structs |
-
-
-## 24. URL Parsing Methods Cross-Reference
-
-Cross-referencing all upstream projects' share URL parsing implementations against our codebase.
-
-### 24.1 Protocol Coverage by Upstream
-
-Clients that consume share URLs directly (v2rayN, v2rayNG, xray-checker) and converters that parse them (subconverter):
-
-| # | Protocol | URL Scheme | v2rayN (C#) | v2rayNG (Kotlin) | subconverter (C++) | xray-checker (Go) | **Our `import_export.rs`** | **Our `proto_spec`** |
-|---|----------|-----------|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1 | VMess | `vmess://base64(JSON)` | ✅ `VmessFmt` | ✅ `VmessFmt.kt` | ✅ `explodeVmess` | ✅ libXray | ✅ full | ✅ VmessConfig |
-| 2 | VLESS | `vless://` | ✅ `VLESSFmt` | ✅ `VlessFmt.kt` | ❌ | ✅ libXray | ✅ full | ✅ VlessConfig |
-| 3 | Trojan | `trojan://` | ✅ `TrojanFmt` | ✅ `TrojanFmt.kt` | ✅ `explodeTrojan` | ✅ libXray | ✅ full | ✅ TrojanConfig |
-| 4 | Shadowsocks | `ss://` | ✅ `ShadowsocksFmt` | ✅ `ShadowsocksFmt.kt` | ✅ `explodeSS` | ✅ libXray | ✅ full | ✅ SsConfig ⚠️\* |
-| 5 | ShadowsocksR | `ssr://` | ❌ | ❌ | ✅ `explodeSSR` | ❌ | ✅ full | ✅ SsrConfig |
-| 6 | SOCKS5 | `socks://` | ✅ `SocksFmt` | ✅ `SocksFmt.kt` | ✅ `explodeSocks` | ✅ native | ✅ full | ⚠️ Placeholder |
-| 7 | HTTP | `http://` | ❌ | ❌ | ✅ `explodeHTTP` | ✅ native | (bridge only) | ⚠️ Placeholder |
-| 8 | TUIC | `tuic://` | ✅ `TuicFmt` | ❌ | ❌ | ❌ | ✅ full | ✅ TuicConfig |
-| 9 | Hysteria2 | `hysteria2://` / `hy2://` | ✅ `Hysteria2Fmt` | ✅ `Hysteria2Fmt.kt` | ✅ `explodeHysteria2` | ✅ libXray | ✅ full | ✅ Hysteria2Config |
-| 10 | Hysteria1 | `hysteria://` / `hy://` | ❌ | ❌ | ❌ | ❌ | ✅ full | ⚠️ Placeholder |
-| 11 | WireGuard | `wireguard://` | ✅ `WireguardFmt` | ✅ `WireguardFmt.kt` | ❌ | ✅ native | ✅ full | ✅ WireguardConfig |
-| 12 | Naïve | `naive+https://` / `naive+quic://` | ✅ `NaiveFmt` | ❌ | ❌ | ❌ | ✅ full | ⚠️ Placeholder |
-| 13 | AnyTLS | `anytls://` | ✅ `AnytlsFmt` | ❌ | ✅ `explodeAnyTLS` | ❌ | ✅ full | ⚠️ Placeholder |
-| 14 | ShadowTLS | `shadowtls://` | ❌ | ❌ | ❌ | ❌ | ✅ full | ⚠️ Placeholder |
-
-> v2ray-core and v2ray-core-legacy have **zero** URL parsing — they are proxy runtimes, not clients.
-
-### 24.2 Standard URL Query Parameter Vocabulary
-
-The following parameter names are **identical across v2rayN (C# `BaseFmt`) and v2rayNG (Kotlin `FmtBase`)**.
-They form the de-facto standard for v2ray-style share URLs.
-
-#### TLS / Security (protocol-agnostic, shared by ALL v2ray-style URLs)
-
-| URL Param | Description | Our proto_spec | v2rayN field | v2rayNG field |
-|-----------|-------------|:---:|:---|:---|
-| `security` | TLS mode (`tls`/`reality`/`none`) | ✅ `SecurityConfig` | `StreamSecurity` | `security` |
-| `sni` | TLS SNI override | ✅ `TlsOpts.sni` | `Sni` | `sni` |
-| `alpn` | ALPN list (comma-separated) | ✅ `TlsOpts.alpn` | `Alpn` | `alpn` |
-| `fp` | uTLS Client Hello fingerprint | ✅ `TlsOpts.fp` | `Fingerprint` | `fingerPrint` |
-| `pbk` | REALITY public key | ✅ `RealityOpts.pbk` | `PublicKey` | `publicKey` |
-| `sid` | REALITY short ID (hex) | ✅ `RealityOpts.sid` | `ShortId` | `shortId` |
-| `spx` | REALITY spider X (path) | ✅ `RealityOpts.spx` | `SpiderX` | `spiderX` |
-| `insecure` / `allowInsecure` / `allow_insecure` | Skip TLS verification | ✅ `TlsOpts.insecure` | `AllowInsecure` | `insecure` |
-| `pqv` | Post-quantum ML-DSA65 signature | ❌ **Missing** | `Mldsa65Verify` | `mldsa65Verify` |
-| `ech` | Encrypted Client Hello config | ❌ **Missing** | `EchConfigList` | `echConfigList` |
-| `vcn` | Verify peer cert by name | ❌ **Missing** | `VerifyPeerCertByName` | `verifyPeerCertByName` |
-| `pcs` | Certificate SHA-256 fingerprint | ❌ **Missing** | `CertSha` | `pinnedCA256` |
-| `fm` | Finalmask JSON blob (advanced routing) | ❌ **Missing** | `Finalmask` | `finalMask` |
-
-#### Transport (by type)
-
-| URL Param | Applies To | Description | Our proto_spec | v2rayN/v2rayNG |
-|-----------|-----------|-------------|:---:|:---:|
-| `type` | All | Transport type (tcp/kcp/ws/grpc/http/xhttp/httpupgrade) | ✅ `TransportConfig` | `Network` |
-| `host` | raw/tcp, ws, http, xhttp, httpupgrade | Transport host header | ✅ per-type | `Host` |
-| `path` | raw/tcp, ws, xhttp, httpupgrade, http | Transport path | ✅ per-type | `Path` |
-| `headerType` | raw/tcp, kcp | TCP/KCP header obfuscation | ❌ **Missing** | `headerType` |
-| `seed` | kcp | KCP seed | ✅ `KcpConfig.seed` | `seed` |
-| `mtu` | kcp | KCP MTU | ✅ `KcpConfig.mtu` | `mtu` |
-| `tti` | kcp | KCP TTI (ms) | ✅ `KcpConfig.tti` | `tti` |
-| `mode` | grpc, xhttp | gRPC GUN/Multi mode, XHttp mode | ❌ **Missing for gRPC** | `mode` |
-| `authority` | grpc | gRPC `:authority` header override | ❌ **Missing** | `authority` |
-| `serviceName` | grpc | gRPC service name | ✅ `GrpcConfig.service_name` | `serviceName` |
-| `extra` | xhttp | XHttp extra JSON blob | ✅ `XHttpConfig.extra` | `extra` |
-| `quicSecurity` | quic | QUIC obfuscation method | ❌ **Missing** | `quicSecurity` |
-| `key` | quic | QUIC obfuscation key | ❌ **Missing** | `key` |
-
-#### Protocol-Specific Parameters
-
-| Protocol | URL Param | Description | Our proto_spec |
-|----------|-----------|-------------|:---:|
-| VLESS | `encryption` | Encryption preset (typically `none`) | ✅ `VlessConfig.encryption` |
-| VLESS | `flow` | XTLS flow control (`xtls-rprx-vision`) | ✅ `VlessConfig.flow` |
-| VMess | `scy` | Security encryption method | ✅ `VmessConfig.security.enc` |
-| VMess | `aid` | Alter ID (must be 0 for AEAD) | ✅ `VmessConfig.alter_id` |
-| Trojan | `flow` | Flow control | ✅ (via SecurityConfig) |
-| TUIC | `congestion_control` | Congestion control algorithm | ✅ `TuicConfig.congestion_control` |
-| Hysteria2 | `obfs` / `obfs-password` | Obfuscation type + password | ✅ `Hysteria2Config` (separate fields) |
-| Hysteria2 | `mport` | Port hopping (e.g. `443,8888-9999`) | ❌ **Missing** |
-| Hysteria2 | `mportHopInt` | Port hopping interval (seconds) | ❌ **Missing** |
-| Hysteria2 | `pinSHA256` | Certificate SHA-256 pin | ❌ **Missing** |
-| WireGuard | `publickey` / `public_key` | Peer's public key | ✅ `WireguardConfig.public_key` |
-| WireGuard | `presharedkey` / `psk` | Pre-shared key | ✅ `WireguardConfig.preshared_key` |
-| WireGuard | `reserved` | Reserved bytes (3-byte) | ✅ `WireguardConfig.reserved` |
-| WireGuard | `address` | Interface address CIDR | ✅ `WireguardConfig.address` |
-| WireGuard | `mtu` | Interface MTU | ✅ `WireguardConfig.mtu` |
-| Shadowsocks | `plugin` | SIP003 plugin (e.g. `obfs-local`) | ✅ `SsConfig.plugin: Option<PluginSpec>` |
-| Shadowsocks | `plugin_opts` | SIP003 plugin options | ✅ typed fields + `extra` in the same struct |
-
-### 24.3 Upstream Fmt File Reference
-
-| Upstream | Dispatch | Parse method | Format method | Shared params |
-|----------|----------|-------------|--------------|---------------|
-| **v2rayN** (C#) | `FmtHandler.cs` class | `*Fmt.Resolve(string)` | `*Fmt.ToUri(ProfileItem)` | `BaseFmt.ResolveUriQuery` / `BaseFmt.ToUriQuery` |
-| **v2rayNG** (Kotlin) | `AngConfigManager.kt:configFmtParsers` map | `*Fmt.parse(String)` | `*Fmt.toUri(ProfileItem)` | `FmtBase.getItemFormQuery` / `FmtBase.getQueryDic` |
-| **subconverter** (C++) | `subparser.cpp:explode()` by URL scheme | `explode*(const string&, Proxy&)` | `subexport.cpp:proxyToSingle()` | Protocol-specific in each `explode*` |
-| **xray-checker** (Go) | `parser.go:parseShareLink()` | Various per-type | libXray CGO | Protocol-specific |
-| **Our** (Rust) | `import_export.rs:parse_share_url()` | `parse_{protocol}()` | `format_{protocol}()` | `common.rs` TransportConfig / TlsOpts |
+The legacy `config_type` integers (`1`–`27`) still map through `ProtocolKind::try_from_i32` / `to_i32`, because `ProfileKey` and fast-ping dispatch are i32-based.
 
 ---
 
-### Thirdparty Repository Snapshots
+## 23. Precision notes and known gaps
 
-| Repository | Path | Latest Commit (HEAD) |
-|------------|------|---------------------|
-| Xray-core | `thirdparty/Xray-core/` | `d7fa207` — Forbid unencrypted outbounds on public Internet for VLESS and Trojan; Remove "none/zero/plain" for VMess and Shadowsocks |
-| v2ray-core | `thirdparty/v2ray-core/` | `9db9c4b` — update version to v5.52.0 |
-| v2ray-core-legacy | `thirdparty/v2ray-core-legacy/` | `d80440f` — Merge pull request #3085 |
-| v2rayN | `thirdparty/v2rayN/` | `ad12a6c` — Update ca cert (#9700) |
-| v2rayNG | `thirdparty/v2rayNG/` | `9397a9e` — Fix (#5889) |
-| sing-box | `thirdparty/sing-box/` | `0f17638` — Fix v2rayhttp upgrade leak |
-| mihomo | `thirdparty/mihomo/` | `2c7309e` — fix: listener duplicate-name check (#2948) |
-| quirktiva | `thirdparty/quirktiva/` | `abece1f` — Chore: update test dependencies |
-| subconverter | `thirdparty/subconverter/` | `fe6666c` — chore: fix build scripts |
-| xray-checker | `thirdparty/xray-checker/` | `f829c2b` — Merge pull request #175 from kutovoys/feat-check-concurrency |
-| shoes (Rust proxy impls) | `thirdparty/shoes/` | `607ccde` — reality/reality_tls13_messages.rs: Match Chrome signature algorithms |
-| leaf (Rust proxy framework) | `thirdparty/leaf/` | `1d20301` — Revert "feat(inbound): limit data transfer and concurrent connections per IP" |
-| shadowsocks-rust | `thirdparty/shadowsocks-rust/` | `f827f6d` — fix(netbsd): use passthrough syntax for RUSTFLAGS in Cross.toml |
-| trojan (reference) | `thirdparty/trojan/` | `3e7bb9a` — Update CONTRIBUTORS.md |
+### Confirmed precision loss
 
-> **Refresh**: Update commit hashes after pulling or re-cloning thirdparty repos.
-> *Last updated: 2026-07-08*
+| # | Protocol | Field | Impact | Priority |
+|---|---|---|---|---|
+| 1 | ShadowsocksR | `obfsparam`, `protoparam` | Kept in the generic `params` map, no typed access; round-trip preserved | low |
+| 2 | Hysteria2 | `up`, `down` | Stored as text; the builder parses Mbps | low |
+| 3 | Quic transport | `quicSecurity`, `key` | Dropped: `Quic` has no options and `QuicOpts` is unused | medium |
+| 4 | Tailscale | five upstream-only fields | Not modelled; lost on import | medium |
+| 5 | All TLS | `min_version`, `max_version`, `cipher_suites`, `certificate`, ECH chain | Not modelled; JSON-only in upstream, and lost on JSON round-trip here | medium |
+| 6 | Redirect, TProxy, Mixed | entire config | Opaque legacy body, no typed fields | medium |
+
+### Fields kept in the URL but not in a typed field
+
+`vmess://` `v` (always `"2"`) and `type` (XHttp mode only) are read for parsing and dropped from the struct.
+
+### Round-trip test coverage
+
+| Test | Scope | Location |
+|---|---|---|
+| `corpus_plugin_rows_parse_and_round_trip` | Parses every fixture containing a SIP003 plugin row, exports, re-imports, compares | `proto_spec/ss.rs` |
+| Per-config parse and reconstruct tests | One or more example URLs per typed config | `#[cfg(test)]` in each `proto_spec/*.rs` |
+| Dispatch and inject coverage | One URL per kind through `inject_to` on its supporting core | `proto_spec/mod.rs` tests |
+| All-fields round-trip | none | no test exercises every optional field |
+| JSON config round-trip | none | no `to_json_config` then parse test |
+| Page filter and ordering tests | not protocol scope | see [`ordering-law.md`](ordering-law.md) |
+
+There is no shared `check_roundtrip` helper; the earlier "all 8 real configs" claim described a helper that no longer exists, and the typed set is now 17.
+
+### Upstream references
+
+| Protocol group | Upstream |
+|---|---|
+| VMess | Xray-core `proxy/vmess/account.proto`; v2rayN `ServiceLib/Models/Dto/VmessQRCode.cs`; sing-box `option/vmess.go`; mihomo `adapter/outbound/vmess.go` |
+| VLESS | Xray-core `proxy/vless/account.proto`; sing-box `option/vless.go`; v2rayN `VLESSFmt.cs`; mihomo `adapter/outbound/vless.go` |
+| Trojan | trojan-gfw `src/core/config.h`; Xray-core `proxy/trojan/protocol.go`; sing-box `option/trojan.go`; mihomo `adapter/outbound/trojan.go` |
+| Shadowsocks | shadowsocks-rust `src/config.rs`; SIP002 spec; sing-box `option/shadowsocks.go`; mihomo `adapter/outbound/shadowsocks.go` |
+| ShadowsocksR | sing-box `option/shadowsocksr.go`; subconverter `explodeSSR()`; mihomo `adapter/outbound/shadowsocksr.go` |
+| SOCKS5 | sing-box `option/simple.go`; mihomo `adapter/outbound/socks5.go`; Xray-core `proxy/socks/config.proto` |
+| HTTP | sing-box `option/simple.go`; mihomo `adapter/outbound/http.go`; Xray-core `proxy/http/config.proto` |
+| TUIC | sing-box `option/tuic.go`; mihomo `adapter/outbound/tuic.go` |
+| Hysteria2 | Hysteria2 `app/internal/url/url.go`; sing-box `option/hysteria2.go`; mihomo `adapter/outbound/hysteria2.go` |
+| Hysteria v1 | sing-box `option/hysteria.go` |
+| WireGuard | sing-box `option/wireguard.go`; Xray-core `proxy/wireguard/config.proto`; mihomo `adapter/outbound/wireguard.go` |
+| Naïve | sing-box `option/naive.go` |
+| AnyTLS | sing-box `option/anytls.go`; mihomo and quirktiva `adapter/outbound/anytls.go` |
+| ShadowTLS | sing-box `option/shadowtls.go` |
+| Transports | Xray-core `transport/internet/*/config.proto`; sing-box `option/v2ray_transport.go` |
+
+---
+
+## 24. Share-URL parameter vocabulary
+
+The names below are the de-facto standard shared by v2rayN and v2rayNG. Per-protocol support in this repository is the matrix in §1.2 plus the parser notes in each section.
+
+### 24.1 TLS and security
+
+| Parameter | Meaning | This code |
+|---|---|---|
+| `security` | TLS mode: `tls`, `reality`, `none` | `SecurityConfig` |
+| `sni` | SNI override | `TlsOpts.sni`, `RealityOpts.sni` |
+| `alpn` | ALPN list | `TlsOpts.alpn` |
+| `fp` | uTLS Client Hello fingerprint | `TlsOpts.fp`, `RealityOpts.fp` |
+| `pbk` | REALITY public key | `RealityOpts.pbk` |
+| `sid` | REALITY short ID | `RealityOpts.sid` |
+| `spx` | REALITY spider X | `RealityOpts.spx` |
+| `pqv` | REALITY ML-DSA-65 verification key | `RealityOpts.mldsa65_verify` |
+| `insecure`, `allowInsecure`, `allow_insecure`, `skipVerify` | Skip certificate verification | `TlsOpts.insecure` |
+| `ech` | Encrypted Client Hello list | not read; `TlsOpts.ech` is JSON-only |
+| `vcn` | Verify peer certificate by name | not read; `TlsOpts.vcn` is JSON-only |
+| `pcs` | Certificate SHA-256 pin | not read; `TlsOpts.pin_sha256` is JSON-only except Hysteria2 `pinSHA256` |
+| `fm` | Finalmask JSON blob | not supported |
+
+### 24.2 Transport
+
+| Parameter | Transport | Meaning | This code |
+|---|---|---|---|
+| `type` | all | Transport type | `TransportConfig` |
+| `host` | tcp, ws, http, xhttp, httpupgrade | Transport host header | per-type `host` |
+| `path` | tcp, ws, http, xhttp, httpupgrade | Transport path | per-type `path` |
+| `headerType` | tcp, kcp | Header obfuscation | `KcpConfig.header_type` only |
+| `seed` | kcp | KCP seed | `KcpConfig.seed` |
+| `mtu`, `tti` | kcp | KCP tuning | `KcpConfig.mtu`, `.tti` |
+| `mode` | grpc, xhttp | gRPC mode, XHttp mode | `GrpcConfig.mode`, `XHttpConfig.mode` |
+| `authority` | grpc | `:authority` override | `GrpcConfig.authority` |
+| `serviceName` | grpc | Service name | `GrpcConfig.service_name` |
+| `extra` | xhttp | Extra JSON blob | `XHttpConfig.extra` |
+| `quicSecurity`, `key` | quic | QUIC obfuscation | dropped (§20) |
+
+### 24.3 Protocol-specific
+
+| Protocol | Parameter | Meaning | This code |
+|---|---|---|---|
+| VLESS | `encryption` | Encryption preset, or the `mlkem768x25519plus` string | `VlessConfig.encryption` |
+| VLESS | `flow` | XTLS flow | `VlessConfig.flow` |
+| VLESS | `mux`, `muxtype` | Mux request | `VlessConfig.mux` |
+| VMess | `scy` | Encryption method (default `auto`) | `SecurityConfig.enc` |
+| VMess | `aid` | Alter ID | `VmessConfig.alter_id` |
+| TUIC | `congestion_control` | Congestion control | `TuicConfig.congestion_control` |
+| TUIC | `udp_relay_mode` | UDP relay mode | `TuicConfig.udp_relay_mode` |
+| Hysteria2 | `obfs`, `obfs-password` | Obfuscation type and key | `Hysteria2Config.obfs`, `.obfs_password` |
+| Hysteria2 | `mportHopInt`, `hop_interval` | Port-hopping interval, seconds | `Hysteria2Config.hop_interval` |
+| Hysteria2 | `pinSHA256`, `pin_sha256` | Certificate pin | `Hysteria2Config.pin_sha256` |
+| Hysteria v1 | `protocol`, `type` | Protocol variant | `Hysteria1Config.protocol` |
+| Hysteria v1 | `up_mbps`/`upmbps`, `down_mbps`/`downmbps` | Bandwidth, Mbps | `Hysteria1Config.up_mbps`, `.down_mbps` |
+| WireGuard | `publickey`/`public_key`, `presharedkey`/`psk` | Peer and pre-shared keys | `WireguardConfig` |
+| WireGuard | `address`, `reserved`, `mtu` | Interface fields | `WireguardConfig` |
+| WireGuard | `persistent_keepalive`/`keepalive`, `dns`, `remote_dns_resolve`/`remote_dns` | Interface fields | `WireguardConfig` |
+| Shadowsocks | `plugin` | SIP003 plugin, name and options in one value | `SsConfig.plugin` |
+
+### 24.4 Upstream format implementations
+
+| Upstream | Dispatch | Parse | Format |
+|---|---|---|---|
+| v2rayN (C#) | `FmtHandler.cs` | `*Fmt.Resolve(string)` | `*Fmt.ToUri(ProfileItem)` |
+| v2rayNG (Kotlin) | `AngConfigManager.kt` `configFmtParsers` | `*Fmt.parse(String)` | `*Fmt.toUri(ProfileItem)` |
+| subconverter (C++) | `subparser.cpp` `explode()` by scheme | `explode*(const string&, Proxy&)` | `subexport.cpp` `proxyToSingle()` |
+| xray-checker (Go) | `parser.go` `parseShareLink()` | per type | libXray CGO |
+| this repo (Rust) | `crates/leas-config/src/import_export.rs` `parse_share_url()` | `ProtocolConfig::try_parse_proto` then each `*Config::try_parse_proto` | `format_share_url()` → `reconstruct_proto` |
+
+v2ray-core and v2ray-core-legacy have no URL parsing at all; they are runtimes, not clients.
+
+### 24.5 Third-party snapshots
+
+| Repository | Path | HEAD commit and subject |
+|---|---|---|
+| Xray-core | `thirdparty/Xray-core/` | `d7fa207`: Forbid unencrypted outbounds on public Internet for VLESS and Trojan; remove none/zero/plain for VMess and Shadowsocks |
+| v2ray-core | `thirdparty/v2ray-core/` | `9db9c4b`: update version to v5.52.0 |
+| v2ray-core-legacy | `thirdparty/v2ray-core-legacy/` | `d80440f`: Merge pull request #3085 |
+| v2rayN | `thirdparty/v2rayN/` | `ad12a6c`: Update ca cert (#9700) |
+| v2rayNG | `thirdparty/v2rayNG/` | `9397a9e`: Fix (#5889) |
+| sing-box | `thirdparty/sing-box/` | `0f17638`: Fix v2rayhttp upgrade leak |
+| mihomo | `thirdparty/mihomo/` | `2c7309e`: fix: listener duplicate-name check (#2948) |
+| quirktiva | `thirdparty/quirktiva/` | `abece1f`: Chore: update test dependencies |
+| subconverter | `thirdparty/subconverter/` | `fe6666c`: chore: fix build scripts |
+| xray-checker | `thirdparty/xray-checker/` | `f829c2b`: Merge pull request #175 |
+| shoes | `thirdparty/shoes/` | `607ccde`: reality: match Chrome signature algorithms |
+| leaf | `thirdparty/leaf/` | `1d20301`: Revert "feat(inbound): limit data transfer and concurrent connections per IP" |
+| shadowsocks-rust | `thirdparty/shadowsocks-rust/` | `f827f6d`: fix(netbsd): passthrough syntax for RUSTFLAGS in Cross.toml |
+| trojan | `thirdparty/trojan/` | `3e7bb9a`: Update CONTRIBUTORS.md |
+
+Refresh these hashes after pulling or re-cloning the submodules.

@@ -1,7 +1,9 @@
-# Transcript: settings-xrat-parity
+# Transcript: settings-xrat-parity (2026-10-16)
 
 Raw captures for
-[2026-10-16-093000-scenario-settings-xrat-parity.md](2026-10-16-093000-scenario-settings-xrat-parity.md).
+[2026-10-16-093000-scenario-settings-xrat-parity.md](2026-10-16-093000-scenario-settings-xrat-parity.md),
+run 2026-10-16 09:30:00 +0500. Every fenced block below is the capture as it was returned; nothing
+inside a fence has been edited.
 
 **Binary: `target/debug/leas` md5 `fe4f62aa9f584fa6a8b5a2f89851cbe5`.** Every frame below was captured
 from that build, in sessions started after the last source change; no frame is carried over from
@@ -11,7 +13,7 @@ Fixture: `/home/user/.cache/leas-tui/settings-parity` (7 synthetic endpoints). S
 `default`, buffer mode, 120x40 unless a heading says otherwise. One key per call (see
 Harness notes).
 
-## E5 / E8 — an unsaved edit, then the discard confirmation (120x40)
+## E5 / E8: an unsaved edit, then the discard confirmation (120x40)
 
 ```
 │ ┌ Sections · 2/20 ────────────┐ ┌ Values · 1/5 ──────────────────────────────────────────────────────────┐ │
@@ -26,7 +28,7 @@ Harness notes).
 
 `Esc` on a dirty form asks before discarding; the status bar switches to `[y] Confirm  [n/Esc] Cancel`.
 
-## E7 — the same state at 80x24 (live resize)
+## E7: the same state at 80x24 (live resize)
 
 ```
 ┌ 1: [Profiles]  Logs ─────────────────────────────────────────────────────────┐
@@ -55,7 +57,7 @@ Harness notes).
 The popup stays framed, the sections list scrolls to keep the selection visible, the `*` row
 stays visible, and the footer drops from the left (`…`) while keeping `[Esc] Back`.
 
-## E1 / E12 — `,` on a fresh launch: the Values pane is never empty
+## E1 / E12: the `,` key on a fresh launch, the Values pane is never empty
 
 ```
 ┌ Settings ──────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -96,7 +98,7 @@ stays visible, and the footer drops from the left (`…`) while keeping `[Esc] B
 `Values · 1/5` on open — no empty state (R1). `—` on empty fields, `✗` on a false boolean,
 `< warning >` on a selector, `·` = saved.
 
-## E13 — one `down`: exactly one row, and the pane follows
+## E13: one `down`: exactly one row, and the pane follows
 
 ```
 │ ┌ Sections · 3/20 ────────────┐ ┌ Values · 1/22 ─────────────────────────────────────────────────────────┐ │
@@ -105,7 +107,7 @@ stays visible, and the footer drops from the left (`…`) while keeping `[Esc] B
 │ │›    Protocol Core           │ │ · Shadowsocks             < Auto >                                     │ │
 ```
 
-## E14 — `←` collapses (the header carries the highlight), `→` expands, `→` then moves focus
+## E14: `←` collapses (the header carries the highlight), `→` expands, `→` then moves focus
 
 ```
 │ ┌ Sections · 1/18 ────────────┐ ┌ Values · 1/22 ─────────────────────────────────────────────────────────┐ │
@@ -119,7 +121,7 @@ After the two `→` presses the footer is the field set:
 └────└────────────────────── [Tab/Shift+Tab] Field  [Space] Advance  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back ┘────┘
 ```
 
-## E15 — a selector advances, steps back, and wraps
+## E15: a selector advances, steps back, and wraps
 
 ```
 Space   : ›* VMess   < Auto >█     →  ›* VMess   < SingBox >█
@@ -128,7 +130,7 @@ Space   : ›* VMess   < Auto >█     →  ›* VMess   < SingBox >█
 ←       :                            →  ›* VMess   < SingBox >█      (wrap past the first option)
 ```
 
-## E16 / E17 — `/gui` narrows sections only; the theme selector saves and repaints
+## E16 / E17: `/gui` narrows sections only; the theme selector saves and repaints
 
 ```
 │ ┌ Sections · 2/2 ─────────────┐ ┌ Values · 1/3 ──────────────────────────────────────────────────────────┐ │
@@ -139,10 +141,10 @@ Space   : ›* VMess   < Auto >█     →  ›* VMess   < SingBox >█
 
 All three fields are listed while the filter is live (`Values · 1/3`): the filter narrows the
 section list only. Theme is a selector bound to `config.theme_name`; `Space` + `Ctrl+S` wrote
-the new slug, reloaded the theme and persisted it — this run's first launch started on
+the new slug, reloaded the theme and persisted it: this run's first launch started on
 `dracula`, and the next one starts on `catppuccin-mocha`.
 
-## E9 — modal surface: one background everywhere
+## E9: modal surface: one background everywhere
 
 ```
 get_cell_style inside the popup (6,20)   : fg=default bg=default
@@ -155,7 +157,7 @@ Before the D13 fix the popup reported `bg=808080` (opaline's `OpalineColor::FALL
 grey that the non-existent `bg.surface` token resolved to) and the dialogs `bg=44475a`
 (`bg.elevated`). Both fills are gone.
 
-## E10 — popup minimum width, 54x24 (Core Settings open, no filter)
+## E10: popup minimum width, 54x24 (Core Settings open, no filter)
 
 ```
 ┌ 1: [Profiles]  Logs ───────────────────────────────┐
@@ -184,7 +186,7 @@ Three things this row asserts, all visible above:
 - `Sections` **drops its counter** rather than clipping `2/20` into `2/` at 16 columns.
 - Every label keeps a separating space at the 15-column value column: `Sing-Box Path —`,
   `Skip Cert Verify ✗`, and the 22-character `Clash Mixin (JSON/YAML)` gets its space and its
-  value is simply cut by the pane edge — a truncation, not the `Sing-Box Path—` collision the
+  value is simply cut by the pane edge: a truncation, not the `Sing-Box Path—` collision the
   pre-fix build rendered.
 - The footer drops from the left (`… [/] Filter [Enter] Open [Esc] Close`) and keeps
   `[Esc] Close`.

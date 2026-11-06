@@ -1,22 +1,24 @@
-# leas Manual
+# leas manual
 
-## Overview
+How to drive the leas terminal interface: the shell, every screen, every key, and
+the workflows that string them together. It does not cover the crate layout
+([architecture](../architecture/architecture.md)), the database schema
+([database](../reference/database.md)), share-URL parsing
+([protocols](../reference/protocols.md)), or the native core's internals
+([native core](../reference/native-core.md)). Screen keys are verified against
+`crates/leas/src/ui/` and the input handler in `crates/leas/src/ui/mod.rs`.
 
-leas is a terminal user interface (TUI) for managing proxy connections through
-xray-core and sing-box. It provides profile management, subscription updates, speed
-testing, settings configuration, and real-time statistics — all from the terminal.
+## What runs behind the interface
 
-The backend architecture abstracts over the two subprocess backends (xray-core,
-sing-box) and the in-process native core. The TUI writes JSON configs and manages
-the binary lifetime for the subprocess backends; the native core runs in-process. Only one backend runs
-per connection session; switching profiles between backends stops the current core
-and starts the other.
+leas manages proxy connections through xray-core, sing-box, or the in-process
+native core. The TUI writes JSON configs and owns the binary lifetime for the
+subprocess backends; the native core runs in-process. Only one backend runs per
+connection session, so switching profiles across backends stops one core and
+starts the other.
 
----
+## Shell
 
-## Shell — two panes, no top-level tabs
-
-The window is two framed panes, a shell-level log row, and a status bar:
+The window is two framed panes, a shell-level log row, and a status bar.
 
 ```
 ┌ 1: [Profiles]  Sniffer  Logs ───────────────────────────┐
@@ -27,286 +29,154 @@ The window is two framed panes, a shell-level log row, and a status bar:
 └ status bar ──────────────────────────────────────────────┘
 ```
 
+| Part | Tabs / behaviour |
+| --- | --- |
+| Pane 1 | `Profiles` (endpoint table), `Sniffer` (per-host traffic for the native session), `Logs` (core log viewer) |
+| Pane 2 | `Details` (selected server's static facts plus DB aggregates), `Metrics` (connection status, traffic, native connection ring, core stats), `Tasks` (job queue) |
+| Log row | Newest log line, between pane 2's bottom border and the status bar. It is outside pane 2's frame, so the pane stays a complete rectangle; it is dropped when pane 2 collapses to one row |
+| Status bar | Connection state and mode on the left, contextual keys on the right (`## Status bar`) |
+
 - Each pane carries an inline tab bar in its border title: pane index (`1:`/`2:`)
-  accent-bold, the active tab bracketed and accent-bold (`[Profiles]`), inactive
-  tabs plain. Focused pane draws an accent border, the other a muted one.
-- **Pane 1 tabs**: `Profiles` (endpoint table), `Sniffer` (per-host traffic for
-  the native session), and `Logs` (live core log viewer).
-- **Pane 2 tabs**: `Details` (the selected server's static facts + the DB's
-  aggregate status), `Metrics` (connection status + traffic + native-core
-  connection ring + core system stats, one scrollable view), and `Tasks` (the
-  job queue).
-- **Log row**: a shell-level row between pane 2's bottom border and the status
-  bar, carrying the newest log line. It is outside pane 2's frame, so the pane
-  stays a complete rectangle; it is dropped when pane 2 collapses to one row.
-- **Pane keys**: `Tab`/`Shift+Tab` or `1`/`2` move focus; `[`/`]` cycle the focused
-  pane's tabs; `Alt+↑`/`Alt+↓` resize pane 2 (pane 2 focused; clamped 3..half the
-  terminal, session-only); `F1` toggles pane 2's compact one-line bar.
-- Settings is a **popup** (`,`) over both panes, not a tab. `Esc` closes it; an
-  unsaved form asks `y/n` before discarding.
-
-Overlays (help `?`, speed-test menu `t`, export `Ctrl+E`, add/edit/import forms,
-delete confirmation) render on top of the shell; only the top-most consumes keys.
-
----
+  and the active tab are accent-bold (`[Profiles]`), inactive tabs plain. The
+  focused pane draws an accent border, the other a muted one.
+- Pane 2's default height is 16 rows on every tab, so switching tabs never
+  resizes. `Alt+↑`/`Alt+↓` resizes it in steps of two rows, clamped to
+  `3..term_height/2` and to leave pane 1 at least 6 rows; the height is
+  session-only.
+- Terminals under 20 rows always collapse pane 2 to the one-line compact bar.
+- Settings is a popup (`,`), not a tab. Overlays (help `?`, speed-test menu `t`,
+  export `Ctrl+E`, add/edit/import forms, delete confirmation) render on top of
+  the shell, and only the top-most consumes keys.
 
 ## Screens
 
 ### Profiles
 
-The main screen. Shows a table of single-line endpoint rows with the following columns:
+The endpoint table. One row per endpoint; multi-protocol endpoints expand into a
+per-link panel.
 
-| Column       | Width | Content                                     |
-| ------------ | ----- | ------------------------------------------- |
-| (status)     | 2     | Connection status or test indicator          |
-| `Flag`       | 5     | Inbound country: `<flag emoji> <ISO>` (e.g. `🇳🇱 NL`) when the terminal renders flag emoji, bare `<ISO>` when it does not (`LEAS_NO_FLAGS`/`NO_EMOJI` force the fallback); `—` unknown |
-| `Address`    | 30    | Host, full width. Multi-variant endpoints carry the expand chevron `▸` (collapsed) / `▾` (expanded) in the status column's gap cell. A DNS name whose subdomain overflows elides the subdomain's tail, keeping the registrable domain: `jp-tyo-05….synthetic-node.example`. IP literals right-truncate with `…` |
-| `Port`       | 6     | Port, right-aligned. Green when it is a conventional mimic port for the representative link's transport: `tcp`/`ws`/`httpupgrade` → any web port (`80`, `443`, `8080`, `8443`, `8880`, `2052`/`2053`, `2082`/`2083`, `2086`/`2087`, `2095`/`2096`); `grpc`/`http`/`xhttp`/`quic`/`kcp` → the TLS set (`443`, `8443`, `2053`, `2083`, `2087`, `2096`). Display hint only — never affects ordering or testing |
-| `White`      | 9     | Whitelist membership tokens: `SNI` / `CIDR` / `SNI+CIDR` / `—` (replaces the old flag glyphs; DNS-unresolved lives in the Test cell's `[name]`) |
-| `│`          | 1     | Single-line separator between `White` and `Protocol` |
-| `Protocol`   | 10    | Protocol kind (e.g. `vless`, `vmess`), right-aligned |
-| `Config`     | 14    | Transport/security pair (e.g. `tcp/reality`), left-aligned; `~` marks a substituted ClientHello |
-| `│`          | 1     | Single-line separator between `Config` and `Fast` |
-| `Fast`       | 6     | The TRANSPORT measurement (e.g. ` 12`), colored (green <500ms, yellow ≥500ms, red ≥1000ms). It is INDEPENDENT of the `Real` cell: a row whose transport answered but whose config did not shows a number here BESIDE the `Real` cell's failure marker. A row with no transport measurement shows blanks (spec `2026-10-21-merged-test-pipeline-design` D2). A `[fast]` marker in the `Real` cell SUPPRESSES the number: the `Fast` column IS the transport measurement, and the marker says "the transport did not come up" — a number beside it would read as the opposite, so the row tells two stories at once |
-| `Auth`       | 4     | The config's ACCEPTANCE flag: `✓` the server accepted it, `✗` positive rejection evidence (an EOF during the VLESS response-header peel, an auth error, a framing error), `·` the family has no server ack (Trojan, classic-AEAD SS) or the engine cannot serve the row, `?` the ack was possible but was not observed in time (a lazy sing-box server + a slow target). Blank = never observed, which is NOT the same fact as `?`. The flag is read by the probe's own protocol phase — the tunnel's read path reports what it saw — and is NOT a band term: it never changes the row's place in the order (spec D3) |
-| `Real`       | 7     | The real probe's delay (e.g. ` 12`), colored as `Fast`; red problem labels `[name]` (DNS unresolved), `[n-a]` (the native engine cannot serve this row — no probe ran), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). `[name]` is suppressed when the row carries a TRANSPORT measurement: the probe dialed the name and the OS resolved it, so the two facts cannot both be true, and the measurement is the fresher one (the probe does not persist the resolution, so the endpoint's address set can be empty while the probe reached it). The cell describes the endpoint's REPRESENTATIVE link (`EndpointRow::representative_link_index`…
-| `Stab`       | 7     | The REPRESENTATIVE link's stability ring as `successes/attempts` (e.g. `14/16`; `—` no samples yet) — the same link the `Real`/`Fast`/`Auth` cells describe. Colored by success rate (green ≥80%, yellow ≥50%, red below; dashed = no samples). A stable server keeps its position and a healthy Stab cell even when its latest real ping failed (spec `2026-10-20-stab-alive-design`) |
-| `Streak`     | 6     | Consecutive successful real probes at the newest end of the representative link's ring. Shown only for currently `Alive` endpoints (newest real probe succeeded, inside the active window); blank otherwise, and always blank when the link carries a real/name error |
-| `Speed`      | 7     | The REPRESENTATIVE link's peak download rate in MiB/s (one decimal, e.g. `12.3`) from `Speed Test (Successful)`; blank when never measured. Neutral colour: a speed number says nothing about the link's health — the `Real`/`Fast` cells carry the verdicts. Same representative link as the other cells, so the number cannot disagree with the row's tier |
-| `│`          | 1     | Single-line separator between `Speed` and `Out` |
-| `Out`        | 5     | Exit country flag, same `<flag emoji> <ISO>` idiom as `Flag`; `—` unknown |
-| `Exit`       | 14    | Exit IP of the active link's persisted real ping (`—` none); survives reruns |
-
-Every label carries the header role; the three `│` cells are the only
-decorative separators. Delay/Speed/Traffic/Outbound details live in the
-expanded panel (below).
-
-The table no longer shows a sort arrow: the page order is always the ordering
-law (`docs/reference/ordering-law.md`), and the `Alive` band (0) leads the
-`Active` band (1), which leads `Purgatory` (2).
-
-**Expandable endpoints**: Endpoints with multiple protocol variants carry a `▸`
-before the `Flag` column (collapsed) or `▾` (expanded). Press `→` to expand: a
-rounded panel appears
-under the row with an `IPs:` line (resolved inbound addresses; `[?]` with an
-`(x resolve)` hint while the DNS name is unresolved) and a per-protocol
-sub-table. The sub-table's column labels sit on the separator line under the
-IPs row — `ID`, `Last Seen`, `Last Used`, `Protocol`, `Config`, `Delay`,
-`Speed`, `Traffic`, `Outbound`, `Exit`, `Stab` — so each field below reads as
-a named column. The panel border is widened past the endpoint grid to fit
-them; on a narrow pane the trailing columns drop whole (never half-drawn) and
-the border follows the last one shown. The panel shows at most 8 sub-rows;
-longer variant lists scroll — the window follows the selected sub-row and the
-separator shows the visible range (`6-13/23`). `←` collapses.
-Expanding lands on the **first sub-row**; `↑`/`↓` then walk the variants.
-`↑` at the first sub-row returns to the full endpoint row; `↓` at the last
-sub-row moves to the next profile; `↓` from the full row of an expanded
-endpoint re-enters the sub-table. `Enter` on a sub-row activates that variant
-(manual override).
-
-**Enrichment**: inbound country, whitelist features, and outbound info are
-computed in the background. Press `x` to force a DNS resolution of the
-selected endpoint. DNS results are cached (TTL configurable in Settings → DNS)
-and persist across launches, so group updates and restarts do not re-resolve.
-
-**Speed tests**: on a collapsed endpoint row with more than one protocol, the
-speed-test menu pings **all protocols of the endpoint** (endpoint-scoped
-batch); on a panel sub-row it pings the **exact protocol**.
-
-**Search:** Press `/` to focus search field, type to filter profiles by
-address/port. `Esc` clears filter and exits search mode.
-
-**Delete confirmation overlay** — centered dialog asking `y/n` when `d` is pressed.
-`y` confirms, `n`/`q`/`Esc` cancels.
-
----
-
-### Settings (popup)
-
-Opened with `,` from anywhere in the shell: a centered modal (width
-`clamp(term-4, 50, 110)`, height `clamp(term-2, 20, 40)`) over both panes. Not a
-tab — the shell stays rendered behind it. `Esc` closes; a form with unsaved edits
-asks `Discard unsaved settings? (y/N)` first. The popup carries its own key hints
-in its bottom border, so the app status bar shows only the mode.
-
-```
-┌ Settings * ─────────────────────────────────────────────┐
-│ ┌ Search ─────────────────────────────────────────────┐ │   filter / edit bar
-│ │Press / to filter settings                          │ │
-│ └─────────────────────────────────────────────────────┘ │
-│ ┌ Sections · 2/20 ─────────┐ ┌ Values · 1/2 ──────────┐ │   section list / fields
-│ │  ▾ Core                  │ │›* Servers (JSON)   x█  │ │
-│ │›    Core Settings        │ │ · DNS Cache TTL    —   │ │
-│ └──────────────────────────┘ └────────────────────────┘ │
-│ ┌ Help · DNS ─────────────────────────────────────────┐ │   field help
-│ │Type     Text                                        │ │
-│ └─────────────────────────────────────────────────────┘ │
-│ Saved DNS                                                │   status (errors/notice)
-└────────────────────── [Enter] Open  [Esc] Close ────────┘
-```
-
-The right pane is **never empty**: the popup opens with the first section's
-settings already on screen, and moving the selection loads that section
-immediately. `Enter` is not needed to see a section — it moves the cursor into
-its fields.
-
-**Bands, top to bottom.**
-
-1. **Filter / edit bar.** Idle it reads `Search` with `Press / to filter settings`;
-   while filtering the title is `Filter` and the body is your query behind a `█`
-   cursor; with a field focused it names what you are editing (`Edit Servers (JSON) · Text`).
-   Its border is accented while it is active.
-2. **Sections** (left, 30 %) and **Values** (right). The titles count where you are:
-   `Sections · n/N` counts rows (group headers included), `Values · i/n` counts the
-   field rows of the open section. A group header carries `▾` when expanded and `▸`
-   when collapsed; `←`/`→` toggles the group that owns the selection, and a collapsed
-   group's header carries the highlight.
-3. **Help** names the field under the cursor: `Field`, `Type`, `Accepts`, `Current`,
-   plus the marker legend. It yields rows first on a short terminal, so the lists keep
-   their viewport.
-4. **Status** appears only when it has something to say: the first validation error,
-   a filter that matched nothing, or the last save.
-
-**Value rows** are `›` (focused) + a provenance marker + the label + the value:
-`·` for a value that matches what the section was loaded with, `*` for an edit that
-has not been saved yet. Bools render `✓`/`✗`, an empty text field renders `—`,
-selects render `< option >`, and a focused row ends with a `█` cursor.
-
-**Selectors** (dropdown fields such as Log Level, the per-protocol core, and
-**Theme**) advance on `Space` or `Enter` and wrap past their last option back to
-the first; `←`/`→` step one option. Because `Enter` belongs to the selector on
-those fields, **`Ctrl+S` saves the section** (`Enter` still saves every other
-field type). Theme lists every builtin opaline slug, is bound to the theme the
-app actually loads, and applies on save — the whole app re-renders in the theme
-you just picked.
-
-**Menu items (in order):**
-
-1. Core Settings — binary paths, log level, default core type
-2. GUI Settings — language, theme (a selector over every builtin theme slug), refresh interval
-3. Inbound Settings — ports, listen address, sniffing
-4. Routing Rules — add/edit/delete/reorder rules
-5. DNS Settings — servers, hosts, query strategy, cache
-6. Protocol Core — per-protocol core override (Auto/Xray/SingBox)
-7. System Proxy — enable/disable HTTP_PROXY, ports, bypass
-8. TUN Mode — enabled, interface name, MTU
-9. Mux — multiplexing settings
-10. Statistics — enable/disable stats collection
-11. Speed Test — ping URL, exit-IP provider, timeouts, batch concurrency, per-profile task queue limit, DNS-failure deferral, error-label TTL
-12. Logging — log level, log-to-file path, log retention
-13. Subscriptions — group list, add/edit/delete/update (`g` from Profiles jumps here)
-14. Updates — check and install backend updates
-
-**Keys.**
-
-| Key | Where | Action |
+| Column | Width | Content |
 | --- | --- | --- |
-| `↑`/`↓` | either pane | move the selection / field focus |
-| `←` | Sections | collapse the selected section's group |
-| `→` | Sections | expand a collapsed group, else focus the Values pane |
-| `←`/`→` | Values | step a selector one option; toggle a boolean |
-| `/` | Sections, or a list pane | focus the filter bar |
-| `Enter` | Sections | focus the selected section's fields (a collapsed group expands first) |
-| `Space` | Values | advance the focused selector (wraps); toggle a boolean |
-| `Backspace` | Values | erase text; on a boolean it toggles (no tail to erase) |
-| `Ctrl+S` | Values | validate and save the section |
-| `Ctrl+V` | Values, a form field | paste the clipboard into the focused text field (a selector or boolean takes nothing) |
-| `Tab`/`Shift+Tab` | Values | next / previous field |
-| `Ctrl+W` | anywhere | swap focus between Sections and Values |
-| `Esc` | popup | close (asks before discarding unsaved edits); while filtering, cancels the filter |
+| (status) | 2 | Connection status or test indicator; also carries the expand chevron in its gap cell |
+| `Flag` | 5 | Inbound country as `<flag emoji> <ISO>` (e.g. `🇳🇱 NL`) when the terminal renders flag emoji, bare `<ISO>` when it does not (`LEAS_NO_FLAGS`/`NO_EMOJI` force the fallback); `—` unknown |
+| `Address` | 30 | Host, full width. A DNS name whose subdomain overflows elides the subdomain's tail, keeping the registrable domain (`jp-tyo-05….synthetic-node.example`); IP literals right-truncate with `…` |
+| `Port` | 6 | Port, right-aligned. Green when it is a conventional mimic port for the representative link's transport: `tcp`/`ws`/`httpupgrade` → any web port (`80`, `443`, `8080`, `8443`, `8880`, `2052`/`2053`, `2082`/`2083`, `2086`/`2087`, `2095`/`2096`); `grpc`/`http`/`xhttp`/`quic`/`kcp` → the TLS set (`443`, `8443`, `2053`, `2083`, `2087`, `2096`). Display hint only; it never affects ordering or testing |
+| `White` | 9 | Whitelist membership tokens: `SNI` / `CIDR` / `SNI+CIDR` / `—`. A DNS-unresolved endpoint is reported in the `Real` cell as `[name]` |
+| `│` | 1 | Separator between `White` and `Protocol` |
+| `Protocol` | 10 | Protocol kind (e.g. `vless`, `vmess`), right-aligned |
+| `Config` | 14 | Transport/security pair (e.g. `tcp/reality`), left-aligned; `~` marks a substituted ClientHello |
+| `│` | 1 | Separator between `Config` and `Fast` |
+| `Fast` | 6 | The transport measurement (e.g. ` 12`), coloured green below 500 ms, yellow at 500 ms or more, red at 1000 ms or more. Independent of `Real`: a row whose transport answered but whose config did not shows a number here beside `Real`'s failure marker. A row with no transport measurement shows blanks. A `[fast]` marker in `Real` suppresses the number, because the marker means the transport did not come up |
+| `Auth` | 4 | The config's acceptance flag from the probe's protocol phase: `✓` accepted, `✗` positive rejection evidence (EOF during the VLESS response-header peel, an auth error, a framing error), `·` the family has no server ack (Trojan, classic-AEAD SS) or the engine cannot serve the row, `?` an ack was possible but not observed in time. Blank means never observed, which is not the same fact as `?`. Never changes the row's place in the order |
+| `Real` | 7 | The real probe's delay (e.g. ` 12`), coloured as `Fast`. Red problem labels: `[name]` (DNS unresolved), `[n-a]` (the native engine cannot serve this row, so no probe ran), `[fast]`/`[real]`. A marker appears only when the active/preferred link has no measured delay; a measurement always wins over a stale marker, and real beats fast. `[name]` is suppressed when the row carries a transport measurement, because that probe dialled the name successfully and the measurement is the fresher fact |
+| `Stab` | 7 | The representative link's stability ring as `successes/attempts` (e.g. `14/16`; `—` no samples). Coloured by success rate: green at 80% or more, yellow at 50% or more, red below; dashed when there are no samples |
+| `Streak` | 6 | Consecutive successful real probes at the newest end of the representative link's ring. Shown only for endpoints that are currently `Alive`; blank otherwise and whenever the link carries a real/name error |
+| `Speed` | 7 | The representative link's peak download rate in MiB/s, one decimal (e.g. `12.3`), from `Speed Test (Successful)`; blank when never measured. Neutral colour: a speed number says nothing about the link's health |
+| `│` | 1 | Separator between `Speed` and `Out` |
+| `Out` | 5 | Exit country flag, same idiom as `Flag`; `—` unknown |
+| `Exit` | 14 | Exit IP of the active link's persisted real ping (`—` none); survives reruns |
 
-**Filter.** `/` starts a case-insensitive substring filter over the **section
-list** (a leaf name or its group name). It never touches the Values pane: the
-selected section keeps showing all of its fields. `Enter` applies (the query
-stays), `Esc` cancels (the query clears), `Ctrl+U` clears it. A query that
-matches nothing says so in the status band. A filtered list ignores collapsed
-groups, so a search always reveals its own matches, and a filter that moves the
-selection moves the Values pane with it.
+The three `│` cells are the only decorative separators; every other cell
+carries the header role. There is no sort arrow: page order is always the
+ordering law ([ordering law](../reference/ordering-law.md)), where the `Alive` band (0)
+leads `Active` (1), which leads `Purgatory` (2).
 
-**Routing Rules** (section 4) has a two-level UI:
-- Routing list: `↑↓` navigate, `Enter` edit, `a` add, `d` delete, `r` reorder
-- Routing rule form: same Tab/S-Tab/Enter/Esc navigation
+**Expandable endpoints.** An endpoint with more than one protocol variant shows
+`▸` (collapsed) or `▾` (expanded) in the status column's gap cell. `→` expands:
+a rounded panel opens under the row with an `IPs:` line (resolved inbound
+addresses; `[?]` and an `(x resolve)` hint while the DNS name is unresolved)
+plus a per-protocol sub-table.
 
-**Updates form** — shows current version and latest available version for each
-backend. `C` triggers a version check, `D` triggers download for all available
-updates. `Esc` returns to menu.
+- The sub-table's labels sit on the separator line under the IPs row: `ID`,
+  `Last Seen`, `Last Used`, `Protocol`, `Config`, `Delay`, `Speed`, `Traffic`,
+  `Outbound`, `Exit`, `Stab`.
+- The panel border widens past the endpoint grid to fit them. On a narrow pane
+  the trailing columns drop whole (never half-drawn) and the border follows the
+  last shown column.
+- At most 8 sub-rows are visible. Longer lists scroll: the window follows the
+  selected sub-row and the separator shows the visible range (`6-13/23`).
+- `→` lands on the first sub-row; `↑`/`↓` walk the variants. `↑` at the first
+  sub-row returns to the endpoint row; `↓` at the last moves to the next
+  profile; `↓` from the full row of an expanded endpoint re-enters the
+  sub-table. `Enter` on a sub-row pins that protocol as the endpoint's default
+  (a manual override). `←` collapses.
 
----
+**Enrichment.** Inbound country, whitelist features, and outbound info are
+computed in the background. `x` forces a DNS resolution of the selected
+endpoint. DNS results are cached (TTL in Settings → Routing → DNS) and persist
+across launches, so group updates and restarts do not re-resolve.
 
-### Sniffer (pane 1 tab)
+**Speed tests.** On a collapsed endpoint row with more than one protocol the
+speed-test menu pings all protocols of the endpoint (endpoint-scoped batch); on
+a panel sub-row it pings the exact protocol.
 
-Per-host traffic for the **in-process native core**, fed by a 1 s snapshot of
-the session's accounting (spec `2026-11-03-sniffer-pane-design.md`). With a
-subprocess core (xray-core / sing-box) or no connection, the tab shows:
+**Search.** `/` focuses the search field; typing filters by address and port.
+`Esc` clears the filter and leaves search mode.
+
+**Views.** `p` cycles `Active → Purgatory → All` (`### Purgatory`).
+
+### Details (pane 2)
+
+The selected server's static fact sheet plus the database's status. The selected
+server is the pane-1 cursor row (`filtered_profiles().nth(selected_index)`), the
+same law the footer and `Metrics` use, so a search filter cannot make the
+surfaces disagree.
+
+**Layout.** Three columns at 3:6:3, separated by single vertical rules:
+`Server` (left), `Link` (middle), `DB` (right). Below 100 columns the facts
+stack above the aggregate block.
 
 ```
-No native session — per-host traffic requires the native core
+Server         │ Link                          │ DB 74,012
+  Address h:443│   Leas URL leas://1a2b/3c4d    │   proven    41,900
+  Country NL   │   Protocol vless              │   untested  28,932
+  Resolved IPs │   Transport tcp               │   failed     2,996
+  Whitelist —  │   Security reality            │   other       184
+               │   Last Seen …                 │
+               │   Real Delay 120ms            │ alive       3,180
+               │   …                           │ active      1,402
+               │   Exit IP 1.2.3.4             │ reliable   12,004
+               │   Last Error [real]           │
+               │   Error Text …                │ View: Active / <query>
 ```
 
-Layout, top to bottom:
+- **Server** holds the inbound identity: `Address` (`host:port`), `Country`,
+  `Resolved IPs`, `Whitelist`.
+- **Link** holds everything the representative link can explain: its `Leas URL`
+  (`leas://<endpoint hex>/<protocol hex>`, the identity the Real Test log lines
+  use), protocol config names (kind, transport, security, SNI, fingerprint; names
+  only, no credentials or keys), timestamps, measurements, auth, speed,
+  stability, traffic, exit IP and country, and the stored `Last Error` plus
+  `Error Text` when one exists. That error text explains the grid's
+  `[real]`/`[fast]`/`[name]` label.
 
-1. **Rates** — `↓ x/s  ↑ y/s` for the last second.
-2. **Summary** — `hosts N · failed N · dropped N datagrams (bytes)`; "dropped"
-   counts undelivered UDP payloads (malformed, blocked, queue-full, unresolvable
-   destination, carrier refusal), while "failed" counts refused or failed TCP
-   legs.
-3. **Two mirrored sparklines** — down grows downward from the top line, up grows
-   upward from the bottom line, over the last 60 s. Both share one scale, so the
-   two directions are comparable; a non-zero sample is never invisible.
-4. **Host table** — `host · ↓ · ↑ · conns · failed`, sorted by total bytes
-   descending. A host is the destination **as the client sent it** (domain or IP
-   literal, no port): a proxied domain keeps its domain because the remote proxy
-   resolves it.
+**The `DB` column is two blocks, not one list.** The four partition counts
+(`proven`, `untested`, `failed`, `other`) are pairwise disjoint and sum to the
+total. `alive`, `active`, and `reliable` are orthogonal filters over the same
+rows and overlap any partition member, so they are drawn as a separate block.
 
-Bytes only — the pane has no bits/packets selector: TCP has no packet boundary,
-so a packet count would mean different things per row. Totals are session-only
-and in memory: disconnect freezes the table, connecting again clears it. Keys:
-`↑`/`↓` scroll, `PgUp`/`PgDn` page, `Home`/`End` jump to the first/last host.
+| Bucket | Meaning |
+| --- | --- |
+| `proven` | The endpoint has at least one live unpurged link with a real success |
+| `untested` | Not proven, and never measured |
+| `failed` | Not proven, and carrying a failure marker |
+| `other` | Not proven and in no other bucket (measured, but the ring holds no success) |
+| `alive` | The newest real probe succeeded and the endpoint is inside the TTL window (band 0). The global scope computes this live; the view scope uses the swept band, so it describes the set the table shows |
+| `active` | Inside the TTL window but not alive (band 1); never overlaps `alive` |
+| `reliable` | The representative link's success rate is 75% or more (at least 4 samples) |
 
----
+**Sources.** `Server` reads the loaded row's persisted addresses, which is the
+grid's own law; `endpoint_info` is a display cache that lags, so a missing entry
+renders `—` and the panel never triggers a background fill. `Link` reads the
+representative link, the same link the grid's `Real`/`Stab` cells describe.
 
-### Logs (pane 1 tab)
+### Metrics (pane 2)
 
-Live log output from the connected core process, rendered frameless inside pane 1
-(the pane supplies the frame). When no core is running, shows:
+One scrollable view: connection status, the connected session's traffic, the
+native core's connection ring, and core system stats. It merges the former
+Statistics and Native Activity screens; the pane frame supplies the border and
+the sections are flat labelled rows.
 
-```
-┌ Logs ───────────────────────────────────────────────────┐
-│No logs                                                  │
-└──────────────────────────────────────────────────────────┘
-```
-
-After connecting to a profile, the core's stdout (xray-core) and stderr (sing-box)
-log lines appear in real time. Log levels are color-coded:
-
-- **error/fatal/panic** — red bold (`Theme::ERROR`)
-- **warning/warn** — yellow (`Theme::WARNING`)
-- **info** — default terminal color
-- **debug/trace** — gray (`Theme::HINT`)
-
-The buffer holds the most recent 1000 log lines (older rows load on demand as you
-scroll up). Scrolling is bottom-anchored: `log_scroll` counts rows up from the
-newest line, and the viewport is filled by a LINE budget — a message longer than
-the Message column wraps onto continuation lines, and the window walks backward
-from the anchor until the pane's lines are spent. So the pane always fills from
-its anchor edge and the newest lines stay visible at the bottom; `PageUp` pages
-by the real pane height, not the terminal's.
-
-A single entry occupies at most **3 lines**. A core can emit a "slow query"
-line longer than the whole pane; rendering it in full would push every other
-row out of view, so the third line is truncated to fit and ends with `...`.
-
----
-
-### Metrics (pane 2 `Metrics` tab)
-
-The dynamic view: **connection status**, the connected session's traffic, the
-native core's connection ring, and core system stats. The Actions Log's content
-moved here — its connection-status row is the `status` section, and its log tail
-is the shell-level log row below the pane (not a frozen row inside it).
-
-One scrollable view merging the former Statistics and Native Activity screens —
-the pane frame supplies the border; sections are flat labelled rows:
 ```
 status
   ○ Disconnected
@@ -321,160 +191,356 @@ core
   api http://127.0.0.1:62789
 ```
 
-- **status** — the connection indicator and state (`● Connected [xray]`,
-  `⠋ Connecting...`, `⏹ Error: ...`, `○ Disconnected`); the Actions Log's
-  connection row, relocated here.
-- **session** — the CONNECTED profile's traffic (today/total, up/down from the
-  link's persisted `profile_stats` plus the session delta); `not connected —
-  select a profile and press Ctrl+Enter` when nothing is connected.
-- **native** — per-connection trace of the in-process native core: one line per
-  connection with byte totals and lifetime; failures render in the error colour.
-  With more rows than fit, a `rows N-M of T` line caps the window and `↑↓` scroll.
-- **core** — memory/routines/uptime from the backend's gRPC/V2Ray API and the API
-  endpoint (the native core reports an in-process event feed).
+- **status**: the connection indicator (`● Connected [xray]`, `⠋ Connecting...`,
+  `⏹ Error: ...`, `○ Disconnected`).
+- **session**: the connected profile's traffic (today and total, up and down from
+  the link's persisted `profile_stats` plus the session delta). Shows
+  `not connected — select a profile and press Ctrl+Enter` when nothing is
+  connected.
+- **native**: one line per connection of the in-process native core, with byte
+  totals and lifetime; failures render in the error colour. With more rows than
+  fit, a `rows N-M of T` line caps the window and `↑`/`↓` scroll.
+- **core**: memory, routines, and uptime from the backend's gRPC/V2Ray API, plus
+  the API endpoint. The native core reports an in-process event feed.
 
-`Alt+↑`/`Alt+↓` (pane 2 focused) resize the pane; `F1` collapses it to the
-one-line compact bar.
+### Tasks (pane 2)
 
-### Subscriptions (Settings)
-
-Group management lives in the Settings popup → Subscriptions. Press `g` on pane 1
-(Profiles tab) to jump straight there; `Esc` returns to the settings menu.
-
-Lists subscription groups with columns: Name, URL (truncated), Enabled,
-Status, Last Updated.
-
-**Actions:**
-
-| Key             | Action                            |
-| --------------- | --------------------------------- |
-| `a`             | Add new group                     |
-| `e`             | Edit selected group               |
-| `d`             | Delete selected group (y/n confirm)|
-| `u`             | Update all groups' subscriptions  |
-| `Esc`           | Return to settings menu           |
-
-**Group form** — fields: `name`, `subscription_url`, `user_agent`,
-`update_interval`, `core_type`. `Tab`/`Shift+Tab` navigates, `Enter` saves,
-`Esc` cancels. `Ctrl+V` pastes the clipboard into the focused text field
-(the subscription URL is the common case — crossterm's Windows backend has no
-bracketed-paste path, so `Ctrl+V` reading the clipboard is the only paste door
-there).
-
----
-
-### Add/Edit Server Forms
-
-Opened with `a` (add) or `e` (edit) from the Profiles tab.
-
-**Protocol picker** (add only) — scrollable list of all supported protocols:
-
-- Xray-core native: VMess, VLESS, Shadowsocks, Shadowsocks-2022, SOCKS, HTTP,
-  Trojan, WireGuard, Hysteria v2, Dokodemo-door, Freedom, Blackhole, DNS,
-  Loopback, Custom
-- Sing-box only: TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH,
-  Tailscale, ShadowsocksR, Redirect
-
-`↑↓` to navigate, `Enter` to select, `Esc` to cancel.
-
-**Parameter form** — after selecting a protocol (or when editing), displays
-fields specific to that protocol. Field types: text, number, boolean (toggle
-on any key press), and select (cycle with `←`/`→` or any key press).
-
-- `Tab` / `Shift+Tab` or `↑↓` — move focus
-- `Enter` — save and return to profile list
-- `Ctrl+S` — save (alternative)
-- `Esc` — cancel
-- `Backspace` — delete character before cursor; on a boolean it toggles (there
-  is no tail to erase), same as `Space`
-- `Space` — type space; on a boolean or select it advances/toggles
-- `←` / `→` — step a select or toggle a boolean in place
-- `-` in number fields — negative sign
-
----
-
-### Import URL Screen
-
-Opened with `Ctrl+V` from the Profiles tab. A bordered input field with title:
+The job queue: the running task's progress bar on top, queued tasks below,
+earliest first. The running task is the bar's label, not a list row, so its
+progress is never drawn twice.
 
 ```
-Import URL — Ctrl+V paste, Enter parse, Esc cancel
+Real Test (Successful) 1,240/3,000 ~12m ━━━●──────────
+  ► Fill Exit IPs (Successful)
+    Compact Duplicate Endpoints
 ```
 
-- Type or paste the share URL (vmess://, ss://, trojan://, etc.)
-- `Enter` — parse and add profile
-- `Esc` — cancel
-- Shows error message in red if parsing fails
+The bar is a `LineGauge` with a manual thumb at the fill boundary, themed from
+the same tokens as the settings download bar. When nothing runs, the label names
+the scheduler state: `paused — N queued, press r to resume`,
+`no tasks — pick one from the Speed Test menu`, or `queued: …`.
 
-### Batch Import Screen
+**Keys are tab-scoped** (see the reference tables) so `d`, `s`, `r` do not collide
+with the Profiles tab's delete or the global stop-test.
 
-Triggered by pasting multiple share URLs into the Import URL screen and pressing Enter.
-Shows a scrollable list of import results with success/failure per URL.
+**Scheduling.** The Speed Test menu is the entry point: picking an item enqueues
+it rather than starting it. A duplicate identity (`(kind, scope)` for batched
+tasks, `(kind, test type, endpoint)` for the Selected variants) is ignored, so a
+task can never be queued or re-armed while it runs. One job at a time is
+structural: the scheduler is the only path into the spawn functions.
 
-**Keyboard shortcuts:**
-- `↑/↓` — scroll results list
-- `Enter` — save all successful imports and return to profile list
-- `Esc` — cancel all and return to profile list
+### Sniffer (pane 1)
 
----
-
-### Speed Test Menu
-
-Opened with `t` from the Profiles tab. Overlay menu centered on screen:
+Per-host traffic for the in-process native core, fed by a 1 s snapshot of the
+session's accounting. With a subprocess core (xray-core or sing-box) or no
+connection, the tab reads:
 
 ```
-┌─ Speed Test ─────────────────────────────────────────┐
-│  Fast Test (Selected)                                  │
-│  Real Test (Selected)                                 │
-│  Speed Test (Selected)                                │
-│  UDP Test (Selected)                                  │
-│  ─────                                                │
-│  Fast Test (All Profiles)                               │
-│  Real Test (All Profiles)                               │
-│  Real Test (Successful)                                 │
-│  Real Test (New)                                        │
-│  Real Test (Successful + New)                           │
-│  Real Test (Failed)                                     │
-│  Speed Test (Successful)                                │
-│  Fill Exit IPs (Successful)                            │
-│  Sort by Test                                         │
-│  Remove Bad Servers                                   │
-│  Retry Failed DNS Lookups                             │
-│  Compact Duplicate Endpoints                          │
-│  ─────                                                │
-│  Stop Testing                                         │
-│  ─────                                                │
-│  Clear All Stats                                      │
-└───────────────────────────────────────────────────────┘
+No native session — per-host traffic requires the native core
 ```
 
-- `↑↓` — navigate (skips separator lines)
-- `Enter` — **enqueue** the selected task (see the Tasks pane)
-- `Esc` — close menu
-- `?` — open help overlay
+Top to bottom:
 
-The schedulable items enqueue: the six Real/Fast Test variants, the four
-Selected variants, `Speed Test (Successful)`, `Fill Exit IPs (Successful)`,
-`Retry Failed DNS Lookups`, and `Compact Duplicate Endpoints`. `Stop Testing`
-cancels the running task and pauses the queue (the Tasks pane's `s`/`r` do the
-same). `Remove Bad Servers` and `Clear All Stats` stay immediate with their
-`y/n` confirmation and are disabled while the scheduler is busy.
+1. **Rates**: `↓ x/s  ↑ y/s` for the last second.
+2. **Summary**: `hosts N · failed N · dropped N datagrams (bytes)`. Dropped
+   counts undelivered UDP payloads (malformed, blocked, queue-full,
+   unresolvable destination, carrier refusal); failed counts refused or failed
+   TCP legs.
+3. **Two mirrored sparklines**: down grows downward from the top line, up grows
+   upward from the bottom line, over the last 60 s. Both share one scale, so the
+   directions are comparable and a non-zero sample is never invisible.
+4. **Host table**: `host · ↓ · ↑ · conns · failed`, sorted by total bytes
+   descending. A host is the destination as the client sent it (domain or IP
+   literal, no port); a proxied domain keeps its domain because the remote proxy
+   resolves it.
 
-Progress is shown in the status bar (`{Task}: {done}/{total}`) and, with the
-queue, in the Tasks pane.
-### Export Menu
+Bytes only: TCP has no packet boundary, so a packet count would mean different
+things per row. Totals are session-only and in memory; disconnecting freezes the
+table and connecting again clears it.
 
-Open with `Ctrl+E` from Profiles. First choose scope, then destination:
+### Logs (pane 1)
 
-- `Only Working` — links with current real/fast success (canonical rank tiers 0/1); distinct from the `Alive` band
-- `Only Resolved` — dialable endpoints; DNS endpoints emit one line per stored IP
-- `Only Active` — exact current Active view
-- `All Valid` — all non-purged links, including aged/stale Purgatory rows
-- `Clipboard` — copies raw subscription text through `arboard`
-- `File` — writes raw subscription text through `tokio::fs`
+Live log output from the connected core, rendered frameless inside pane 1 (the
+pane supplies the frame). With no output yet:
 
-`↑↓` navigates, `Enter` selects, `Esc` closes. File paths are editable; existing destinations require `y` confirmation. Output has four metadata comment lines followed by one share URL per line. `Количество` counts matching stored links before Resolved IP expansion or serializer skips; Actions reports emitted and skipped counts separately.
-Output header:
+```
+┌ Logs ───────────────────────────────────────────────────┐
+│ No logs yet. Run a profile or wait for core output.       │
+└──────────────────────────────────────────────────────────┘
+```
+
+The core's stdout (xray-core) and stderr (sing-box) arrive in real time; leas's
+own `tracing` events land in the same buffer. A filter bar above the log area
+shows the active target filter (`[T] Filter (all)` or `(N active)`) and the key
+hints for the current mode.
+
+| Level | Colour |
+| --- | --- |
+| error / fatal / panic | red bold (`Theme::ERROR`) |
+| warning / warn | yellow (`Theme::WARNING`) |
+| info | default terminal colour |
+| debug / trace | gray (`Theme::HINT`) |
+
+- The in-memory buffer holds the most recent 10,000 lines; older rows load from
+  the database on demand as you scroll up.
+- Scrolling is bottom-anchored: `log_scroll` counts rows up from the newest
+  line, and the viewport is filled by a line budget, so a wrapped message
+  consumes several rows and the window walks backward from the anchor until the
+  pane's lines are spent. `PageUp`/`PageDown` page by the real pane height, not
+  the terminal's.
+- A single entry occupies at most 3 lines. The third line is truncated to fit and
+  ends with `...`, so one long core line cannot push every other row out of view.
+- `T` opens the target picker (`↑`/`↓` or `j`/`k` move, `Enter` applies, `t`/`q`/`Esc` closes).
+- `y` copies the selected range when a selection anchor is set, else the cursor
+  line; `Y` copies every filtered line. Selection is made with
+  `Shift+↑`/`Shift+↓` and cleared with `Esc`.
+- `c` clears the view (confirm), `Delete` purges the logs database (confirm), and
+  `d` dumps the last 20 database-monitor lines into the log.
+
+### Settings (popup)
+
+`,` opens a centered modal (width `clamp(term-4, 50, 110)`, height
+`clamp(term-2, 20, 40)`) over both panes. The shell keeps rendering behind it.
+`Esc` closes; leaving a dirty form asks `Discard unsaved settings? (y/N)` first.
+The popup carries its key hints in its bottom border; the app status bar shows
+only the mode.
+
+```
+┌ Settings * ─────────────────────────────────────────────┐
+│ ┌ Search ─────────────────────────────────────────────┐ │   filter / edit bar
+│ │Press / to filter settings                          │ │
+│ └─────────────────────────────────────────────────────┘ │
+│ ┌ Sections · 2/20 ─────────┐ ┌ Values · 1/2 ──────────┐ │   section list / fields
+│ │  ▾ Core                  │ │›* Servers (JSON)   x█  │ │
+│ │›    Core Settings        │ │ · DNS Cache TTL    —   │ │
+│ └──────────────────────────┘ └────────────────────────┘ │
+│ ┌ Help · DNS ─────────────────────────────────────────┐ │   field help
+│ │Type     Text                                        │ │
+│ └─────────────────────────────────────────────────────┘ │
+│ Saved DNS                                                │   status (errors/notice)
+└────────────────── [Enter] Open  [Esc] Close ────────────┘
+```
+
+The right pane is never empty: the popup opens with the first section's settings
+already showing, and moving the selection loads that section immediately. `Enter`
+moves the cursor into the fields.
+
+**Bands, top to bottom.**
+
+1. **Filter / edit bar.** Idle it reads `Search` with `Press / to filter settings`;
+   while filtering the title is `Filter` and the body is the query behind a `█`
+   cursor; with a field focused it names what you are editing (`Edit Servers (JSON) · Text`).
+   Its border is accented while active.
+2. **Sections** (left, 30%) and **Values** (right). The titles count position:
+   `Sections · n/N` counts display rows (group headers included), `Values · i/n`
+   counts the open section's field rows. A group header carries `▾` when expanded
+   and `▸` when collapsed; `←`/`→` toggles the group that owns the selection, and
+   a collapsed group's header carries the highlight.
+3. **Help** names the field under the cursor: `Field`, `Type`, `Accepts`,
+   `Current`, plus the marker legend. It yields rows first on a short terminal so
+   the lists keep their viewport.
+4. **Status** appears only when it has something to say: the first validation
+   error, a filter that matched nothing, or the last save.
+
+**Value rows** are `›` (focused) + a provenance marker + the label + the value:
+`·` when the value matches what the section was loaded with, `*` for an edit not
+yet saved. Bools render `✓`/`✗`, an empty text field renders `—`, selects render
+`< option >`, and a focused row ends with a `█` cursor.
+
+**Selectors** (Log Level, the per-protocol core, **Theme**) advance on `Space` or
+`Enter` and wrap past the last option; `←`/`→` step one option. Because `Enter`
+belongs to the selector on those fields, `Ctrl+S` saves the section (`Enter`
+still saves every other field type). Theme lists every builtin opaline slug, is
+bound to the theme the app actually loads, and applies on save.
+
+**Section tree (15 leaves in 5 groups):**
+
+| Group | Leaves |
+| --- | --- |
+| Core | Core Settings, Protocol Core |
+| Connection | Inbound, System Proxy, TUN, Mux |
+| Routing | Routing Rules, Probe Hosts, DNS |
+| GUI | GUI Settings |
+| Advanced | Statistics, Updates, Speed Test, Logging, Subscriptions |
+
+**Filter.** `/` starts a case-insensitive substring filter over the section list
+(a leaf name or its group name). It never filters the Values pane. `Enter`
+applies and leaves the query in place; `Esc` cancels and clears it; `Ctrl+U`
+clears it while typing. A query that matches nothing says so in the status band.
+A filtered list ignores collapsed groups, so a search reveals its own matches,
+and a filter that moves the selection moves the Values pane with it. `/` is
+claimed only where it cannot be text: the sections list, or the routing and
+subscription list panes.
+
+#### Routing Rules (Settings → Routing)
+
+Two levels:
+
+- **Routing list**: `↑`/`↓` navigate, `a` adds, `e` edits, `d` deletes (no
+  confirmation), `Ctrl+↑`/`Ctrl+↓` move the selected rule one place and persist
+  the whole order immediately.
+- **Routing rule form**: `Tab`/`Shift+Tab` and `↑`/`↓` move between fields,
+  `Enter` saves, `Esc` returns to the list.
+
+#### Subscriptions (Settings → Advanced)
+
+`g` on the Profiles tab jumps straight here. The list shows Name, URL
+(truncated), Enabled, Status, and Last Updated.
+
+| Key | Action |
+| --- | --- |
+| `a` | Add a group |
+| `e` | Edit the selected group |
+| `d` | Delete the selected group (`y` confirms) |
+| `u` | Update every group's subscription |
+| `Space` | Toggle the selected group's enabled mask |
+| `Esc` | Return to the section list |
+
+**Group form** fields: `name`, `subscription_url`, `user_agent`,
+`update_interval`, `core_type`. `Tab`/`Shift+Tab` moves, `Enter` saves, `Esc`
+cancels. `Ctrl+V` pastes the clipboard into the focused text field (crossterm's
+Windows backend has no bracketed paste, so `Ctrl+V` is the only paste door there).
+
+#### Updates (Settings → Advanced)
+
+Shows the current and latest version of each backend. `C` checks, `D` downloads
+every available update, `Esc` returns to the section list.
+
+### Add and edit server
+
+`a` adds (protocol picker first), `e` edits the selected endpoint, `c` clones it.
+
+**Protocol picker** (add only), a scrollable list in two blocks:
+
+| Backend | Protocols |
+| --- | --- |
+| Xray-core | VMess, VLESS, Shadowsocks, Shadowsocks-2022, SOCKS, HTTP, Trojan, WireGuard, Hysteria v2, Dokodemo-door, Freedom, Blackhole, DNS, Loopback, Custom |
+| Sing-box only | TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect |
+
+**Parameter form.** Fields are text, number, boolean, or select. `Tab`/`Shift+Tab`
+or `↑`/`↓` move, `Enter` saves and returns to the list, `Ctrl+S` also saves,
+`Esc` cancels. In a field: typing appends, `Backspace` erases (on a boolean it
+toggles, because there is no tail to erase), `Space` advances a select or
+toggles a boolean, `←`/`→` step a select or toggle a boolean, and `-` is accepted
+in number fields.
+
+### Import and batch import
+
+`Ctrl+V` on the Profiles tab reads the clipboard and sorts the payload:
+
+- no share URL found: the import screen opens with
+  `No valid share URLs found`;
+- exactly one URL: the import screen opens with it filled in;
+- more than one URL: the batch import screen opens directly.
+
+The import screen is a bordered field titled
+`Import URL — Ctrl+V paste, Enter parse, Esc cancel`; typing edits the URL,
+`Enter` parses and adds the profile, `Esc` cancels, and a parse failure shows a
+red error line.
+
+The batch screen lists one result per URL with success or failure. `↑`/`↓`
+scroll, `Enter` saves every successful import and returns to the list, `Esc`
+cancels the whole batch.
+
+### Speed test menu
+
+`t` from the Profiles tab. Items, in menu order (separators between groups):
+
+| Item | Scope |
+| --- | --- |
+| `Fast Test (Selected)` | Transport measurement only, with a TCP or UDP/QUIC adapter chosen from the protocol. Endpoint-scoped batch on a collapsed multi-protocol row, exact protocol on a sub-row |
+| `Real Test (Selected)` | One probe through the proxy, producing the transport span (`Fast`) and the probe's own span (`Real`) |
+| `Speed Test (Selected)` | Download a payload through the link |
+| `UDP Test (Selected)` | UDP forwarding check |
+| `Fast Test (All Profiles)` | Every (protocol, endpoint) link in the database, not the filtered view |
+| `Real Test (All Profiles)` | One probe per link over the whole database |
+| `Real Test (Successful)` | Endpoints that have achieved a real success |
+| `Real Test (New)` | Endpoints nothing has answered for yet |
+| `Real Test (Successful + New)` | Both of the above |
+| `Real Test (Failed)` | Endpoints whose links all failed, including a DNS name that never resolved |
+| `Speed Test (Successful)` | Downloads the configured file through each Successful-band link's own native tunnel and stores the peak one-second-windowed rate in `Speed` (MiB/s) |
+| `Fill Exit IPs (Successful)` | Fetches the exit IP and country for Successful-band links on its own rate limiter |
+| `Remove Bad Servers` | Immediate removal of failed profiles |
+| `Retry Failed DNS Lookups` | Re-resolves every DNS-name endpoint whose address set is empty, bypassing the TTL; Purgatory included |
+| `Compact Duplicate Endpoints` | Merges provably identical endpoints |
+| `Stop Testing` | Cancels the running task and pauses the queue |
+| `Clear All Stats` | Immediate, confirmed |
+
+Behaviour:
+
+- `↑`/`↓` navigate and skip separators; `Enter` enqueues (or runs an immediate
+  one-shot); `Esc` closes; `?` opens help.
+- `Stop Testing` is enabled exactly while the scheduler is busy. `Remove Bad
+  Servers` and `Clear All Stats` are immediate with a `y/n` confirmation and are
+  disabled while anything runs or queues.
+- The "All Profiles" entry points test the whole database, so a filtered or paged
+  view does not narrow a run. Only links imported after the run starts can be
+  missed.
+- A scoped run freezes its endpoint list before the first probe, so an endpoint
+  leaving the scope mid-run is still tested.
+- **One probe, two measurements.** The Real Test is one probe per link producing
+  the transport span (time to establish the endpoint's transport, the `Fast`
+  column) and the real span (the probe's own request time, the `Real` column).
+  They do not overlap, and the transport span survives a failure: a row whose
+  server answered but whose config did not shows `12` in `Fast` and `[real]` in
+  `Real`. A row with a transport failure has neither measurement.
+- **Links of one endpoint are probed one at a time.** The walk order is
+  `PageSort::Test` and an endpoint's links are contiguous in it. At the group
+  entry the first protocol is probed and the siblings wait for the verdict: on
+  success the group is dropped (no probe, marker, delay, or exit IP for any of
+  its links); on failure the siblings are probed too, each writing its own
+  marker. There is no second barrier and no cancel-on-winner.
+- **Speed Test (Successful)** needs no connected core and no local SOCKS hop. It
+  tests only links that are currently passing (no marker and a measured real
+  delay), runs the download under its own maximum duration, and retries only
+  after a failed attempt. A failed download is counted in the batch summary and
+  never marks or purges a link: an unreachable target says nothing about the
+  config, and a slow link is not a dead one.
+- **Fill Exit IPs (Successful)** has its own rate limiter because the free
+  IP-API tiers publish roughly 45 requests/minute. It writes the exit IP and
+  country and never the real delay; the two are independently aged facts. Its
+  own progress bar in Details is labelled `Look` and counts
+  `N ok, N failed, N retryable`.
+- **Retry Failed DNS Lookups** re-resolves every DNS-name endpoint whose address
+  set is empty, including Purgatory rows; the log reports how many lookups were
+  dispatched.
+- **Compact Duplicate Endpoints** merges endpoints with the same port, a shared
+  protocol config, and an overlapping resolved-address set. The DNS host survives
+  an IP-literal duplicate; two DNS hosts keep the older row. The survivor keeps
+  its own purge verdicts; the absorbed side's addresses, group memberships and
+  measured evidence move over; rank keys are recomputed in the same transaction.
+  There is no undo. An endpoint with a live connection is skipped.
+- Batch runs go through the per-profile task queue: one live test per profile,
+  further tests queued FIFO up to `task_queue_limit` (default 3; `0` disables
+  queueing). A full queue skips the profile with a warning. Profiles whose DNS
+  failed recently are deferred by `dns_failure_defer_secs` (default 5 s). Both
+  live in Settings → Advanced → Speed Test. Probe concurrency is
+  `real_ping_concurrency`, the one limit, and it bounds the native handshakes.
+- **Error labels** in `Real`: the label reflects the active/preferred link, and
+  only when that link has no measured delay. Two exceptions outrank a stored
+  delay: a protocol or config the native engine cannot test (`[real]` with the
+  reason; such rows are never removed by Remove Bad Servers), and a purge verdict
+  (`[mitm]`, `[cert]`, `[expired]`, `[notls]`, `[cfg]`, `[http]`, `[origin]`).
+  Markers persist across restarts; `error_ttl_hours` (empty means never) clears
+  them on profile reload and at batch finish.
+
+### Export
+
+`Ctrl+E` from the Profiles tab. Choose scope, then destination.
+
+| Scope | Content |
+| --- | --- |
+| `Only Working` | Links with current real/fast success (canonical rank tiers 0/1); distinct from the `Alive` band |
+| `Only Resolved` | Dialable endpoints; DNS endpoints emit one line per stored IP |
+| `Only Active` | The exact current Active view |
+| `All Valid` | All non-purged links, including aged/stale Purgatory rows |
+| `Clipboard` | Copies raw subscription text through `arboard` |
+| `File` | Writes raw subscription text through `tokio::fs` |
+
+`↑`/`↓` navigate, `Enter` selects, `Esc` closes. Paths are editable; an existing
+destination asks `[Y] Overwrite`. File export writes to the confirmed path and
+does not claim success when the write fails (a partial file can remain). Output
+has four metadata comment lines followed by one share URL per line:
 
 ```text
 # profile-title: leas export • <Scope>
@@ -485,737 +551,399 @@ Output header:
 <one share URL per line>
 ```
 
-File export writes directly to the confirmed destination. A write failure can leave a partial destination; the UI reports the error and does not claim success.
+`Количество` counts matching stored links before Resolved-IP expansion or
+serializer skips; the log reports emitted and skipped counts separately.
 
-**Batch behavior (Fast Test / Real Test on All Profiles):** the
-"All Profiles" entry points test the whole DATABASE — every (protocol,
-endpoint) link it holds, not the rows the tab currently shows — so a filtered
-or paged view does not narrow a run (only links imported after the run starts
-can be missed).
+### Help overlay
 
-**One probe, two measurements.** The Real Test is ONE probe per link, and it
-produces two independent facts: the **transport span** (the time to establish
-the endpoint's transport — the `Fast` column) and the **real span** (the
-probe's own request time — the `Real` column). They do not overlap, and the
-transport span survives a failure: a row whose server answered but whose
-config did not shows ` 12 ` in `Fast` and `[real]` in `Real` — "the server
-is up, the config is not". A row with a transport failure has neither
-measurement and shows the transport failure marker.
+`?` opens a rounded modal listing shortcuts for the current context. `Esc` or `?`
+closes it.
 
-**The endpoint's links are probed one at a time.** The walk's order is
-unchanged (`PageSort::Test` — the working servers first), and an endpoint's
-links are contiguous in it. At the group's entry the endpoint's FIRST
-protocol is probed and its siblings wait for that verdict: the endpoint
-succeeded → the whole group is dropped (no probe, no marker, no delay, no
-exit IP for any of its links); the endpoint did not succeed → the siblings
-are probed too, and a sibling that fails writes its own marker. There is no
-second barrier check and no cancel-on-winner: a sibling already in flight
-completes and records its full result, because its config is a different
-config and may route elsewhere.
-
-**`Fill Exit IPs (Successful)`** is its own command: it fetches the exit IP
-for the Successful band's links, on its own rate limiter (the free IP-API
-tiers publish ~45 requests/minute, so a fill that asks as fast as it can is
-refused by every provider). It writes the exit IP and the country flag and
-**never** the real delay — the two are independently-aged facts in one row.
-
-The batch runs on a per-profile (protocol, endpoint) task queue — one live test
-per profile, further tests queued FIFO up to `task_queue_limit` (default 3,
-`0` disables queueing). Profiles whose queue is full are skipped with a
-warning. Profiles whose DNS failed recently are deferred and retried after
-`dns_failure_defer_secs` (default 5s). Both settings live in Settings → Speed
-Test and apply immediately. The probe concurrency is
-`real_ping_concurrency` — the ONE limit, and it bounds the native
-handshakes.
-
-**Error labels:** failed tests mark the profile (`[fast]`/`[real]`/`[name]`
-in the Real column). The label reflects the endpoint's ACTIVE (preferred)
-link, and only when it has NO measured delay — a link that carries both a
-successful measurement and a later failure marker still shows its delay (the
-expanded panel keeps per-link markers). One exception: a profile the native
-engine cannot test (a protocol kind or config it has no implementation for)
-is marked `[real]` with the reason, and that marker outranks a stored delay —
-it says something about the profile, not about a failed attempt. Such rows
-are never removed by **Remove Bad Servers** (they are fine, just untestable
-here). A second exception, same precedence: a link carrying a **purge verdict**
-shows the verdict instead of its delay (`[mitm]`, `[cert]`, `[expired]`,
-`[notls]`, `[cfg]`, `[http]`, `[origin]` — see **Purgatory** below). Markers
-persist across restarts;
-`error_ttl_hours` (empty = never) clears them automatically on profile reload
-and at batch finish. The Test cell describes the endpoint's REPRESENTATIVE link — the argmin of the
-ordering key, not `active_link()` (lowest-delay measured, error-blind) — so the
-single-row view shows the row's tier band.
-
----
-
-### Help Overlay
-
-Opened with `?` from any main screen. Rounded-border centered modal listing
-keyboard shortcuts grouped by current context (Profiles, Settings, Statistics,
-Logs, or Native Activity). `Esc` or `?` closes.
-
-
-### Details (pane 2 `Details` tab)
-
-The selected server's static fact sheet plus the database's own status. The
-selected server is the pane-1 cursor row (`filtered_profiles().nth(selected_index)`) — the same law the footer and Metrics use, so a search filter can never make three surfaces disagree.
-
-**Layout** — three columns at 3:6:3, separated by single vertical rules:
-`Server` (left), `Link` (middle), `DB` (right). Below ~100 cols they stack:
-the server and link facts first, then the aggregate block.
-
-```
-Server         │ Link                          │ DB 74,012
-  Address h:443│   Leas URL leas://1a2b/3c4d    │   proven    41,900
-  Country NL   │   Protocol vless              │   untested  28,932
-  Resolved IPs │   Transport tcp              │   failed     2,996
-  Whitelist —  │   Security reality            │   other       184
-               │   Last Seen …                 │
-               │   Real Delay 120ms            │ alive       3,180
-               │   …                           │ active      1,402
-               │   Exit IP 1.2.3.4             │ reliable   12,004
-               │   Last Error [real]           │
-               │   Error Text …                │ View: Active / <query>
-```
-
-**The `Server` section** holds the inbound identity: address, country,
-resolved IPs, whitelist.
-
-**The `Link` section** holds everything the representative link can explain:
-its `Leas URL` (`leas://<endpoint hex>/<protocol hex>`, the same hex identity
-the Real Test log lines use), protocol config names (kind, transport,
-security, SNI, fingerprint — names only, no credentials or keys), timestamps,
-measurements, auth, speed, stability, traffic, exit IP/country, and the stored
-`Last Error` + `Error Text` when one exists. That error text is the explanation
-behind the grid's `[real]`/`[fast]`/`[name]` label.
-
-**The two blocks in `DB` are not one list.** The four **partition** counts
-(`proven`/`untested`/`failed`/`other`) are pairwise disjoint and sum to the
-group's total. `alive`, `active`, and `reliable` are **orthogonal filters**
-over the same rows and overlap any partition member — they are drawn as a
-separate block so they cannot be added into the partition.
-
-- `proven` — the endpoint has ≥1 live unpurged link with a real success.
-- `untested` — not proven AND never measured.
-- `failed` — not proven AND carrying a failure marker.
-- `other` — not proven and in no other bucket (measured, but the ring holds no success).
-- `alive` — the newest real probe succeeded and the endpoint is inside the
-  TTL window (band 0). The **global** group computes this live
-  (`rank_newest_seen` + `rank_alive`); the **view** group uses the swept
-  `band`, so it describes the same set the table shows.
-- `active` — inside the TTL window but NOT alive (band 1). Distinct from
-  `alive`; the two never overlap.
-- `reliable` — the **representative link's** success rate ≥ 75% (≥4 samples).
-
-**Sources.** The `Server` section reads the loaded row's persisted addresses
-for resolution (the grid's own law); `endpoint_info` is a display cache that
-lags, so a missing entry renders `—` and the panel never triggers a background
-fill. The `Link` section reads the **representative link** — the same link the
-grid's Test/Stab cells describe.
-
-**Behavior:**
-- `↑↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the `Link` column (its own offset,
-  not the native ring's); the `Server` and aggregate columns are pinned, so
-  the global numbers are never the ones a short pane eats.
-- `F1` collapses pane 2 to the one-line compact bar.
-- Pane 2's default height is uniform across tabs (16 rows) so switching never
-  resizes; `Alt+↑`/`Alt+↓` adjusts it (clamped so pane 1 keeps ≥6 rows).
-
-### Tasks (pane 2 `Tasks` tab)
-
-The job queue: the running task's progress bar on top, the queued tasks below
-(earliest first). The running task is the bar's label, **not** a list row — its
-progress is never drawn twice.
-
-```
-Real Test (Successful) 1,240/3,000 ~12m ━━━●──────────
-  ► Fill Exit IPs (Successful)
-    Compact Duplicate Endpoints
-```
-
-The bar is a `LineGauge` with a manual thumb at the fill boundary; it is themed
-from the same tokens as the settings download bar. The bar's label names the
-scheduler state when nothing runs: `paused — N queued, press r to resume`,
-`no tasks — pick one from the Speed Test menu`, or `queued: …`.
-
-**Keys (Tasks-tab-scoped):**
-- `↑↓` move the cursor over the queued list; the list scrolls to keep it visible.
-- `d` deletes the selected queued task (no confirmation — it is a reversible
-  queue edit; a log line makes the removal visible).
-- `s` cancels the running task and **pauses** the queue (the contents survive).
-- `r` resumes draining the paused queue.
-
-**Scheduling.** The Speed Test menu is the entry point: picking an item
-**enqueues** it rather than starting it. A duplicate identity — `(kind, scope)`
-for batched tasks, `(kind, test type, endpoint)` for the Selected variants —
-is ignored, so a task can never be queued or re-armed while it runs. One job at
-a time is structural: the scheduler is the only path into the spawn functions.
-
-**Destructive one-shots.** `Remove Bad Servers` and `Clear All Stats` are not
-schedulable (no meters, destructive). They stay immediate with their `y/n`
-confirmation, and are disabled while the scheduler is busy.
-
-
----
-
-## Status Bar
-
-Bottom line of the terminal. Left side shows connection state and mode context;
-right side shows contextual key hints.
-
-**Connection states (left side):**
-
-| State                      | Display                                 |
-| -------------------------- | --------------------------------------- |
-| Disconnected               | ` Disconnected` (red)                   |
-| Connecting                  | ` ⠋ Connecting...` (yellow spinner)     |
-| Connected (xray)           | ` Connected [xray]` (green)             |
-| Connected (sing-box)       | ` Connected [sing-box]` (green)         |
-| Error                      | ` Error: <message>` (red bold)          |
-| Testing (individual)       | ` Testing...` (yellow)                  |
-| Testing (batch)            | ` Testing: 3/7 profiles...` (yellow)    |
-
-**Mode prefix** is shown before the connection state:
-
-- No prefix for List mode
-- ` Settings`, ` Settings > Core`, etc. when in Settings
-- ` Add Server`, ` Edit Server` when adding/editing
-- ` Speed Test` when speed test menu is open
-- ` Help` when help overlay is open
-
-**Update indicator** — `[Update: xray]` or `[Update: xray, sing-box]` (yellow)
-appended when updates are available for installed backends.
-**Contextual hints (right side):**
-
-
-| Context                 | Hints                                    |
-| ----------------------- | ---------------------------------------- |
-| Pane 1 · Profiles (disconnected) | `[a] Add  [Ctrl+V] Import  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
-| Pane 1 · Profiles (connecting)   | `[,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit`  |
-| Pane 1 · Profiles (connected)    | `[Ctrl+D] Disconnect  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
-| Pane 1 · Profiles (filtered-empty) | `No match for "<q>"  [Esc] Clear  [q/Ctrl+C] Quit` |
-| Pane 1 · Logs          | `[↑↓] Scroll  [c] Clear  [t] Targets  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
-| Pane 2 · Details       | `[↑↓] Scroll  [F1] Compact  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
-| Pane 2 · Metrics       | `[↑↓] Scroll  [Alt+↑↓] Resize  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
-| Pane 2 · Tasks         | `[↑↓] Select  [d] Delete  [s] Stop  [r] Resume  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
-| Settings popup (sections) | `[↑↓] Navigate  [←] Collapse  [→] Fields  [/] Filter  [Enter] Open  [Esc] Close` |
-| Settings popup (fields)   | `[Tab/Shift+Tab] Field  [Space] Advance  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back` |
-| Settings popup (filtering) | `[type] Filter  [Enter] Apply  [Ctrl+U] Clear  [Esc] Cancel` |
-| Settings popup (routing list) | `[↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Sections  [Esc] Back` |
-| Settings popup (routing form) | `[Enter] Save  [Ctrl+W] Sections  [Esc] Back` |
-| Settings popup (updates) | `[C] Check  [D] Download  [Ctrl+W] Sections  [Esc] Back` |
-| Settings popup (subscriptions) | `[↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Sections  [Esc] Back` |
-| Confirm modal          | `[y] Confirm  [n/Esc] Cancel`             |
-| Speed test menu        | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
-| Help overlay           | `[Esc] Close help`                        |
-
-## Keyboard Shortcuts — Full Reference
-
-### Profiles Tab (List mode)
-
-| Key               | Action                              |
-| ----------------- | ----------------------------------- |
-| `↑` / `↓`        | Navigate profile list               |
-| `PgUp` / `PgDn`  | Page up/down in profile list        |
-| `Home` / `End`   | Jump to first/last profile          |
-| `Enter`          | Set as active server                |
-|| `Ctrl+Enter`     | Connect to selected server          |
-|| `Ctrl+G`         | Connect fallback (for terminals without Ctrl+Enter) |
-|| `Space`          | Toggle multi-select                 |
-|| `Ctrl+A`         | Select all / deselect all           |
-|| `a`              | Add new server                      |
-| `e`              | Edit selected server                |
-| `d`              | Delete selected server(s)           |
-| `c`              | Clone selected server               |
-| `g`              | Open Settings popup at Subscriptions |
-| `t`              | Open speed test menu                |
-| `x`              | Resolve DNS of selected endpoint    |
-| `p`              | Cycle view: Active → Purgatory → All |
-| `/`              | Focus search/filter input           |
-| `Ctrl+V`         | Import share URL                    |
- | `Ctrl+Shift+S`   | Copy selected server's share URL    |
-| `Ctrl+↑`         | Move selected profile up            |
-| `Ctrl+↓`         | Move selected profile down          |
-| `Tab` / `Shift+Tab` | Switch pane focus (or `1`/`2`)   |
-| `?`              | Toggle help overlay                 |
-| `q` / `Ctrl+C`   | Quit application                    |
-| `F1`             | Toggle pane 2 compact/full view     |
-| `,`              | Open Settings popup                |
- | `Ctrl+D`   | Disconnect from active server       |
-
-### Settings Popup
-
-| Key               | Action                              |
-| ----------------- | ----------------------------------- |
-| `↑` / `↓`        | Navigate the section list (the Values pane follows) |
-| `←`              | Collapse the selected section's group |
-| `→`              | Expand a collapsed group, else focus the Values pane |
-| `/`              | Filter the section list              |
-| `Enter`          | Focus the selected section's fields  |
-| `Tab` / `Shift+Tab` | Move focus into the Values pane |
-| `Ctrl+W`         | Toggle focus between the two panes  |
-| `Esc`            | Close settings (asks before discarding unsaved edits) |
-| `q` / `Ctrl+C`   | Quit application                    |
-
-### Settings Forms
-
-| Key               | Action                              |
-| ----------------- | ----------------------------------- |
-| `Tab` / `Shift+Tab` | Move focus between fields        |
-| `Enter`          | Save and return to menu             |
-| `Esc`            | Cancel and return to menu           |
-| `Ctrl+C`         | Quit application                    |
-
-### Routing List
-
-| Key               | Action                              |
-| ----------------- | ----------------------------------- |
-| `↑` / `↓`        | Navigate rules                      |
-| `Enter`          | Edit selected rule                  |
-| `a`              | Add new rule                        |
-| `d`              | Delete selected rule                |
-| `r`              | Reorder rules                       |
-
-### Updates Form
-
-| Key               | Action                              |
-| ----------------- | ----------------------------------- |
-| `C`              | Check for updates                   |
-| `D`              | Download and install updates        |
-| `Esc`            | Return to settings menu             |
-
-### Logs Tab
-
-| Key               | Action                              |
-| ----------------- | ----------------------------------- |
-| `↑` / `↓`        | Scroll logs                         |
-| `PgUp` / `PgDn`  | Page up/down by one viewport        |
-| `Home`           | Jump to the oldest loaded entry; loading continues to the true top |
-| `End`            | Jump to newest log entry            |
-| `Tab` / `Shift+Tab` | Cycle tabs                       |
-| `?`              | Toggle help overlay                 |
-| `q` / `Ctrl+C`   | Quit application                    |
-
-### Statistics Tab
-
-| Key               | Action                              |
-| ----------------- | ----------------------------------- |
-| `Tab` / `Shift+Tab` | Cycle tabs                       |
-| `?`              | Toggle help overlay                 |
-| `q` / `Ctrl+C`   | Quit application                    |
-
-### Native Activity Tab
-
-| Key               | Action                              |
-| ----------------- | ----------------------------------- |
-| `↑` / `↓`        | Scroll connections                  |
-| `PgUp` / `PgDn`  | Page up/down                        |
-| `Home`           | Jump to oldest connection           |
-| `End`            | Jump to newest connection           |
-| `Tab` / `Shift+Tab` | Cycle tabs                       |
-| `?`              | Toggle help overlay                 |
-| `q` / `Ctrl+C`   | Quit application                    |
-
-### Anywhere (Global)
-
-| Key               | Action                              |
-| ----------------- | ----------------------------------- |
-| `q` / `Ctrl+C`   | Quit application                    |
-| `?`              | Help overlay (main screens only)    |
-
----
-
-## Common Workflows
-
-### Adding a server manually
-
-1. From Profiles tab, press `a`
-2. Scroll through the protocol picker with `↑↓`
-3. Press `Enter` on your protocol (e.g. VMess)
-4. Fill in form fields: `Tab` to move focus, type values
-5. Press `Enter` to save; profile appears in the list
-
-### Importing a subscription URL
-
-1. From Profiles tab, press `Ctrl+V`
-2. Type or paste the subscription URL
-3. Press `Enter` to parse and import
-4. Profiles are added with automatic dedup based on content hash
-5. If parsing fails, an error message appears in red below the input
-
-### Running a speed test
-
-1. Select a profile with `↑↓`
-2. Press `t` to open the speed test menu
-3. Navigate with `↑↓` (skips the separator line)
-4. Press `Enter` on the test type:
-   - **Fast Test** — the transport measurement on its own: the time to
-     establish the endpoint's transport, auto-selecting a TCP or UDP/QUIC
-     adapter based on protocol. On a collapsed endpoint row with >1 protocols
-     this runs an **endpoint-scoped batch** (all protocols of the endpoint); on
-     an expanded panel sub-row it pings the **exact protocol**
-   - **Real Test** — ONE probe through the proxy, producing two facts: the
-     transport span (the `Fast` column) and the probe's own span (the `Real`
-     column). Same scoping as the Fast Test.
-   - **Speed Test** — downloads a test payload to measure throughput
-   - **UDP Test** — tests UDP forwarding
-   - **Fast Test (All Profiles)** — batch transport measurements over every link in the database
-   - **Real Test (All Profiles)** — one probe per link over the whole database (a link whose transport failed is retired; rows the native engine cannot serve are marked instead of probed)
-   - **Real Test (Successful / New / Successful + New / Failed)** — the same run narrowed to a scope of the feed: endpoints that achieved a real success; endpoints nothing has answered for yet (untested); those two together; or those whose links all failed (including a DNS name that never resolved). The scope reads the endpoint's stored test tier, so it is a filter on the plan, not a different pipeline. A scoped run freezes its endpoint list before the first probe, so an endpoint leaving the scope mid-run is still tested.
-   - **Speed Test (Successful)** — downloads the configured test file through each Successful-band link's OWN native tunnel and stores the peak 1-second-windowed rate in the `Speed` column (MiB/s). No local SOCKS5 hop in the measurement, and no connected core needed. It tests only links that are CURRENTLY passing (no marker and a measured real delay), the download runs under its own `max duration` (the real-ping timeout bounds only the tunnel build and the target handshake), and a retry starts only after the previous attempt failed. A failed download is counted in the batch summary only — it never marks or purges a link: a target the exit cannot reach says nothing about the config, and a slow link is not a dead one. Settings > Speed Test owns the URL, concurrency, retries, min duration/bytes and max duration.
-   - **Fill Exit IPs (Successful)** — fetches the exit IP for the Successful band's links, on its own rate limiter (the free IP-API tiers publish ~45 requests/minute). It writes the exit IP and the country flag and **never** the real delay — the two are independently-aged facts in one row. It has its own progress bar in the Details pane, labelled `Look`, with the three outcomes counted separately: `N ok, N failed, N retryable` — "the fill finished" is not one number.
-   - **Sort by Test** — re-sorts the table by test priority (real successes by delay, then the failure bands)
-   - **Remove Bad Servers** — removes profiles with failed tests
-   - **Retry Failed DNS Lookups** — re-resolves every DNS-name endpoint whose address set is empty (never attempted or previously failed), bypassing the TTL. Purgatory rows are included. Results appear as usual resolutions; the actions panel logs how many lookups were dispatched.
-   - **Compact Duplicate Endpoints** — merges endpoints that are provably the same server: same port, a shared protocol config, AND an overlapping resolved-address set (config identity is host-independent, so the address overlap is the discriminator). The DNS host survives an IP-literal duplicate; two DNS hosts keep the older row. The survivor's links keep their own purge verdicts; the absorbed side's addresses, group memberships and measured evidence move over; rank keys are recomputed in the same transaction. Applies immediately with no undo — the actions-panel report lists every merge. An endpoint with a live connection is skipped.
-5. Results populate the expanded panel's per-protocol sub-table; real-ping
-   exit IPs fill the single-line Outbound/Country columns — shown only once the
-   endpoint's address is resolved, since an exit IP is evidence a tunnel worked.
-   The Test cell reports the endpoint's representative protocol, so a row shows
-   a delay or the marker for its worst state, never a failed protocol's stale
-   delay. The free ip-api tier allows ~45 exit-IP lookups/minute, so a
-   feed-wide run fills only the earliest results; when it refuses, the other
-   family-agnostic providers are asked automatically (the exit IP is the same
-   either way), which raises but does not remove the ceiling — and the
-   provider set is fixed (Settings → Speed Test → IP Provider picks which one
-   is asked first), so a keyed provider is not available.
-
-   Batch runs (All Visible) go through the per-profile task queue: a profile
-   already being tested queues further tests up to `task_queue_limit` (queue
-   full = skipped with a warning), and profiles whose DNS failed recently are
-   retried after `dns_failure_defer_secs`. Failed tests leave `[name]`/
-   `[fast]`/`[real]` markers that persist until `error_ttl_hours` sweeps them.
-
-### Connecting/Disconnecting
-
-**Connect:**
-1. Select a profile with `↑↓`
-2. Press `Ctrl+Enter`
-3. Status bar shows spinner and `Connecting...`
-4. On success: status bar shows `Connected [xray]` (or `[sing-box]`)
-5. Statistics tab becomes active with traffic data
-
-**Disconnect:**
- 1. Press `Ctrl+D`
-2. Status bar returns to `Disconnected`
-
-### Subscription group management
-
-1. From the Profiles tab, press `g` to jump to Settings → Subscriptions
-2. **Add:** press `a`, fill fields (name, URL, user_agent, update_interval, core_type), `Enter` saves
-3. **Edit:** select a group, press `e`, modify fields, `Enter` saves
-4. **Update:** press `u` to fetch the latest subscriptions for every group
-5. **Delete:** select a group, press `d`, confirm with `y`, cancel with `n`/`Esc`
-6. Press `Esc` twice to return to the profile list, or `Ctrl+C` to quit the app
-
-Group filtering on the Profiles tab is done with `p` (cycle Active → Purgatory →
-All views) and `/` (search); the per-group filter keys were removed.
-
----
-
-## Visual Theme
-
-Color tokens used throughout the TUI.
-
-### Tab Bar
-
-| Token             | Style                                |
-| ----------------- | ------------------------------------ |
-| `TAB_SELECTED`    | White text on Cyan background, Bold  |
-| `TAB_DESELECTED`  | White text on DarkGray background    |
-
-### Profile Table
-
-| Token               | Style                            |
-| ------------------- | -------------------------------- |
-| `TABLE_HEADER`      | White on DarkGray, Bold           |
-| `TABLE_ROW_SELECTED`| White on `rgb(50,60,90)`, Bold    |
-| `TABLE_ROW_ALT`     | White on `rgb(25,25,35)`          |
-| `TABLE_ROW_NORMAL`  | White (no background)             |
-
-### Containers / Borders
-
-| Token                | Style                          |
-| -------------------- | ------------------------------ |
-| `CONTAINER_BORDER`   | Cyan foreground                |
-| `CONTAINER_TITLE`    | Cyan foreground, Bold          |
-
-### Status Bar
-
-| Token                | Style                          |
-| -------------------- | ------------------------------ |
-| `STATUS_BAR_BG`      | Background `rgb(20,30,60)`     |
-| `STATUS_BAR_MODE`    | Cyan foreground, Bold          |
-
-### Feedback / Progress
-
-| Token                | Style                          |
-| -------------------- | ------------------------------ |
-| `PROGRESS_BAR`       | White on DarkGray              |
-| `PROGRESS_FILL`      | Cyan on Cyan                   |
-| `SPINNER`            | Yellow foreground, Bold        |
-
-### Semantic Colors
-
-| Token       | Style            | Used For                     |
-| ----------- | ---------------- | ---------------------------- |
-| `ERROR`     | Red, Bold        | Connection errors            |
-| `WARNING`   | Yellow           | Testing state, batch progress|
-| `SUCCESS`   | Green            | Connected status             |
-| `HINT`      | Gray             | Footer hints, placeholder text|
-
-### Core Type Colors
-
-| Core       | Color  |
-| ---------- | ------ |
-| xray-core  | Blue   |
-| sing-box   | Green  |
-| Auto       | White  |
-
----
-
-## Automated Testing with tui-test
-
-The `tui-test` MCP tools drive leas programmatically for automated testing.
-All tools operate on a session identified by `session_id` (default `"default"`).
-
-### Tool Reference
-
-#### Session lifecycle
-
-| Tool                      | Purpose                                      |
-| ------------------------- | -------------------------------------------- |
-| `launch_tui`              | Start `target/release/leas` in buffer mode|
-| `close_session`           | Kill subprocess and clean up                 |
-| `get_session_info`        | PID, uptime, command, mode                   |
-| `list_sessions`           | All active sessions                          |
-
-Launch the TUI:
-
-```
-launch_tui(
-    command: "target/release/leas",
-    mode: "buffer",
-    dimensions: "120x36",
-    session_id: "smoke-test"
-)
-```
-
-#### Waiting and synchronizing
-
-Always wait for the screen to stabilize after any action.
-
-| Tool                       | When to use                                  |
-| -------------------------- | -------------------------------------------- |
-| `wait_for_stable`          | After every key press or state change        |
-| `expect_text(pattern)`     | Block until text appears (async operations)  |
-| `wait_for_change(ref)`     | Poll until screen differs from a snapshot    |
-
-```
-# After launch, wait for the UI to render
-wait_for_stable(session_id: "smoke-test")
-
-# Wait for an async subscription download
-expect_text(pattern: "Groups", timeout: 15)
-```
-
-#### Reading screen state
-
-| Tool                     | When to use                                  |
-| ------------------------ | -------------------------------------------- |
-| `capture_screen`         | Full terminal text for debugging             |
-| `assert_contains(text)`  | Pass/fail assertion for substring            |
-| `get_line(row)`          | Single row content (pixel-perfect layout)    |
-| `get_char(row, col)`     | Single character at position                 |
-| `get_screen_region(...)`  | Rectangular region of the buffer             |
-| `assert_at_position(text, row, col)` | Assert text at exact position |
-
-```
-# Verify the Profiles tab header
-assert_at_position(text: " Profiles ", row: 0, col: 1)
-
-# Verify status bar shows disconnected
-assert_contains(text: "Disconnected")
-
-# Check speed test menu rendering
-let third_line = get_line(row: 5)
-# Expect "  Speed Test (Selected)" or "► Speed Test (Selected)"
-```
-
-#### Sending input
-
-| Tool                   | When to use                                  |
-| ---------------------- | -------------------------------------------- |
-| `send_keys(text)`      | Type text; `\r` = Enter, `\t` = Tab, `\x1b` = Esc |
-| `send_special_keys(keys)` | Arrow keys, function keys, Home/End, Page Up/Down |
-| `send_ctrl(key)`       | Ctrl+letter (e.g. `"c"` Ctrl+C, `"v"` Ctrl+V) |
-
-Rules:
-- Use `send_special_keys(["down"])`, NOT `send_keys("\x1b[B")` for arrows
-- Use `\r` for Enter (raw-mode TUI apps require `\r` not `\n`)
-- Use `inter_key_delay: 0.02` for reliable character-by-character typing of long strings
-- Always call `wait_for_stable` after sending keys
-
-#### Example: Full smoke test
-
-```
-# Start
-launch_tui(
-    command: "target/release/leas",
-    mode: "buffer",
-    dimensions: "120x36",
-    session_id: "smoke"
-)
-
-# Wait for initial render
-wait_for_stable(session_id: "smoke")
-
-# Verify initial state
-assert_contains(text: "Profiles")
-assert_contains(text: "Disconnected")
-
-# Cycle through all 4 tabs
-send_special_keys(session_id: "smoke", keys: ["tab"])
-wait_for_stable(session_id: "smoke")
-assert_contains(text: "Settings")
-
-send_special_keys(session_id: "smoke", keys: ["tab"])
-wait_for_stable(session_id: "smoke")
-assert_contains(text: "Logs")
-
-send_special_keys(session_id: "smoke", keys: ["tab"])
-wait_for_stable(session_id: "smoke")
-assert_contains(text: "Statistics")
-
-send_special_keys(session_id: "smoke", keys: ["tab"])
-wait_for_stable(session_id: "smoke")
-assert_contains(text: "Profiles")
-
-# Open help
-send_keys(session_id: "smoke", keys: "?")
-wait_for_stable(session_id: "smoke")
-assert_contains(text: "Keyboard Shortcuts")
-
-# Close help
-send_keys(session_id: "smoke", keys: "\x1b")
-wait_for_stable(session_id: "smoke")
-
-# Quit
-send_ctrl(session_id: "smoke", key: "q")
-wait_for_stable(session_id: "smoke")
-
-# Cleanup
-close_session(session_id: "smoke")
-```
-
-#### Example: Subscription import
-
-```
-launch_tui(
-    command: "target/release/leas",
-    mode: "buffer",
-    dimensions: "120x36",
-    session_id: "sub-test"
-)
-wait_for_stable(session_id: "sub-test")
-
-# Open Subscriptions (Settings -> Subscriptions)
-send_keys(session_id: "sub-test", keys: "g")
-wait_for_stable(session_id: "sub-test")
-assert_contains(text: "Subscriptions")
-
-# Add group: press 'a'
-send_keys(session_id: "sub-test", keys: "a")
-wait_for_stable(session_id: "sub-test")
-assert_contains(text: "Group")
-
-# Type group name
-send_keys(session_id: "sub-test", keys: "My Group", inter_key_delay: 0.02)
-# Tab to URL field
-send_special_keys(session_id: "sub-test", keys: ["tab"])
-# Type URL
-send_keys(session_id: "sub-test", keys: "https://example.com/sub", inter_key_delay: 0.02)
-# Save
-send_keys(session_id: "sub-test", keys: "\r")
-wait_for_stable(session_id: "sub-test")
-
-# Select group and update
-send_special_keys(session_id: "sub-test", keys: ["down"])
-send_keys(session_id: "sub-test", keys: "u")
-expect_text(session_id: "sub-test", pattern: "Profiles", timeout: 15)
-
-# Back to settings menu (Esc), then quit the app
-send_keys(session_id: "sub-test", keys: "\x1b")
-wait_for_stable(session_id: "sub-test")
-
-close_session(session_id: "sub-test")
-```
-
-#### Example: Speed test (with connected core)
-
-```
-launch_tui(
-    command: "target/release/leas",
-    mode: "buffer",
-    dimensions: "120x36",
-    session_id: "speed-test"
-)
-wait_for_stable(session_id: "speed-test")
-
-# Connect (assumes a profile exists and is selected)
-send_ctrl(session_id: "speed-test", key: "\r")
-expect_text(session_id: "speed-test", pattern: "Connected", timeout: 15)
-
-# Open speed test menu
-send_keys(session_id: "speed-test", keys: "t")
-wait_for_stable(session_id: "speed-test")
-assert_contains(text: "Speed Test")
-# Select first test (Fast Ping) and run
-send_keys(session_id: "speed-test", keys: "\r")
-wait_for_stable(session_id: "speed-test")
-
-close_session(session_id: "speed-test")
-```
-
-### Important notes
-
-- Always wait for the screen to stabilize (`wait_for_stable`) after every action
-- Prefer `send_special_keys` over raw `\x1b` sequences for arrow/function keys —
-  raw escape sequences are unreliable in buffer mode
-- Use `inter_key_delay: 0.02` for reliable character-by-character typing of
-  long strings (URLs, names)
-- Always call `close_session` at the end to clean up the subprocess
-- Use 10s+ timeout for slow operations (subscription fetch, speed test) via
-  `expect_text` or `wait_for_stable(timeout: 10)`
-- `send_keys` uses `\r` for Enter (not `\n`)
-- For delete confirmation dialogs: `y`/`n` are plain key presses, use
-  `send_keys("y")` or `send_keys("n")`
-- Check `get_session_info` for quick debugging: PID, uptime, dimensions
-
-## Purgatory (view `p`)
+### Purgatory (view `p`)
 
 `p` cycles **Active → Purgatory → All**.
 
-- **Active** is the effective-profiles list: it shows profiles confirmed live
-  and recent (newest live link within `purgatory.ttl_days`, default 7), and it
-  does not load purged links at all — a profile whose every link is purged is
-  simply absent.
+- **Active** is the effective list: profiles confirmed live and recent (newest
+  live link within `purgatory.ttl_days`, default 7). Purged links are not loaded
+  at all, so a profile whose every link is purged is absent.
 - **Purgatory** is everything else: links whose newest live link aged past the
-  TTL, plus every profile whose links all carry a purge verdict — including one
-  confirmed by its subscription *today*. This is where a purged link can be
+  TTL, plus every profile whose links all carry a purge verdict, even one
+  confirmed by its subscription today. This is where a purged link can be
   re-proved by hand.
 - **All** shows every profile and every link.
 
-**Purge verdicts.** A real (Real Ping) probe that returns permanent evidence
-retires its link: a REALITY server answering with a real certificate
-(`[mitm]`), a certificate the configured name cannot match (`[cert]`) or that
-has expired (`[expired]`), a port answering cleartext (`[notls]`), a config
-that can never dial (`[cfg]`), the proxy's own handshake answering 4xx/3xx
-(`[http]`), or a CDN origin error 530/521/522/526 (`[origin]`). Timeouts, TLS
-alerts, framing failures, rate limits and the client-side `not testable by the
-native engine` marker are deliberately **not** verdicts.
+**Purge verdicts.** A Real Test probe that returns permanent evidence retires its
+link: a REALITY server answering with a real certificate (`[mitm]`), a
+certificate the configured name cannot match (`[cert]`) or that has expired
+(`[expired]`), a port answering cleartext (`[notls]`), a config that can never
+dial (`[cfg]`), the proxy's own handshake answering 4xx/3xx (`[http]`), or a CDN
+origin error 530/521/522/526 (`[origin]`). Timeouts, TLS alerts, framing
+failures, rate limits, and the client-side `not testable by the native engine`
+marker are not verdicts.
 
-Run **Real Test** on a purged row in Purgatory and a success clears the verdict,
-returning the link to Active. The verdict outlives the error-marker TTL
-(`error_ttl_hours` never clears it) and the sweep deletes the profile only after
-`purgatory.retention_days` (default 30) with no upstream confirmation.
+Run a Real Test on a purged row and a success clears the verdict. The verdict
+outlives `error_ttl_hours`; the sweep deletes the profile only after
+`purgatory.retention_days` (default 30) with no upstream confirmation. `r` on a
+Purgatory row restores it immediately.
+
+## Status bar
+
+The bottom row. Left: mode prefix, then connection state. Right: contextual keys.
+
+| State | Display |
+| --- | --- |
+| Connecting | `⠋ Connecting...` (spinner, yellow) |
+| Stopping | `■ Stopping...` (red) |
+| Running task | `<task label>: <done>/<total>`, or `<task label> …` with no total (yellow) |
+| Testing | `Testing...` or `Testing: <done>/<total>` (yellow) |
+| Maintenance | `Maintenance...`, `Name: n/N`, `Comp: n/N`, or both (yellow) |
+| Error | `Error: <message>` (red bold) |
+| Disconnected | `Disconnected` (red) |
+| Connected | `Connected [xray]` / `Connected [sing-box]` / `Connected [native]` (green) |
+
+Mode prefixes: none in List mode, then `Settings`, `Settings > Core`,
+`Settings > Routing`, `Settings > Updates`, `Settings > Subscriptions`,
+`Add Server`, `Edit Server`, `Speed Test`, `Export`, `Export File`,
+`Batch Import`, `Help`.
+
+Indicators: `⇧Update:xray,sing-box` (yellow bold) when installed backends have
+updates, and `⇩<name> <pct>%` while a backend downloads. The Settings popup's
+own title reads `Settings *` while a form is dirty.
+
+Hints by context:
+
+| Context | Hints |
+| --- | --- |
+| Pane 1 · Profiles (no rows loaded) | `[a] Add  [Ctrl+V] Import  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 1 · Profiles (connecting) | `[,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 1 · Profiles (connected) | `[Ctrl+D] Disconnect  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 1 · Profiles (rows loaded) | `[→] Expand  [↑↓] Variant  [Ctrl+Enter/Ctrl+G] Connect  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 1 · Profiles (filtered-empty) | `No match for "<q>"  [Esc] Clear  [q/Ctrl+C] Quit` |
+| Pane 1 · Profiles (filter applied) | `[Esc] Clear filter  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 1 · Sniffer | `[↑↓] Scroll  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 1 · Logs | `[↑↓] Scroll  [c] Clear  [t] Targets  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 2 · Metrics | `[↑↓] Scroll  [Alt+↑↓] Resize  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 2 · Details | `[↑↓] Scroll  [F1] Compact  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Pane 2 · Tasks | `[↑↓] Select  [d] Delete  [s] Stop  [r] Resume  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit` |
+| Confirm modal | `[y] Confirm  [n/Esc] Cancel` |
+| Speed test menu | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
+| Help overlay | `[Esc] Close help` |
+| Export scope/destination | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
+| Export overwrite | `[Y] Overwrite  [N] Cancel` |
+| Export path | `[Enter] Write  [Esc] Cancel` |
+| Add/edit/import form | `[Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel  [q/Ctrl+C] Quit` |
+| Settings popup | none; its hints live in the popup's bottom border |
+
+The Settings popup's own hint sets, drawn in its bottom border and not in the
+status bar:
+
+| Popup state | Hints |
+| --- | --- |
+| Section list | `[↑↓] Navigate  [←] Collapse  [→] Fields  [/] Filter  [Enter] Open  [Esc] Close` |
+| Values pane (form, group form) | `[Tab/Shift+Tab] Field  [Space] Advance  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back` |
+| Filtering | `[type] Filter  [Enter] Apply  [Ctrl+U] Clear  [Esc] Cancel` |
+| Routing list | `[↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Sections  [Esc] Back` |
+| Routing form | `[Enter] Save  [Ctrl+W] Sections  [Esc] Back` |
+| Updates | `[C] Check  [D] Download  [Ctrl+W] Sections  [Esc] Back` |
+| Subscription list | `[↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Sections  [Esc] Back` |
+
+## Keyboard reference
+
+One table per context. A key appears only in the context whose handler consumes
+it. `q` and `Ctrl+C` quit from every main list screen; inside a form they are
+typed (use `Esc` to leave, `Ctrl+C` to quit).
+
+### Shell and panes
+
+| Key | Action |
+| --- | --- |
+| `Tab` / `Shift+Tab` | Move focus between pane 1 and pane 2 |
+| `1` / `2` | Focus pane 1 / pane 2 |
+| `[` / `]` | Previous / next tab of the focused pane |
+| `Alt+↑` / `Alt+↓` | Resize pane 2 by two rows (pane 2 focused; clamped 3..term/2) |
+| `F1` | Toggle pane 2 between full and the one-line compact bar |
+| `,` | Open the Settings popup (List mode) |
+| `?` | Open help; `?` or `Esc` closes it |
+| `q` / `Ctrl+C` | Quit (asks first while connected) |
+| `Ctrl+D` | Disconnect the running core |
+| `Ctrl+V` | Paste into the focused text field, or open the import screen on Profiles |
+
+### Profiles tab
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move the selection; inside an expanded endpoint, walk its variants |
+| `PgUp` / `PgDn` | Page by `term_height - 5` rows |
+| `Home` / `End` | First / last profile |
+| `Ctrl+↑` / `Ctrl+↓` | Move the selected profile up / down |
+| `→` | Expand the endpoint, or enter the sub-table |
+| `←` | Collapse the endpoint, or leave the sub-table |
+| `Enter` | Set the selected endpoint active; on a sub-row, pin that protocol as default |
+| `Ctrl+Enter` / `Ctrl+G` | Connect to the selected endpoint |
+| `Space` | Toggle multi-select |
+| `Ctrl+A` | Select every filtered profile |
+| `a` | Add a server |
+| `e` | Edit the selected server |
+| `d` | Delete the selected server, or every multi-selected server (confirm) |
+| `c` | Clone the selected server |
+| `g` | Open Settings → Subscriptions |
+| `t` | Open the speed-test menu |
+| `s` | Stop the running speed test |
+| `x` | Force a DNS resolution of the selected endpoint |
+| `p` | Cycle the view: Active → Purgatory → All |
+| `r` | Restore the selected row from Purgatory |
+| `/` | Focus search |
+| `Ctrl+V` | Import from the clipboard (batch screen when it holds several URLs) |
+| `Ctrl+E` | Open the export menu |
+| `Ctrl+Shift+S` | Copy the active link's share URL |
+
+Search mode takes printable characters and `Backspace`; `Esc` clears the query
+and leaves search mode.
+
+### Logs tab
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Scroll one row |
+| `PgUp` / `PgDn` | Page by the pane's visible rows |
+| `Home` | Oldest loaded entry; loading continues to the true top |
+| `End` | Newest entry |
+| `Shift+↑` / `Shift+↓` | Extend the copy selection |
+| `y` | Copy the selection, or the cursor line when nothing is selected |
+| `Y` | Copy every filtered line |
+| `Esc` | Clear the selection, else fall through |
+| `T` / `t` | Open the target filter picker |
+| `c` | Clear the log view (confirm) |
+| `d` | Dump the last 20 database-monitor lines into the log |
+| `Delete` | Purge the logs database (confirm) |
+
+Target picker: `↑`/`↓` or `k`/`j` move, `Enter` applies, `t`/`T`/`q`/`Esc` closes.
+
+### Sniffer tab
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Scroll the host table |
+| `PgUp` / `PgDn` | Page by 10 rows |
+| `Home` / `End` | First / last host |
+
+### Details tab (pane 2)
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Scroll the `Link` column one row |
+| `PgUp` / `PgDn` | Scroll five rows |
+| `Home` | Top of the column |
+| `End` | Bottom of the column (the render clamps) |
+
+### Metrics tab (pane 2)
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Scroll the connection ring |
+| `PgUp` / `PgDn` | Page the connection ring |
+| `Home` / `End` | Oldest / newest connection |
+
+### Tasks tab (pane 2)
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move the cursor over the queued list |
+| `d` | Delete the selected queued task (no confirmation; logged) |
+| `s` | Cancel the running task and pause the queue |
+| `r` | Resume the paused queue |
+
+### Settings: section list
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move the selection; the Values pane follows |
+| `←` | Collapse the group that owns the selection |
+| `→` | Expand a collapsed group, else focus the Values pane |
+| `Enter` | Expand a collapsed group, else load the section and focus its fields |
+| `Tab` / `Shift+Tab` | Focus the Values pane |
+| `/` | Filter the section list |
+| `Ctrl+W` | Toggle focus between the two panes |
+| `Esc` | Close Settings |
+
+### Settings: field (Values pane)
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Previous / next field |
+| `Tab` / `Shift+Tab` | Next / previous field, wrapping |
+| `Space` | Advance the focused selector (wraps) or toggle a boolean |
+| `Enter` | Advance a selector; toggle a boolean; otherwise save the section |
+| `←` / `→` | Step a selector one option; toggle a boolean |
+| `Backspace` | Erase a character; on a boolean it toggles |
+| `Ctrl+S` | Validate and save the section |
+| `Ctrl+V` | Paste into the focused text field; selectors and booleans ignore it |
+| `Esc` | Return focus to the section list; asks before discarding a dirty form |
+
+### Settings: popup-wide keys
+
+These apply wherever the popup is open and no text field owns the key:
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+W` | Toggle focus between the section list and the Values pane |
+| `/` | Start a filter (only where it cannot be text: the section list, the routing list, the subscription list) |
+| `Ctrl+C` | Quit (asks first while connected) |
+
+## Common workflows
+
+### Add a server manually
+
+1. On Profiles, press `a`.
+2. Pick a protocol with `↑`/`↓`, then `Enter`.
+3. Fill the fields: `Tab` moves, typing edits.
+4. Press `Enter` to save. The profile appears in the list.
+
+### Import one or many share URLs
+
+1. Copy subscription text containing one or more `vmess://`, `ss://`,
+   `trojan://` (or other share) URLs.
+2. On Profiles, press `Ctrl+V`. One URL opens the import screen; several open the
+   batch screen.
+3. `Enter` parses (single) or saves every successful result (batch).
+4. Imports are deduplicated by content hash. A parse failure shows a red error.
+
+### Run a speed test
+
+1. Select an endpoint with `↑`/`↓` (or a variant inside an expanded row).
+2. Press `t`, move with `↑`/`↓`, press `Enter`.
+3. Watch the status bar (`<task>: <done>/<total>`) and the `Tasks` tab. `s` stops
+   and pauses; `r` in Tasks resumes.
+
+### Connect and disconnect
+
+1. Select a profile and press `Ctrl+Enter` (or `Ctrl+G` where the terminal eats
+   `Ctrl+Enter`).
+2. The status bar shows the spinner, then `Connected [xray]` (or `[sing-box]`,
+   `[native]`); `Metrics` starts reporting traffic.
+3. `Ctrl+D` disconnects; the status bar returns to `Disconnected`.
+
+### Manage subscription groups
+
+1. On Profiles, press `g` to open Settings → Subscriptions.
+2. `a` adds a group, `e` edits, `d` deletes (`y` confirms), `u` updates all.
+3. `Esc` returns to the section list, `Esc` again closes Settings.
+
+### Re-prove a purged link
+
+1. Press `p` until the view reads `Purgatory`.
+2. Select the row and run `Real Test (Selected)` from `t`.
+3. A success clears the verdict and moves the link back to Active. `r` restores
+   the row without testing.
+
+## Theme
+
+Every style is named in `crates/leas/src/ui/theme.rs` and resolved from the
+loaded opaline theme: no hex and no `Color::*` literal sits in a render path.
+The 28 core tokens and 14 styles opaline guarantees cover most roles; the roles
+it does not name are registered on the theme at load time, so a user TOML can
+still override them.
+
+| Role | Style source | Used for |
+| --- | --- | --- |
+| `tab_selected` | `active_selected` | Active pane tab, connected row, status mode |
+| `tab_deselected` | `muted` | Inactive tabs |
+| `table_header` | `app.table_header` (`text.primary` on `bg.selection`, bold) | Grid header row |
+| `table_row_selected` | `selected` | Selected grid row |
+| `table_row_normal` | `text.primary` | Grid rows |
+| `table_row_alt` | `app.table_row_alt` (`text.primary` on `bg.panel`) | Alternating rows |
+| `table_row_connected` | `active_selected` | The connected endpoint's row |
+| `panel_row_selected` | `text.primary`, background reset, bold | Selected sub-row inside an expanded panel |
+| `test_delay_ok` / `test_delay_warn` / `test_delay_bad` | `success_style` / `warning_style` / `error_style` | `Fast`/`Real` delay thresholds |
+| `container_border` | `unfocused_border` | Unfocused pane frames |
+| `container_border_focused` | `focused_border` | Focused pane frame |
+| `container_title` | `keyword` | Pane titles and group headers |
+| `status_bar_bg` | `app.statusbar` (`text.primary` on `bg.selection`) | Status bar fill |
+| `status_bar_mode` | `active_selected` | Mode prefix |
+| `status_bar_hint` | `app.statusbar_hint` | Right-side key hints |
+| `progress_bar` | `app.progress_bar` | Progress bar track |
+| `progress_fill` | `app.progress_fill` (`accent.primary` on itself) | Progress bar fill |
+| `spinner` | theme spinner | Connecting indicator |
+| `error` / `warning` / `success` / `hint` | `error` / `warning` / `success` / derived muted | Semantic text |
+| `dialog` | `app.dialog` (`text.primary`, no fill) | Modals and the Settings popup |
+| `badge` | `app.badge` (`error` on `bg.elevated`) | Error badges |
+
+The hint role is derived rather than taken from `text.muted`: on a light theme
+`text.muted` computes to 2.72:1 on the selection background, and no Latte token
+reaches 4.5:1 there. The derivation walks the colour until it clears 4.6:1
+against the strip it sits on, and leaves a user TOML able to override the result.
+Modals deliberately share the app background, with only the border separating
+them; a `bg.elevated` fill earlier made every dialog read as a slab of colour.
+
+`Theme::load` takes a kebab-case slug. An unknown slug is an error, not a silent
+fallback: `unknown theme \`<slug>\``.
+
+## Automated testing
+
+Scenarios drive the real binary through the `tui-test` MCP server. A scenario is
+a markdown document in `tui/` whose script block is parsed, not
+executed: bare step calls with literal arguments only
+([the scenario index](tui/INDEX.md) lists the existing scenarios and
+[the Details scenario](tui/2026-10-23-scenario-details-panel.md) is a compact example).
+
+### Steps
+
+| Step | Maps to | Notes |
+| --- | --- | --- |
+| `launch(cmd, mode="buffer", dimensions="120x40", timeout=30)` | `launch_tui` | Pin `env TERM=xterm-256color LC_ALL=C` in the command |
+| `send("text", delay=0.3)` | `send_keys` | Literal text; `\n` warns on buffer launches, raw-mode Enter is `\r` |
+| `key("down", "enter")` | `send_special_keys` | Special-key vocabulary: arrows, `home`, `end`, `pageup`, `pagedown`, `tab`, `enter`, `escape`, `f1`.. |
+| `ctrl("o")` | `send_ctrl` | One Ctrl chord |
+| `expect("regex", timeout=5)` | `expect_text` | Regex, validated at lint time: `[` and `(` are metacharacters |
+| `assert_text("literal")` | `assert_contains` | Literal substring |
+| `assert_at("text", row=1, col=0)` | `assert_at_position` | Exact cell position |
+| `line(row=1)` | `get_line` | Rows and columns are 0-indexed screen coordinates |
+| `region(0, 4)` | `get_screen_region` | Rectangular read |
+| `char`, `cursor`, `capture`, `stable`, `change`, `info`, `sessions` | the matching read/wait tools | `stable` = `wait_for_stable` |
+| `style(row, col)` | `get_cell_style` | The only way to read colour; text reads carry none |
+| `shot(path=...)`, `gif(frames=[...])` | `screenshot`, `gif` | For anything colour, focus, or motion |
+| `resize("80x24")` | `resize` | Delivers SIGWINCH mid-session |
+| `close()` | `close_session` | Required teardown |
+
+`run_scenario(script=<document>, session_id=<label>)` lints and then executes;
+lint with `dry_run=True` first. `session_id` is not a script argument. A
+`choice({...})` epilogue of `expect`/`assert_text`/`assert_at` is allowed only at
+the very end.
+
+### Harness rules that bite
+
+- **`assert_text` is a literal match; `expect` is a regular expression.** A
+  pattern with literal brackets (`2: [Details]  Metrics`) cannot go through
+  `expect`, and `expect` needs its metacharacters escaped.
+- **Send one key per call.** A list of keys in a single call over-delivers (a
+  six-`down` list moved eight rows), so write `key("down")` once per press.
+- **`Esc` goes through `key("escape")`.** A raw `\u001b` byte is swallowed and the
+  keypress silently becomes the next `Enter`.
+- **Enter is `\r` in `send`.** `\n` is not the raw-mode Enter key.
+- **`wait_for_stable` (or `expect`) after every action.** Reads taken immediately
+  after a keystroke can show the previous frame.
+- **`wait_for_change` wants bare buffer text.** A `capture()` result carries a
+  header and a 60-character `=` rule that must be sliced off before reuse.
+- **Text reads lose colour and trailing whitespace.** Use `style(row, col)` for
+  colour claims and `preserve_format=True` or `char(row, col)` for geometry.
+- **Use 10 s or more as the timeout** for subscription downloads and speed
+  tests.
+- **Close the session.** `close()` at the end (or `keep_alive=False`), and check
+  `sessions()` afterwards; a leftover session blocks its id.
+
+### Minimal scenario
+
+```python
+launch("env TERM=xterm-256color LC_ALL=C target/debug/leas", mode="buffer", dimensions="120x40", timeout=30)
+expect("Profiles", timeout=10)
+assert_text("1: [Profiles]")          # literal: expect() would read [Profiles] as a class
+key("tab")                            # one key per call
+expect("2: [Details]")
+send(",")                             # the Settings popup, not a tab
+expect("Sections · 2/20")
+key("escape")
+send("?")
+expect("Keyboard Shortcuts")
+key("escape")
+close()
+```

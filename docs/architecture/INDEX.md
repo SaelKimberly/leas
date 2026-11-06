@@ -1,9 +1,10 @@
 # architecture/
 
-How the system is put together.
+How the system is put together: the crate graph, the process boundaries, the shared state and the flows that cross them. Decisions live one level up in `decisions.md`; this folder explains the shape, that page explains the choices.
 
 | File | Contents |
 | --- | --- |
-| `architecture.md` | Crate dependency graph, crate responsibilities, `AppState`/`CoreEvent`, TUI screens, batch-ping flow |
-| `decisions.md` | Durable design decisions (identity, schema policy, ordering, native core, transports, secrets) |
-| `native-core-integration.md` | Design brief for the in-process native backend — **superseded in part** by ADR 0004 and the shipped `ops/connect.rs` selection |
+| `architecture.md` | Crate dependency graph, crate responsibilities, runtime boundaries, `AppState`/`CoreEvent`, TUI screen map, batch-ping flow, connect path |
+| `decisions.md` | Durable design decisions, one line each, with a link to the page that owns the detail |
+| `native-core-integration.md` | Design brief for the in-process native backend: why it exists, its seams, risks and work items; partly superseded by ADR 0004 and the shipped `ops/connect.rs` |
+| `INDEX.md` | This listing |
