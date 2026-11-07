@@ -170,10 +170,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.pem");
         std::fs::write(&path, certified.cert.pem()).unwrap();
-        let row = spec(
-            "v2ray-plugin",
-            &format!("host=h;tls;cert={}", path.display()),
-        );
+        // SIP003 reads `\` as an escape (`option_tokens`), so a Windows path must
+        // be escaped like a `certRaw` body: `\\` per separator, `\;` per
+        // delimiter. A raw `path.display()` loses every separator and the read
+        // then fails on a file that exists.
+        let cert_opt = path
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace(';', "\\;");
+        let row = spec("v2ray-plugin", &format!("host=h;tls;cert={cert_opt}"));
         let pin = plugin_pin(Some(&row)).await.unwrap().expect("a pin");
         assert_eq!(
             pin,
