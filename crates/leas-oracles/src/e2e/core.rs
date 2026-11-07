@@ -10,13 +10,14 @@ pub enum CoreKind {
 }
 
 impl CoreKind {
-    /// Binary file name inside `LEAS_CORE_BIN_DIR`.
+    /// Host binary file name (`xray.exe` on Windows).
     #[must_use]
-    pub const fn bin_name(self) -> &'static str {
-        match self {
+    pub fn bin_name(self) -> String {
+        let base = match self {
             Self::Xray => "xray",
             Self::SingBox => "sing-box",
-        }
+        };
+        format!("{base}{}", std::env::consts::EXE_SUFFIX)
     }
 }
 
@@ -29,24 +30,25 @@ pub struct CoreUnderTest {
 }
 
 impl CoreUnderTest {
-    /// Resolve from `LEAS_CORE_BIN_DIR/<bin_name>`, probe its version,
-    /// and sanity-check it against `expected_version` (substring match).
+    /// Resolve the binary from the runtime `LEAS_CORE_BIN_DIR` or, when that
+    /// is unset, from the directory `build.rs` baked into the crate. Probe
+    /// its version and sanity-check it against `expected_version` (substring
+    /// match).
     pub fn resolve(kind: CoreKind, expected_version: &str) -> Result<Self, String> {
-        Self::resolve_from(kind, expected_version, "LEAS_CORE_BIN_DIR")
-    }
-
-    /// Resolve from an arbitrary env-named directory.
-    ///
-    /// Exists so a SECOND pinned peer can coexist with the suite's baseline
-    /// without re-pinning it: the pq-enc differential targets a peer built from
-    /// `thirdparty/Xray-core` HEAD, and pointing the baseline env at it would
-    /// re-baseline every row in the suite (and restate its compatibility claim).
-    pub fn resolve_from(
-        kind: CoreKind,
-        expected_version: &str,
-        dir_env: &str,
-    ) -> Result<Self, String> {
-        let dir = std::env::var(dir_env).map_err(|_| format!("{dir_env} is not set"))?;
+        let dir = match std::env::var("LEAS_CORE_BIN_DIR") {
+            Ok(dir) => dir,
+            Err(_) => match option_env!("LEAS_ORACLES_CORE_DIR") {
+                Some(dir) => dir.to_owned(),
+                None => {
+                    return Err(format!(
+                        "no core directory: set LEAS_CORE_BIN_DIR, or build with \
+                         leas-oracles' build.rs enabled (it fetches the pinned cores into \
+                         OUT_DIR/core-bin); the missing binary is {}",
+                        kind.bin_name()
+                    ));
+                }
+            },
+        };
         let bin = PathBuf::from(dir).join(kind.bin_name());
         if !bin.is_file() {
             return Err(format!(
@@ -69,8 +71,10 @@ impl CoreUnderTest {
     }
 }
 
-/// Probe the version string: exact probe per kind, bounded to 5s.
+/// Probe the version string: exact probe per kind, bounded to 15s.
 /// xray: `-version`; sing-box: `version`. A hang is a bug → timeout error.
+/// The bound is generous because Windows AV can take seconds to scan a ~45 MB
+/// core on its first execution.
 fn probe_version(bin: &std::path::Path, kind: CoreKind) -> Result<String, String> {
     let flag = match kind {
         CoreKind::Xray => "-version",
@@ -83,7 +87,7 @@ fn probe_version(bin: &std::path::Path, kind: CoreKind) -> Result<String, String
         let _ = tx.send(Command::new(&cmd_bin).arg(flag).output());
     });
     let out = rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(15))
         .map_err(|_| format!("version probe timed out for {}", bin.display()))?
         .map_err(|e| format!("failed to run {}: {e}", bin.display()))?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned();

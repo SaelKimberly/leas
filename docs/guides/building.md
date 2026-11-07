@@ -54,11 +54,13 @@ the `LEAS_CORE_BIN_DIR` default. Two consequences matter:
 Arguments are word-split, so keep the command simple.
 
 `just bench` runs the criterion targets; `just bench micro` skips the one that
-needs real cores (`throughput` loads `$LEAS_CORE_BIN_DIR`). Results land in
-`./.benchmarks`; `LEAS_BENCH_MB` defaults to 4 inside the recipe (the value
-`crates/leas-native/benches/baseline.md` was captured at; the harness default is 64), and `all`
-refuses to start when `$LEAS_CORE_BIN_DIR` has no `xray`/`sing-box`, because the
-throughput rows would otherwise skip silently and exit 0.
+needs real cores (`throughput`, now in the dev-only `leas-oracles` crate, loads
+`$LEAS_CORE_BIN_DIR`; when that is unset, the crate's `build.rs` fetches the
+pinned cores into `OUT_DIR`). Results land in `./.benchmarks`; `LEAS_BENCH_MB`
+defaults to 4 inside the recipe (the value `crates/leas-native/benches/baseline.md`
+was captured at; the harness default is 64), and `all` refuses to start when
+`$LEAS_CORE_BIN_DIR` has no `xray`/`sing-box`, because the throughput rows would
+otherwise skip silently and exit 0.
 
 ## Host state can fake a green build
 

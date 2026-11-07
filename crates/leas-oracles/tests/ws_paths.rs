@@ -19,7 +19,7 @@
 //! binaries stays green. Run it with
 //!
 //! ```text
-//! cargo test -p leas-native --test ws_paths -- --ignored
+//! cargo test -p leas-oracles --test ws_paths -- --ignored
 //! ```
 //!
 //! See `docs/aegis/specs/2026-09-23-ws-path-canonicalization-design.md` §7.5.
@@ -66,39 +66,14 @@ fn spawn_http_target() -> (u16, tokio::task::JoinHandle<()>) {
     (port, handle)
 }
 
-/// Resolve a REAL xray-core binary (`-version` must answer with an `Xray`
-/// banner, so a same-named binary from another project is not mistaken for it).
-fn xray_binary() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let mut dirs: Vec<String> = Vec::new();
-    if let Ok(dir) = std::env::var("LEAS_CORE_BIN_DIR") {
-        dirs.push(dir);
-    }
-    dirs.push(format!("{home}/.config/leas/bin"));
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    for dir in dirs {
-        candidates.push(std::path::PathBuf::from(format!("{dir}/xray/xray")));
-        candidates.push(std::path::PathBuf::from(format!("{dir}/xray-core/xray")));
-        candidates.push(std::path::PathBuf::from(format!("{dir}/xray")));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|p| p.join("xray")));
-    }
-    candidates.into_iter().find(|p| is_xray_core(p))
-}
-
-fn is_xray_core(bin: &std::path::Path) -> bool {
-    if !bin.is_file() {
-        return false;
-    }
-    std::process::Command::new(bin)
-        .arg("-version")
-        .output()
-        .is_ok_and(|out| {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
-            text.contains("Xray")
-        })
+/// Resolve the pinned xray-core: `LEAS_CORE_BIN_DIR` when set, else the
+/// directory `build.rs` fetched into, version-checked against `XRAY_VERSION`.
+fn xray_binary() -> Option<leas_oracles::e2e::CoreUnderTest> {
+    leas_oracles::e2e::CoreUnderTest::resolve(
+        leas_oracles::e2e::CoreKind::Xray,
+        leas_oracles::e2e::XRAY_VERSION,
+    )
+    .ok()
 }
 
 /// Start a real xray-core VLESS-over-ws server on `port` with `server_path`
@@ -257,7 +232,7 @@ async fn run_row(
 }
 
 #[tokio::test]
-#[ignore = "needs a real xray-core binary (LEAS_CORE_BIN_DIR or ~/.config/leas/bin)"]
+#[ignore = "needs the pinned xray-core (build.rs fetch or LEAS_CORE_BIN_DIR)"]
 async fn ws_upgrade_survives_a_path_that_needs_canonicalization() {
     let Some(bin) = xray_binary() else {
         panic!("no xray binary found");
@@ -283,6 +258,6 @@ async fn ws_upgrade_survives_a_path_that_needs_canonicalization() {
     ];
 
     for (server_path, client_path, canonical) in rows {
-        run_row(&bin, server_path, client_path, canonical).await;
+        run_row(&bin.bin, server_path, client_path, canonical).await;
     }
 }

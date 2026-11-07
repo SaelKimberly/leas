@@ -102,14 +102,6 @@ quinn.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
 
-# X25519 keypair generation for REALITY e2e configs (feature `native-e2e`
-# only): ring 0.17 cannot serialize the private half of a generated
-# `EphemeralPrivateKey` (its `bytes()` is test-gated), and the server inbound
-# needs the raw private key — x25519-dalek derives the public half from
-# arbitrary 32-byte seeds. The runtime tunnel never needs keygen: the client
-# only ECDHs with the server's `pbk`.
-x25519-dalek = { workspace = true, optional = true }
-
 # errors
 thiserror.workspace = true
 
@@ -134,39 +126,16 @@ base64.workspace = true
 # misc
 uuid.workspace = true
 
-# e2e pipeline (crate-side module -> real deps, optional behind the feature)
-serde_json = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
-rcgen = { workspace = true, optional = true }
-tiny_http = { version = "0.12.0", optional = true }
-# inner-TLS echo target for the vision e2e rows (spec §7.4): a tokio TLS
-# server completing a real TLS 1.3 session through the tunnel. Ring backend
-# only (workspace TLS standard — tokio-rustls 0.26 defaults to aws_lc_rs;
-# see the workspace rustls pin / leas-core's transitive override).
-tokio-rustls = { workspace = true, optional = true }
+# workspace feature-unification hack (hakari)
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
 [lints]
 workspace = true
 
 [features]
-native-e2e = ["dep:serde_json", "dep:tempfile", "dep:rcgen", "dep:tiny_http", "dep:x25519-dalek", "dep:tokio-rustls"]
-
-# [[bench]] target: `harness = false` — criterion owns `main`. The bench
-# file itself is `#![cfg(feature = "native-e2e")]`-gated and
-# `required-features` keeps cargo from building it without the feature.
-[[bench]]
-name = "throughput"
-harness = false
-required-features = ["native-e2e"]
-
-# `relay` benches the SOCKS5 inbound + Direct outbound path. The feature is
-# only for the in-process sink/source/udp-echo harness targets — the bench
-# never resolves a core binary, so it always measures instead of skipping.
-[[bench]]
-name = "relay"
-harness = false
-required-features = ["native-e2e"]
+# Exposes the test-only CA trust hooks and the stream accessors the external
+# `leas-oracles` e2e crate needs. Nothing in this crate sets it.
+e2e-support = []
 
 # `dispatch` measures the `Box<dyn Stream>` seam against a monomorphized
 # stack of the same depth over `tokio::io::duplex`: no feature gate, no
@@ -184,10 +153,9 @@ harness = false
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-# serde_json/rcgen are used by unit tests in security/transport/context/chain,
-# which compile without the `native-e2e` feature — dev-deps make them available
-# to lib unit tests regardless of feature selection (normal optional deps stay
-# for the feature-gated e2e module).
+# serde_json/rcgen are used by lib unit tests in
+# security/transport/context/chain; dev-deps make them available to lib unit
+# tests regardless of feature selection.
 serde_json.workspace = true
 rcgen.workspace = true
 rstest.workspace = true

@@ -67,9 +67,16 @@ hakari-check mode='report':
     @cargo hakari manage-deps --dry-run
     @cargo hakari verify
 
-# Clippy, all workspace targets and features, warnings denied
+# Clippy, all workspace targets and features, warnings denied. `leas-oracles`
+# is a dev-only member (see `default-members`); check it on demand with
+# `just oracles-check`.
 clippy mode='report':
-    @cargo clippy --workspace --all-targets --all-features -- -D warnings
+    @cargo clippy --workspace --exclude leas-oracles --all-targets --all-features -- -D warnings
+
+# Compile-check the dev-only oracle crate (dead adapters included) without
+# fetching the pinned cores: the build script honours the skip flag.
+oracles-check:
+    @LEAS_ORACLES_SKIP_DOWNLOAD=1 cargo clippy -p leas-oracles --all-targets -- -D warnings
 
 # Tests via cargo-nextest (.config/nextest.toml; `ci` mode uses the `ci` profile)
 nextest mode='report':
@@ -196,10 +203,31 @@ bench target='all':
     just fast cargo criterion -p leas-native --bench ss_codec
     # Per-kind ProtocolId identity traversal — hermetic, micro-safe.
     just fast cargo criterion -p leas-proto  --bench identity
-    just fast cargo criterion -p leas-native --features native-e2e --bench relay
+    just fast cargo criterion -p leas-oracles --bench relay
     if [ "{{target}}" = all ]; then
-        just fast cargo criterion -p leas-native --features native-e2e --bench throughput
+        just fast cargo criterion -p leas-oracles --bench throughput
     fi
+
+# ─── Oracle pin table ──────────────────────────────────────────────
+#
+# Print the four pinned assets (name + sha256) for each version, ready to paste
+# into `crates/leas-oracles/src/pins.rs`. Print-only: no source is rewritten.
+# `curl` needs to reach api.github.com; on a workstation whose proxy breaks
+# TLS or has no DNS, set ALL_PROXY=socks5h://<host>:<port> (the proxy resolves).
+oracles-pins xray singbox:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for spec in "XTLS/Xray-core:$xray" "SagerNet/sing-box:$singbox"; do
+        repo="${spec%%:*}"
+        ver="${spec##*:}"
+        echo "== $repo v$ver"
+        curl -fsSL --ssl-no-revoke "https://api.github.com/repos/$repo/releases/tags/v$ver" \
+        | awk '
+            /^[[:space:]]*"name":/ { n=$0; sub(/.*"name": "/,"",n); sub(/".*/,"",n) }
+            /^[[:space:]]*"digest":/ { d=$0; sub(/.*"digest": "sha256:/,"",d); sub(/".*/,"",d); print n, d }
+        ' \
+        | grep -E '^Xray-(linux|windows)-(64|arm64-v8a)\.zip |^sing-box-.*-(linux|windows)-(amd64|arm64)\.(tar\.gz|zip) '
+    done
 
 # ─── Tier-3b test oracle: pinned SIP003 plugin binaries ────────────
 #
@@ -351,7 +379,7 @@ plugin-bins:
     echo
     echo "run the plugin rows with:"
     echo "  LEAS_PLUGIN_BIN_DIR=$dir \\"
-    echo "    cargo test -p leas-native --features native-e2e --test plugin_sip003 -- --ignored"
+    echo "    cargo test -p leas-oracles --test plugin_sip003 -- --ignored"
     echo
     echo "(--ignored matters: the plugin rows live in an #[ignore]d test. Set"
     echo "LEAS_SSSERVER_BIN if the vendored thirdparty build is not present."

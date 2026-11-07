@@ -76,7 +76,7 @@ Tier-3 note, 2026-09-03: the vmess UDP row fails identically on the clean baseli
 
 ## Verification
 
-- Hermetic: `cargo test -p leas-native --features native-e2e --lib`.
+- Hermetic: `cargo test -p leas-native --lib`.
 - Real-core tiers and their commands: [`reference/native-core.md`](../reference/native-core.md) § Verification tiers.
 - Workspace: `cargo test` plus `just quality-gate code`.
 - Manual: import a link for each of the six kinds, connect (no core selection needed), confirm live traffic in the Metrics pane and per-connection rows in the native activity section; kill the network mid-connection and confirm `Failed` rows; confirm SOCKS5 and HTTP CONNECT both work on the effective port, including with `mixed_port` set; set an `xray` entry in `protocol_core_overrides` and confirm the subprocess path is unchanged.

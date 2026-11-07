@@ -2,6 +2,24 @@
 resolver = "3"
 
 members = ["crates/*"]
+# `leas-oracles` is a dev-only crate (pinned real-core e2e oracles). It is a
+# member so it shares the lockfile/dependencies/hakari, but it is NOT built by
+# bare `cargo build/test/nextest/run`; only an explicit `-p leas-oracles`
+# builds it (and runs its build-time fetch).
+default-members = [
+    "crates/leas",
+    "crates/leas-config",
+    "crates/leas-core",
+    "crates/leas-db",
+    "crates/leas-dns",
+    "crates/leas-geoip",
+    "crates/leas-hakari",
+    "crates/leas-host-features",
+    "crates/leas-native",
+    "crates/leas-proto",
+    "crates/leas-route",
+    "crates/leas-tls",
+]
 
 [workspace.package]
 version = "0.1.0"

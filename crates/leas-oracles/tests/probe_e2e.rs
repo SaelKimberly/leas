@@ -7,7 +7,7 @@
 //! so it is `#[ignore]`d — a machine without binaries stays green. Run it with
 //!
 //! ```text
-//! cargo test -p leas-native --test probe_e2e -- --ignored
+//! cargo test -p leas-oracles --test probe_e2e -- --ignored
 //! ```
 
 use std::process::{Child, Command};
@@ -51,46 +51,19 @@ fn spawn_http_target() -> (u16, tokio::task::JoinHandle<()>) {
     (port, handle)
 }
 
-/// Resolve a REAL xray-core binary: the managed layout
-/// (`bin_dir/<core>/<exe>`, then the dir itself) and PATH are both probed, and
-/// each candidate must answer `-version` with an `Xray` banner — a same-named
-/// binary from another project must not be mistaken for the core.
-fn xray_binary() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let mut dirs: Vec<String> = Vec::new();
-    if let Ok(dir) = std::env::var("LEAS_CORE_BIN_DIR") {
-        dirs.push(dir);
+/// Resolve the pinned xray-core: `LEAS_CORE_BIN_DIR` when set, else the
+/// directory `build.rs` fetched into, version-checked against `XRAY_VERSION`.
+fn xray_binary() -> Option<leas_oracles::e2e::CoreUnderTest> {
+    match leas_oracles::e2e::CoreUnderTest::resolve(
+        leas_oracles::e2e::CoreKind::Xray,
+        leas_oracles::e2e::XRAY_VERSION,
+    ) {
+        Ok(core) => Some(core),
+        Err(e) => {
+            eprintln!("SKIP: {e}");
+            None
+        }
     }
-    // The managed layout the app itself uses (`.cargo/config.toml` exports
-    // `LEAS_CORE_BIN_DIR` for the benches, and it may be unpopulated).
-    dirs.push(format!("{home}/.config/leas/bin"));
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    for dir in dirs {
-        candidates.push(std::path::PathBuf::from(format!("{dir}/xray/xray")));
-        candidates.push(std::path::PathBuf::from(format!("{dir}/xray-core/xray")));
-        candidates.push(std::path::PathBuf::from(format!("{dir}/xray")));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|p| p.join("xray")));
-    }
-    candidates.into_iter().find(|p| is_xray_core(p))
-}
-
-/// The `-version` banner is the discriminator: another tool named `xray`
-/// (a container-image scanner, say) answers with its own usage text. The core
-/// prints its banner on stderr, so both streams are checked.
-fn is_xray_core(bin: &std::path::Path) -> bool {
-    if !bin.is_file() {
-        return false;
-    }
-    std::process::Command::new(bin)
-        .arg("-version")
-        .output()
-        .is_ok_and(|out| {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
-            text.contains("Xray")
-        })
 }
 
 /// Start a real xray-core VLESS server on `port`; returns the child, the
@@ -147,14 +120,14 @@ async fn wait_for_port(port: u16) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "needs a real xray-core binary (LEAS_CORE_BIN_DIR or ~/.config/leas/bin)"]
+#[ignore = "needs the pinned xray-core (build.rs fetch or LEAS_CORE_BIN_DIR)"]
 async fn probe_through_real_xray_vless_server() {
     let Some(bin) = xray_binary() else {
         panic!("no xray binary found");
     };
     let (target_port, target) = spawn_http_target();
     let server_port = free_port();
-    let (mut child, config_path, log_path) = spawn_xray_server(&bin, server_port);
+    let (mut child, config_path, log_path) = spawn_xray_server(&bin.bin, server_port);
     if !wait_for_port(server_port).await {
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         let _ = child.kill();

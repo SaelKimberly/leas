@@ -35,7 +35,6 @@
 //! `LEAS_CORE_BIN_DIR` to hold a `sing-box`, whose **version is asserted into the
 //! failure messages** so a green run names which implementation it compared.
 #![allow(clippy::future_not_send)]
-#![cfg(feature = "native-e2e")]
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};

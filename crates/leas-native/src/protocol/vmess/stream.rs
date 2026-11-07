@@ -751,10 +751,12 @@ impl<S> VmessClientStream<S> {
         Self { inner, read, write }
     }
 
-    /// The secured connection behind the record codec (crate-internal; the
-    /// e2e PQ assertion recovers the engine `TlsStream` through it).
-    #[cfg_attr(not(feature = "native-e2e"), allow(dead_code))] // e2e PQ assertion only
-    pub(crate) const fn inner(&self) -> &S {
+    /// The secured connection behind the record codec (the external e2e PQ
+    /// assertion recovers the engine `TlsStream` through it).
+    #[cfg(feature = "e2e-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn inner(&self) -> &S {
         &self.inner
     }
 }

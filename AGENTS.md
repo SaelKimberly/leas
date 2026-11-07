@@ -34,6 +34,7 @@ This file is auto-detected project context: commands, structure, conventions. Th
 
 ## Structure
 - `crates/leas` — binary: `main.rs`, `state.rs` (`AppState`), `types.rs`, `ops/` (connect, ping, events, scheduler — the PER-LINK ping gate —, **job_scheduler — the job queue / one-job-at-a-time gate**, profiles, enrich, subscriptions, settings, updates, export, stream_import, db_monitor, clipboard, native_connect, ping_native, purge, compact), `ui/` (profiles, settings, logs, statistics, **details** (pane-2 `Details`: three 3:6:3 sections — Server, Link, DB aggregates), **tasks** (pane-2 `Tasks`: the progress bar + the job queue), native_activity, **sniffer** (pane-1 `Sniffer`: per-host traffic for the native session), add_server, export, status_bar, theme, widgets).
+- `crates/leas-oracles` — dev-only e2e oracle crate: `build.rs` fetches the pinned xray-core/sing-box assets (SHA-256 verified), `e2e/` builds the server/client config pairs and launches the cores, and the moved integration tests/benches live here. Excluded from `default-members`; run with `-p leas-oracles`.
 - Other crates and their responsibilities: [`docs/architecture/architecture.md`](docs/architecture/architecture.md).
 
 ## Key Conventions
@@ -47,7 +48,7 @@ This file is auto-detected project context: commands, structure, conventions. Th
 - Tests identical modulo literals are ONE `#[rstest]` table with named `#[case::…]` rows — never N near-identical `#[test]` fns. Every `#[case]`-supplied parameter must carry `#[case]` (a missing one makes rstest report "Wrong case signature" and silently drop the whole fn).
 - Perf labs and planner/timing probes are not tests: they live behind the crate's `perf-lab` feature as `#[cfg(all(test, feature = "perf-lab"))]` (the `test` term is required — a lab that drives test-only helpers and `tempfile` cannot compile in the lib unit), stay `#[ignore]`d, and print tables. Run one with `cargo nextest run -p <crate> --features perf-lab --run-ignored all <name>`.
 - Every hand-written crate opts into `[lints] workspace = true`. A crate without it is silently outside `pedantic`+`nursery`, generated code included (prost's `PartialEq`-without-`Eq` needs a scoped allow at the `include_proto!`).
-- `cargo nextest run` uses default features and is the suite; `--all-features` is clippy's surface. The `native-e2e` rows are opt-in and need real cores at `$LEAS_CORE_BIN_DIR`.
+- `cargo nextest run` is the suite (default members; the dev-only `leas-oracles` is skipped). `--all-features` is clippy's surface, with `--exclude leas-oracles`. The real-core e2e rows live in `leas-oracles`: `cargo nextest run -p leas-oracles`; its `build.rs` fetches the pinned cores (override `$LEAS_CORE_BIN_DIR`, or `LEAS_ORACLES_SKIP_DOWNLOAD=1` for a compile check).
 - The toolchain floats on `stable`; a new stable release can promote a lint and redden the gate. That is now detected rather than silent: `stable-drift.yml` re-runs the `code` gate weekly against the newest stable, so drift surfaces within a week, and `just quality-gate code` after a toolchain bump stays the local check. CI (`.github/workflows/`, added 2026-10-13): `code-linux` runs the `code` gate plus a release build inside an `ubuntu:22.04` container (the `GLIBC_2.35` floor), `code-windows` runs the `code` gate on `windows-2022`, `deps` runs single-homed on the host.
 
 ## External References

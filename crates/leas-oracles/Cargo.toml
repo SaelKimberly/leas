@@ -1,0 +1,68 @@
+[package]
+name = "leas-oracles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "E2E oracles for leas: pinned real cores, config pairs, and process launch"
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# The client core under test (the e2e suite dials it against real servers).
+leas-native = { path = "../leas-native", features = ["e2e-support"] }
+leas-proto.workspace = true
+leas-tls.workspace = true
+
+# Async runtime + TLS used by the harness (spawned cores, TLS echo targets).
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "process"] }
+rustls = { workspace = true, features = ["ring"] }
+tokio-rustls.workspace = true
+ring.workspace = true
+rcgen.workspace = true
+
+# Config generation (base64url REALITY keys, JSON server configs).
+base64.workspace = true
+serde_json.workspace = true
+x25519-dalek.workspace = true
+
+# Local targets: HTTP echo + per-test scratch dirs.
+tiny_http = "0.12.0"
+tempfile.workspace = true
+
+# The workspace feature-unification hack (hakari).
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[build-dependencies]
+# HTTPS fetch of the pinned release assets (rustls + ring, no aws-lc-rs).
+ureq = { version = "3", features = ["socks-proxy"] }
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
+tar = "0.4.46"
+flate2.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+rstest.workspace = true
+criterion = { workspace = true, features = ["async_tokio"] }
+tokio-tungstenite = "0.30.0"
+futures-core = "0.3.34"
+# `relay` benches the SOCKS5 inbound through the routing engine.
+leas-route = { path = "../leas-route" }
+
+[[bench]]
+name = "relay"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[package.metadata.cargo-machete]
+# `build.rs` consumes these; cargo-machete does not scan build scripts.
+ignored = ["flate2", "sha2", "tar", "ureq", "zip"]
+
+[lints]
+workspace = true

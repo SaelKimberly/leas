@@ -71,7 +71,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
 // own OS thread with its own harness CA, so parallel e2e cases can't
 // clobber each other's trust store. Production builds use webpki-roots and
 // carry no test state.
-#[cfg(any(test, feature = "native-e2e"))]
+#[cfg(any(test, feature = "e2e-support"))]
 std::thread_local! {
     static TEST_CA: std::cell::RefCell<Option<rustls::pki_types::CertificateDer<'static>>> =
         const { std::cell::RefCell::new(None) };
@@ -80,7 +80,7 @@ std::thread_local! {
 /// Install a test-only QUIC trust anchor trusting exactly `ca_der`
 /// (test/e2e harness).
 #[doc(hidden)]
-#[cfg(any(test, feature = "native-e2e"))]
+#[cfg(any(test, feature = "e2e-support"))]
 pub fn set_test_ca(ca_der: &[u8]) {
     let der = rustls::pki_types::CertificateDer::from(ca_der.to_vec());
     TEST_CA.with(|c| *c.borrow_mut() = Some(der));
@@ -109,14 +109,14 @@ pub fn quic_tls_config(
             .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore::empty();
-        #[cfg(any(test, feature = "native-e2e"))]
+        #[cfg(any(test, feature = "e2e-support"))]
         match TEST_CA.with(|c| c.borrow().clone()) {
             Some(ca) => roots
                 .add(ca)
                 .map_err(|e| NativeError::Config(format!("QUIC test CA: {e}")))?,
             None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
         }
-        #[cfg(not(any(test, feature = "native-e2e")))]
+        #[cfg(not(any(test, feature = "e2e-support")))]
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)

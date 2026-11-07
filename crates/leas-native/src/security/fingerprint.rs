@@ -141,7 +141,7 @@ pub const fn profile_for(fp: FingerprintId) -> Result<Fingerprint, NativeError> 
 // Thread-local: each `#[tokio::test]` runs on its own OS thread with its own
 // harness CA, so parallel e2e cases can't clobber each other's trust store.
 // Production builds use webpki-roots and carry no test state.
-#[cfg(any(test, feature = "native-e2e"))]
+#[cfg(any(test, feature = "e2e-support"))]
 std::thread_local! {
     static TEST_CA: std::cell::RefCell<Option<WebPkiVerifier>> =
         const { std::cell::RefCell::new(None) };
@@ -149,7 +149,7 @@ std::thread_local! {
 
 /// Install a test-only verifier trusting exactly `ca_der` (test/e2e harness).
 #[doc(hidden)]
-#[cfg(any(test, feature = "native-e2e"))]
+#[cfg(any(test, feature = "e2e-support"))]
 pub fn set_test_ca(ca_der: &[u8]) {
     let verifier = WebPkiVerifier::from_ca_der(ca_der).expect("harness CA der is a valid cert");
     TEST_CA.with(|c| *c.borrow_mut() = Some(verifier));
@@ -158,11 +158,11 @@ pub fn set_test_ca(ca_der: &[u8]) {
 /// Build the verifier for a connect: test CA (harness) else webpki-roots,
 /// then `insecure` / `pin_sha256` overrides from the TLS opts.
 pub(crate) fn verifier_for(insecure: bool, pin: Option<[u8; 32]>) -> WebPkiVerifier {
-    #[cfg(any(test, feature = "native-e2e"))]
+    #[cfg(any(test, feature = "e2e-support"))]
     let verifier = TEST_CA
         .with(|c| c.borrow().clone())
         .unwrap_or_else(WebPkiVerifier::webpki_roots);
-    #[cfg(not(any(test, feature = "native-e2e")))]
+    #[cfg(not(any(test, feature = "e2e-support")))]
     let verifier = WebPkiVerifier::webpki_roots();
     let verifier = verifier.with_insecure(insecure);
     match pin {

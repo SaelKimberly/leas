@@ -25,6 +25,7 @@ bit-set = { version = "0.11", features = ["serde"] }
 bit-vec = { version = "0.10", default-features = false, features = ["serde", "std"] }
 bitflags = { version = "2", default-features = false, features = ["serde", "std"] }
 block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
+bumpalo = { version = "3", features = ["collections"] }
 bytemuck = { version = "1", default-features = false, features = ["derive"] }
 chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
@@ -43,9 +44,12 @@ futures-core = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["async-await-macro", "channel", "io", "sink"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hashbrown = { version = "0.17" }
+http = { version = "1" }
 http-body-util = { version = "0.1", features = ["channel"] }
+httparse = { version = "1" }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
@@ -110,19 +114,33 @@ zerofrom = { version = "0.1", default-features = false, features = ["alloc", "de
 zeroize = { version = "1", features = ["derive"] }
 zerotrie = { version = "0.2", default-features = false, features = ["alloc", "yoke", "zerofrom"] }
 zerovec = { version = "0.11", default-features = false, features = ["alloc", "derive", "yoke"] }
+zip = { version = "9" }
 zstd = { version = "0.14" }
 zstd-safe = { version = "8", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
 
 [build-dependencies]
+aes = { version = "0.9", default-features = false, features = ["zeroize"] }
+base64 = { version = "0.23" }
 bit-set = { version = "0.11", features = ["serde"] }
 bit-vec = { version = "0.10", default-features = false, features = ["serde", "std"] }
 bitflags = { version = "2", default-features = false, features = ["serde", "std"] }
+block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
+bumpalo = { version = "3", features = ["collections"] }
 cc = { version = "1", default-features = false, features = ["parallel"] }
+cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
+crc32fast = { version = "1" }
+crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
+digest = { version = "0.11", features = ["alloc", "mac", "oid", "zeroize"] }
 either = { version = "1", features = ["use_std"] }
+flate2 = { version = "1", features = ["zlib-rs"] }
 form_urlencoded = { version = "1" }
 futures-core = { version = "0.3" }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown = { version = "0.17" }
+http = { version = "1" }
+httparse = { version = "1" }
+hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
 itertools = { version = "0.14" }
 libc = { version = "0.2" }
 log = { version = "0.4", default-features = false, features = ["std"] }
@@ -134,9 +152,16 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 regex = { version = "1" }
 regex-automata = { version = "0.4" }
 regex-syntax = { version = "0.8" }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["alloc", "derive"] }
 serde_core = { version = "1", features = ["alloc"] }
+sha1 = { version = "0.11", features = ["zeroize"] }
+sha2 = { version = "0.11", features = ["zeroize"] }
+simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 siphasher = { version = "1" }
+subtle = { version = "2", default-features = false, features = ["const-generics"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }
 toasty-core = { version = "0.11", features = ["jiff", "migration"] }
@@ -146,12 +171,17 @@ toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
+typenum = { version = "1", default-features = false, features = ["const-generics"] }
 uuid = { version = "1", features = ["fast-rng", "js", "v4", "v5", "v7"] }
 winnow = { version = "1" }
+zeroize = { version = "1", features = ["derive"] }
+zip = { version = "9" }
+zstd = { version = "0.14" }
+zstd-safe = { version = "8", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
+zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
@@ -164,21 +194,15 @@ tower = { version = "0.5", default-features = false, features = ["balance", "buf
 tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip", "follow-redirect"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
-block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
 chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
-cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
-crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["io_uring", "pipe", "process", "stdio", "system", "termios", "time"] }
-typenum = { version = "1", default-features = false, features = ["const-generics"] }
-zeroize = { version = "1", features = ["derive"] }
+simd-adler32 = { version = "0.3" }
+time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "parsing"] }
 
 [target.x86_64-pc-windows-msvc.dependencies]
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 simd-adler32 = { version = "0.3" }
@@ -190,19 +214,13 @@ winapi = { version = "0.3", default-features = false, features = ["consoleapi", 
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
-block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
 chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
-cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
-crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
-typenum = { version = "1", default-features = false, features = ["const-generics"] }
+simd-adler32 = { version = "0.3" }
+time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "parsing"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
-zeroize = { version = "1", features = ["derive"] }
 
 [target.x86_64-pc-windows-gnu.dependencies]
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 simd-adler32 = { version = "0.3" }
@@ -214,15 +232,10 @@ winapi = { version = "0.3", default-features = false, features = ["consoleapi", 
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 
 [target.x86_64-pc-windows-gnu.build-dependencies]
-block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
 chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
-cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
-crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
-typenum = { version = "1", default-features = false, features = ["const-generics"] }
+simd-adler32 = { version = "0.3" }
+time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "parsing"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
-zeroize = { version = "1", features = ["derive"] }
 
 ### END HAKARI SECTION
 

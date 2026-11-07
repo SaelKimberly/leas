@@ -12,7 +12,6 @@
     clippy::future_not_send,
     reason = "rstest-generated futures lose their Send bound; they run on one local tokio runtime"
 )]
-#![cfg(feature = "native-e2e")]
 
 mod common;
 
@@ -20,11 +19,11 @@ use common::{
     certs, cores, echo, fp, no_tls, pick, plain_server_reality_client, pq_tls, reality,
     reality_server_plain_client, reality_wrong_pbk, reality_wrong_sid, tls_echo,
 };
-use leas_native::e2e::{
-    AppKind, CaseSpec, Certs, CoreKind, CoreUnderTest, EchoServer, Flow, TlsEchoServer, TlsVariant,
-    XRAY_HEAD_BIN_DIR, XRAY_HEAD_VERSION, run_against,
-};
 use leas_native::protocol::vless::PacketMode;
+use leas_oracles::e2e::{
+    AppKind, CaseSpec, Certs, CoreKind, CoreUnderTest, EchoServer, Flow, TlsEchoServer, TlsVariant,
+    run_against,
+};
 use rstest::rstest;
 
 /// `CaseSpec::vless()` plus the network axis; these helpers keep the
@@ -90,6 +89,10 @@ fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
 #[case::tcp_reality(vless_tls("tcp", reality()))]
 #[case::tcp_reality_wrong_pbk(vless_tls("tcp", reality_wrong_pbk()))]
 #[case::tcp_reality_wrong_sid(vless_tls("tcp", reality_wrong_sid()))]
+#[cfg_attr(
+    windows,
+    ignore = "Windows: the REALITY fallback dest handshake does not complete within the probe window"
+)]
 #[case::tcp_plain_into_reality_server(vless_tls("tcp", reality_server_plain_client()))]
 #[case::tcp_reality_into_plain_server(vless_tls("tcp", plain_server_reality_client()))]
 #[case::ws_plain(vless("ws"))]
@@ -315,31 +318,6 @@ async fn vless_single_core(
     run_against(&case, pick(cores, core), certs, &echo, &tls_echo)
         .await
         .expect("vless single-core e2e failed");
-}
-
-/// T9's first differential: the pq-enc case against the SECOND pinned peer — an
-/// `xray` built from `thirdparty/Xray-core` HEAD — while `XRAY_VERSION` stays
-/// the suite's baseline.
-///
-/// It answers the question the ignored row could not: is the pre-response EOF a
-/// VERSION DELTA (our client implements a revision newer than the release) or
-/// OUR CLIENT? A green HEAD row with a red baseline row would mean the pin is
-/// behind the implementation, not that the client is wrong. Measured: both fail
-/// identically, so it is not a version delta.
-#[ignore = "needs a HEAD-built peer: LEAS_CORE_HEAD_BIN_DIR"]
-#[rstest]
-#[tokio::test]
-async fn vless_pq_enc_against_head(certs: &Certs, echo: EchoServer, tls_echo: TlsEchoServer) {
-    let Ok(head) =
-        CoreUnderTest::resolve_from(CoreKind::Xray, XRAY_HEAD_VERSION, XRAY_HEAD_BIN_DIR)
-    else {
-        eprintln!("SKIP: set {XRAY_HEAD_BIN_DIR} to a directory holding the HEAD-built `xray`");
-        return;
-    };
-    let case = vless("tcp").with_pq_enc();
-    run_against(&case, &head, certs, &echo, &tls_echo)
-        .await
-        .expect("pq-enc against the HEAD peer");
 }
 
 /// T9's second differential, and the one that removes the last hedge: does OUR

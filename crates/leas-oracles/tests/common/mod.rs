@@ -1,7 +1,6 @@
-//! Shared rstest fixtures for the e2e integration tests (feature `native-e2e`).
-#![cfg(feature = "native-e2e")]
+//! Shared rstest fixtures for the e2e integration tests.
 
-use leas_native::e2e::{
+use leas_oracles::e2e::{
     Certs, CoreKind, CoreUnderTest, EchoServer, FingerprintTls, NoTls, PlainServerRealityClientTls,
     PqTls, RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls, RealityWrongSidTls,
     SINGBOX_VERSION, TlsEchoServer, TlsVariant, XRAY_VERSION, generate_certs, spawn_echo,

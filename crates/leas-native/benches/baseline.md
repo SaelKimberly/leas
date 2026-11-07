@@ -210,7 +210,7 @@ the seam costs **~2 %**, because it is one virtual call per `poll_*` (≈ one pe
 
 ## 2026-09-04 (v1)
 
-Commit `4292c47`. `cargo criterion -p leas-native --features native-e2e --bench throughput`.
+Commit `4292c47`. `cargo criterion -p leas-oracles --bench throughput`.
 
 | bench | send | recv |
 |---|---|---|

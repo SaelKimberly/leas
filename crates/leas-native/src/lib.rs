@@ -52,8 +52,6 @@ pub mod capability;
 pub mod chain;
 pub mod context;
 pub mod crypto;
-#[cfg(feature = "native-e2e")]
-pub mod e2e;
 pub mod error;
 pub mod headers;
 pub mod inbound;
@@ -145,10 +143,12 @@ impl NativeTunnel {
         Self { inner }
     }
 
-    /// The completed layer stack behind the tunnel (crate-internal; the
-    /// e2e runner inspects it to assert PQ negotiation).
-    #[cfg_attr(not(feature = "native-e2e"), allow(dead_code))]
-    pub(crate) fn inner_stream(&self) -> &BoxStream {
+    /// The completed layer stack behind the tunnel (the external e2e crate
+    /// inspects it to assert PQ negotiation).
+    #[cfg(feature = "e2e-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inner_stream(&self) -> &BoxStream {
         &self.inner
     }
 }

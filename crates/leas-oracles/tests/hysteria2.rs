@@ -5,14 +5,13 @@
 //!
 //! `clippy::future_not_send` is allowed file-wide (rstest, see `vmess.rs`).
 #![allow(clippy::future_not_send)]
-#![cfg(feature = "native-e2e")]
 
 mod common;
 
 use common::{certs, cores, echo, pick, tls_echo};
 use leas_native::PacketMode;
-use leas_native::e2e::AppKind;
-use leas_native::e2e::{
+use leas_oracles::e2e::AppKind;
+use leas_oracles::e2e::{
     CaseSpec, Certs, CoreKind, CoreUnderTest, E2eCase, EchoServer, TlsEchoServer, config,
     run_against,
 };

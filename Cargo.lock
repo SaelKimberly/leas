@@ -3317,6 +3317,7 @@ dependencies = [
  "bit-vec 0.10.1",
  "bitflags 2.13.2",
  "block-buffer 0.12.1",
+ "bumpalo",
  "bytemuck",
  "cc",
  "chacha20",
@@ -3339,7 +3340,9 @@ dependencies = [
  "getrandom 0.4.3",
  "h2",
  "hashbrown 0.17.1",
+ "http",
  "http-body-util",
+ "httparse",
  "hybrid-array",
  "hyper",
  "hyper-util",
@@ -3415,6 +3418,7 @@ dependencies = [
  "zeroize",
  "zerotrie",
  "zerovec",
+ "zip",
  "zstd",
  "zstd-safe",
  "zstd-sys",
@@ -3484,16 +3488,43 @@ dependencies = [
  "socket2",
  "tempfile",
  "thiserror 2.0.21",
- "tiny_http",
  "tokio",
- "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "uuid",
  "webpki-roots",
  "wide",
- "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "leas-oracles"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "criterion",
+ "flate2",
+ "futures-core",
+ "leas-hakari",
+ "leas-native",
+ "leas-proto",
+ "leas-route",
+ "leas-tls",
+ "rcgen",
+ "ring",
+ "rstest",
+ "rustls",
+ "serde_json",
+ "sha2 0.11.1",
+ "tar",
+ "tempfile",
+ "tiny_http",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "ureq",
+ "x25519-dalek",
+ "zip",
 ]
 
 [[package]]
@@ -7773,6 +7804,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7be76686bdf7198002062423ca0d8cf9b75a27c8e1de804513b97e97b555d9d"
+dependencies = [
+ "base64 0.23.1",
+ "flate2",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622dce33c252115466d83f63e9744a18f12b4406aae51a01c15ad8fcf1185eb3"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7798,6 +7858,12 @@ checksum = "1c7de35d9d8757dbc1f5125dc8b51438c68b4430546a735c3a9b91aaaaf9a18a"
 dependencies = [
  "utf_types",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"

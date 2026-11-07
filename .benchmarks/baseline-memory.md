@@ -42,7 +42,7 @@
 Console vs stored previous baseline: `dispatch/static` time +4.5720%
 ("Performance has regressed"), `dispatch/boxed` time +7.2043% (regressed).
 
-## relay (`-p leas-native --features native-e2e --bench relay`)
+## relay (`-p leas-oracles --bench relay`)
 
 | bench | mean (est) | throughput (est) |
 |---|---|---|

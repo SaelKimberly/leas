@@ -13,14 +13,13 @@
     clippy::future_not_send,
     reason = "rstest-generated futures lose their Send bound; they run on one local tokio runtime"
 )]
-#![cfg(feature = "native-e2e")]
 
 mod common;
 
 use common::{certs, cores, echo, fp, pick, pq_tls, reality, tls_echo};
 use leas_native::PacketMode;
-use leas_native::e2e::AppKind;
-use leas_native::e2e::{
+use leas_oracles::e2e::AppKind;
+use leas_oracles::e2e::{
     Aes128GcmVariant, CaseSpec, Certs, Chacha20Poly1305Variant, CoreKind, CoreUnderTest,
     EchoServer, SecurityVariant, TlsEchoServer, TlsVariant, run_against,
 };

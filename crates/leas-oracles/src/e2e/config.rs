@@ -11,8 +11,8 @@ use ring::rand::SecureRandom as _;
 use std::fmt::Write as _;
 
 use super::{CoreKind, Flow, ServerEnv, TlsVariant};
-use crate::NativeConnectParams;
-use crate::addr::{Host, TargetAddr};
+use leas_native::NativeConnectParams;
+use leas_native::addr::{Host, TargetAddr};
 
 pub const UUID: &str = "00000000-0000-0000-0000-000000000000";
 pub const BODY: &str = "hello native core";
@@ -1221,7 +1221,7 @@ mod tests {
     /// the server's pbk/sid, the fingerprint engine sets `fp`, stock TLS leaves
     /// it unset, and `NoTls` omits the object entirely.
     #[rstest]
-    #[case::reality(Box::new(RealityTls::fresh()) as Tls, Some("reality"), None)]
+    #[case::reality(Box::new(RealityTls::fresh()) as Tls, Some("reality"), Some("chrome"))]
     #[case::fingerprint(Box::new(FingerprintTls("chrome")) as Tls, Some("tls"), Some("chrome"))]
     #[case::standard(Box::new(StandardTls) as Tls, Some("tls"), None)]
     #[case::no_tls(Box::new(NoTls) as Tls, None, None)]
@@ -1249,7 +1249,7 @@ mod tests {
 
     #[test]
     fn client_params_xhttp_mode_drives_dialect() {
-        use crate::context::LinkContext;
+        use leas_native::context::LinkContext;
 
         let target = "1.2.3.4:80".parse().unwrap();
         let dest = TargetAddr::new(Host::Domain("dest.test".into()), 80);
@@ -1277,7 +1277,7 @@ mod tests {
 
     #[test]
     fn xhttp3_emits_h3_alpn_both_sides_and_dispatches_quic() {
-        use crate::transport::xhttp::http_version;
+        use leas_native::transport::xhttp::e2e_http_version;
 
         // Server: xray splithttp listener with exactly-one ALPN "h3" → the
         // QUIC/HTTP-3 mode (hub.go isH3; no quic_settings needed).
@@ -1314,7 +1314,7 @@ mod tests {
         assert_eq!(params.protocol.transport_type(), Some("xhttp"));
         let sec = params.protocol.security().unwrap();
         assert_eq!(sec.alpn(), Some("h3"));
-        assert_eq!(http_version(Some(sec)), "3");
+        assert_eq!(e2e_http_version(Some(sec)), "3");
     }
 
     /// A `Flow::Vision` row lands the flow in xray's `settings.clients[0].flow`.

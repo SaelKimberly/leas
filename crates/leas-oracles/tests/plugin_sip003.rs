@@ -11,7 +11,7 @@
 //! Opt-in, like the core binaries: `#[ignore]`d, and run with
 //! ```text
 //! just plugin-bins                                  # installs the pinned binaries
-//! cargo test -p leas-native --features native-e2e --test plugin_sip003 -- --ignored
+//! cargo test -p leas-oracles --test plugin_sip003 -- --ignored
 //! ```
 //!
 //! Two environment inputs, both printed by `just plugin-bins`:
@@ -23,7 +23,6 @@
 //!
 //! `clippy::future_not_send` is allowed file-wide (rstest, see `shadowsocks.rs`).
 #![allow(clippy::future_not_send)]
-#![cfg(feature = "native-e2e")]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,8 +31,8 @@ use leas_native::BoxStream;
 use leas_native::NativeConnectParams;
 use leas_native::addr::{Host, TargetAddr};
 use leas_native::connect;
-use leas_native::e2e::config::BODY;
-use leas_native::e2e::harness::spawn_echo;
+use leas_oracles::e2e::config::BODY;
+use leas_oracles::e2e::harness::spawn_echo;
 use leas_proto::proto_spec::PluginSpec;
 use leas_proto::proto_spec::TlsConfig;
 use leas_proto::proto_spec::TlsOpts;
@@ -456,7 +455,7 @@ async fn wss_row_connects_and_its_negative_fails_verification() {
     let dir = plugin_dir();
     let echo = spawn_echo();
     let target = TargetAddr::new(Host::Ip(echo.addr.ip()), echo.addr.port());
-    let certs = leas_native::e2e::harness::generate_certs();
+    let certs = leas_oracles::e2e::harness::generate_certs();
 
     // v2ray-plugin in server mode with `tls` needs material: with no `cert`/`key`
     // it looks for `~/.acme.sh/<host>/fullchain.cer` and exits 23.

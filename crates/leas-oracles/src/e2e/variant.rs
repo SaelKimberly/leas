@@ -118,10 +118,10 @@ impl TlsVariant for StandardTls {
     }
     fn client_trust(&self, certs: &Certs) {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        crate::security::fingerprint::set_test_ca(&certs.ca_der);
+        leas_native::security::fingerprint::set_test_ca(&certs.ca_der);
         // The h3 (QUIC) arm's rustls is quinn-internal — the engine verifier
         // never sees it, so the harness CA needs its own hook (SP5 T4).
-        crate::transport::quic::set_test_ca(&certs.ca_der);
+        leas_native::transport::quic::set_test_ca(&certs.ca_der);
     }
 }
 
@@ -145,8 +145,8 @@ impl TlsVariant for PqTls {
     }
     fn client_trust(&self, certs: &Certs) {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        crate::security::fingerprint::set_test_ca(&certs.ca_der);
-        crate::transport::quic::set_test_ca(&certs.ca_der);
+        leas_native::security::fingerprint::set_test_ca(&certs.ca_der);
+        leas_native::transport::quic::set_test_ca(&certs.ca_der);
     }
 }
 
@@ -168,7 +168,7 @@ impl TlsVariant for FingerprintTls {
         Some(self.0)
     }
     fn client_trust(&self, certs: &Certs) {
-        crate::security::fingerprint::set_test_ca(&certs.ca_der);
+        leas_native::security::fingerprint::set_test_ca(&certs.ca_der);
     }
 }
 
@@ -333,7 +333,7 @@ impl TlsVariant for RealityServerPlainClientTls {
         self.0.reality_sid()
     }
     fn client_trust(&self, certs: &Certs) {
-        crate::security::fingerprint::set_test_ca(&certs.ca_der);
+        leas_native::security::fingerprint::set_test_ca(&certs.ca_der);
     }
     fn probe_dest(&self) -> bool {
         true

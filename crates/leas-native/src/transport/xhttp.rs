@@ -157,6 +157,15 @@ pub(crate) fn http_version(security: Option<&SecurityConfig>) -> &'static str {
     }
 }
 
+/// E2E-only view of [`http_version`] for the external oracle crate's config
+/// tests.
+#[cfg(feature = "e2e-support")]
+#[doc(hidden)]
+#[must_use]
+pub fn e2e_http_version(security: Option<&SecurityConfig>) -> &'static str {
+    http_version(security)
+}
+
 /// Build a request with Host + config headers + Referer padding (shared by
 /// the h1/h2 hyper arm and the h3 arm — the body is unit; callers map in
 /// their transport's body type).

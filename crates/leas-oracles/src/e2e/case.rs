@@ -10,8 +10,8 @@ use super::{
     Certs, ConnectExpect, CoreKind, E2eCase, E2eExpect, SecurityVariant, ServerEnv, StandardTls,
     TlsVariant, config,
 };
-use crate::NativeConnectParams;
-use crate::protocol::vless::PacketMode;
+use leas_native::NativeConnectParams;
+use leas_native::protocol::vless::PacketMode;
 use leas_proto::proto_spec::common::TransportConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

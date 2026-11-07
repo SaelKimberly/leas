@@ -2,7 +2,9 @@
 //!
 //! Consumers implement [`E2eCase`] to describe one scenario (label, server
 //! config, client params, expectations); a driver (Task 3) runs them against
-//! resolved core binaries. Gated behind feature `native-e2e`.
+//! resolved core binaries. The crate is dev-only: it is excluded from the
+//! workspace's `default-members` and built only by an explicit
+//! `-p leas-oracles`.
 
 pub mod case;
 pub mod config;
@@ -28,22 +30,14 @@ pub use variant::{
     SecurityVariant, StandardTls, TlsVariant,
 };
 
-use crate::{NativeConnectParams, NativeError};
+use leas_native::{NativeConnectParams, NativeError};
+
+use crate::pins;
 
 /// Core version strings for the e2e sweep (single source of truth; tests
 /// import these instead of duplicating constants).
-pub const SINGBOX_VERSION: &str = "1.13.16";
-pub const XRAY_VERSION: &str = "26.3.27";
-
-/// The SECOND pinned peer: `thirdparty/Xray-core` built from source at HEAD.
-///
-/// A separate pin on purpose. Pointing `LEAS_CORE_BIN_DIR` at a HEAD build
-/// would re-baseline every row in the suite and silently restate its
-/// compatibility claim; this pin exists so one differential can target HEAD
-/// while `XRAY_VERSION` stays the baseline. Only the pq-enc row uses it.
-pub const XRAY_HEAD_VERSION: &str = "26.7.28";
-/// Env var naming the directory that holds the HEAD-built `xray` binary.
-pub const XRAY_HEAD_BIN_DIR: &str = "LEAS_CORE_HEAD_BIN_DIR";
+pub const SINGBOX_VERSION: &str = pins::SINGBOX_VERSION;
+pub const XRAY_VERSION: &str = pins::XRAY_VERSION;
 
 /// Environment handed to an [`E2eCase`]'s `server_config` builder.
 pub struct ServerEnv<'a> {
@@ -91,7 +85,7 @@ impl Default for E2eExpect {
         Self {
             connect: ConnectExpect::Ok,
             status: 200,
-            body: crate::e2e::config::BODY.to_string(),
+            body: config::BODY.to_string(),
         }
     }
 }
@@ -205,7 +199,7 @@ pub async fn run_against(
             // tls_echo recording) — then skip the probe (there is no tunnel
             // to probe). Accepting *any* connect error here would let an
             // unrelated failure (server not up, timeout) pass the case.
-            match crate::connect(params).await {
+            match leas_native::connect(params).await {
                 Ok(_) => {
                     return Err(format!(
                         "{}: expected RealityFallback, got a connection",
@@ -281,7 +275,7 @@ pub async fn run_against(
             );
             continue;
         }
-        let mut tunnel = match crate::connect(params).await {
+        let mut tunnel = match leas_native::connect(params).await {
             Ok(t) => t,
             Err(e) => {
                 eprintln!(
@@ -328,14 +322,14 @@ pub async fn run_against(
 /// The engine `TlsStream` sits one or two wrappers down the boxed seam
 /// (`VlessClientStream` / `VmessClientStream` response-header peel); the
 /// walk recovers it through the `Any` supertrait like the vision splice.
-fn outer_tls_negotiated_hybrid(stream: &crate::BoxStream) -> bool {
-    use crate::protocol::vless::stream::VlessClientStream;
-    use crate::protocol::vmess::stream::VmessClientStream;
+fn outer_tls_negotiated_hybrid(stream: &leas_native::BoxStream) -> bool {
+    use leas_native::protocol::vless::stream::VlessClientStream;
+    use leas_native::protocol::vmess::stream::VmessClientStream;
     use leas_tls::record::stream::TlsStream;
 
-    fn hybrid(s: &crate::BoxStream) -> bool {
+    fn hybrid(s: &leas_native::BoxStream) -> bool {
         let any: &dyn std::any::Any = &**s;
-        any.downcast_ref::<TlsStream<crate::BoxStream>>()
+        any.downcast_ref::<TlsStream<leas_native::BoxStream>>()
             .is_some_and(leas_tls::record::stream::TlsStream::negotiated_hybrid)
     }
 

@@ -1,12 +1,11 @@
 //! Throughput benches: bulk send/recv per native config (spec
 //! `docs/superpowers/specs/2026-09-04-native-throughput-bench-design.md`).
-#![cfg(feature = "native-e2e")]
 
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use leas_native::NativeTunnel;
-use leas_native::e2e::{
+use leas_oracles::e2e::{
     Aes128GcmVariant, CaseSpec, Certs, Chacha20Poly1305Variant, CoreKind, CoreUnderTest, E2eCase,
     FingerprintTls, Flow, NoTls, RealityTls, SINGBOX_VERSION, ServerEnv, XRAY_VERSION,
     generate_certs,

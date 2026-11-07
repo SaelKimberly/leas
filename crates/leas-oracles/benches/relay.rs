@@ -9,7 +9,6 @@
 //! shape, `server/mod.rs:104-112`). Every measured nanosecond belongs to this
 //! crate — nothing here resolves or spawns an external core, so no row can
 //! skip.
-#![cfg(feature = "native-e2e")]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -18,8 +17,8 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use leas_native::addr::{Host, TargetAddr};
-use leas_native::e2e::harness::{spawn_sink, spawn_source, spawn_udp_echo};
 use leas_native::inbound::{Outbound, OutboundKind, Socks5Inbound, Socks5InboundConfig, socks5};
+use leas_oracles::e2e::harness::{spawn_sink, spawn_source, spawn_udp_echo};
 use leas_route::Engine;
 use leas_route::ir::{DefaultRoute, ResolveStrategy, RuleSet};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

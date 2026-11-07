@@ -232,10 +232,12 @@ impl VlessClientStream {
         &mut self.inner
     }
 
-    /// The wrapped stream, shared (the e2e PQ assertion recovers the
+    /// The wrapped stream, shared (the external e2e PQ assertion recovers the
     /// engine `TlsStream` through the peel wrapper).
-    #[cfg_attr(not(feature = "native-e2e"), allow(dead_code))] // e2e PQ assertion only
-    pub(crate) fn inner(&self) -> &BoxStream {
+    #[cfg(feature = "e2e-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inner(&self) -> &BoxStream {
         &self.inner
     }
 }

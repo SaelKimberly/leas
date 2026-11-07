@@ -1,8 +1,9 @@
 //! E2E harness: local HTTP echo, real core server spawn, certs, probe.
 //!
-//! Gating: feature `native-e2e` AND env `LEAS_CORE_BIN_DIR` pointing at
-//! a directory containing `xray` and/or `sing-box` binaries. Absent → callers
-//! skip (eprintln + early return). Never downloads anything.
+//! The cores come from `LEAS_CORE_BIN_DIR` when set, else from the directory
+//! `build.rs` fetched into (`OUT_DIR/core-bin`). This module itself never
+//! downloads: `cargo check`/`clippy` of the crate can run with
+//! `LEAS_ORACLES_SKIP_DOWNLOAD=1`.
 
 use std::io::Read as _;
 use std::net::{SocketAddr, TcpListener};
@@ -410,6 +411,9 @@ impl Drop for CoreGuard {
 /// port too (measured: 80/80 unconnected sends to a closed loopback port time
 /// out; 60/60 connected ones report `ConnectionRefused`). That made every
 /// UDP-readiness call a no-op.
+///
+/// Windows surfaces the same ICMP port-unreachable as `WSAECONNRESET`
+/// (`ConnectionReset`), so both kinds mean "not ready".
 fn udp_ready(port: u16) -> bool {
     use std::net::UdpSocket;
     let Ok(sock) = UdpSocket::bind("127.0.0.1:0") else {
@@ -423,7 +427,10 @@ fn udp_ready(port: u16) -> bool {
     let mut buf = [0u8; 4];
     !matches!(
         sock.recv(&mut buf),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused
+        Err(e) if matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+        )
     )
 }
 
@@ -564,7 +571,7 @@ where
 /// Fully bounded: the write fails fast on a broken tunnel instead of
 /// blocking. Returns `(0, String::new())` on a timeout or short read — the
 /// e2e tests retry the whole connection on such outcomes.
-pub async fn probe(tunnel: &mut crate::NativeTunnel) -> (u16, String) {
+pub async fn probe(tunnel: &mut leas_native::NativeTunnel) -> (u16, String) {
     http_exchange(tunnel).await
 }
 
@@ -578,7 +585,7 @@ pub async fn probe(tunnel: &mut crate::NativeTunnel) -> (u16, String) {
 /// the target). Consumes the tunnel: the engine client takes ownership of
 /// the stream. Returns `(0, String::new())` when the inner session cannot
 /// be established (the e2e runner retries the whole connection).
-pub async fn probe_inner_tls(tunnel: crate::NativeTunnel) -> (u16, String) {
+pub async fn probe_inner_tls(tunnel: leas_native::NativeTunnel) -> (u16, String) {
     use leas_tls::client::{TlsConfig, connect as tls_connect};
     use leas_tls::fingerprints::{Browser, Fingerprint};
     use leas_tls::handshake::ServerVerifier;
@@ -624,7 +631,7 @@ const UDP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Probe the case protocol's UDP path over a datagram tunnel.
 ///
-/// Establishes the tunnel via [`crate::connect_udp`], sends
+/// Establishes the tunnel via [`leas_native::connect_udp`], sends
 /// [`UDP_PROBE_COUNT`] distinct payloads to the case target, and receives
 /// until every echo arrives (matched by payload, order-independent) or the
 /// deadline expires. Fully bounded: the whole exchange (connect, sends,
@@ -633,9 +640,9 @@ const UDP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// echoes received; the e2e runner asserts both equal
 /// [`UDP_PROBE_COUNT`]. Returns `(0, 0)` on a failed connect or a deadline
 /// expiry before any datagram was sent.
-pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
+pub async fn probe_udp(params: &leas_native::NativeConnectParams) -> (usize, usize) {
     let deadline = tokio::time::Instant::now() + UDP_PROBE_TIMEOUT;
-    let mut conn = match tokio::time::timeout_at(deadline, crate::connect_udp(params)).await {
+    let mut conn = match tokio::time::timeout_at(deadline, leas_native::connect_udp(params)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             eprintln!("probe_udp connect error: {e}");
@@ -656,17 +663,17 @@ pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
     // (packetaddr rejects domains client-side), so `None` — the header
     // destination — is the right argument there.
     let dest = match &params.target.host {
-        crate::addr::Host::Ip(ip) => Some(SocketAddr::new(*ip, params.target.port)),
-        crate::addr::Host::Domain(_) => None,
+        leas_native::addr::Host::Ip(ip) => Some(SocketAddr::new(*ip, params.target.port)),
+        leas_native::addr::Host::Domain(_) => None,
     };
     udp_exchange(&mut conn, dest, deadline).await
 }
 
 /// Probe the VLESS XUDP path — datagrams through the mux tunnel.
 ///
-/// Establishes the tunnel via [`crate::connect_udp`] with `params.mux`
-/// (the mux tunnel → one UDP session → the [`crate::PacketMode::XUdp`]
-/// [`crate::PacketConn`]; the `xtls-rprx-vision-udp443` flow forces the same
+/// Establishes the tunnel via [`leas_native::connect_udp`] with `params.mux`
+/// (the mux tunnel → one UDP session → the [`leas_native::PacketMode::XUdp`]
+/// [`leas_native::PacketConn`]; the `xtls-rprx-vision-udp443` flow forces the same
 /// path), sends [`UDP_PROBE_COUNT`] distinct payloads to the case target,
 /// and receives until every echo arrives (matched by payload,
 /// order-independent) or the deadline expires. Fully bounded: the whole
@@ -677,9 +684,9 @@ pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
 /// `(sent, received)` — the e2e runner asserts both equal
 /// [`UDP_PROBE_COUNT`]. Returns `(0, 0)` on a failed connect or a
 /// deadline expiry before any datagram was sent.
-pub async fn probe_udp_mux(params: &crate::NativeConnectParams) -> (usize, usize) {
+pub async fn probe_udp_mux(params: &leas_native::NativeConnectParams) -> (usize, usize) {
     let deadline = tokio::time::Instant::now() + UDP_PROBE_TIMEOUT;
-    let mut conn = match tokio::time::timeout_at(deadline, crate::connect_udp(params)).await {
+    let mut conn = match tokio::time::timeout_at(deadline, leas_native::connect_udp(params)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             eprintln!("probe_udp_mux connect error: {e}");
@@ -693,8 +700,8 @@ pub async fn probe_udp_mux(params: &crate::NativeConnectParams) -> (usize, usize
     // XUDP carries the per-packet destination in the mux frames — always
     // Some (the UDP echo target).
     let dest = match &params.target.host {
-        crate::addr::Host::Ip(ip) => Some(SocketAddr::new(*ip, params.target.port)),
-        crate::addr::Host::Domain(_) => None,
+        leas_native::addr::Host::Ip(ip) => Some(SocketAddr::new(*ip, params.target.port)),
+        leas_native::addr::Host::Domain(_) => None,
     };
     udp_exchange(&mut conn, dest, deadline).await
 }
@@ -705,7 +712,7 @@ pub async fn probe_udp_mux(params: &crate::NativeConnectParams) -> (usize, usize
 /// every echo arrives (matched by payload, order-independent) or the
 /// deadline expires. Returns `(sent, received)`.
 async fn udp_exchange(
-    conn: &mut crate::PacketTunnel,
+    conn: &mut leas_native::PacketTunnel,
     dest: Option<SocketAddr>,
     deadline: tokio::time::Instant,
 ) -> (usize, usize) {
@@ -749,7 +756,7 @@ async fn udp_exchange(
 }
 
 /// The number of concurrent sessions [`probe_mux`] opens through one
-/// [`crate::MuxClient`], each carrying a distinct HTTP GET to the echo
+/// [`leas_native::MuxClient`], each carrying a distinct HTTP GET to the echo
 /// target; the e2e runner requires every response back.
 pub const MUX_SESSION_COUNT: usize = 4;
 
@@ -791,7 +798,7 @@ where
     parse_http_response(&buf)
 }
 
-/// Probe the VLESS mux path: one [`crate::connect_mux`] tunnel,
+/// Probe the VLESS mux path: one [`leas_native::connect_mux`] tunnel,
 /// [`MUX_SESSION_COUNT`] concurrent sessions to the echo target, each with
 /// a distinct HTTP GET, every response asserted (order-independent).
 ///
@@ -800,10 +807,13 @@ where
 /// of sessions successfully opened and the number whose response matched
 /// the echo (status 200 + [`super::config::BODY`]); the e2e runner asserts
 /// both equal [`MUX_SESSION_COUNT`]. Returns `(0, 0)` on a failed connect.
-pub async fn probe_mux(params: &crate::NativeConnectParams, target: SocketAddr) -> (usize, usize) {
-    use crate::addr::{Host, TargetAddr};
+pub async fn probe_mux(
+    params: &leas_native::NativeConnectParams,
+    target: SocketAddr,
+) -> (usize, usize) {
+    use leas_native::addr::{Host, TargetAddr};
     let deadline = tokio::time::Instant::now() + MUX_PROBE_TIMEOUT;
-    let client = match tokio::time::timeout_at(deadline, crate::connect_mux(params)).await {
+    let client = match tokio::time::timeout_at(deadline, leas_native::connect_mux(params)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             eprintln!("probe_mux connect error: {e}");
