@@ -211,11 +211,6 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
 
     // (channels already created in AppState::new)
 
-    // Trigger startup version check if enabled
-    if state.config.updates.check_on_startup {
-        state.spawn_update_check();
-    }
-
     // Initial logs no longer loaded here — deferred to first Logs tab access (lazy loading).
     // Draw the first frame now; the gate below would otherwise wait a full
     // refresh_interval before anything appears on screen.
@@ -597,7 +592,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     if matches!(&state.mode, crate::AppMode::Settings { .. }) {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if state.connected_core.is_some() && state.confirmation.is_none() {
+                if state.connected && state.confirmation.is_none() {
                     state.confirmation = Some(ConfirmAction::Quit);
                 } else {
                     state.should_quit = true;
@@ -629,7 +624,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if state.connected_core.is_some() && state.confirmation.is_none() {
+                if state.connected && state.confirmation.is_none() {
                     state.confirmation = Some(ConfirmAction::Quit);
                 } else {
                     state.should_quit = true;
@@ -1102,20 +1097,18 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.mode = crate::AppMode::Help;
         }
         KeyCode::Char('q' | 'Q') => {
-            if state.connected_core.is_some() && state.confirmation.is_none() {
+            if state.connected && state.confirmation.is_none() {
                 state.confirmation = Some(ConfirmAction::Quit);
             } else {
                 state.should_quit = true;
             }
         }
-        KeyCode::Char('d')
-            if key.modifiers.contains(KeyModifiers::CONTROL) && state.connected_core.is_some() =>
-        {
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) && state.connected => {
             state.disconnect();
         }
 
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if state.connected_core.is_some() && state.confirmation.is_none() {
+            if state.connected && state.confirmation.is_none() {
                 state.confirmation = Some(ConfirmAction::Quit);
             } else {
                 state.should_quit = true;
@@ -1357,7 +1350,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.log_trace("warn", "tui::ui", "No active protocol to copy");
                 return;
             };
-            let essentials = leas_core::config_builder::endpoint_essentials(&endpoint, &addresses);
+            let essentials = leas_db::models::endpoint_essentials(&endpoint, &addresses);
             let url = match crate::state::load_protocol_with_config(&state.db, pid).await {
                 Ok(Some(p)) if !p.config.is_unloaded() => {
                     p.config.get().0.reconstruct_proto(&essentials).ok()
@@ -1537,7 +1530,7 @@ mod overlay_tests {
                     mode: crate::SettingsMode::Split {
                         focus: crate::SplitFocus::Tree,
                         right: crate::SplitRightPane::Form {
-                            section: crate::SettingsSection::Core,
+                            section: crate::SettingsSection::Gui,
                             fields: Vec::new(),
                             focus_index: 0,
                             form_errors: std::collections::HashMap::new(),

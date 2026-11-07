@@ -33,6 +33,7 @@ compact_str = { version = "0.10", features = ["serde"] }
 crc32fast = { version = "1" }
 criterion = { version = "0.8", features = ["async_tokio"] }
 crossbeam-epoch = { version = "0.9" }
+crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 data-encoding = { version = "2" }
 digest = { version = "0.11", features = ["alloc", "mac", "oid", "zeroize"] }
@@ -48,7 +49,6 @@ getrandom = { version = "0.4", default-features = false, features = ["std", "sys
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hashbrown = { version = "0.17" }
 http = { version = "1" }
-http-body-util = { version = "0.1", features = ["channel"] }
 httparse = { version = "1" }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
@@ -88,6 +88,7 @@ sha2 = { version = "0.11", features = ["zeroize"] }
 shake = { version = "0.1" }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 siphasher = { version = "1" }
+slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
 stable_deref_trait = { version = "1", default-features = false, features = ["alloc"] }
 strum = { version = "0.28", default-features = false, features = ["derive", "std"] }
@@ -182,14 +183,15 @@ zstd-sys = { version = "2", default-features = false, features = ["legacy", "std
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
+http-body-util = { version = "0.1", features = ["channel"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["io_uring", "pipe", "process", "stdio", "system", "termios", "time"] }
 simd-adler32 = { version = "0.3" }
-slab = { version = "0.4" }
 time = { version = "0.3", default-features = false, features = ["formatting", "parsing"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip", "follow-redirect"] }
 
@@ -203,11 +205,12 @@ time = { version = "0.3", default-features = false, features = ["formatting", "l
 
 [target.x86_64-pc-windows-msvc.dependencies]
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
+http-body-util = { version = "0.1", features = ["channel"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 simd-adler32 = { version = "0.3" }
-slab = { version = "0.4" }
 time = { version = "0.3", default-features = false, features = ["formatting", "parsing"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip", "follow-redirect"] }
 winapi = { version = "0.3", default-features = false, features = ["consoleapi", "handleapi", "impl-default", "processenv", "synchapi", "sysinfoapi", "winbase", "winerror", "winuser"] }
@@ -221,11 +224,12 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 
 [target.x86_64-pc-windows-gnu.dependencies]
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
+http-body-util = { version = "0.1", features = ["channel"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 simd-adler32 = { version = "0.3" }
-slab = { version = "0.4" }
 time = { version = "0.3", default-features = false, features = ["formatting", "parsing"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip", "follow-redirect"] }
 winapi = { version = "0.3", default-features = false, features = ["consoleapi", "handleapi", "impl-default", "processenv", "synchapi", "sysinfoapi", "winbase", "winerror", "winuser"] }
@@ -352,4 +356,8 @@ ignored = [
     "zstd",
     "zstd-safe",
     "zstd-sys",
+    "bumpalo",
+    "http",
+    "httparse",
+    "zip",
 ]

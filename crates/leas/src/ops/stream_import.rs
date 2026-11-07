@@ -651,7 +651,7 @@ pub async fn import_http_subscription(
         .user_agent(user_agent)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
-        .redirect(leas_core::updater::safe_redirect_policy(false));
+        .redirect(leas_core::http::safe_redirect_policy(false));
     if let Some(proxy) = proxy {
         let proxy_url = proxy.socks5h_url();
         match reqwest::Proxy::all(&proxy_url) {

@@ -965,12 +965,23 @@ fn format_speed_mibps(bps: u64) -> String {
 /// Protocol cell: the representative link's protocol kind, right aligned in
 /// the fixed-width column (the header is padded to match in `GRID_COLUMNS`).
 fn protocol_cell(row: &EndpointRow, dns_unresolved: bool) -> String {
-    let kind = row
+    let proto = row
         .representative_link_index(dns_unresolved)
         .and_then(|idx| row.links.get(idx))
-        .and_then(|l| row.protocols.get(&l.protocol_id))
-        .map_or_else(|| "—".to_string(), |p| p.proto_kind.to_string());
-    format!("{kind:>PROTOCOL_WIDTH$}")
+        .and_then(|l| row.protocols.get(&l.protocol_id));
+    let Some(proto) = proto else {
+        return format!("{:>PROTOCOL_WIDTH$}", "—");
+    };
+    let kind = proto.proto_kind.to_string();
+    // D16: an unsupported kind stays visible and carries a marker; connect
+    // refuses it with `support_reason`. Config-level refusals need the loaded
+    // config, so they surface on the connect attempt instead.
+    if leas_native::capability::kind_supported(proto.proto_kind) {
+        format!("{kind:>PROTOCOL_WIDTH$}")
+    } else {
+        // Keep the column width: the marker replaces the leftmost padded cell.
+        format!("{kind:>PROTOCOL_WIDTH$}").replacen(' ', "!", 1)
+    }
 }
 
 /// Config cell: the representative link's `transport/security` pair, left
@@ -1799,8 +1810,6 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &opalin
             ))
         },
         |row| {
-            let core = state.resolved_core(row);
-
             let host = row.endpoint.display_host(&row.resolved_ips);
             let addr = if host.is_empty() {
                 "-".to_string()
@@ -1811,7 +1820,6 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &opalin
             Line::from(vec![
                 Span::styled(" Server: ", ThemeStyles::footer_label(theme)),
                 Span::styled(format!("{addr}:{port}  "), ThemeStyles::footer_value(theme)),
-                Span::styled(format!("[{core}] "), ThemeStyles::footer_value(theme)),
             ])
         },
     );

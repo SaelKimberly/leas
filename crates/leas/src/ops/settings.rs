@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use leas_config::IpProvider;
-use leas_core::CoreType;
 use leas_db::models::RoutingRule;
 
 use crate::AppState;
@@ -24,7 +23,7 @@ pub async fn enter_settings(state: &mut AppState) {
     state.settings_sections = crate::types::SectionList::default();
     state.settings_search = crate::types::SettingsSearch::default();
     state.settings_notice = None;
-    let section = crate::SettingsSection::Core;
+    let section = crate::SettingsSection::Gui;
     let right = state.build_right_pane(section).await;
     state.mode = AppMode::Settings {
         mode: SettingsMode::Split {
@@ -39,31 +38,9 @@ pub async fn build_settings_fields(
     section: SettingsSection,
 ) -> Vec<(String, String)> {
     use crate::SettingsSection::{
-        Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
-        Subscriptions, SystemProxy, Tun, Updates,
+        Dns, Gui, Inbound, Logging, Mux, Routing, SpeedTest, Subscriptions, SystemProxy, Tun,
     };
     match section {
-        Core => {
-            vec![
-                (
-                    "xray_path".into(),
-                    state.config.core.xray_path.clone().unwrap_or_default(),
-                ),
-                (
-                    "sing_box_path".into(),
-                    state.config.core.sing_box_path.clone().unwrap_or_default(),
-                ),
-                ("log_level".into(), state.config.core.log_level.clone()),
-                (
-                    "skip_cert_verify".into(),
-                    state.config.core.skip_cert_verify.to_string(),
-                ),
-                (
-                    "clash_mixin".into(),
-                    state.config.clash_mixin.clone().unwrap_or_default(),
-                ),
-            ]
-        }
         Gui => {
             vec![
                 ("language".into(), state.config.gui.language.clone()),
@@ -223,18 +200,7 @@ pub async fn build_settings_fields(
                 ),
             ]
         }
-        Stats => {
-            vec![(
-                "enabled".into(),
-                state.config.statistics.enabled.to_string(),
-            )]
-        }
-        // All 22 protocols, defaulting to "Auto": the form must render every
-        // PROTOCOL_CORE_DEFS entry even when no overrides are saved, or the
-        // Select Left/Right handler indexes `fields[focus_index]` against an
-        // empty vec (panic "index out of bounds: the len is 0 but the index
-        // is 0").
-        ProtocolCore => protocol_core_form_fields(&state.config.core.protocol_core_overrides),
+
         SpeedTest => {
             vec![
                 ("ping_url".into(), state.config.speed_test.ping_url.clone()),
@@ -321,6 +287,7 @@ pub async fn build_settings_fields(
                 ),
             ]
         }
+
         Dns => {
             if let Ok(Some(dns)) = state.db.get_dns_settings().await {
                 vec![
@@ -358,12 +325,7 @@ pub async fn build_settings_fields(
                 ]
             }
         }
-        Updates => {
-            vec![(
-                "check_on_startup".into(),
-                state.config.updates.check_on_startup.to_string(),
-            )]
-        }
+
         // Routing/Subscriptions list panes build their own state; RouteProbes
         // loads in build_right_pane (async db read can't live here).
         Routing | Subscriptions | crate::SettingsSection::RouteProbes => vec![],
@@ -392,8 +354,7 @@ fn apply_settings_fields(
     fields: &[(String, String)],
 ) {
     use crate::SettingsSection::{
-        Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
-        Subscriptions, SystemProxy, Tun, Updates,
+        Dns, Gui, Inbound, Logging, Mux, Routing, SpeedTest, Subscriptions, SystemProxy, Tun,
     };
     let get_str = |key: &str| -> &str {
         fields
@@ -411,22 +372,6 @@ fn apply_settings_fields(
         }
     };
     match section {
-        Core => {
-            state.config.core.xray_path = get_opt("xray_path");
-            state.config.core.sing_box_path = get_opt("sing_box_path");
-            if !get_str("log_level").is_empty() {
-                state.config.core.log_level = get("log_level");
-            }
-            state.config.core.skip_cert_verify = get_str("skip_cert_verify") == "true";
-            state.config.clash_mixin = {
-                let v = get_str("clash_mixin");
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.to_owned())
-                }
-            };
-        }
         Gui => {
             state.config.gui.language = get("language");
             let theme_slug = get_str("theme");
@@ -486,26 +431,7 @@ fn apply_settings_fields(
             state.config.mux.fragment_length = get_opt("fragment_length");
             state.config.mux.fragment_interval = get_opt("fragment_interval");
         }
-        Stats => {
-            state.config.statistics.enabled = get_str("enabled") == "true";
-        }
-        ProtocolCore => {
-            for (key, val) in fields {
-                if val == "Auto" {
-                    state
-                        .config
-                        .core
-                        .protocol_core_overrides
-                        .remove(key.as_str());
-                } else {
-                    state
-                        .config
-                        .core
-                        .protocol_core_overrides
-                        .insert(key.clone(), val.clone());
-                }
-            }
-        }
+
         SpeedTest => {
             if !get_str("ping_url").is_empty() {
                 state.config.speed_test.ping_url = get("ping_url");
@@ -566,7 +492,7 @@ fn apply_settings_fields(
             }
         }
         // Dns, Routing and RouteProbes are handled separately (DB-backed)
-        Dns | Routing | Updates | Subscriptions | crate::SettingsSection::RouteProbes => {}
+        Dns | Routing | Subscriptions | crate::SettingsSection::RouteProbes => {}
         Logging => {
             if let Ok(d) = humantime::parse_duration(get_str("log_ttl_secs")) {
                 *state.config.logging.ttl_secs = d;
@@ -589,18 +515,7 @@ pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) ->
             state.reload_routing_rules().await;
             SplitRightPane::RoutingList { selected: 0 }
         }
-        SettingsSection::Updates => SplitRightPane::UpdateForm {
-            status_xray: state
-                .update_status
-                .get(&CoreType::Xray)
-                .cloned()
-                .unwrap_or_default(),
-            status_singbox: state
-                .update_status
-                .get(&CoreType::SingBox)
-                .cloned()
-                .unwrap_or_default(),
-        },
+
         SettingsSection::Subscriptions => SplitRightPane::GroupList {
             selected: 0,
             selected_mask: vec![false; state.groups.len()],
@@ -877,57 +792,13 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
     }
 }
 
-/// One form field per protocol in `PROTOCOL_CORE_DEFS`, in def order.
-/// Missing overrides default to "Auto" so the form field list always matches
-/// the field definitions — a mismatch lets the Select Left/Right handler
-/// index `fields[focus_index]` past an empty vec (panic, see build arm).
-fn protocol_core_form_fields(overrides: &HashMap<String, String>) -> Vec<(String, String)> {
-    crate::ui::settings::PROTOCOL_CORE_DEFS
-        .iter()
-        .map(|(key, _, _)| {
-            (
-                (*key).to_string(),
-                overrides
-                    .get(*key)
-                    .cloned()
-                    .unwrap_or_else(|| "Auto".to_string()),
-            )
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::apply_settings_fields;
     use super::build_settings_fields;
-    use super::protocol_core_form_fields;
     use super::save_route_probes;
     use crate::AppState;
     use crate::types::SettingsSection;
-    use crate::ui::settings::PROTOCOL_CORE_DEFS;
-    use rstest::rstest;
-    use std::collections::HashMap;
-
-    /// Regression: pressing Right on the Protocol Core form panicked
-    /// ("index out of bounds: the len is 0 but the index is 0") because the
-    /// fields vec was empty when no overrides were saved, while the field
-    /// defs (22 protocols) were not. Both the populated and the empty override
-    /// map are rows of one table: every def key must appear exactly once, in
-    /// def order, and a key with no override must read "Auto".
-    #[rstest]
-    #[case::protocol_core_fields_cover_all_defs_with_auto_default(
-        HashMap::from([("vless".to_string(), "Xray".to_string())])
-    )]
-    #[case::protocol_core_fields_empty_overrides_all_auto(HashMap::new())]
-    fn protocol_core_form_fields_table(#[case] overrides: HashMap<String, String>) {
-        let fields = protocol_core_form_fields(&overrides);
-        assert_eq!(fields.len(), PROTOCOL_CORE_DEFS.len());
-        for ((key, val), (def_key, _, _)) in fields.iter().zip(PROTOCOL_CORE_DEFS) {
-            assert_eq!(key, def_key, "field order/keys must match the defs");
-            let expected = overrides.get(key.as_str()).map_or("Auto", String::as_str);
-            assert_eq!(val, expected, "unsaved protocols must default to Auto");
-        }
-    }
 
     /// The exit-IP provider crosses three representations on one save: the
     /// Select's option string, the stored field value, and the enum the apply

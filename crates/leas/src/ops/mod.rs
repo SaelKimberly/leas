@@ -1,7 +1,6 @@
 pub mod clipboard;
 pub mod compact;
 pub mod connect;
-pub mod core;
 pub mod db_monitor;
 pub mod enrich;
 pub mod events;
@@ -17,4 +16,3 @@ pub mod settings;
 pub mod speed_test;
 pub mod stream_import;
 pub mod subscriptions;
-pub mod updates;

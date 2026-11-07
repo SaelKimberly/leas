@@ -1,8 +1,8 @@
 use tracing::warn;
 
-use crate::bin_manager::{BinError, get_core_info};
-use crate::config_builder::BackendConfig;
-use crate::core_type::CoreType;
+use crate::oracle_adapters::bin_manager::{BinError, get_core_info};
+use crate::oracle_adapters::config_builder::BackendConfig;
+use crate::oracle_adapters::core_type::CoreType;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncBufReadExt;
@@ -579,7 +579,9 @@ mod tests {
         let result = mgr
             .start(
                 CoreType::Xray,
-                &BackendConfig::Xray(crate::config_builder::xray::XrayConfig::default()),
+                &BackendConfig::Xray(
+                    crate::oracle_adapters::config_builder::xray::XrayConfig::default(),
+                ),
                 Path::new("/nonexistent/binary"),
                 None,
             )

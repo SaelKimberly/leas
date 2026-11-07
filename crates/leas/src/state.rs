@@ -6,7 +6,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use leas_config::AppConfig;
-use leas_core::CoreType;
 use leas_core::grpc_client;
 use leas_core::log_heed::HeedLogStorage;
 use leas_core::speed_test::TestType;
@@ -24,10 +23,8 @@ use leas_proto::proto_spec::{
 };
 use toasty::{Deferred, Json};
 
-use crate::BackendUpdateStatus;
 use crate::ops::{
     compact, connect, events, ping, profiles, scheduler, settings, speed_test, subscriptions,
-    updates,
 };
 use crate::types::{
     AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, FocusedPane, LogLine,
@@ -204,7 +201,7 @@ pub struct AppState {
     pub log_viewport_rows: Cell<usize>,
     pub search_query: String,
     pub search_focused: bool,
-    pub connected_core: Option<CoreType>,
+    pub connected: bool,
     /// Local SOCKS5 endpoint of the live tunnel; subscription fetches ride it.
     pub live_proxy: Arc<LiveProxy>,
     pub connecting: bool,
@@ -242,7 +239,6 @@ pub struct AppState {
     /// `(endpoint_id, protocol_id)` like `testing_profiles`.
     pub testing_details: HashMap<(i64, i64), TestType>,
     /// Cached update status for both backends.
-    pub update_status: HashMap<CoreType, BackendUpdateStatus>,
     pub actions_compact: bool,
     pub connected_protocol_id: Option<i64>,
     /// Shared stop flag for batch speed tests.
@@ -330,7 +326,6 @@ pub struct AppState {
     /// `TuiLogLayer` and core log forwarder send `LogMessage` here; background writer batches and writes to heed.
     pub log_sender_tx: Option<std::sync::mpsc::SyncSender<leas_core::log_heed::LogMessage>>,
     /// Channel sender for core subprocess log lines (String lines from stdout/stderr).
-    pub core_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Whether initial logs have been loaded from heed into `log_cache` yet.
     pub logs_loaded: bool,
 
@@ -791,7 +786,6 @@ impl AppState {
             settings_sections: SectionList::default(),
             settings_search: SettingsSearch::default(),
             settings_notice: None,
-            update_status: HashMap::new(),
             endpoints: Vec::new(),
             filter_cache_valid: Cell::new(true),
             page_total: 0,
@@ -813,7 +807,7 @@ impl AppState {
             log_cache: VecDeque::new(),
             log_has_older: false,
             log_seek_home: false,
-            connected_core: None,
+            connected: false,
             live_proxy: Arc::new(LiveProxy::default()),
             connecting: false,
             connection_error: None,
@@ -864,7 +858,6 @@ impl AppState {
             selected_targets: HashSet::new(),
             last_heed_poll: std::time::Instant::now(),
             log_sender_tx: None,
-            core_log_tx: None,
             logs_loaded: false,
             geo_ip: None,
             dns_resolver: None,
@@ -1086,13 +1079,6 @@ impl AppState {
         self.sniffer.reset();
         crate::ui::native_activity::reset_scroll();
         crate::ui::sniffer::reset_scroll();
-    }
-    /// Resolve which core a profile row should use, considering (in order):
-    ///   1. Per-pair override (`link.core_type` — resolved at parse time)
-    ///   2. Per-protocol config override (`config.core.protocol_core_overrides`)
-    ///   3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
-    pub fn resolved_core(&self, row: &EndpointRow) -> CoreType {
-        profiles::resolved_core(self, row)
     }
     // ── CRUD operations ──────────────────────────────────────────────────
 
@@ -1365,16 +1351,6 @@ impl AppState {
 
     pub fn update_all_subscriptions(&mut self) {
         subscriptions::update_all_subscriptions(self);
-    }
-
-    /// Spawn async task to check for backend updates on startup or manual trigger.
-    pub fn spawn_update_check(&mut self) {
-        updates::spawn_update_check(self);
-    }
-
-    /// Spawn async task to download and install an update for the given core.
-    pub fn spawn_update_download(&mut self, core_type: CoreType) {
-        updates::spawn_update_download(self, core_type);
     }
 
     /// Start a background task to check and update subscriptions.

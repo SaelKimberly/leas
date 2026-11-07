@@ -54,7 +54,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(block, area);
 
     // Only the in-process native core emits trace events.
-    if state.connected_core != Some(leas_core::CoreType::Native) {
+    if !state.connected {
         let paragraph = Paragraph::new(
             " No native session — connect with the native core to see live connections ",
         )

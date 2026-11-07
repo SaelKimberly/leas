@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use leas_config::import_export::{ParsedProfile, ValidationSummary};
-use leas_core::CoreType;
 use leas_core::grpc_client;
 use leas_core::speed_test::TestType;
 use leas_native::telemetry::{TraceEvent, TraceKind, TraceSecurity};
@@ -13,24 +12,6 @@ use leas_native::telemetry::{TraceEvent, TraceKind, TraceSecurity};
 pub use leas_db::models::EndpointRow;
 use leas_db::models::HostType;
 use leas_proto::proto_spec::ProtocolKind;
-
-/// Clash API /traffic response struct.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct ClashTraffic {
-    pub up: i64,
-    pub down: i64,
-}
-
-/// Cached update status for a proxy backend.
-#[derive(Debug, Clone, Default)]
-pub struct BackendUpdateStatus {
-    pub current_version: Option<String>,
-    pub latest_version: Option<String>,
-    pub update_available: bool,
-    pub downloading: bool,
-    pub download_progress: Option<(u64, u64)>,
-    pub error: Option<String>,
-}
 
 /// One traced native-core connection leg, fed by `CoreEvent::NativeTrace`.
 #[derive(Debug, Clone)]
@@ -378,10 +359,6 @@ pub enum SplitRightPane {
         focus_index: usize,
         form_errors: HashMap<String, String>,
     },
-    UpdateForm {
-        status_xray: BackendUpdateStatus,
-        status_singbox: BackendUpdateStatus,
-    },
     /// Group/subscription list shown in the settings Subscriptions section.
     GroupList {
         selected: usize,
@@ -453,7 +430,6 @@ pub struct SettingsSearch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
-    Core,
     Gui,
     Inbound,
     Routing,
@@ -461,9 +437,6 @@ pub enum SettingsSection {
     SystemProxy,
     Tun,
     Mux,
-    Stats,
-    ProtocolCore,
-    Updates,
     SpeedTest,
     Logging,
     Subscriptions,
@@ -473,7 +446,6 @@ pub enum SettingsSection {
 impl std::fmt::Display for SettingsSection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Core => write!(f, "Core"),
             Self::Gui => write!(f, "GUI"),
             Self::Inbound => write!(f, "Inbound"),
             Self::Routing => write!(f, "Routing"),
@@ -481,9 +453,6 @@ impl std::fmt::Display for SettingsSection {
             Self::SystemProxy => write!(f, "System Proxy"),
             Self::Tun => write!(f, "TUN"),
             Self::Mux => write!(f, "Mux"),
-            Self::Stats => write!(f, "Statistics"),
-            Self::ProtocolCore => write!(f, "Protocol Core"),
-            Self::Updates => write!(f, "Updates"),
             Self::SpeedTest => write!(f, "Speed Test"),
             Self::Logging => write!(f, "Logging"),
             Self::Subscriptions => write!(f, "Subscriptions"),
@@ -591,11 +560,9 @@ pub struct BatchImportItem {
 /// Events from the core process manager to the UI event loop.
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
-    Connected(CoreType),
+    Connected,
     Disconnected,
     Error(String),
-    /// Non-fatal stats error — keeps `connected_core` intact
-    StatsError(String),
     StatsUpdate {
         protocol_id: i64,
         today_up: i64,
@@ -730,27 +697,6 @@ pub enum CoreEvent {
         /// handshake never reaches a protocol phase, and the single Real
         /// Test's event carries the flag through its own field).
         auth_ack: Option<leas_native::protocol::AuthAck>,
-    },
-    /// Result of a version check for a proxy backend.
-    UpdateCheckResult {
-        core_type: CoreType,
-        current_version: Option<String>,
-        latest_version: Option<String>,
-        error: Option<String>,
-    },
-    /// Progress notification during update download.
-    UpdateDownloadProgress {
-        core_type: CoreType,
-        downloaded: u64,
-        total: u64,
-    },
-    /// Result of a download+install operation.
-    UpdateCompleted {
-        core_type: CoreType,
-        old_version: Option<String>,
-        new_version: String,
-        success: bool,
-        error: Option<String>,
     },
     /// Update the displayed test type for a profile without triggering cleanup.
     /// Used by `batch_then_real_ping` to switch from TcpPing→RealPing emoji.

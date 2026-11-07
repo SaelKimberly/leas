@@ -22,8 +22,6 @@ impl Default for AppConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
-    pub core: CoreConfig,
-    #[serde(default)]
     pub gui: GuiConfig,
     #[serde(default)]
     pub inbound: InboundConfig,
@@ -33,10 +31,6 @@ pub struct AppConfig {
     pub mux: MuxConfig,
     #[serde(default)]
     pub system_proxy: SystemProxyConfig,
-    #[serde(default)]
-    pub statistics: StatisticsConfig,
-    #[serde(default)]
-    pub updates: UpdateConfig,
     #[serde(default)]
     pub speed_test: SpeedTestConfig,
     #[serde(default)]
@@ -50,9 +44,6 @@ pub struct AppConfig {
     /// a *file* is an error, not this.
     #[serde(default = "default_theme_name")]
     pub theme_name: String,
-    pub clash_api_port: Option<u16>,
-    #[serde(default)]
-    pub clash_mixin: Option<String>,
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
     #[serde(default)]
@@ -123,34 +114,6 @@ impl Default for PurgatoryConfig {
             retention_days: default_purgatory_retention_days(),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoreConfig {
-    pub xray_path: Option<String>,
-    pub sing_box_path: Option<String>,
-    #[serde(default = "default_log_level")]
-    pub log_level: String,
-    #[serde(default)]
-    pub protocol_core_overrides: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    pub skip_cert_verify: bool,
-}
-
-impl Default for CoreConfig {
-    fn default() -> Self {
-        Self {
-            xray_path: None,
-            sing_box_path: None,
-            log_level: default_log_level(),
-            protocol_core_overrides: std::collections::HashMap::new(),
-            skip_cert_verify: false,
-        }
-    }
-}
-
-fn default_log_level() -> String {
-    "warning".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,31 +236,6 @@ pub struct SystemProxyConfig {
     pub bypass: Option<String>,
 }
 
-const fn default_clash_api_port() -> u16 {
-    9090
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatisticsConfig {
-    #[serde(default = "default_stats_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_clash_api_port")]
-    pub clash_api_port: u16,
-}
-
-const fn default_stats_enabled() -> bool {
-    true
-}
-
-impl Default for StatisticsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_stats_enabled(),
-            clash_api_port: default_clash_api_port(),
-        }
-    }
-}
-
 const fn default_socks_port() -> u16 {
     10808
 }
@@ -321,17 +259,7 @@ impl AppConfig {
         let path = default_config_path();
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            let mut config: Self = serde_json::from_str(&content)?;
-            // Normalize old protocol Display strings in protocol_core_overrides keys.
-            // The Display impl was changed to short forms ("ss", "hy", etc.)
-            // which broke backward-compat with configs saved using the old
-            // kebab-case Debug forms ("shadowsocks", "hysteria", etc.).
-            config.core.protocol_core_overrides = config
-                .core
-                .protocol_core_overrides
-                .into_iter()
-                .map(|(k, v)| (normalize_protocol_key(&k), v))
-                .collect();
+            let config: Self = serde_json::from_str(&content)?;
             Ok(config)
         } else {
             let config = Self::default();
@@ -367,24 +295,6 @@ fn default_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("leas")
         .join("config.json")
-}
-
-/// Normalize old protocol (Display) key names to current short forms.
-/// The `Protocol::Display` impl was changed from kebab-case Debug-derived
-/// names to short forms (e.g. "shadowsocks" → "ss", "hysteria" → "hy").
-/// This maps old config-file keys to their current equivalents.
-fn normalize_protocol_key(key: &str) -> String {
-    match key {
-        "shadowsocks" => "ss",
-        "shadowsocks-2022" => "ss-2022",
-        "shadowsocks-r" => "ssr",
-        "hysteria" => "hy",
-        "hysteria-2" => "hy2",
-        "dokodemo-door" => "dokodemo",
-        "wire-guard" => "wireguard",
-        other => other,
-    }
-    .to_owned()
 }
 
 /// An EXISTING `config.json` must load unchanged: the `import` section is
@@ -436,7 +346,6 @@ mod tests {
         let json = serde_json::to_string_pretty(&original).unwrap();
         let restored: AppConfig = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(restored.core.log_level, "warning");
         assert_eq!(restored.gui.language, "en");
         assert_eq!(
             *restored.gui.refresh_interval_secs,
@@ -538,122 +447,6 @@ mod tests {
             *config.speed_test.speed_test_max_duration,
             std::time::Duration::from_secs(30)
         );
-    }
-
-    #[test]
-    fn normalize_protocol_key_known_pairs() {
-        // Each known old Display string → current short form
-        let cases = [
-            ("shadowsocks", "ss"),
-            ("shadowsocks-2022", "ss-2022"),
-            ("shadowsocks-r", "ssr"),
-            ("hysteria", "hy"),
-            ("hysteria-2", "hy2"),
-            ("dokodemo-door", "dokodemo"),
-            ("wire-guard", "wireguard"),
-        ];
-        for (old, expected) in &cases {
-            assert_eq!(normalize_protocol_key(old), *expected, "failed for {old}");
-        }
-    }
-
-    #[test]
-    fn normalize_protocol_key_passes_through_unknown() {
-        // Already-short or unknown keys pass through unchanged
-        let passthrough = [
-            "vmess",
-            "vless",
-            "ss",
-            "ss-2022",
-            "ssr",
-            "hy",
-            "hy2",
-            "trojan",
-            "socks",
-            "http",
-            "dokodemo",
-            "wireguard",
-            "tuic",
-            "naive",
-            "any-tls",
-            "shadow-tls",
-            "tor",
-            "ssh",
-            "redirect",
-            "t-proxy",
-            "mixed",
-            "tailscale",
-        ];
-        for key in &passthrough {
-            assert_eq!(
-                normalize_protocol_key(key),
-                *key,
-                "passthrough failed for {key}"
-            );
-        }
-    }
-
-    #[test]
-    fn normalise_protocol_key_round_trips_config() {
-        // Simulate loading a config with old keys — they should survive
-        // normalization and be usable at runtime.
-        let old_config_json = r#"{
-            "core": {
-                "protocol_core_overrides": {
-                    "shadowsocks-2022": "xray",
-                    "wire-guard": "sing-box",
-                    "dokodemo-door": "xray"
-                }
-            },
-            "gui": {},
-            "inbound": {}
-        }"#;
-        let mut config: AppConfig = serde_json::from_str(old_config_json).unwrap();
-        // Apply normalization (same as AppConfig::load() does)
-        config.core.protocol_core_overrides = config
-            .core
-            .protocol_core_overrides
-            .into_iter()
-            .map(|(k, v)| (normalize_protocol_key(&k), v))
-            .collect();
-        let overrides = &config.core.protocol_core_overrides;
-        assert_eq!(overrides.get("ss-2022").map(String::as_str), Some("xray"));
-        assert_eq!(
-            overrides.get("wireguard").map(String::as_str),
-            Some("sing-box")
-        );
-        assert_eq!(overrides.get("dokodemo").map(String::as_str), Some("xray"));
-        // Old keys should no longer exist
-        assert!(overrides.get("shadowsocks-2022").is_none());
-        assert!(overrides.get("wire-guard").is_none());
-        assert!(overrides.get("dokodemo-door").is_none());
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateConfig {
-    #[serde(default = "default_update_check_enabled")]
-    pub check_on_startup: bool,
-    #[serde(default)]
-    pub last_check: Option<String>,
-    #[serde(default)]
-    pub xray_latest_known: Option<String>,
-    #[serde(default)]
-    pub sing_box_latest_known: Option<String>,
-}
-
-const fn default_update_check_enabled() -> bool {
-    true
-}
-
-impl Default for UpdateConfig {
-    fn default() -> Self {
-        Self {
-            check_on_startup: true,
-            last_check: None,
-            xray_latest_known: None,
-            sing_box_latest_known: None,
-        }
     }
 }
 

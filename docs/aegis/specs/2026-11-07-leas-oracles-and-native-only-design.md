@@ -1,7 +1,7 @@
 # `leas-oracles` extraction and the native-only client
 
 **Date:** 2026-11-07
-**Status:** approved 2026-11-07 (grilling interview, D1–D17) — plan pending
+**Status:** approved 2026-11-07 (grilling interview, D1–D17); implemented
 **Owns:** the `leas-oracles` dev crate (build-time pinned cores, config-pair
 generation, process launch), its build-inclusion model (no features), and
 the client's native-only cutover (core-choice settings, protocol identity,

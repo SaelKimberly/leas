@@ -15,8 +15,8 @@ This file is auto-detected project context: commands, structure, conventions. Th
 | Run | `cargo run` |
 | Release build | `cargo build --release` |
 | One test | `cargo nextest run -p <crate> <filter>` |
-| Full test suite | `cargo nextest run --workspace` |
-| Lint (authoritative) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| Full test suite | `cargo nextest run` (default members; `--workspace` adds the dev-only oracles) |
+| Lint (authoritative) | `cargo clippy --workspace --exclude leas-oracles --all-targets --all-features -- -D warnings` |
 | Format | `cargo fmt` |
 | Full gate (verbose) | `just quality-gate` |
 | Full gate (CI, exit-code) | `just quality-gate-ci` |
@@ -33,7 +33,7 @@ This file is auto-detected project context: commands, structure, conventions. Th
 - Display files with `read`, never `cat`/`head`/`tail`/`ls`.
 
 ## Structure
-- `crates/leas` — binary: `main.rs`, `state.rs` (`AppState`), `types.rs`, `ops/` (connect, ping, events, scheduler — the PER-LINK ping gate —, **job_scheduler — the job queue / one-job-at-a-time gate**, profiles, enrich, subscriptions, settings, updates, export, stream_import, db_monitor, clipboard, native_connect, ping_native, purge, compact), `ui/` (profiles, settings, logs, statistics, **details** (pane-2 `Details`: three 3:6:3 sections — Server, Link, DB aggregates), **tasks** (pane-2 `Tasks`: the progress bar + the job queue), native_activity, **sniffer** (pane-1 `Sniffer`: per-host traffic for the native session), add_server, export, status_bar, theme, widgets).
+- `crates/leas` — binary: `main.rs`, `state.rs` (`AppState`), `types.rs`, `ops/` (connect, ping, events, scheduler — the PER-LINK ping gate —, **job_scheduler — the job queue / one-job-at-a-time gate**, profiles, enrich, subscriptions, settings, export, stream_import, db_monitor, clipboard, native_connect, ping_native, purge, compact), `ui/` (profiles, settings, logs, statistics, **details** (pane-2 `Details`: three 3:6:3 sections — Server, Link, DB aggregates), **tasks** (pane-2 `Tasks`: the progress bar + the job queue), native_activity, **sniffer** (pane-1 `Sniffer`: per-host traffic for the native session), add_server, export, status_bar, theme, widgets).
 - `crates/leas-oracles` — dev-only e2e oracle crate: `build.rs` fetches the pinned xray-core/sing-box assets (SHA-256 verified), `e2e/` builds the server/client config pairs and launches the cores, and the moved integration tests/benches live here. Excluded from `default-members`; run with `-p leas-oracles`.
 - Other crates and their responsibilities: [`docs/architecture/architecture.md`](docs/architecture/architecture.md).
 

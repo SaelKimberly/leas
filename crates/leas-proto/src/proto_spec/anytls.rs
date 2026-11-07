@@ -33,11 +33,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
+    CoreTarget, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
     ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashAnyTls, ClashProxy};
@@ -136,7 +135,6 @@ impl AnyTlsConfig {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::AnyTls,
-                core_type: core_mapping::resolve_core(ProtocolKind::AnyTls, None, None),
                 config: ProtocolConfig::AnyTls(config),
             },
         })
@@ -249,7 +247,6 @@ impl AnyTlsConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::AnyTls,
-                        core_type: core_mapping::resolve_core(ProtocolKind::AnyTls, None, None),
                         config: ProtocolConfig::AnyTls(config),
                     },
                 })
@@ -359,13 +356,13 @@ impl InjectToCoreConf for AnyTlsConfig {
     fn inject_to(
         &self,
         core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError> {
         match core_type {
-            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
-            other @ CoreType::Xray => {
+            CoreTarget::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            other @ CoreTarget::Xray => {
                 Err(SupportError::UnsupportedProtocol("any-tls".into(), other))
             }
         }
@@ -403,7 +400,9 @@ impl AnyTlsConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind};
+    use super::super::{
+        CoreTarget, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+    };
     use super::AnyTlsConfig;
     use crate::urlx::{RawUrlX, SchemeX};
 
@@ -460,7 +459,6 @@ mod tests {
         assert_eq!(ep.port, 8080);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::AnyTls);
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let cfg = config(parsed);
         assert_eq!(cfg.password.as_deref(), Some("secret"));
         assert_no_top_level_host_port(&cfg);
@@ -615,7 +613,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("1.2.3.4", 8080)),
             InjectOptions::default(),
         )
@@ -636,7 +634,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("1.2.3.4", 8080)),
             InjectOptions::default(),
         )
@@ -648,7 +646,12 @@ mod tests {
 
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .inject_to(
+                &mut conf,
+                CoreTarget::SingBox,
+                None,
+                InjectOptions::default(),
+            )
             .expect_err("orphan anytls must be rejected");
         assert!(matches!(
             err,

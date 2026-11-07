@@ -4,9 +4,9 @@ How the workspace is put together: which crates exist, what each one owns, where
 
 ## Workspace layout
 
-`Cargo.toml` declares `members = ["crates/*"]`, resolver 3, edition 2024, rust-version `1.99.1`, workspace version `0.1.0`. Twelve crates exist:
+`Cargo.toml` declares `members = ["crates/*"]`, resolver 3, edition 2024, rust-version `1.99.1`, workspace version `0.1.0`. Thirteen crates exist:
 
-`leas`, `leas-config`, `leas-core`, `leas-db`, `leas-dns`, `leas-geoip`, `leas-hakari`, `leas-host-features`, `leas-native`, `leas-proto`, `leas-route`, `leas-tls`.
+`leas`, `leas-config`, `leas-core`, `leas-db`, `leas-dns`, `leas-geoip`, `leas-hakari`, `leas-host-features`, `leas-native`, `leas-oracles`, `leas-proto`, `leas-route`, `leas-tls`. (`leas-oracles` is dev-only and excluded from `default-members`.)
 
 ## Crate dependency graph
 
@@ -14,9 +14,8 @@ Edges are runtime dependencies from each `crates/*/Cargo.toml`. `leas-hakari` is
 
 ```text
 leas (binary)
-  ├── leas-core            config builders, subprocess lifecycle, gRPC stats, ping adapters, heed logs
-  │     ├── leas-db        config builders read the typed model rows
-  │     └── leas-proto     CoreType mapping, per-kind binary identity
+  ├── leas-core            ping adapters, speed tests, heed logs (native-shared glue)
+  │     └── leas-proto     typed configs, per-kind binary identity
   ├── leas-native          in-process backend: tunnels, inbounds, telemetry
   │     ├── leas-proto     typed ProtocolConfig / EndpointEssentials
   │     ├── leas-tls       TLS 1.3 + 1.2-fallback client engine, REALITY
@@ -38,7 +37,7 @@ Notes that the manifests enforce:
 
 - `leas-route`'s `dns` and `geoip` dependencies are optional and `default = []`; no member enables either feature today, so the adapters in `dns_adapter.rs` are not part of a default build. `leas-route`'s `leas-tls` edge is a dev-dependency for benches and tests.
 - `leas-native` does not depend on `leas-core`; it takes typed configs straight from `leas-proto` and returns `leas-native` types.
-- `leas-core` depends on `leas-db` only for the model types its config builders read (`Endpoint`, `Protocol`, `RoutingRule`, `DnsSetting`).
+- `leas-core` carries only native-shared glue: ping adapters, speed tests, the heed log store, `SysStats`/formatters and `ensure_tls_provider`. The oracle adapters (config builders, subprocess lifecycle, updater, gRPC stats client, `CoreType`, `core_mapping`) live in the dev-only `leas-oracles::oracle_adapters`; the client graph has no tonic/prost edge.
 - `leas` depends on `leas-proto` and `leas-route` directly, in addition to the crates listed above.
 
 `leas-hakari` is a cargo-hakari generated feature-unification crate. Every member depends on it; its own dependencies are never referenced from code and exist only to unify feature flags. Regenerate after a `Cargo.lock` change with `cargo hakari generate`; the `hakari-check` gate runs `cargo hakari generate --diff`, `cargo hakari manage-deps --dry-run` and `cargo hakari verify`, and `--dry-run` is what catches a member missing the dependency.
@@ -79,15 +78,11 @@ Export splits across three owners: `leas-db/src/export.rs` opens a dedicated Tur
 
 ### leas-core (library)
 
-Facade for everything that talks to an external core binary: `bin_manager`, `config_builder`, `core_type`, `dns`, `grpc_client`, `log_heed`, `ping`, `process`, `speed_test`, `updater`. Its top-level re-exports are the crate's public surface.
+Native-shared session glue: `log_heed` (LMDB log store + `LogMessage`), `grpc_client`'s `SysStats` + `format_bytes`/`format_uptime`, `ping` (fast adapters and `FastPingManager`), `speed_test` (`TestType`, `speed_test`, `tcp_ping`, `udp_ping`, `udp_test`) and `ensure_tls_provider`. It has no subprocess, updater, gRPC client or `CoreType` surface.
 
-- `CoreType` is the runtime enum `{Xray, SingBox, Auto, Native}`. The persisted stamp is `leas_proto::proto_spec::CoreType`, which stays `{Xray, SingBox}`; `Native` and `Auto` are never written to the database or a core config. `resolve_core` returns only the persisted two.
-- `CoreManager` abstracts subprocess lifecycle (`start`, `stop`, `is_running`, `running_core_type`, `sighup_reload`, `rewrite_config`) with `RealCoreManager` and `MockCoreManager` implementations. `RealCoreManager::start` writes the built config to a temporary directory, spawns `xray run -c <path>` or `sing-box run -c <path>`, and polls for early exit with a 5 s readiness deadline. The stats loops live in `ops/connect.rs`, not in this crate.
-- `ConfigBuilder::build` dispatches to the xray or sing-box emitter and returns `BackendConfig`; both emitters validate Shadowsocks methods against their own whitelists and refuse to write an invalid config. Format details belong to [`../reference/protocols.md`](../reference/protocols.md); the Clash overlay is [`../reference/clash.md`](../reference/clash.md).
-- `grpc_client` speaks the vendored `v2ray.core.app.stats.command` proto (`GetStats`, `QueryStats`, `GetSysStats`) at `http://127.0.0.1:62789`. `create_stats_provider()` returns the shared `StatsProvider` implementation; both backends expose the same V2Ray-compatible API, and `format_bytes`/`format_uptime` are the display helpers.
-- `ping` exports the fast adapters (`TcpPingAdapter`, `UdpPingAdapter`, optional `QuicPingAdapter` behind the `quic-ping` feature, `FastPingManager`).
-- `log_heed` owns the LMDB-backed log store and its `LogMessage` type.
-- `updater` handles release lookup, download and binary installation for the two subprocess cores. `Auto` and `Native` have no binary, so every updater entry point refuses them.
+- `ping` dials the endpoint directly (never a core); `speed_test`/UDP dial the connected native inbound.
+- The gRPC Stats client (`StatsProvider`, `GrpcStatsClient`, `create_stats_provider`) and its tonic/prost codegen moved to the dev-only `leas-oracles::oracle_adapters`; `SysStats` stays here because native telemetry writes it.
+- `CoreType` (`{Xray, SingBox, Auto, Native}`), `core_mapping`, `bin_manager`, `config_builder`, `process` and `updater` moved to `leas-oracles::oracle_adapters`. The client has no core choice; the protocol identity no longer carries one.
 
 Share-URL parsing and client-config export live in `leas-config`, not here.
 

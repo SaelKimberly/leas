@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,9 +8,10 @@ use crate::clash::ClashProxy;
 use crate::urlx::{HostSpec, RawUrlX, SchemeX};
 
 pub mod common;
-pub mod core_mapping;
 pub mod endpoint;
 pub(crate) mod identity;
+pub mod ss_method_support;
+pub use identity::IDENTITY_VERSION;
 pub mod utils;
 
 use identity::IdentityWriter;
@@ -96,14 +96,19 @@ pub enum ParseError {
     Unimplemented(&'static str),
 }
 
-/// Which proxy core to target for JSON config generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
-pub enum CoreType {
+/// Config-generation target for the oracle adapters.
+///
+/// This is NOT the client's core choice: the TUI has no core setting and the
+/// protocol identity no longer carries a core. It exists only so the
+/// per-protocol config injectors can emit xray-core or sing-box JSON; the
+/// oracle crate owns the user-facing core-choice enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreTarget {
     Xray,
     SingBox,
 }
 
-impl CoreType {
+impl CoreTarget {
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
@@ -113,43 +118,9 @@ impl CoreType {
     }
 }
 
-impl std::str::FromStr for CoreType {
-    type Err = ();
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "xray" | "xray-core" => Ok(Self::Xray),
-            "sing-box" | "singbox" | "sing_box" => Ok(Self::SingBox),
-            _ => Err(()),
-        }
-    }
-}
-
-impl std::fmt::Display for CoreType {
+impl std::fmt::Display for CoreTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-// Serde for `CoreType` follows the same as_str dialect as the kind enums in
-// `kinds.rs` ("xray" / "sing-box") — required so `ProtocolEssentials` can
-// derive `Serialize`/`Deserialize` (T3 parse boundary).
-impl Serialize for CoreType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for CoreType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Self::from_str(&s)
-            .map_err(|()| serde::de::Error::custom(format_args!("invalid core type: '{s}'")))
     }
 }
 
@@ -362,17 +333,6 @@ pub trait ProtoSpec: ProtoIdentity {
     fn country_flags(&self) -> SmallVec<[crate::urlx::TinyText; 4]> {
         self.remarks().map(|_| SmallVec::new()).unwrap_or_default()
     }
-    /// Generate JSON config for the specified proxy core.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProtoSpecError`] if the config cannot be serialized.
-    fn to_json_config(&self, _core: CoreType) -> Result<serde_json::Value, ProtoSpecError> {
-        Err(ProtoSpecError::Unsupported(
-            "json config not implemented for this protocol".into(),
-        ))
-    }
-
     /// Parse this protocol from a Clash YAML proxy entry.
     ///
     /// # Errors
@@ -433,7 +393,7 @@ pub trait InjectToCoreConf {
     fn inject_to(
         &self,
         core_conf: &mut serde_json::Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError>;
@@ -501,9 +461,6 @@ impl ProtoSpec for ProtocolConfig {
     fn country_flags(&self) -> SmallVec<[crate::urlx::TinyText; 4]> {
         dispatch!(self, country_flags)
     }
-    fn to_json_config(&self, core: CoreType) -> Result<serde_json::Value, ProtoSpecError> {
-        dispatch!(self, to_json_config, core)
-    }
 
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
@@ -551,7 +508,7 @@ impl InjectToCoreConf for ProtocolConfig {
     fn inject_to(
         &self,
         core_conf: &mut serde_json::Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError> {
@@ -662,16 +619,13 @@ impl ProtoSpec for PlaceholderConfig {
     fn transport_type(&self) -> Option<&str> {
         None
     }
-    fn to_json_config(&self, _core: CoreType) -> Result<serde_json::Value, ProtoSpecError> {
-        Err(ProtoSpecError::Unsupported(self.proto_name.clone()))
-    }
 }
 
 impl InjectToCoreConf for PlaceholderConfig {
     fn inject_to(
         &self,
         _core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         _endpoint: Option<&EndpointEssentials>,
         _opts: InjectOptions,
     ) -> Result<(), SupportError> {
@@ -722,11 +676,7 @@ impl PlaceholderConfig {
         };
         ParsedProto {
             endpoints: vec![],
-            protocol: ProtocolEssentials {
-                proto_kind,
-                core_type: core_mapping::resolve_core(proto_kind, None, None),
-                config,
-            },
+            protocol: ProtocolEssentials { proto_kind, config },
         }
     }
 
@@ -818,7 +768,6 @@ mod tests {
         let parsed = redirect.try_parse_proto();
         assert_eq!(parsed.endpoints.len(), 0, "orphan protocol: no endpoint");
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Redirect);
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         assert_eq!(
             parsed.protocol.config,
             ProtocolConfig::Redirect(redirect.clone())
@@ -913,7 +862,6 @@ mod tests {
             endpoints: vec![],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::Shadowsocks,
-                core_type: CoreType::Xray,
                 config,
             },
         };
@@ -923,30 +871,6 @@ mod tests {
         assert_eq!(parsed.sig(), sig, "sig is stable across calls");
         assert_eq!(parsed.cred_hash(), cred_hash, "cred_hash is stable");
         assert_eq!(parsed.uid(), uid, "uid is stable across calls");
-    }
-
-    #[test]
-    fn core_type_display_matches_as_str() {
-        assert_eq!(CoreType::Xray.to_string(), "xray");
-        assert_eq!(CoreType::SingBox.to_string(), "sing-box");
-        assert_eq!(CoreType::Xray.as_str(), "xray");
-        assert_eq!(CoreType::SingBox.as_str(), "sing-box");
-    }
-
-    #[test]
-    fn core_type_from_str_round_trip() {
-        for original in [CoreType::Xray, CoreType::SingBox] {
-            let parsed: CoreType = original.to_string().parse().expect("round-trip parse");
-            assert_eq!(parsed, original);
-        }
-        // Accepted aliases.
-        assert_eq!("xray-core".parse::<CoreType>(), Ok(CoreType::Xray));
-        assert_eq!("singbox".parse::<CoreType>(), Ok(CoreType::SingBox));
-        assert_eq!("sing_box".parse::<CoreType>(), Ok(CoreType::SingBox));
-        assert_eq!("SING-BOX".parse::<CoreType>(), Ok(CoreType::SingBox));
-        // Unknown strings must error.
-        assert!("auto".parse::<CoreType>().is_err());
-        assert!("".parse::<CoreType>().is_err());
     }
 
     // ── InjectToCoreConf dispatch (Task 6) ────────────────────────────────
@@ -1105,7 +1029,7 @@ mod tests {
 
     /// Cores that can build an outbound for the variant (T14 xray + T15
     /// sing-box for the shared set; sing-box only for the sing-box-native set).
-    fn supported_core(config: &ProtocolConfig) -> CoreType {
+    fn supported_core(config: &ProtocolConfig) -> CoreTarget {
         match config {
             ProtocolConfig::Vless(_)
             | ProtocolConfig::Vmess(_)
@@ -1114,8 +1038,8 @@ mod tests {
             | ProtocolConfig::Ss(_)
             | ProtocolConfig::Wireguard(_)
             | ProtocolConfig::Socks(_)
-            | ProtocolConfig::Http(_) => CoreType::Xray,
-            _ => CoreType::SingBox,
+            | ProtocolConfig::Http(_) => CoreTarget::Xray,
+            _ => CoreTarget::SingBox,
         }
     }
 
@@ -1127,7 +1051,7 @@ mod tests {
         vless
             .inject_to(
                 &mut json!({}),
-                CoreType::Xray,
+                CoreTarget::Xray,
                 Some(&endpoint),
                 InjectOptions::default(),
             )
@@ -1135,7 +1059,7 @@ mod tests {
         vless
             .inject_to(
                 &mut json!({}),
-                CoreType::SingBox,
+                CoreTarget::SingBox,
                 Some(&endpoint),
                 InjectOptions::default(),
             )
@@ -1149,7 +1073,7 @@ mod tests {
         let err = tuic
             .inject_to(
                 &mut json!({}),
-                CoreType::SingBox,
+                CoreTarget::SingBox,
                 None,
                 InjectOptions::default(),
             )
@@ -1169,7 +1093,7 @@ mod tests {
         vless
             .inject_to(
                 &mut json!({}),
-                CoreType::Xray,
+                CoreTarget::Xray,
                 Some(&endpoint),
                 InjectOptions::default(),
             )
@@ -1177,7 +1101,7 @@ mod tests {
         let err = vless
             .inject_to(
                 &mut json!({}),
-                CoreType::Xray,
+                CoreTarget::Xray,
                 None,
                 InjectOptions::default(),
             )
@@ -1198,7 +1122,7 @@ mod tests {
             "redirect".into(),
             serde_json::to_vec(&raw).expect("serialize"),
         );
-        for core in [CoreType::SingBox, CoreType::Xray] {
+        for core in [CoreTarget::SingBox, CoreTarget::Xray] {
             let mut conf = json!({});
             let err = placeholder
                 .inject_to(&mut conf, core, None, InjectOptions::default())
@@ -1238,10 +1162,10 @@ mod tests {
         // Xray arm (no Xray shape, permanently).
         let mut kinds = Vec::new();
         for (config, expected) in &variants {
-            if supported_core(config) == CoreType::SingBox {
+            if supported_core(config) == CoreTarget::SingBox {
                 match config.inject_to(
                     &mut json!({}),
-                    CoreType::Xray,
+                    CoreTarget::Xray,
                     Some(&endpoint),
                     InjectOptions::default(),
                 ) {

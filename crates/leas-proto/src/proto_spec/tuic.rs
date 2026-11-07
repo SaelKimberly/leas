@@ -42,11 +42,10 @@ use super::ProtoIdentity;
 use super::common::{
     SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param, to_singbox_tls_or_default,
 };
-use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
+    CoreTarget, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
     ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashTuic};
@@ -153,7 +152,6 @@ impl TuicConfig {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::Tuic,
-                core_type: core_mapping::resolve_core(ProtocolKind::Tuic, None, None),
                 config: ProtocolConfig::Tuic(config),
             },
         })
@@ -280,7 +278,6 @@ impl TuicConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::Tuic,
-                        core_type: core_mapping::resolve_core(ProtocolKind::Tuic, None, None),
                         config: ProtocolConfig::Tuic(config),
                     },
                 })
@@ -417,13 +414,15 @@ impl InjectToCoreConf for TuicConfig {
     fn inject_to(
         &self,
         core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError> {
         match core_type {
-            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
-            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol("tuic".into(), other)),
+            CoreTarget::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            other @ CoreTarget::Xray => {
+                Err(SupportError::UnsupportedProtocol("tuic".into(), other))
+            }
         }
     }
 }
@@ -466,7 +465,9 @@ impl TuicConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind};
+    use super::super::{
+        CoreTarget, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+    };
     use super::TuicConfig;
     use crate::urlx::{RawUrlX, SchemeX};
 
@@ -525,7 +526,6 @@ mod tests {
         assert_eq!(ep.ports, vec![30006]);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Tuic);
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let cfg = config(parsed);
         assert_eq!(cfg.uuid, "36106e0f-4d9a-470b-a3fd-535f3b7a1e92");
         assert_eq!(cfg.password, "dongtaiwang.com");
@@ -679,7 +679,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("5.178.101.117", 30006)),
             InjectOptions::default(),
         )
@@ -708,7 +708,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("ip1.758733.xyz", 10088)),
             InjectOptions {
                 skip_cert_verify: true,
@@ -724,7 +724,12 @@ mod tests {
         let cfg = config(parse(TUIC_URL));
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .inject_to(
+                &mut conf,
+                CoreTarget::SingBox,
+                None,
+                InjectOptions::default(),
+            )
             .expect_err("orphan tuic must be rejected");
         assert!(matches!(err, SupportError::MissingField("server", "tuic")));
     }
@@ -736,14 +741,14 @@ mod tests {
         let err = cfg
             .inject_to(
                 &mut conf,
-                CoreType::Xray,
+                CoreTarget::Xray,
                 Some(&EndpointEssentials::new("5.178.101.117", 30006)),
                 InjectOptions::default(),
             )
             .expect_err("tuic has no xray shape");
         assert!(matches!(
             &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::Xray) if kind == "tuic"
+            SupportError::UnsupportedProtocol(kind, CoreTarget::Xray) if kind == "tuic"
         ));
     }
 }

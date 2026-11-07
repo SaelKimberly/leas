@@ -11,12 +11,10 @@ use ratatui_cheese::list::{List, ListItem, ListItemContext, ListState};
 use std::collections::{HashMap, HashSet};
 
 use crate::ui::theme::ThemeStyles;
-use crate::ui::widgets::progress::bar_cells;
+
 use crate::{
-    AppMode, AppState, BackendUpdateStatus, SectionList, SettingsMode, SettingsSection, SplitFocus,
-    SplitRightPane,
+    AppMode, AppState, SectionList, SettingsMode, SettingsSection, SplitFocus, SplitRightPane,
 };
-use leas_core::CoreType;
 // ── Settings section data — the source of the left list and its filter ──
 
 struct SettingsTreeNode {
@@ -30,19 +28,6 @@ struct SettingsTreeGroup {
 }
 
 const SETTINGS_TREE: &[SettingsTreeGroup] = &[
-    SettingsTreeGroup {
-        name: "Core",
-        items: &[
-            SettingsTreeNode {
-                name: "Core Settings",
-                section: Some(SettingsSection::Core),
-            },
-            SettingsTreeNode {
-                name: "Protocol Core",
-                section: Some(SettingsSection::ProtocolCore),
-            },
-        ],
-    },
     SettingsTreeGroup {
         name: "Connection",
         items: &[
@@ -91,14 +76,6 @@ const SETTINGS_TREE: &[SettingsTreeGroup] = &[
     SettingsTreeGroup {
         name: "Advanced",
         items: &[
-            SettingsTreeNode {
-                name: "Statistics",
-                section: Some(SettingsSection::Stats),
-            },
-            SettingsTreeNode {
-                name: "Updates",
-                section: Some(SettingsSection::Updates),
-            },
             SettingsTreeNode {
                 name: "Speed Test",
                 section: Some(SettingsSection::SpeedTest),
@@ -382,7 +359,6 @@ fn field_type_label(field_type: &str) -> &'static str {
 
 const fn section_name(section: SettingsSection) -> &'static str {
     match section {
-        SettingsSection::Core => "Core",
         SettingsSection::Gui => "GUI",
         SettingsSection::Inbound => "Inbound",
         SettingsSection::Routing => "Routing",
@@ -390,12 +366,9 @@ const fn section_name(section: SettingsSection) -> &'static str {
         SettingsSection::SystemProxy => "System Proxy",
         SettingsSection::Tun => "TUN",
         SettingsSection::Mux => "Mux",
-        SettingsSection::Stats => "Statistics",
         SettingsSection::Subscriptions => "Subscriptions",
-        SettingsSection::ProtocolCore => "Protocol Core",
         SettingsSection::SpeedTest => "Speed Test",
         SettingsSection::Logging => "Logging",
-        SettingsSection::Updates => "Updates",
         SettingsSection::RouteProbes => "Probe Hosts",
     }
 }
@@ -797,7 +770,6 @@ fn render_right_pane(
         }
         SplitRightPane::RoutingList { .. } => " Routing Rules ".to_string(),
         SplitRightPane::RoutingForm { .. } => " Routing Rule ".to_string(),
-        SplitRightPane::UpdateForm { .. } => " Updates ".to_string(),
         SplitRightPane::GroupList { .. } => " Subscriptions ".to_string(),
     };
     let block = Block::default()
@@ -843,12 +815,6 @@ fn render_right_pane(
                 *focus_index,
                 form_errors,
             );
-        }
-        SplitRightPane::UpdateForm {
-            status_xray,
-            status_singbox,
-        } => {
-            render_update_form_inner(frame, inner, theme, status_xray, status_singbox);
         }
         SplitRightPane::GroupList {
             selected,
@@ -927,7 +893,6 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
                     SplitRightPane::Form { .. } => 1,
                     SplitRightPane::RoutingList { .. } => 2,
                     SplitRightPane::RoutingForm { .. } => 3,
-                    SplitRightPane::UpdateForm { .. } => 4,
                     SplitRightPane::GroupList { .. } => 5,
                     SplitRightPane::GroupForm { .. } => 6,
                 },
@@ -937,7 +902,6 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
                 1 => handle_form_key(state, key).await,
                 2 => handle_routing_list_key(state, key).await,
                 3 => handle_routing_form_key(state, key).await,
-                4 => handle_update_form_key(state, key),
                 5 => handle_group_list_key(state, key).await,
                 6 => handle_group_form_key(state, key).await,
                 _ => {}
@@ -1131,31 +1095,9 @@ async fn handle_sections_key(state: &mut AppState, key: &KeyEvent) {
     }
 }
 
-pub static PROTOCOL_CORE_DEFS: &[(&str, &str, &str)] = &[
-    ("vmess", "VMess", "Select:Auto,Xray,SingBox"),
-    ("vless", "VLESS", "Select:Auto,Xray,SingBox"),
-    ("ss", "Shadowsocks", "Select:Auto,Xray,SingBox"),
-    ("ss-2022", "SS-2022", "Select:Auto,Xray,SingBox"),
-    ("socks", "SOCKS", "Select:Auto,Xray,SingBox"),
-    ("http", "HTTP", "Select:Auto,Xray,SingBox"),
-    ("trojan", "Trojan", "Select:Auto,Xray,SingBox"),
-    ("wireguard", "WireGuard", "Select:Auto,Xray,SingBox"),
-    ("hy2", "Hysteria2", "Select:Auto,Xray,SingBox"),
-    ("hy", "Hysteria", "Select:Auto,Xray,SingBox"),
-    ("tuic", "TUIC", "Select:Auto,Xray,SingBox"),
-    ("naive", "Naïve", "Select:Auto,Xray,SingBox"),
-    ("any-tls", "AnyTLS", "Select:Auto,Xray,SingBox"),
-    ("shadow-tls", "ShadowTLS", "Select:Auto,Xray,SingBox"),
-    ("tor", "Tor", "Select:Auto,Xray,SingBox"),
-    ("ssh", "SSH", "Select:Auto,Xray,SingBox"),
-    ("ssr", "ShadowsocksR", "Select:Auto,Xray,SingBox"),
-    ("redirect", "Redirect", "Select:Auto,Xray,SingBox"),
-    ("dokodemo", "Dokodemo-door", "Select:Auto,Xray,SingBox"),
-    ("t-proxy", "TProxy", "Select:Auto,Xray,SingBox"),
-    ("mixed", "Mixed", "Select:Auto,Xray,SingBox"),
-    ("tailscale", "Tailscale", "Select:Auto,Xray,SingBox"),
-];
-fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str, &'static str)] {
+const fn form_field_defs(
+    mode: &SettingsMode,
+) -> &'static [(&'static str, &'static str, &'static str)] {
     // &[(key, label, field_type)]
     // field_type: "Text", "Number", "Url", "Duration", "Boolean", "Select" (comma-separated)
     match mode {
@@ -1167,17 +1109,10 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
     }
 }
 
-fn form_field_defs_for_section(
+const fn form_field_defs_for_section(
     section: SettingsSection,
 ) -> &'static [(&'static str, &'static str, &'static str)] {
     match section {
-        SettingsSection::Core => &[
-            ("xray_path", "Xray Path", "Text"),
-            ("sing_box_path", "Sing-Box Path", "Text"),
-            ("log_level", "Log Level", "Select:debug,info,warning,error"),
-            ("skip_cert_verify", "Skip Cert Verify", "Boolean"),
-            ("clash_mixin", "Clash Mixin (JSON/YAML)", "Text"),
-        ],
         SettingsSection::Gui => &[
             ("language", "Language", "Select:en,zh"),
             // A selector over opaline's builtin slugs: as free text it could
@@ -1230,7 +1165,6 @@ fn form_field_defs_for_section(
             ("fragment_length", "Fragment Length", "Text"),
             ("fragment_interval", "Fragment Interval", "Text"),
         ],
-        SettingsSection::ProtocolCore => PROTOCOL_CORE_DEFS,
         SettingsSection::SpeedTest => &[
             ("ping_url", "Ping Test URL", "Url"),
             (
@@ -1281,14 +1215,13 @@ fn form_field_defs_for_section(
             ("log_to_file", "Log to File", "Boolean"),
             ("log_file_path", "Log File Path", "Text"),
         ],
-        SettingsSection::Stats => &[("enabled", "Enabled", "Boolean")],
         SettingsSection::Subscriptions => &[
             ("name", "Name", "Text"),
             ("subscription_url", "Subscription URL", "Url"),
             ("user_agent", "User Agent", "Text"),
             ("update_interval", "Update Interval", "Duration"),
         ],
-        SettingsSection::Updates | SettingsSection::Routing => &[],
+        SettingsSection::Routing => &[],
         SettingsSection::RouteProbes => &[("probes", "Probes (comma-sep)", "Text")],
     }
 }
@@ -1610,86 +1543,6 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         _ => {}
     }
 }
-fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
-    match key.code {
-        KeyCode::Char('c' | 'C') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.spawn_update_check();
-            // Refresh the form with current status
-            let status_xray = state
-                .update_status
-                .get(&CoreType::Xray)
-                .cloned()
-                .unwrap_or_default();
-            let status_singbox = state
-                .update_status
-                .get(&CoreType::SingBox)
-                .cloned()
-                .unwrap_or_default();
-            if let AppMode::Settings {
-                mode: SettingsMode::Split { right, .. },
-            } = &mut state.mode
-            {
-                *right = SplitRightPane::UpdateForm {
-                    status_xray,
-                    status_singbox,
-                };
-            }
-        }
-        KeyCode::Char('d' | 'D') => {
-            // Download updates for all cores that have them available
-            let any_updates = state.update_status.values().any(|s| s.update_available);
-            if !any_updates {
-                return;
-            }
-            // Check each core and trigger download if available
-            let xray_avail = state
-                .update_status
-                .get(&CoreType::Xray)
-                .is_some_and(|s| s.update_available);
-            let singbox_avail = state
-                .update_status
-                .get(&CoreType::SingBox)
-                .is_some_and(|s| s.update_available);
-
-            if xray_avail {
-                state.spawn_update_download(CoreType::Xray);
-            }
-            if singbox_avail {
-                state.spawn_update_download(CoreType::SingBox);
-            }
-            // Refresh the form with current status
-            let status_xray = state
-                .update_status
-                .get(&CoreType::Xray)
-                .cloned()
-                .unwrap_or_default();
-            let status_singbox = state
-                .update_status
-                .get(&CoreType::SingBox)
-                .cloned()
-                .unwrap_or_default();
-            if let AppMode::Settings {
-                mode: SettingsMode::Split { right, .. },
-            } = &mut state.mode
-            {
-                *right = SplitRightPane::UpdateForm {
-                    status_xray,
-                    status_singbox,
-                };
-            }
-        }
-        KeyCode::Esc => {
-            if let AppMode::Settings {
-                mode: SettingsMode::Split { focus, .. },
-            } = &mut state.mode
-            {
-                *focus = SplitFocus::Tree;
-            }
-        }
-        _ => {}
-    }
-}
-
 // ── Routing list ────────────────────────────────────────────────────────
 
 /// Persist a full sort-order pass: each rule's `sort_order` is the index in
@@ -2117,126 +1970,6 @@ async fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
         _ => {}
     }
 }
-
-// ── Render: Update Form ─────────────────────────────────────────────────
-
-fn render_update_form_inner(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &opaline::Theme,
-    status_xray: &BackendUpdateStatus,
-    status_singbox: &BackendUpdateStatus,
-) {
-    let label_style = Style::default()
-        .fg(theme.color("text.primary").into())
-        .add_modifier(Modifier::BOLD);
-    let header_style = Style::default()
-        .fg(theme.color("accent.primary").into())
-        .add_modifier(Modifier::BOLD);
-    let avail_style = Style::default()
-        .fg(theme.color("success").into())
-        .add_modifier(Modifier::BOLD);
-    let error_style = Style::default().fg(theme.color("error").into());
-    let hint_style = Style::default().fg(theme.color("text.muted").into());
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // ── Xray-core ──
-    lines.push(Line::from(Span::styled("  Xray-core", header_style)));
-    if let Some(ver) = &status_xray.current_version {
-        lines.push(Line::from(format!("    Current: {ver}")));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "    Current: not installed",
-            label_style,
-        )));
-    }
-    if let Some(ver) = &status_xray.latest_version {
-        lines.push(Line::from(format!("    Latest:  {ver}")));
-    } else if status_xray.error.is_some() {
-        lines.push(Line::from(Span::styled(
-            "    Latest:  (check failed)",
-            error_style,
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "    Latest:  (checking...)",
-            hint_style,
-        )));
-    }
-    if status_xray.update_available {
-        lines.push(Line::from(Span::styled(
-            "    [Update available!]",
-            avail_style,
-        )));
-    }
-    if let Some((downloaded, total)) = status_xray.download_progress {
-        lines.push(progress_bar_line(downloaded, total, &hint_style));
-    } else if status_xray.downloading {
-        lines.push(Line::from(Span::styled("    Downloading...", hint_style)));
-    }
-    if let Some(err) = &status_xray.error {
-        lines.push(Line::from(Span::styled(
-            format!("    Error: {err}"),
-            error_style,
-        )));
-    }
-
-    // ── Sing-box ──
-    lines.push(Line::from(Span::styled("  Sing-box", header_style)));
-    if let Some(ver) = &status_singbox.current_version {
-        lines.push(Line::from(format!("    Current: {ver}")));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "    Current: not installed",
-            label_style,
-        )));
-    }
-    if let Some(ver) = &status_singbox.latest_version {
-        lines.push(Line::from(format!("    Latest:  {ver}")));
-    } else if status_singbox.error.is_some() {
-        lines.push(Line::from(Span::styled(
-            "    Latest:  (check failed)",
-            error_style,
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "    Latest:  (checking...)",
-            hint_style,
-        )));
-    }
-    if status_singbox.update_available {
-        lines.push(Line::from(Span::styled(
-            "    [Update available!]",
-            avail_style,
-        )));
-    }
-    if let Some((downloaded, total)) = status_singbox.download_progress {
-        lines.push(progress_bar_line(downloaded, total, &hint_style));
-    } else if status_singbox.downloading {
-        lines.push(Line::from(Span::styled("    Downloading...", hint_style)));
-    }
-    if let Some(err) = &status_singbox.error {
-        lines.push(Line::from(Span::styled(
-            format!("    Error: {err}"),
-            error_style,
-        )));
-    }
-
-    // Action hints
-    lines.push(Line::from(""));
-    let any_updates = status_xray.update_available || status_singbox.update_available;
-    let help = if any_updates {
-        " [C] Check for Updates  [D] Download & Install  [Esc] Back "
-    } else {
-        " [C] Check for Updates  [Esc] Back "
-    };
-    lines.push(Line::from(Span::styled(help, hint_style)));
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, area);
-}
-
 // ── Render: Routing List ────────────────────────────────────────────────
 
 struct RoutingRuleItem {
@@ -2803,34 +2536,6 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-/// Format byte count to a human-readable string (KB/MB).
-fn format_bytes(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    if n >= MB {
-        format!("{:.1}MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.1}KB", n as f64 / KB as f64)
-    } else {
-        format!("{n}B")
-    }
-}
-
-/// Build a text-based progress bar line for download progress.
-fn progress_bar_line(downloaded: u64, total: u64, style: &Style) -> Line<'static> {
-    let bar = bar_cells(downloaded, total, 20);
-    let sizes = format!(
-        " ({}/{})",
-        format_bytes(downloaded),
-        if total > 0 {
-            format_bytes(total)
-        } else {
-            "?".to_string()
-        }
-    );
-    Line::from(Span::styled(format!("    {bar}{sizes}"), *style))
-}
-
 #[cfg(test)]
 mod section_list_tests {
     use super::{
@@ -2881,25 +2586,25 @@ mod section_list_tests {
 
     #[test]
     fn filter_matches_leaf_or_its_group_name() {
-        // Leaf 8 is DNS; leaf 0 is Core Settings (group "Core").
-        assert!(leaf_matches(8, "dns"));
-        assert!(leaf_matches(0, "core"));
-        assert!(leaf_matches(7, "probe"));
-        assert!(!leaf_matches(8, "zszs"));
+        // Leaf 6 is DNS; leaf 0 is Inbound (group "Connection").
+        assert!(leaf_matches(6, "dns"));
+        assert!(leaf_matches(0, "connection"));
+        assert!(leaf_matches(5, "probe"));
+        assert!(!leaf_matches(6, "zszs"));
         // An empty query keeps every leaf.
         assert!(leaf_matches(0, ""));
     }
 
     #[test]
     fn collapsed_group_hides_its_leaves_but_a_filter_reveals_them() {
-        // 15 leaves, all visible with no filter.
+        // 11 leaves, all visible with no filter.
         let list = SectionList::default();
-        assert_eq!(visible_leaves("", &list).len(), 15);
+        assert_eq!(visible_leaves("", &list).len(), 11);
         let mut collapsed = SectionList::default();
         collapsed.toggle_expanded(0);
-        assert_eq!(visible_leaves("", &collapsed).len(), 13);
+        assert_eq!(visible_leaves("", &collapsed).len(), 7);
         // A filter always shows what it matched, collapse or not.
-        assert_eq!(visible_leaves("core settings", &collapsed).len(), 1);
+        assert_eq!(visible_leaves("dns", &collapsed).len(), 1);
     }
 
     #[test]
@@ -2918,9 +2623,9 @@ mod section_list_tests {
 
     #[test]
     fn the_values_pane_never_hides_part_of_the_selected_section() {
-        // The `/` filter narrows sections only (R1): Core's five fields are all
+        // The `/` filter narrows sections only (R1): GUI's three fields are all
         // listed whatever the query is.
-        assert_eq!(visible_field_rows(SettingsSection::Core).len(), 5);
+        assert_eq!(visible_field_rows(SettingsSection::Gui).len(), 3);
         assert_eq!(visible_field_rows(SettingsSection::Dns).len(), 7);
     }
 
@@ -3028,7 +2733,7 @@ mod navigation_tests {
     #[tokio::test]
     async fn selection_walks_visible_rows_and_clamps_at_the_ends() {
         let mut app = state().await;
-        // 15 leaves, all visible.
+        // 11 leaves, all visible.
         assert_eq!(app.settings_sections.selected, 0);
         step_selection(&mut app, false);
         assert_eq!(app.settings_sections.selected, 0, "clamps at the first row");
@@ -3037,24 +2742,24 @@ mod navigation_tests {
         for _ in 0..40 {
             step_selection(&mut app, true);
         }
-        assert_eq!(app.settings_sections.selected, 14, "clamps at the last row");
+        assert_eq!(app.settings_sections.selected, 10, "clamps at the last row");
     }
 
     #[tokio::test]
     async fn collapsed_group_is_skipped_and_a_filter_snaps_the_selection() {
         let mut app = state().await;
-        // Collapsing "Core" hides leaves 0 and 1.
+        // Collapsing "Connection" hides leaves 0-3.
         app.settings_sections.toggle_expanded(0);
         app.settings_sections.selected = 0;
         step_selection(&mut app, true);
         assert_eq!(
-            app.settings_sections.selected, 2,
+            app.settings_sections.selected, 4,
             "a hidden leaf is skipped, not selected"
         );
         // A filter that hides the selection moves it to the first match.
         app.settings_search.query = "dns".to_string();
         snap_selection_to_filter(&mut app);
-        assert_eq!(app.settings_sections.selected, 8, "DNS is the only match");
+        assert_eq!(app.settings_sections.selected, 6, "DNS is the only match");
     }
 }
 
@@ -3080,12 +2785,12 @@ mod tests {
                 .unwrap(),
         );
         let mut state = AppState::new(db, leas_config::AppConfig::default()).await;
-        // Pre-fix failure state: Protocol Core form with empty stored fields.
+        // Pre-fix failure state: a form with empty stored fields.
         state.mode = AppMode::Settings {
             mode: SettingsMode::Split {
                 focus: SplitFocus::Right,
                 right: SplitRightPane::Form {
-                    section: SettingsSection::ProtocolCore,
+                    section: SettingsSection::Gui,
                     fields: Vec::new(),
                     focus_index: 0,
                     form_errors: HashMap::new(),

@@ -24,9 +24,8 @@ use crate::clash::{ClashProxy, ClashTor};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::clash_to_endpoint;
-use crate::proto_spec::core_mapping;
 use crate::proto_spec::{
-    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
+    CoreTarget, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
     ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
@@ -100,7 +99,6 @@ impl TorConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::Tor,
-                        core_type: core_mapping::resolve_core(ProtocolKind::Tor, None, None),
                         config: ProtocolConfig::Tor(config),
                     },
                 })
@@ -208,14 +206,14 @@ impl InjectToCoreConf for TorConfig {
     fn inject_to(
         &self,
         core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         _endpoint: Option<&EndpointEssentials>,
         _opts: InjectOptions,
     ) -> Result<(), SupportError> {
         match core_type {
             // Tor is a self-contained outbound (no server field) — the old
             // builder emitted `{ "type": "tor" }` endpoint-less.
-            CoreType::SingBox => {
+            CoreTarget::SingBox => {
                 let mut out = json!({ "tag": "proxy", "type": "tor" });
                 if let Some(path) = &self.executable_path {
                     out["executable_path"] = json!(path);
@@ -232,14 +230,14 @@ impl InjectToCoreConf for TorConfig {
                 *core_conf = out;
                 Ok(())
             }
-            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol("tor".into(), other)),
+            other @ CoreTarget::Xray => Err(SupportError::UnsupportedProtocol("tor".into(), other)),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CoreType, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
+    use super::super::{CoreTarget, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
     use super::TorConfig;
     use crate::proto_spec::common::SecurityConfig;
     use crate::urlx::{RawUrlX, SchemeX};
@@ -268,7 +266,6 @@ mod tests {
         assert_eq!(parsed.endpoints[0].port, 9050);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Tor);
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let cfg = match &parsed.protocol.config {
             ProtocolConfig::Tor(c) => c,
             other => panic!("expected TorConfig, got {other:?}"),
@@ -324,7 +321,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             None, // tor needs no server — endpoint-less is fine
             InjectOptions::default(),
         )
@@ -348,8 +345,13 @@ mod tests {
             remarks: None,
         };
         let mut conf = serde_json::json!({});
-        cfg.inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
-            .expect("tor sing-box inject");
+        cfg.inject_to(
+            &mut conf,
+            CoreTarget::SingBox,
+            None,
+            InjectOptions::default(),
+        )
+        .expect("tor sing-box inject");
         assert_eq!(conf, serde_json::json!({ "tag": "proxy", "type": "tor" }));
     }
 
@@ -365,11 +367,11 @@ mod tests {
         };
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .inject_to(&mut conf, CoreTarget::Xray, None, InjectOptions::default())
             .expect_err("tor has no xray shape");
         assert!(matches!(
             &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::Xray) if kind == "tor"
+            SupportError::UnsupportedProtocol(kind, CoreTarget::Xray) if kind == "tor"
         ));
     }
 }

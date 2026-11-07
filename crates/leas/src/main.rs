@@ -392,33 +392,6 @@ async fn main() -> Result<()> {
     let _flush_task = state.link_stage.spawn_flush_task();
     state.heed_storage = Some(heed.clone());
     state.log_sender_tx = Some(log_sender_tx.clone());
-    // Create core process log channel (stdout/stderr lines from xray-core/sing-box subprocesses).
-    let (core_log_tx, mut core_log_rx) = tokio::sync::mpsc::channel::<String>(512);
-    state.core_log_tx = Some(core_log_tx);
-    {
-        let log_sender = log_sender_tx.clone();
-        tokio::spawn(async move {
-            while let Some(line) = core_log_rx.recv().await {
-                let (target, level, message, _ts) =
-                    leas::parse_core_log_line(&line, leas_core::CoreType::Auto);
-                let msg = leas_core::log_heed::LogMessage {
-                    timestamp_nanos: u64::try_from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos(),
-                    )
-                    .unwrap_or(u64::MAX),
-                    level,
-                    target,
-                    message,
-                };
-                // `try_send`: a blocking `send` on the full bounded queue would
-                // stall the async executor; drop instead (counted on the layer).
-                let _ = log_sender.try_send(msg);
-            }
-        });
-    }
     // 4. Install tracing subscriber with TuiLogLayer (non-blocking channel send).
     //    Do not crash if global subscriber was already set (e.g., in tests)
     let log_file = if log_to_file {

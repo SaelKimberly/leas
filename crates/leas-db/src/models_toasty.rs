@@ -963,6 +963,34 @@ pub enum PurgatoryView {
     All,
 }
 
+/// Host/port projection of an [`Endpoint`] for config generation and export.
+///
+/// DNS hosts keep their canonical name; a non-DNS endpoint uses its first
+/// resolved address. `port`/`ports` are copied verbatim (the multi-port hop
+/// spec is part of the endpoint, not the protocol config).
+#[must_use]
+pub fn endpoint_essentials(
+    e: &Endpoint,
+    addresses: &[std::net::IpAddr],
+) -> leas_proto::proto_spec::EndpointEssentials {
+    use leas_proto::proto_spec::HostKind;
+    let (host, host_type) = if e.is_dns() {
+        (e.dns_name(), HostKind::Dns)
+    } else {
+        match addresses.first() {
+            Some(std::net::IpAddr::V4(_)) => (addresses[0].to_string(), HostKind::Ipv4),
+            Some(std::net::IpAddr::V6(_)) => (addresses[0].to_string(), HostKind::Ipv6),
+            None => (String::new(), HostKind::Undefined),
+        }
+    };
+    leas_proto::proto_spec::EndpointEssentials {
+        host,
+        host_type,
+        port: e.port,
+        ports: e.ports.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

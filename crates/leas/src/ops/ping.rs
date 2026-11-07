@@ -464,7 +464,7 @@ pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64
     if state.testing_profiles.contains(&(endpoint_id, protocol_id)) {
         return;
     }
-    if state.connected_core.is_none() {
+    if !state.connected {
         state.log_trace(
             "warn",
             "tui::ops::ping",
@@ -523,7 +523,7 @@ pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
     if state.testing_profiles.contains(&(endpoint_id, protocol_id)) {
         return;
     }
-    if state.connected_core.is_none() {
+    if !state.connected {
         state.log_trace(
             "warn",
             "tui::ops::ping",

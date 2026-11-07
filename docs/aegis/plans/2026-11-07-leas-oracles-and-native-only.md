@@ -4,7 +4,10 @@
 **Spec:** `docs/aegis/specs/2026-11-07-leas-oracles-and-native-only-design.md` (D1–D17)
 **Status:** Phase 1 implemented — verification: oracle unit 32/32, probe green,
 VLESS 81/88 (the 7 failures are accepted xhttp pin drift), `leas-native`
-756/756; workspace clippy/hakari/machete pending.
+756/756; workspace clippy/hakari/machete green. Phase 2 implemented (T9–T14);
+clean-cache rebuild + targeted verification green: workspace clippy (oracles
+excluded), 913 db/proto/config tests, 398 `leas` units, 173 oracle units,
+fmt, hakari, machete. The full workspace suite is not run on this workstation.
 
 ## Goal
 
@@ -151,3 +154,21 @@ resolves locally and fails without DNS). CI has normal egress.
   (packet/stream/stream-one/h3) where the pinned xray 26.3.27 rejects the
   generated splithttp server config with `400 Bad Request`. That is the
   pin-drift class D17 accepts; no client regression is implied.
+
+### Phase 2 deviations
+
+- `cargo tree -p leas` still shows `prost`, but only through
+  `turso → turso_sync_sdk_kit → turso_sync_engine` (the database engine's
+  `mimalloc` feature). `tonic` is absent, and no oracle adapter is in the
+  client graph. The spec's literal "tree has no prost" check was over-broad:
+  prost is a pre-existing DB-edge dependency, not an oracle one.
+- `leas-proto` keeps the per-protocol injectors and a proto-local `CoreTarget`
+  (`{Xray, SingBox}`) because they are config-generation glue validated against
+  `ss_method_support`; moving the impls would also relocate their ~60 config
+  tests for no client-graph gain. The *core-choice* surface — `CoreType`,
+  `resolve_core`, `SINGBOX_ONLY_KINDS` — moved to
+  `leas-oracles::oracle_adapters::core_mapping`, and `Protocol.core_type` left
+  the identity (`IDENTITY_VERSION` 4). The client never names either enum.
+- `safe_redirect_policy` and `endpoint_essentials` stayed in shared crates
+  (`leas-core::http`, `leas-db::models`) because the subscription fetcher and
+  the TUI export path use them; the oracle adapters re-export the same owners.

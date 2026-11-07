@@ -600,15 +600,32 @@ flowchart LR
    change, and a cursor bump would report a compatible file as
    `IncompatibleSchema` and wipe an already-imported feed.
 
-   **A re-key has no detector today.** No code reads or writes an
-   `app_meta.identity_version`, and no step in `schema/steps.rs` rebuilds
-   protocol rows (`StepKind::Rebuild` exists for this purpose and is unused), so
-   nothing compares stored uids against `IDENTITY_VERSION`. A re-key therefore
-   leaves every stored uid stale, and the next import inserts a second
-   `Protocol` row per config under the new uids, breaking identity dedup
-   silently. Until that machinery exists, ship the reset yourself: a
-   hand-written reset entry in `schema/ddl.rs` guarded by your own marker, or an
-   `IncompatibleSchema`-style wipe. This mirrors decision 11.
+   **The re-key detector is `schema::rekey`.** `app_meta.identity_version`
+   records the identity version a database has been re-keyed to; absent = 0.
+   On every open, `schema::migrate` calls `rekey::rekey_once` (current and
+   post-step arms) or `rekey::stamp` (fresh database). When the marker is below
+   `IDENTITY_VERSION`, one immediate transaction:
+
+   1. recomputes `sig`/`cred_hash`/`uid` for every `protocols` row from its
+      stored `proto_kind` + `config` (never from the old id);
+   2. groups old ids by new id; each collision group's survivor is the
+      **lowest old id**, and every other row is a loser;
+   3. merges a loser's `profile_stats` into the survivor's with the same
+      evidence law as `merge.rs` (measured latency beats untested, then the
+      lower `RankLink::key`); the survivor keeps its traffic counters and
+      `purge_reason`, so a duplicate identity cannot double-count;
+   4. re-points `endpoints.manual_protocol_override` from a loser to the
+      survivor;
+   5. **rebuilds** `protocols` and `profile_stats` into fresh tables and
+      renames them atomically — never an in-place primary-key update, because
+      a new id can equal another row's OLD id (a permutation);
+   6. clears the `endpoint_rank` cache so `endpoint_rank::ensure` recomputes
+      the ordering keys, then stamps `app_meta.identity_version`.
+
+   Failures abort the transaction and leave the marker untouched, so the next
+   open retries. `StepKind::Rebuild` stays reserved: a cursor-gated step would
+   advance `user_version`, which an identity-only change must not do.
+   The identity version is 4 (the core choice left the identity).
 
    **Format versus value.** The rule above is about the FORMAT: what
    `write_identity` writes (tags, order, which values are elided) decides the

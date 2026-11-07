@@ -44,6 +44,11 @@ use smallvec::SmallVec;
 /// Identity format version, written first into both streams. A bump is a
 /// deliberate, global re-key.
 ///
+/// **4** — the core choice (`CoreType`) left the identity: the client is
+/// native-only, so which external core used to dial a profile is no longer
+/// part of what the profile IS. Every stored uid changes; the marker-guarded
+/// re-key rebuilds `protocols`/`profile_stats` instead of wiping.
+///
 /// **3** — the `config_type` (`ShareUrl` vs `Form`) discriminator left the
 /// identity (db-rewamp D9): the origin of a config does not change what it is,
 /// so a form config and an identical share URL now share one `Protocol` row.
@@ -51,7 +56,7 @@ use smallvec::SmallVec;
 /// accepted pre-alpha cost, `AGENTS.md` decision 4/11).
 ///
 /// **2** — the SIP003 plugin field became a typed, lossless `PluginSpec`.
-pub const IDENTITY_VERSION: u8 = 3;
+pub const IDENTITY_VERSION: u8 = 4;
 
 /// Domain separator for the credential stream: credential bytes are hashed
 /// with a different prefix than sig bytes, so a byte slice moved between the
@@ -63,7 +68,7 @@ const CRED_DOMAIN: &[u8] = b"\x00cred\x00";
 pub mod tag {
     pub const PROTO_KIND: u8 = 0x01;
     // 0x02 was CONFIG_TYPE, dropped with IDENTITY_VERSION 3 (db-rewamp D9).
-    pub const CORE_TYPE: u8 = 0x03;
+    // 0x03 was CORE_TYPE, dropped with IDENTITY_VERSION 4 (native-only).
 
     // ── SecurityConfig ──
     /// TLS vs REALITY discriminator; written only when TLS/REALITY is present.

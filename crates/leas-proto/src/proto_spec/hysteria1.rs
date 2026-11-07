@@ -45,11 +45,10 @@ use super::ProtoIdentity;
 use super::common::{
     SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param, to_singbox_tls_or_default,
 };
-use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
+    CoreTarget, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
     ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashHysteria1, ClashProxy};
@@ -166,7 +165,6 @@ impl Hysteria1Config {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::Hysteria,
-                core_type: core_mapping::resolve_core(ProtocolKind::Hysteria, None, None),
                 config: ProtocolConfig::Hysteria1(config),
             },
         })
@@ -296,7 +294,6 @@ impl Hysteria1Config {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::Hysteria,
-                        core_type: core_mapping::resolve_core(ProtocolKind::Hysteria, None, None),
                         config: ProtocolConfig::Hysteria1(config),
                     },
                 })
@@ -419,13 +416,13 @@ impl InjectToCoreConf for Hysteria1Config {
     fn inject_to(
         &self,
         core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError> {
         match core_type {
-            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
-            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol("hy".into(), other)),
+            CoreTarget::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            other @ CoreTarget::Xray => Err(SupportError::UnsupportedProtocol("hy".into(), other)),
         }
     }
 }
@@ -468,7 +465,9 @@ impl Hysteria1Config {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind};
+    use super::super::{
+        CoreTarget, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+    };
     use super::Hysteria1Config;
     use crate::urlx::{RawUrlX, SchemeX};
 
@@ -525,7 +524,6 @@ mod tests {
         assert_eq!(ep.port, 443);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Hysteria);
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let cfg = config(parsed);
         assert_eq!(cfg.protocol.as_deref(), Some("udp"));
         assert_eq!(cfg.obfs.as_deref(), Some("xplus"));
@@ -700,7 +698,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("example.com", 443)),
             InjectOptions::default(),
         )
@@ -725,7 +723,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("example.com", 443)),
             InjectOptions::default(),
         )
@@ -743,7 +741,12 @@ mod tests {
         let cfg = config(parse("hysteria://example.com:443"));
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .inject_to(
+                &mut conf,
+                CoreTarget::SingBox,
+                None,
+                InjectOptions::default(),
+            )
             .expect_err("orphan hysteria must be rejected");
         assert!(matches!(err, SupportError::MissingField("server", "hy")));
     }

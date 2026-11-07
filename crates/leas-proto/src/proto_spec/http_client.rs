@@ -36,11 +36,10 @@ use super::common::{
     SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
     should_skip_endpoint_param, to_singbox_tls, to_xray_stream_settings,
 };
-use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
+    CoreTarget, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
     ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashHttp, ClashProxy};
@@ -150,7 +149,6 @@ impl HttpClientConfig {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::Http,
-                core_type: core_mapping::resolve_core(ProtocolKind::Http, None, None),
                 config: ProtocolConfig::Http(config),
             },
         })
@@ -256,7 +254,6 @@ impl HttpClientConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::Http,
-                        core_type: core_mapping::resolve_core(ProtocolKind::Http, None, None),
                         config: ProtocolConfig::Http(config),
                     },
                 })
@@ -376,13 +373,13 @@ impl InjectToCoreConf for HttpClientConfig {
     fn inject_to(
         &self,
         core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError> {
         match core_type {
-            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            CoreTarget::Xray => self.inject_xray(core_conf, endpoint, opts),
+            CoreTarget::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -461,7 +458,9 @@ impl HttpClientConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind};
+    use super::super::{
+        CoreTarget, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+    };
     use super::HttpClientConfig;
     use crate::urlx::{RawUrlX, SchemeX};
     use rstest::rstest;
@@ -519,7 +518,6 @@ mod tests {
         assert_eq!(ep.port, 8080);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Http);
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let cfg = config(parsed);
         assert_eq!(cfg.username.as_deref(), Some("user"));
         assert_eq!(cfg.password.as_deref(), Some("pass"));
@@ -692,7 +690,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::Xray,
+            CoreTarget::Xray,
             Some(&EndpointEssentials::new("1.2.3.4", 8080)),
             InjectOptions::default(),
         )
@@ -715,7 +713,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::Xray,
+            CoreTarget::Xray,
             Some(&EndpointEssentials::new("example.com", 8443)),
             InjectOptions::default(),
         )
@@ -728,9 +726,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case::xray(CoreType::Xray)]
-    #[case::singbox(CoreType::SingBox)]
-    fn inject_without_endpoint_is_rejected(#[case] core: CoreType) {
+    #[case::xray(CoreTarget::Xray)]
+    #[case::singbox(CoreTarget::SingBox)]
+    fn inject_without_endpoint_is_rejected(#[case] core: CoreTarget) {
         let cfg = http_auth();
         let mut conf = serde_json::json!({});
         let err = cfg
@@ -745,7 +743,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("1.2.3.4", 8080)),
             InjectOptions::default(),
         )
@@ -767,7 +765,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("1.2.3.4", 8443)),
             InjectOptions {
                 skip_cert_verify: true,

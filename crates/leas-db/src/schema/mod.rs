@@ -34,6 +34,7 @@ use crate::error::DatabaseError;
 use crate::models_toasty::AppMeta;
 
 pub mod ddl;
+mod rekey;
 pub mod steps;
 
 /// The version this crate's schema is at. Distinct from
@@ -122,6 +123,9 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             // (weeks on a large feed). The stamp is written in the same
             // transaction as the seed, so the pair is all-or-nothing.
             seed_stability_once(conn).await?;
+            // Identity re-key (IDENTITY_VERSION 4): marker-guarded DATA step,
+            // never a cursor bump.
+            rekey::rekey_once(conn).await?;
             Ok(())
         }
         0 => {
@@ -157,6 +161,7 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             toasty::sql::query(format!("PRAGMA user_version = {LATEST}"))
                 .exec(conn)
                 .await?;
+            rekey::stamp(conn).await?;
             Ok(())
         }
         other => {
@@ -172,6 +177,7 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
                 let steps = steps::steps_after(other);
                 if let Some(steps) = steps {
                     apply_steps(conn, steps).await?;
+                    rekey::rekey_once(conn).await?;
                     return Ok(());
                 }
             }

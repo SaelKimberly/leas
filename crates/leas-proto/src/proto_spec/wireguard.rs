@@ -41,11 +41,10 @@ use super::ProtoIdentity;
 use super::common::{
     SecurityConfig, TransportConfig, security_force_insecure, to_xray_stream_settings,
 };
-use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
+    CoreTarget, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
     ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashWireGuard};
@@ -176,7 +175,6 @@ impl WireguardConfig {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::WireGuard,
-                core_type: core_mapping::resolve_core(ProtocolKind::WireGuard, None, None),
                 config: ProtocolConfig::Wireguard(config),
             },
         })
@@ -305,7 +303,6 @@ impl WireguardConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::WireGuard,
-                        core_type: core_mapping::resolve_core(ProtocolKind::WireGuard, None, None),
                         config: ProtocolConfig::Wireguard(config),
                     },
                 })
@@ -445,13 +442,13 @@ impl InjectToCoreConf for WireguardConfig {
     fn inject_to(
         &self,
         core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError> {
         match core_type {
-            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            CoreTarget::Xray => self.inject_xray(core_conf, endpoint, opts),
+            CoreTarget::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -631,7 +628,9 @@ fn parse_reserved_bytes(raw: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind};
+    use super::super::{
+        CoreTarget, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+    };
     use super::{WireguardConfig, parse_reserved_bytes};
     use crate::urlx::{RawUrlX, SchemeX};
     use rstest::rstest;
@@ -692,7 +691,6 @@ mod tests {
         assert_eq!(ep.ports, vec![2408]);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::WireGuard);
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let cfg = config(parsed);
         assert_eq!(cfg.address, "172.16.0.2/32");
         assert_eq!(cfg.mtu.as_deref(), Some("1280"));
@@ -865,7 +863,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::Xray,
+            CoreTarget::Xray,
             Some(&ep),
             InjectOptions::default(),
         )
@@ -904,7 +902,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::Xray,
+            CoreTarget::Xray,
             Some(&EndpointEssentials::new("2606:4700:d0::a29f:c001", 2408)),
             InjectOptions::default(),
         )
@@ -953,7 +951,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::Xray,
+            CoreTarget::Xray,
             Some(&EndpointEssentials::new("162.159.192.1", 2408)),
             InjectOptions::default(),
         )
@@ -973,7 +971,7 @@ mod tests {
         let err = cfg
             .inject_to(
                 &mut conf,
-                CoreType::Xray,
+                CoreTarget::Xray,
                 Some(&EndpointEssentials::new("162.159.192.1", 2408)),
                 InjectOptions::default(),
             )
@@ -985,9 +983,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case::xray(CoreType::Xray)]
-    #[case::singbox(CoreType::SingBox)]
-    fn inject_without_endpoint_is_rejected(#[case] core: CoreType) {
+    #[case::xray(CoreTarget::Xray)]
+    #[case::singbox(CoreTarget::SingBox)]
+    fn inject_without_endpoint_is_rejected(#[case] core: CoreTarget) {
         let cfg = config(parse(WG_URL));
         let mut conf = serde_json::json!({});
         let err = cfg
@@ -1005,7 +1003,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("162.159.192.1", 2408)),
             InjectOptions::default(),
         )
@@ -1045,7 +1043,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("162.159.192.1", 2408)),
             InjectOptions::default(),
         )

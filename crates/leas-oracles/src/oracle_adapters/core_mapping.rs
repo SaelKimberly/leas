@@ -1,77 +1,18 @@
-//! Core resolution for protocol kinds — canonical logic.
+//! Core resolution for protocol kinds — oracle-side policy.
 //!
-//! The core crate's `protocol_core_mapping.rs` adapter shim (which converted
-//! core's `Protocol`/`CoreType` types) was deleted in T23; `leas-core`
-//! now re-exports this module verbatim.
+//! The protocol-level cipher capability lists stay in
+//! [`leas_proto::proto_spec::ss_method_support`] because the per-protocol
+//! injector validates against them; the *choice* of which core should dial a
+//! kind lives here, with the oracle adapters.
 
-use crate::proto_spec::{CoreType, ProtocolKind};
+pub use leas_proto::proto_spec::ss_method_support::{
+    SINGBOX_SS_METHODS, XRAY_SS_METHODS, singbox_supports_ss_method, ss_method_supported,
+    xray_supports_ss_method,
+};
 
-/// Shadowsocks ciphers xray-core accepts, case-insensitive.
-///
-/// The AEAD set from `CipherType` (proxy/shadowsocks/config.proto) plus the
-/// `aead_*` and `chacha20-poly1305` name aliases of `cipherFromString`
-/// (infra/conf/shadowsocks.go), plus the 2022-blake3 family
-/// (`shadowaead_2022.List`).
-pub const XRAY_SS_METHODS: &[&str] = &[
-    "aes-128-gcm",
-    "aes-256-gcm",
-    "chacha20-poly1305",
-    "chacha20-ietf-poly1305",
-    "xchacha20-poly1305",
-    "xchacha20-ietf-poly1305",
-    "aead_aes_128_gcm",
-    "aead_aes_256_gcm",
-    "aead_chacha20_poly1305",
-    "aead_xchacha20_poly1305",
-    "2022-blake3-aes-128-gcm",
-    "2022-blake3-aes-256-gcm",
-    "2022-blake3-chacha20-poly1305",
-];
+use leas_proto::proto_spec::ProtocolKind;
 
-/// Shadowsocks methods sing-box accepts (docs/configuration/outbound/
-/// shadowsocks.md — modern + legacy).
-pub const SINGBOX_SS_METHODS: &[&str] = &[
-    "2022-blake3-aes-128-gcm",
-    "2022-blake3-aes-256-gcm",
-    "2022-blake3-chacha20-poly1305",
-    "none",
-    "aes-128-gcm",
-    "aes-192-gcm",
-    "aes-256-gcm",
-    "chacha20-ietf-poly1305",
-    "xchacha20-ietf-poly1305",
-    "aes-128-ctr",
-    "aes-192-ctr",
-    "aes-256-ctr",
-    "aes-128-cfb",
-    "aes-192-cfb",
-    "aes-256-cfb",
-    "rc4-md5",
-    "chacha20-ietf",
-    "xchacha20",
-];
-
-/// True when xray-core can build a shadowsocks outbound for `method`.
-#[must_use]
-pub fn xray_supports_ss_method(method: &str) -> bool {
-    XRAY_SS_METHODS
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(method))
-}
-
-/// True when sing-box can build a shadowsocks outbound for `method`.
-#[must_use]
-pub fn singbox_supports_ss_method(method: &str) -> bool {
-    SINGBOX_SS_METHODS
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(method))
-}
-
-/// True when at least one core can build a shadowsocks outbound for `method`.
-#[must_use]
-pub fn ss_method_supported(method: &str) -> bool {
-    xray_supports_ss_method(method) || singbox_supports_ss_method(method)
-}
+use crate::oracle_adapters::core_type::CoreType;
 
 /// Protocol kinds that only sing-box implements.
 ///
@@ -258,26 +199,6 @@ mod tests {
             ),
             CoreType::SingBox,
         );
-    }
-
-    #[test]
-    fn xray_supports_only_aead_and_2022() {
-        assert!(xray_supports_ss_method("aes-256-gcm"));
-        assert!(xray_supports_ss_method("aead_aes_128_gcm"));
-        assert!(xray_supports_ss_method("2022-blake3-chacha20-poly1305"));
-        assert!(!xray_supports_ss_method("aes-256-cfb"));
-        assert!(!xray_supports_ss_method("none"));
-        assert!(!xray_supports_ss_method("salsa20"));
-    }
-
-    #[test]
-    fn singbox_supports_modern_and_legacy() {
-        assert!(singbox_supports_ss_method("aes-256-cfb"));
-        assert!(singbox_supports_ss_method("none"));
-        assert!(singbox_supports_ss_method("aes-192-gcm"));
-        assert!(singbox_supports_ss_method("2022-blake3-aes-256-gcm"));
-        assert!(!singbox_supports_ss_method("salsa20"));
-        assert!(!singbox_supports_ss_method("chacha20")); // bare, non-ietf
     }
 
     #[test]

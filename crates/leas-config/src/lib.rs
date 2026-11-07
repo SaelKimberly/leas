@@ -14,8 +14,8 @@ pub mod permissive_json;
 pub mod subscription;
 
 pub use app_config::{
-    AppConfig, CoreConfig, GuiConfig, InboundConfig, LogConfig, MuxConfig, ParsingSettings,
-    PurgatoryConfig, StatisticsConfig, SystemProxyConfig, TunConfig, UpdateConfig,
+    AppConfig, GuiConfig, InboundConfig, LogConfig, MuxConfig, ParsingSettings, PurgatoryConfig,
+    SystemProxyConfig, TunConfig,
 };
 pub use duration_or_secs::DurationOrSecs;
 pub use import_export::{ValidationSettings, ValidationSummary, profile_user_id};

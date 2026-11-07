@@ -1,5 +1,6 @@
+use crate::oracle_adapters::core_type::CoreType;
 use leas_db::models::{DnsSetting, Endpoint, Protocol, RoutingRule};
-use leas_proto::proto_spec::{CoreType, InjectOptions, InjectToCoreConf};
+use leas_proto::proto_spec::{InjectOptions, InjectToCoreConf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -258,7 +259,7 @@ fn build_proxy_outbound(
     let mut conf = json!({});
     protocol_config(protocol)?.inject_to(
         &mut conf,
-        core_type,
+        core_type.proto_target(),
         Some(&endpoint_essentials(endpoint, addresses)),
         InjectOptions { skip_cert_verify },
     )?;

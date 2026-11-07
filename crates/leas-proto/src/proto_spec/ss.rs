@@ -52,16 +52,16 @@ use serde_json::{Value, json};
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
+use super::ss_method_support;
 use super::ss_plugin::{MuxSetting, PluginFamily, PluginMode, PluginSpec, TlsSetting};
 
 use super::common::{
     SecurityConfig, TransportConfig, security_force_insecure, to_xray_stream_settings,
 };
-use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
+    CoreTarget, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
     ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashSS};
@@ -108,7 +108,7 @@ impl SsConfig {
     ///
     /// The protocol kind is cipher-aware: `2022-blake3-*` methods route to
     /// [`ProtocolKind::Shadowsocks2022`] and the core is resolved with the
-    /// method ([`core_mapping::resolve_core`]) so legacy ciphers route to
+    /// method ([`ss_method_support::resolve_core`]) so legacy ciphers route to
     /// sing-box and AEAD/2022 ciphers to xray-core.
     pub fn try_parse_proto(raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
         let (userinfo, hostport) = if let Some(hostport) = raw.hostport {
@@ -176,7 +176,6 @@ impl SsConfig {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind,
-                core_type: core_mapping::resolve_core(proto_kind, None, Some(method)),
                 config: ProtocolConfig::Ss(config),
             },
         })
@@ -278,7 +277,6 @@ impl SsConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind,
-                        core_type: core_mapping::resolve_core(proto_kind, None, Some(&c.cipher)),
                         config: ProtocolConfig::Ss(config),
                     },
                 })
@@ -305,7 +303,7 @@ fn plain_userinfo(userinfo: &str) -> String {
 /// [`ProtocolKind::Shadowsocks`].
 ///
 /// Case-insensitive, like every consumer of the method string
-/// (`core_mapping::xray_supports_ss_method`, `SsMethod::from_method`, and
+/// (`ss_method_support::xray_supports_ss_method`, `SsMethod::from_method`, and
 /// xray's own `cipherFromString`/`GetCipherMethod`, both of which lowercase):
 /// a `2022-BLAKE3-AES-256-GCM` row is the same row as its lowercase spelling.
 fn proto_kind_for_method(method: &str) -> ProtocolKind {
@@ -582,13 +580,13 @@ impl InjectToCoreConf for SsConfig {
     fn inject_to(
         &self,
         core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError> {
         match core_type {
-            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            CoreTarget::Xray => self.inject_xray(core_conf, endpoint, opts),
+            CoreTarget::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -608,7 +606,7 @@ impl SsConfig {
         let Some(ep) = endpoint else {
             return Err(SupportError::MissingField("server", "ss"));
         };
-        if !core_mapping::xray_supports_ss_method(self.method.as_str()) {
+        if !ss_method_support::xray_supports_ss_method(self.method.as_str()) {
             return Err(SupportError::Config(format!(
                 "Shadowsocks cipher '{}' is not supported by xray-core; \
                  supported: aes-128-gcm, aes-256-gcm, chacha20-poly1305, \
@@ -651,7 +649,7 @@ impl SsConfig {
     /// sing-box outbound for this config, ported field-by-field from the old
     /// builder's `Protocol::Shadowsocks | Protocol::Shadowsocks2022` arm
     /// (`method`/`password` with build-time cipher validation via
-    /// `core_mapping::singbox_supports_ss_method` — legacy cfb/ctr/rc4-md5/
+    /// `ss_method_support::singbox_supports_ss_method` — legacy cfb/ctr/rc4-md5/
     /// none methods build on sing-box, unknown ones are refused so the config
     /// is never written invalid), plus the typed `plugin`/`plugin_opts`
     /// (sing-box `ShadowsocksOutboundOptions` keys the old builder dropped).
@@ -664,7 +662,7 @@ impl SsConfig {
         let Some(ep) = endpoint else {
             return Err(SupportError::MissingField("server", "ss"));
         };
-        if !core_mapping::singbox_supports_ss_method(self.method.as_str()) {
+        if !ss_method_support::singbox_supports_ss_method(self.method.as_str()) {
             return Err(SupportError::Config(format!(
                 "Shadowsocks cipher '{}' is not supported by sing-box; \
                  supported: modern AEAD/2022-blake3 + legacy cfb/ctr/rc4-md5 \
@@ -702,7 +700,7 @@ mod tests {
     use base64::Engine as _;
 
     use super::super::{
-        CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind, SecurityConfig,
+        CoreTarget, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind, SecurityConfig,
         TlsConfig, TlsOpts,
     };
     use super::SsConfig;
@@ -765,7 +763,6 @@ mod tests {
         assert_eq!(ep.ports, vec![8080]);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let cfg = config(parsed);
         assert_eq!(cfg.method, "aes-256-gcm");
         assert_eq!(cfg.password, "password");
@@ -792,17 +789,14 @@ mod tests {
         // 2022-blake3 method -> Shadowsocks2022 + Xray (xray supports the family).
         let parsed = parse("ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206cGFzcw@1.2.3.4:8388");
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks2022);
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
 
         // Legacy method -> Shadowsocks + SingBox (xray has no cfb/ctr/rc4).
         let parsed = parse("ss://YWVzLTI1Ni1jZmI6cGFzcw@1.2.3.4:8388");
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
 
         // AEAD (non-2022) -> Shadowsocks + Xray.
         let parsed = parse("ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388");
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
     }
 
     /// `ProtoSpec::security()` must hand back the row's TLS/REALITY layer: the
@@ -924,7 +918,6 @@ mod tests {
         assert_eq!(parsed.endpoints[0].host_type, HostKind::Ipv4);
         assert_eq!(parsed.endpoints[0].port, 8080);
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let cfg = match &parsed.protocol.config {
             ProtocolConfig::Ss(c) => c,
             other => panic!("expected SsConfig, got {other:?}"),
@@ -1004,7 +997,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::Xray,
+            CoreTarget::Xray,
             Some(&ep),
             InjectOptions::default(),
         )
@@ -1028,7 +1021,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::Xray,
+            CoreTarget::Xray,
             Some(&EndpointEssentials::new("1.2.3.4", 8080)),
             InjectOptions::default(),
         )
@@ -1048,7 +1041,7 @@ mod tests {
         let err = cfg
             .inject_to(
                 &mut conf,
-                CoreType::Xray,
+                CoreTarget::Xray,
                 Some(&EndpointEssentials::new("1.2.3.4", 8080)),
                 InjectOptions::default(),
             )
@@ -1060,9 +1053,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case::xray(CoreType::Xray)]
-    #[case::singbox(CoreType::SingBox)]
-    fn inject_without_endpoint_is_rejected(#[case] core: CoreType) {
+    #[case::xray(CoreTarget::Xray)]
+    #[case::singbox(CoreTarget::SingBox)]
+    fn inject_without_endpoint_is_rejected(#[case] core: CoreTarget) {
         let cfg = ss_aead();
         let mut conf = serde_json::json!({});
         let err = cfg
@@ -1077,7 +1070,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("1.2.3.4", 8080)),
             InjectOptions::default(),
         )
@@ -1097,7 +1090,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("1.2.3.4", 8388)),
             InjectOptions::default(),
         )
@@ -1120,7 +1113,7 @@ mod tests {
         let err = cfg
             .inject_to(
                 &mut conf,
-                CoreType::SingBox,
+                CoreTarget::SingBox,
                 Some(&EndpointEssentials::new("1.2.3.4", 8388)),
                 InjectOptions::default(),
             )
@@ -1261,7 +1254,7 @@ mod tests {
         let err = config(parsed.clone())
             .inject_to(
                 &mut conf,
-                CoreType::Xray,
+                CoreTarget::Xray,
                 Some(&parsed.endpoints[0]),
                 InjectOptions::default(),
             )
@@ -1282,7 +1275,7 @@ mod tests {
         config(parsed.clone())
             .inject_to(
                 &mut conf,
-                CoreType::SingBox,
+                CoreTarget::SingBox,
                 Some(&parsed.endpoints[0]),
                 InjectOptions::default(),
             )

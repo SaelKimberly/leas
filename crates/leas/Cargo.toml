@@ -26,11 +26,9 @@ jiff.workspace = true
 # ============ Async Runtime & I/O ============
 tokio.workspace = true
 tokio.features = ["fs", "io-util", "rt-multi-thread", "macros", "signal", "sync"]
-futures-util.workspace = true
 dashmap.workspace = true
 
 # ============ Serialization ============
-serde.workspace = true
 serde_json.workspace = true
 
 # ============ Networking ============

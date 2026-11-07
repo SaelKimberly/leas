@@ -1,5 +1,4 @@
 use leas_proto::proto_spec::common::{GrpcConfig, TransportConfig, WebSocketConfig};
-use leas_proto::proto_spec::core_mapping;
 use leas_proto::proto_spec::{
     AnyTlsConfig, EndpointEssentials, HostKind, HttpClientConfig, Hysteria1Config, Hysteria2Config,
     NaiveConfig, ParsedProto, PlaceholderConfig, PluginSpec, ProtocolConfig, ProtocolEssentials,
@@ -1372,7 +1371,6 @@ pub fn build_typed_config(
                 endpoints: vec![endpoint_from(address, port)],
                 protocol: ProtocolEssentials {
                     proto_kind: kind,
-                    core_type: core_mapping::resolve_core(kind, None, Some(cfg.method.as_str())),
                     config: ProtocolConfig::Ss(cfg),
                 },
             });
@@ -1424,11 +1422,7 @@ pub fn build_typed_config(
 
     Ok(ParsedProto {
         endpoints: vec![endpoint],
-        protocol: ProtocolEssentials {
-            proto_kind,
-            core_type: core_mapping::resolve_core(proto_kind, None, None),
-            config,
-        },
+        protocol: ProtocolEssentials { proto_kind, config },
     })
 }
 
@@ -1702,11 +1696,7 @@ fn placeholder_parsed(
     };
     Ok(ParsedProto {
         endpoints: vec![endpoint_from(address, port)],
-        protocol: ProtocolEssentials {
-            proto_kind,
-            core_type: core_mapping::resolve_core(proto_kind, None, None),
-            config,
-        },
+        protocol: ProtocolEssentials { proto_kind, config },
     })
 }
 
@@ -2273,7 +2263,6 @@ mod tests {
     use leas_proto::urlx::RawUrlX;
 
     use super::*;
-    use leas_proto::proto_spec::CoreType;
     use rstest::rstest;
 
     /// Row 31's form half, and the guard for the arm that was unreachable:
@@ -2608,7 +2597,6 @@ mod tests {
             ]),
         );
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Vless);
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
             panic!("expected Vless config");
         };
@@ -2857,7 +2845,6 @@ mod tests {
             ]),
         );
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let ProtocolConfig::Ss(c) = &parsed.protocol.config else {
             panic!("expected Ss config");
         };
@@ -2898,7 +2885,6 @@ mod tests {
             ]),
         );
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks2022);
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
     }
 
     #[test]
@@ -2907,7 +2893,6 @@ mod tests {
             ProtocolKind::Shadowsocks,
             &producer_settings(&[("user_id", "passw0rd"), ("method", "aes-256-cfb")]),
         );
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
     }
 
@@ -2924,7 +2909,6 @@ mod tests {
                 ("allow_insecure", "true"),
             ]),
         );
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let ProtocolConfig::Trojan(c) = &parsed.protocol.config else {
             panic!("expected Trojan config");
         };
@@ -2989,7 +2973,6 @@ mod tests {
                 ("persistent_keepalive", "25"),
             ]),
         );
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let ProtocolConfig::Wireguard(c) = &parsed.protocol.config else {
             panic!("expected Wireguard config");
         };
@@ -3019,7 +3002,6 @@ mod tests {
                 ("insecure", "true"),
             ]),
         );
-        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let ProtocolConfig::Hysteria2(c) = &parsed.protocol.config else {
             panic!("expected Hysteria2 config");
         };
@@ -3076,7 +3058,6 @@ mod tests {
                 ("insecure", "false"),
             ]),
         );
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let ProtocolConfig::Tuic(c) = &parsed.protocol.config else {
             panic!("expected Tuic config");
         };
@@ -3243,7 +3224,6 @@ mod tests {
                 ("obfs_param", "example.com"),
             ]),
         );
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let ProtocolConfig::Ssr(c) = &parsed.protocol.config else {
             panic!("expected Ssr config");
         };

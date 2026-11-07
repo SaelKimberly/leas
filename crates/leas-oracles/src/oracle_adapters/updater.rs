@@ -1,83 +1,18 @@
-use crate::core_type::CoreType;
+use crate::oracle_adapters::core_type::CoreType;
 use futures_util::StreamExt;
+pub use leas_core::http::{redirect_target_is_local, safe_redirect_policy};
 use semver::Version;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 /// Shared HTTP client for update checks/downloads: one connection pool per
 /// process instead of one `Client::new()` per check.
 static UPDATE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-    crate::ensure_tls_provider();
+    leas_core::ensure_tls_provider();
     reqwest::Client::builder()
         .redirect(safe_redirect_policy(false))
         .build()
         .expect("update HTTP client build must succeed")
 });
-
-/// Whether a redirect target is an interior/local address or a local name.
-/// A fetch whose response is adopted (an update, a geo file, a subscription
-/// feed) must not be movable onto a loopback/LAN/metadata endpoint by the
-/// origin that answers it (findings f10/f11).
-#[allow(clippy::case_sensitive_file_extension_comparisons)] // `lower` is already ASCII-lowercased, so this comparison is case-insensitive
-fn redirect_target_is_local(url: &reqwest::Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
-        return true;
-    }
-    // `Url::host_str` keeps the brackets around an IPv6 literal.
-    let bare = lower
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(&lower);
-    let Ok(ip) = bare.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                || v6.is_unspecified()
-        }
-    }
-}
-
-/// Redirect policy for fetch clients whose body is adopted (updates, geo
-/// files, subscription feeds).
-///
-/// Rejects a plaintext downgrade, refuses to land
-/// on a local-use host, and caps the chain. `require_https` forces every hop
-/// to HTTPS (pass `false` for feeds whose provider may legitimately be http —
-/// a downgrade from https is still always refused).
-#[must_use]
-pub fn safe_redirect_policy(require_https: bool) -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 5 {
-            return attempt.error("too many redirects");
-        }
-        let target = attempt.url();
-        let downgrade = attempt
-            .previous()
-            .last()
-            .is_some_and(|prev| prev.scheme() == "https" && target.scheme() != "https");
-        if downgrade
-            || (require_https && target.scheme() != "https")
-            || redirect_target_is_local(target)
-        {
-            return attempt.stop();
-        }
-        attempt.follow()
-    })
-}
 
 /// Clone the shared update HTTP client (`Client::clone` is an `Arc` bump).
 #[must_use]
@@ -297,13 +232,18 @@ pub async fn install_binary(
         std::fs::create_dir_all(&temp_dir_clone)?;
 
         // 1. Extract archive to temp dir
-        crate::bin_manager::extract_archive(&archive_owned, core_type, &temp_dir_clone)
-            .map_err(|e| UpdateError::Archive(e.to_string()))?;
+        crate::oracle_adapters::bin_manager::extract_archive(
+            &archive_owned,
+            core_type,
+            &temp_dir_clone,
+        )
+        .map_err(|e| UpdateError::Archive(e.to_string()))?;
 
         // 2. Find extracted binary — through the same platform-spelled
         // candidate list `find_binary` uses, so `xray` vs `xray.exe` has one
         // owner instead of a second hardcoded match here.
-        let exe_names = crate::bin_manager::exe_names(core_type).ok_or(UpdateError::AutoCore)?;
+        let exe_names = crate::oracle_adapters::bin_manager::exe_names(core_type)
+            .ok_or(UpdateError::AutoCore)?;
         let binary = find_binary_in_dir(&temp_dir_clone, &exe_names)?;
 
         // Make executable
@@ -734,7 +674,7 @@ mod tests {
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         if assert_find_binary {
-            let found = crate::bin_manager::find_binary(core_type, &tmp);
+            let found = crate::oracle_adapters::bin_manager::find_binary(core_type, &tmp);
             assert!(
                 found.is_some(),
                 "find_binary should find managed {core_subdir}"

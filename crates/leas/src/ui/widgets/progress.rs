@@ -15,7 +15,7 @@ const FULL_BAR_CELLS: usize = 20;
 /// A shortened bar never shrinks past this, even if the text then overflows.
 const MIN_SHORT_BAR_CELLS: usize = 6;
 /// The cells the shape spends outside the bar: two separators around the
-/// counters/ETA text, the brackets, the `>` head, and the separator `bar_cells`
+/// counters/ETA text, the brackets, the `>` head, and the separator `bar_line`
 /// puts between the bar and the percent.
 const LADDER_FRAME: usize = 6;
 
@@ -40,17 +40,6 @@ fn pct_text(done: u64, total: u64) -> String {
         .checked_mul(100)
         .and_then(|n| n.checked_div(total))
         .map_or_else(String::new, |pct| format!(" {pct}%"))
-}
-
-/// The bar cells for a counter pair, width-adapted: `[███>░░] 42%`.
-///
-/// The single owner of the glyph rendering (the Settings download bar and the
-/// batch ping bars share it). `width` is the *bar* cell budget (the brackets
-/// and counters are extra).
-#[must_use]
-pub(crate) fn bar_cells(done: u64, total: u64, width: usize) -> String {
-    let (fill, track) = runs(done, total, width);
-    format!("[{fill}>{track}]{}", pct_text(done, total))
 }
 
 /// `~12m` / `~40s` / `~1h05m`; `--` when the estimate is unknown.
@@ -120,7 +109,7 @@ pub fn bar_line(
 
 #[cfg(test)]
 mod tests {
-    use super::{bar_cells, bar_line, format_eta};
+    use super::{bar_line, format_eta};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::text::Line;
@@ -132,34 +121,6 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
-    }
-
-    #[test]
-    fn bar_cells_matches_the_settings_shape() {
-        let empty = format!("[>{}]", "░".repeat(20));
-        assert_eq!(
-            bar_cells(0, 0, 20),
-            empty,
-            "no total: empty bar, no percent"
-        );
-        assert_eq!(
-            bar_cells(1, 2, 20),
-            format!("[{}>{}] 50%", "█".repeat(10), "░".repeat(10))
-        );
-        assert_eq!(
-            bar_cells(1, 4, 8),
-            format!("[{}>{}] 25%", "█".repeat(2), "░".repeat(6))
-        );
-        assert_eq!(
-            bar_cells(2, 2, 20),
-            format!("[{}>] 100%", "█".repeat(20)),
-            "an exact fill keeps the > head"
-        );
-        assert_eq!(
-            bar_cells(3, 2, 20),
-            format!("[{}>] 100%", "█".repeat(20)),
-            "a done past total clamps to a full bar"
-        );
     }
 
     #[test]

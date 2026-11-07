@@ -61,6 +61,18 @@ impl FromStr for CoreType {
     }
 }
 
+impl CoreType {
+    /// The per-protocol injector's target. `Auto`/`Native` never reach a
+    /// builder; they fall back to Xray so the match stays total.
+    #[must_use]
+    pub const fn proto_target(self) -> leas_proto::proto_spec::CoreTarget {
+        match self {
+            Self::Xray | Self::Auto | Self::Native => leas_proto::proto_spec::CoreTarget::Xray,
+            Self::SingBox => leas_proto::proto_spec::CoreTarget::SingBox,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

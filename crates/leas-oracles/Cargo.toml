@@ -13,19 +13,49 @@ publish = false
 [dependencies]
 # The client core under test (the e2e suite dials it against real servers).
 leas-native = { path = "../leas-native", features = ["e2e-support"] }
+leas-core = { path = "../leas-core", version = "0.1.0" }
+leas-db = { path = "../leas-db", version = "0.1.0" }
 leas-proto.workspace = true
 leas-tls.workspace = true
 
-# Async runtime + TLS used by the harness (spawned cores, TLS echo targets).
-tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "process"] }
+# Async runtime + TLS used by the harness (spawned cores, TLS echo targets)
+# and by the oracle adapters moved from `leas-core`.
+tokio = { workspace = true, features = [
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "rt",
+    "rt-multi-thread",
+    "process",
+    "fs",
+    "signal",
+] }
 rustls = { workspace = true, features = ["ring"] }
 tokio-rustls.workspace = true
 ring.workspace = true
 rcgen.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+
+# Oracle adapters: config generation, core download/update, gRPC stats.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+reqwest.features = ["socks", "stream", "json"]
+semver = { version = "1.0.28", features = ["std"] }
+tonic = "0.14.9"
+tonic-prost = "0.14.9"
+prost = "0.14.4"
+zip = "9.1.3"
+tar = "0.4.46"
+flate2.workspace = true
+yaml-rust2.workspace = true
 
 # Config generation (base64url REALITY keys, JSON server configs).
 base64.workspace = true
-serde_json.workspace = true
 x25519-dalek.workspace = true
 
 # Local targets: HTTP echo + per-test scratch dirs.
@@ -42,6 +72,8 @@ zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
 tar = "0.4.46"
 flate2.workspace = true
 sha2.workspace = true
+protox = "0.10"
+tonic-prost-build = "0.14.9"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
@@ -49,6 +81,7 @@ rstest.workspace = true
 criterion = { workspace = true, features = ["async_tokio"] }
 tokio-tungstenite = "0.30.0"
 futures-core = "0.3.34"
+toasty = { workspace = true, features = ["serde"] }
 # `relay` benches the SOCKS5 inbound through the routing engine.
 leas-route = { path = "../leas-route" }
 
@@ -61,8 +94,19 @@ name = "throughput"
 harness = false
 
 [package.metadata.cargo-machete]
-# `build.rs` consumes these; cargo-machete does not scan build scripts.
-ignored = ["flate2", "sha2", "tar", "ureq", "zip"]
+# build.rs / OUT_DIR-generated code and build-script-only deps.
+ignored = [
+    "flate2",
+    "sha2",
+    "tar",
+    "ureq",
+    "zip",
+    "prost",
+    "tonic-prost",
+    "tonic-prost-build",
+    "protox",
+    "tokio-rustls",
+]
 
 [lints]
 workspace = true

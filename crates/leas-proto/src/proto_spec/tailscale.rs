@@ -28,9 +28,8 @@ use crate::clash::{ClashProxy, ClashTailscale};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::clash_to_endpoint;
-use crate::proto_spec::core_mapping;
 use crate::proto_spec::{
-    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
+    CoreTarget, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
     ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use serde_json::{Value, json};
@@ -127,7 +126,6 @@ impl TailscaleConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::Tailscale,
-                        core_type: core_mapping::resolve_core(ProtocolKind::Tailscale, None, None),
                         config: ProtocolConfig::Tailscale(config),
                     },
                 })
@@ -247,7 +245,7 @@ impl InjectToCoreConf for TailscaleConfig {
     fn inject_to(
         &self,
         core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         _endpoint: Option<&EndpointEssentials>,
         _opts: InjectOptions,
     ) -> Result<(), SupportError> {
@@ -255,7 +253,7 @@ impl InjectToCoreConf for TailscaleConfig {
             // Tailscale is a self-contained endpoint outbound (no server
             // field) — the old builder emitted `{ "type": "tailscale" }`
             // endpoint-less.
-            CoreType::SingBox => {
+            CoreTarget::SingBox => {
                 let mut out = json!({ "tag": "proxy", "type": "tailscale" });
                 if let Some(v) = &self.hostname {
                     out["hostname"] = json!(v);
@@ -287,7 +285,7 @@ impl InjectToCoreConf for TailscaleConfig {
                 *core_conf = out;
                 Ok(())
             }
-            other @ CoreType::Xray => {
+            other @ CoreTarget::Xray => {
                 Err(SupportError::UnsupportedProtocol("tailscale".into(), other))
             }
         }
@@ -296,7 +294,7 @@ impl InjectToCoreConf for TailscaleConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CoreType, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
+    use super::super::{CoreTarget, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
     use super::TailscaleConfig;
     use crate::proto_spec::common::SecurityConfig;
     use crate::urlx::{RawUrlX, SchemeX};
@@ -333,7 +331,6 @@ mod tests {
         assert_eq!(parsed.endpoints[0].port, 100);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Tailscale);
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let cfg = match &parsed.protocol.config {
             ProtocolConfig::Tailscale(c) => c,
             other => panic!("expected TailscaleConfig, got {other:?}"),
@@ -403,7 +400,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             None, // tailscale needs no server — endpoint-less is fine
             InjectOptions::default(),
         )
@@ -437,8 +434,13 @@ mod tests {
             remarks: None,
         };
         let mut conf = serde_json::json!({});
-        cfg.inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
-            .expect("tailscale sing-box inject");
+        cfg.inject_to(
+            &mut conf,
+            CoreTarget::SingBox,
+            None,
+            InjectOptions::default(),
+        )
+        .expect("tailscale sing-box inject");
         assert_eq!(
             conf,
             serde_json::json!({ "tag": "proxy", "type": "tailscale" })
@@ -462,11 +464,11 @@ mod tests {
         };
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .inject_to(&mut conf, CoreTarget::Xray, None, InjectOptions::default())
             .expect_err("tailscale has no xray shape");
         assert!(matches!(
             &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::Xray) if kind == "tailscale"
+            SupportError::UnsupportedProtocol(kind, CoreTarget::Xray) if kind == "tailscale"
         ));
     }
 }

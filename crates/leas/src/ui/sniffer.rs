@@ -52,7 +52,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if state.connected_core != Some(leas_core::CoreType::Native) {
+    if !state.connected {
         render_hint(
             frame,
             inner,
@@ -332,7 +332,7 @@ mod tests {
             "a non-native session must say why the pane is empty"
         );
 
-        state.connected_core = Some(leas_core::CoreType::Native);
+        state.connected = true;
         state.sniffer.record(sample_snapshot());
         terminal
             .draw(|frame| render(frame, frame.area(), &state))

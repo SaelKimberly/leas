@@ -1,5 +1,6 @@
+use crate::oracle_adapters::core_type::CoreType;
 use leas_db::models::{DnsSetting, Endpoint, Protocol, RoutingRule};
-use leas_proto::proto_spec::{CoreType, InjectOptions, InjectToCoreConf};
+use leas_proto::proto_spec::{InjectOptions, InjectToCoreConf};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -174,7 +175,7 @@ fn build_proxy_outbound(
     let mut out = json!({});
     protocol_config(protocol)?.inject_to(
         &mut out,
-        core_type,
+        core_type.proto_target(),
         Some(&endpoint_essentials(endpoint, addresses)),
         InjectOptions {
             skip_cert_verify: params.skip_cert_verify,
@@ -553,7 +554,10 @@ mod tests {
         let api = &json["experimental"]["v2ray_api"];
         assert_eq!(
             api["listen"],
-            format!("127.0.0.1:{}", crate::config_builder::API_PORT)
+            format!(
+                "127.0.0.1:{}",
+                crate::oracle_adapters::config_builder::API_PORT
+            )
         );
         assert_eq!(api["stats"]["enabled"], true);
         assert_eq!(api["stats"]["outbounds"], json!(["proxy", "direct"]));
@@ -606,7 +610,10 @@ mod tests {
         let exp = &json["experimental"];
         assert_eq!(
             exp["clash_api"]["external_controller"],
-            format!("127.0.0.1:{}", crate::config_builder::CLASH_API_PORT)
+            format!(
+                "127.0.0.1:{}",
+                crate::oracle_adapters::config_builder::CLASH_API_PORT
+            )
         );
         // v2ray_api should still be present (it was true in default_params)
         assert!(exp["v2ray_api"].is_object(), "v2ray_api should be present");

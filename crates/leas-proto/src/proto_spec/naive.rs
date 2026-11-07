@@ -28,11 +28,10 @@ use serde_json::{Value, json};
 
 use super::ProtoIdentity;
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, to_singbox_tls};
-use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
+    CoreTarget, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError, ParsedProto,
     ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashNaive, ClashProxy};
@@ -104,7 +103,6 @@ impl NaiveConfig {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::Naive,
-                core_type: core_mapping::resolve_core(ProtocolKind::Naive, None, None),
                 config: ProtocolConfig::Naive(config),
             },
         })
@@ -178,7 +176,6 @@ impl NaiveConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::Naive,
-                        core_type: core_mapping::resolve_core(ProtocolKind::Naive, None, None),
                         config: ProtocolConfig::Naive(config),
                     },
                 })
@@ -293,13 +290,15 @@ impl InjectToCoreConf for NaiveConfig {
     fn inject_to(
         &self,
         core_conf: &mut Value,
-        core_type: CoreType,
+        core_type: CoreTarget,
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError> {
         match core_type {
-            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
-            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol("naive".into(), other)),
+            CoreTarget::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            other @ CoreTarget::Xray => {
+                Err(SupportError::UnsupportedProtocol("naive".into(), other))
+            }
         }
     }
 }
@@ -338,7 +337,9 @@ impl NaiveConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind};
+    use super::super::{
+        CoreTarget, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+    };
     use super::NaiveConfig;
     use crate::urlx::{RawUrlX, SchemeX};
 
@@ -395,7 +396,6 @@ mod tests {
         assert_eq!(ep.port, 443);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Naive);
-        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let cfg = config(parsed);
         assert_eq!(cfg.username, "user");
         assert_eq!(cfg.password, "pass");
@@ -521,7 +521,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("example.com", 443)),
             InjectOptions::default(),
         )
@@ -544,7 +544,7 @@ mod tests {
         let mut conf = serde_json::json!({});
         cfg.inject_to(
             &mut conf,
-            CoreType::SingBox,
+            CoreTarget::SingBox,
             Some(&EndpointEssentials::new("example.com", 443)),
             InjectOptions {
                 skip_cert_verify: true,
@@ -559,7 +559,12 @@ mod tests {
         let cfg = config(parse("naive+https://user:pass@example.com:443"));
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .inject_to(
+                &mut conf,
+                CoreTarget::SingBox,
+                None,
+                InjectOptions::default(),
+            )
             .expect_err("orphan naive must be rejected");
         assert!(matches!(err, SupportError::MissingField("server", "naive")));
     }

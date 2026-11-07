@@ -2,11 +2,9 @@ pub mod singbox;
 pub mod xray;
 
 pub mod clash_mixin;
-use crate::core_type::CoreType;
+use crate::oracle_adapters::core_type::CoreType;
 use leas_db::models::{DnsSetting, Endpoint, Protocol, RoutingRule};
-use leas_proto::proto_spec::{
-    CoreType as ProtoCoreType, EndpointEssentials, HostKind, ProtocolConfig, SupportError,
-};
+use leas_proto::proto_spec::{CoreTarget as ProtoCoreType, ProtocolConfig, SupportError};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -90,24 +88,7 @@ pub fn shadowsocks_method(protocol: &Protocol) -> Option<String> {
 /// An IP host's literal lives in `endpoint_ip` (db-rewamp D10), not on the
 /// endpoint row, so the caller threads the addresses; a DNS host dials its
 /// reconstructed name. An exotic host (empty domain, no address) is Undefined.
-#[must_use]
-pub fn endpoint_essentials(e: &Endpoint, addresses: &[std::net::IpAddr]) -> EndpointEssentials {
-    let (host, host_type) = if e.is_dns() {
-        (e.dns_name(), HostKind::Dns)
-    } else {
-        match addresses.first() {
-            Some(std::net::IpAddr::V4(_)) => (addresses[0].to_string(), HostKind::Ipv4),
-            Some(std::net::IpAddr::V6(_)) => (addresses[0].to_string(), HostKind::Ipv6),
-            None => (String::new(), HostKind::Undefined),
-        }
-    };
-    EndpointEssentials {
-        host,
-        host_type,
-        port: e.port,
-        ports: e.ports.clone(),
-    }
-}
+pub use leas_db::models::endpoint_essentials;
 
 /// Borrow the typed [`ProtocolConfig`] from a `Protocol`'s deferred JSON
 /// column, refusing unloaded rows with a clear error instead of panicking on
@@ -191,13 +172,25 @@ impl ConfigBuilder {
         match core_type {
             ProtoCoreType::Xray => {
                 let config = xray::XrayConfigBuilder::build(
-                    endpoint, addresses, protocol, core_type, params, routing, dns,
+                    endpoint,
+                    addresses,
+                    protocol,
+                    CoreType::Xray,
+                    params,
+                    routing,
+                    dns,
                 )?;
                 Ok(BackendConfig::Xray(config))
             }
             ProtoCoreType::SingBox => {
                 let config = singbox::SingBoxConfigBuilder::build(
-                    endpoint, addresses, protocol, core_type, params, routing, dns,
+                    endpoint,
+                    addresses,
+                    protocol,
+                    CoreType::SingBox,
+                    params,
+                    routing,
+                    dns,
                 )?;
                 Ok(BackendConfig::SingBox(config))
             }
@@ -209,9 +202,10 @@ impl ConfigBuilder {
 mod tests {
     use super::*;
     use leas_db::models::{HostType, Latency, ProfileStats, TrafficStats, Transport};
+    use leas_proto::proto_spec::HostKind;
     use leas_proto::proto_spec::common::TransportConfig;
     use leas_proto::proto_spec::{
-        CoreType as ProtoCoreType, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+        CoreTarget as ProtoCoreType, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         VlessConfig,
     };
     use toasty::{Deferred, Json};
@@ -442,8 +436,8 @@ mod tests {
         assert_eq!(
             backend.core_type(),
             match expected_core {
-                ProtoCoreType::Xray => crate::core_type::CoreType::Xray,
-                ProtoCoreType::SingBox => crate::core_type::CoreType::SingBox,
+                ProtoCoreType::Xray => crate::oracle_adapters::core_type::CoreType::Xray,
+                ProtoCoreType::SingBox => crate::oracle_adapters::core_type::CoreType::SingBox,
             }
         );
         let json = match &backend {

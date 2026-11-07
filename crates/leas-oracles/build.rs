@@ -23,8 +23,16 @@ use sha2::{Digest as _, Sha256};
 #[path = "src/pins.rs"]
 mod pins;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Oracle adapters' gRPC Stats client (moved from `leas-core`): `protox`
+    // parses the .proto in-process, so `protoc` is not a build prerequisite.
+    let fds = protox::compile(["proto/stats.proto"], ["proto"])?;
+    tonic_prost_build::configure()
+        .build_server(false)
+        .compile_fds(fds)?;
+
     println!("cargo:rerun-if-changed=src/pins.rs");
+    println!("cargo:rerun-if-changed=proto/stats.proto");
     println!("cargo:rerun-if-env-changed=LEAS_CORE_BIN_DIR");
     println!("cargo:rerun-if-env-changed=LEAS_ORACLES_SKIP_DOWNLOAD");
     println!("cargo:rerun-if-env-changed=LEAS_ORACLES_PROXY");
@@ -36,10 +44,10 @@ fn main() {
         // The runtime override wins in `CoreUnderTest::resolve`; baking it as
         // well keeps a build-time-only value usable by the test process.
         println!("cargo:rustc-env=LEAS_ORACLES_CORE_DIR={dir}");
-        return;
+        return Ok(());
     }
     if env::var_os("LEAS_ORACLES_SKIP_DOWNLOAD").is_some() {
-        return;
+        return Ok(());
     }
 
     let os = env::consts::OS;
@@ -89,6 +97,7 @@ fn main() {
         "cargo:rustc-env=LEAS_ORACLES_CORE_DIR={}",
         bin_dir.display()
     );
+    Ok(())
 }
 
 /// The binary file name for `core` on this host (with `.exe` on Windows).

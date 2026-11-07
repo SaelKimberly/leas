@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use leas_core::CoreType;
 use leas_core::speed_test::TestType;
 use leas_db::LinkGroups;
 use leas_db::models::{
@@ -11,7 +10,7 @@ use leas_db::models::{
 use crate::AppState;
 use crate::ops::profiles::endpoint_dns_unresolved;
 use crate::state::ProxyEndpoint;
-use crate::types::{AppMode, CoreEvent, SettingsMode, SplitRightPane};
+use crate::types::CoreEvent;
 
 /// Format a profile ID as a URL-like hex identifier.
 fn fmt_profile_id(id: i64) -> String {
@@ -427,15 +426,13 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
         };
         handled = true;
         match event {
-            CoreEvent::Connected(core_type) => {
+            CoreEvent::Connected => {
                 // A native session starts from an empty ring: the session
                 // task is aborted on teardown and can swallow its own
                 // `Disconnected`, so the previous session's rows and totals
                 // would otherwise linger into this one.
-                if core_type == CoreType::Native {
-                    state.reset_native_activity();
-                }
-                state.connected_core = Some(core_type);
+                state.reset_native_activity();
+                state.connected = true;
                 let port = state.config.inbound.local_port();
                 if port == 0 {
                     state.live_proxy.clear();
@@ -451,20 +448,18 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 }
                 state.connecting = false;
                 state.connection_error = None;
-                state.log_trace("info", "core::process", &format!("Connected [{core_type}]"));
+                state.log_trace("info", "core::process", "Connected [native]");
             }
             CoreEvent::Disconnected => {
                 // Ignore stale Disconnected if already reconnecting
                 if !state.connecting {
                     // Native session over: legs whose `Closed` trace died with
                     // the session task must not render live. Deliberately not
-                    // gated on `connected_core`: `connect::disconnect` clears
-                    // it synchronously, well before the session task emits
-                    // this event, so a core-type guard would skip every
-                    // user-initiated stop. The ring only ever holds native
-                    // rows, and the call no-ops when none are open.
+                    // gated on `connected`: `connect::disconnect` clears it
+                    // synchronously, well before the session task emits this
+                    // event, so a guard would skip every user-initiated stop.
                     state.native_activity.close_out_open();
-                    state.connected_core = None;
+                    state.connected = false;
                     state.live_proxy.clear();
                     state.connected_protocol_id = None;
                     // Session over: the actions-log traffic segment must not
@@ -477,7 +472,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
             CoreEvent::Error(err) => {
                 state.connection_error = Some(err.clone());
                 state.connecting = false;
-                state.connected_core = None;
+                state.connected = false;
                 state.live_proxy.clear();
                 state.log_trace(
                     "error",
@@ -485,10 +480,6 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     &format!("Connection error: {err}"),
                 );
                 state.connected_protocol_id = None;
-            }
-            CoreEvent::StatsError(msg) => {
-                state.connection_error = Some(msg.clone());
-                state.log_trace("warning", "core::process", &format!("Stats error: {msg}"));
             }
             CoreEvent::StatsUpdate {
                 protocol_id,
@@ -1025,131 +1016,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     crate::ops::enrich::spawn_dns_resolve(state, ep_id, false);
                 }
             }
-            CoreEvent::UpdateCheckResult {
-                core_type,
-                current_version,
-                latest_version,
-                error,
-            } => {
-                let status = state.update_status.entry(core_type).or_default();
-                status.current_version.clone_from(&current_version);
-                status.latest_version.clone_from(&latest_version);
-                status.update_available = current_version.as_ref().map_or_else(
-                    // Not installed but latest known → install available
-                    || latest_version.is_some(),
-                    |cur_str| {
-                        latest_version.as_ref().is_some_and(|latest_str| {
-                            let cur = leas_core::updater::parse_version(cur_str);
-                            let latest = leas_core::updater::parse_version(latest_str);
-                            match (cur, latest) {
-                                (Some(c), Some(l)) => leas_core::updater::is_newer(&c, &l),
-                                _ => false,
-                            }
-                        })
-                    },
-                );
-                status.error = error;
-                if let Some(ref ver) = latest_version {
-                    match core_type {
-                        CoreType::Xray => {
-                            state.config.updates.xray_latest_known = Some(ver.clone());
-                        }
-                        CoreType::SingBox => {
-                            state.config.updates.sing_box_latest_known = Some(ver.clone());
-                        }
-                        // Native is in-process: no binary, no version check.
-                        CoreType::Auto | CoreType::Native => {}
-                    }
-                }
-                // Refresh form snapshots if currently viewing the updates form
-                if let AppMode::Settings {
-                    mode:
-                        SettingsMode::Split {
-                            right:
-                                SplitRightPane::UpdateForm {
-                                    status_xray,
-                                    status_singbox,
-                                },
-                            ..
-                        },
-                } = &mut state.mode
-                {
-                    *status_xray = state
-                        .update_status
-                        .get(&CoreType::Xray)
-                        .cloned()
-                        .unwrap_or_default();
-                    *status_singbox = state
-                        .update_status
-                        .get(&CoreType::SingBox)
-                        .cloned()
-                        .unwrap_or_default();
-                }
-            }
-            CoreEvent::UpdateDownloadProgress {
-                core_type,
-                downloaded,
-                total,
-            } => {
-                if let Some(status) = state.update_status.get_mut(&core_type) {
-                    status.download_progress = Some((downloaded, total));
-                }
-            }
-            CoreEvent::UpdateCompleted {
-                core_type,
-                old_version,
-                new_version,
-                success,
-                error,
-            } => {
-                let status = state.update_status.entry(core_type).or_default();
-                status.downloading = false;
-                status.download_progress = None;
-                if success {
-                    status.current_version = Some(new_version.clone());
-                    status.update_available = false;
-                    state.log_trace(
-                        "info",
-                        "tui::ops::events",
-                        &format!(
-                            "{core_type} updated: {} → {}",
-                            old_version.as_deref().unwrap_or("none"),
-                            new_version,
-                        ),
-                    );
-                } else {
-                    status.error.clone_from(&error);
-                    state.log_trace(
-                        "error",
-                        "tui::ops::events",
-                        &format!("{core_type} update failed: {error:?}"),
-                    );
-                }
-                // Refresh form snapshots if currently viewing the updates form
-                if let AppMode::Settings {
-                    mode:
-                        SettingsMode::Split {
-                            right:
-                                SplitRightPane::UpdateForm {
-                                    status_xray,
-                                    status_singbox,
-                                },
-                            ..
-                        },
-                } = &mut state.mode
-                {
-                    *status_xray = state
-                        .update_status
-                        .get(&CoreType::Xray)
-                        .cloned()
-                        .unwrap_or_default();
-                    *status_singbox = state
-                        .update_status
-                        .get(&CoreType::SingBox)
-                        .cloned()
-                        .unwrap_or_default();
-                }
-            }
+
             CoreEvent::BatchEnded => {
                 // Batch finished: clear the shared meters and re-arm the stop
                 // flag (the pipeline retired everything; a stopped batch must not
@@ -1399,11 +1266,11 @@ fn apply_stats_delta(
 /// must not be lost (e.g. a `SubscriptionsUpdated` whose
 /// `updating_groups.remove` never runs would leave the group spinner stuck).
 /// Session-scoped lifecycle/error events (`Connected`/`Disconnected`/
-/// `Error`/`StatsError`) are exceptions: meaningless after teardown, and
+/// `Error`) are exceptions: meaningless after teardown, and
 /// their handlers mutate session state unconditionally — a re-sent
-/// `StatsError` would re-set `connection_error` after `disconnect()` cleared
+/// `Error` would re-set `connection_error` after `disconnect()` cleared
 /// it (the footer would paint "Error: ..." for the whole disconnected
-/// period), and a re-sent `Connected` would resurrect `connected_core` on a
+/// period), and a re-sent `Connected` would resurrect `connected` on a
 /// disconnected UI.
 pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileStats> {
     let mut touched: Vec<ProfileStats> = Vec::new();
@@ -1445,10 +1312,7 @@ pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileSt
                 }
             }
             // Session-scoped: dropped at the disconnect boundary.
-            CoreEvent::Connected(_)
-            | CoreEvent::Disconnected
-            | CoreEvent::Error(_)
-            | CoreEvent::StatsError(_) => {}
+            CoreEvent::Connected | CoreEvent::Disconnected | CoreEvent::Error(_) => {}
             other => non_stats.push(other),
         }
     }
@@ -1998,9 +1862,7 @@ mod tests {
         let (mut state, tx) = event_state().await;
 
         // Session one: two legs open, one of them closes.
-        tx.send(CoreEvent::Connected(CoreType::Native))
-            .await
-            .unwrap();
+        tx.send(CoreEvent::Connected).await.unwrap();
         tx.send(CoreEvent::NativeTrace(opened(1))).await.unwrap();
         tx.send(CoreEvent::NativeTrace(opened(2))).await.unwrap();
         tx.send(CoreEvent::NativeTrace(closed(1))).await.unwrap();
@@ -2011,10 +1873,10 @@ mod tests {
         // Disconnect: leg 2 never reported a close (its trace died with the
         // session task) — it must still end up closed, count at 0. Mimic the
         // real user-initiated order: `connect::disconnect` clears
-        // `connected_core` synchronously and the session task emits
+        // `connected` synchronously and the session task emits
         // `Disconnected` afterwards, so the close-out must not depend on the
         // core still being set.
-        state.connected_core = None;
+        state.connected = false;
         tx.send(CoreEvent::Disconnected).await.unwrap();
         poll_core_events(&mut state).await;
         assert_eq!(state.native_activity.open_count, 0);
@@ -2022,9 +1884,7 @@ mod tests {
         assert_eq!(state.native_activity.total_up, 100);
 
         // Session two starts empty: no rows, no totals from session one.
-        tx.send(CoreEvent::Connected(CoreType::Native))
-            .await
-            .unwrap();
+        tx.send(CoreEvent::Connected).await.unwrap();
         poll_core_events(&mut state).await;
         assert!(state.native_activity.entries.is_empty());
         assert_eq!(
@@ -2037,11 +1897,8 @@ mod tests {
             (0, 0, 0, 0)
         );
 
-        // Connecting a subprocess core leaves the native ring alone.
-        tx.send(CoreEvent::NativeTrace(opened(3))).await.unwrap();
-        tx.send(CoreEvent::Connected(CoreType::Xray)).await.unwrap();
-        poll_core_events(&mut state).await;
-        assert_eq!(state.native_activity.entries.len(), 1);
+        // Every native session starts empty — there is no subprocess arm
+        // that could leave the ring alone.
     }
 
     #[tokio::test]
@@ -2214,9 +2071,9 @@ mod tests {
         // Idle: no events -> false (keeps the refresh-cadence draw path).
         assert!(!state.poll_core_events().await);
         // A real event -> true, and the state change is applied.
-        tx.send(CoreEvent::Connected(CoreType::Xray)).await.unwrap();
+        tx.send(CoreEvent::Connected).await.unwrap();
         assert!(state.poll_core_events().await);
-        assert_eq!(state.connected_core, Some(CoreType::Xray));
+        assert!(state.connected);
         // Drained -> idle again.
         assert!(!state.poll_core_events().await);
     }
@@ -2551,10 +2408,9 @@ mod tests {
     #[tokio::test]
     async fn drain_flush_drops_session_scoped_error_events() {
         // Session-scoped lifecycle/error events pending at disconnect must
-        // not be re-sent: a re-sent StatsError would re-set
-        // `connection_error` after disconnect() cleared it (stale "Error:"
-        // footer), and a re-sent Connected would resurrect connected_core on
-        // a disconnected UI.
+        // not be re-sent: a re-sent Error would re-set `connection_error`
+        // after disconnect() cleared it (stale "Error:" footer), and a
+        // re-sent Connected would resurrect `connected` on a disconnected UI.
         let (mut state, _orig_tx) = event_state().await;
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         state.core_event_rx = Some(rx);
@@ -2562,28 +2418,25 @@ mod tests {
         let row = row_with_protocols(100, 1, 7);
         state.endpoints = vec![row];
         state.connected_protocol_id = Some(100);
-        state.connected_core = Some(CoreType::Xray);
+        state.connected = true;
 
-        tx.send(CoreEvent::StatsError("stats api unavailable".to_string()))
-            .await
-            .unwrap();
         tx.send(CoreEvent::Error("config build failed".to_string()))
             .await
             .unwrap();
-        tx.send(CoreEvent::Connected(CoreType::Xray)).await.unwrap();
+        tx.send(CoreEvent::Connected).await.unwrap();
 
         state.disconnect();
         assert_eq!(
             state.connection_error, None,
             "footer stays clean after disconnect"
         );
-        assert_eq!(
-            state.connected_core, None,
+        assert!(
+            !state.connected,
             "connected state not resurrected by a stale Connected"
         );
         // The only event re-delivered after the drain is disconnect()'s own
         // "Disconnected" TuiLog (it logs through the same channel) — the
-        // session-scoped StatsError/Error/Connected must be gone.
+        // session-scoped Error/Connected must be gone.
         let mut seen_disconnect_log = false;
         while let Some(rx) = state.core_event_rx.as_mut() {
             match rx.try_recv() {

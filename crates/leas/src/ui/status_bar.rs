@@ -3,7 +3,6 @@ use crate::SettingsSection;
 use crate::ui::theme::ThemeStyles;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -89,68 +88,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         (text, ThemeStyles::warning(theme))
     } else if let Some(err) = &state.connection_error {
         (format!(" Error: {err}"), ThemeStyles::error(theme))
-    } else {
-        state.connected_core.as_ref().map_or_else(
-            || (" Disconnected".to_string(), ThemeStyles::error(theme)),
-            |core| (format!(" Connected [{core}]"), ThemeStyles::success(theme)),
+    } else if state.connected {
+        (
+            " Connected [native]".to_string(),
+            ThemeStyles::success(theme),
         )
+    } else {
+        (" Disconnected".to_string(), ThemeStyles::error(theme))
     };
 
-    // Append update indicator if any backend has an update available
-    let update_indicator_span = if state.update_status.values().any(|s| s.update_available) {
-        let cores: Vec<&str> = state
-            .update_status
-            .iter()
-            .filter(|(_, s)| s.update_available)
-            .map(|(ct, _)| match ct {
-                leas_core::CoreType::Xray => "xray",
-                leas_core::CoreType::SingBox => "sing-box",
-                // Auto never has a pending update row; native is in-process.
-                leas_core::CoreType::Auto | leas_core::CoreType::Native => "",
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-        if cores.is_empty() {
-            Span::raw("")
-        } else {
-            Span::styled(
-                format!(" ⇧Update:{} ", cores.join(",")),
-                ThemeStyles::warning(theme).add_modifier(Modifier::BOLD),
-            )
-        }
-    } else {
-        Span::raw("")
-    };
-    // Download progress indicator while updating backends
-    let download_span = {
-        let parts: Vec<String> = state
-            .update_status
-            .iter()
-            .filter(|(_, s)| s.downloading)
-            .map(|(ct, s)| {
-                let name = match ct {
-                    leas_core::CoreType::Xray => "x",
-                    leas_core::CoreType::SingBox => "sb",
-                    leas_core::CoreType::Auto | leas_core::CoreType::Native => "",
-                };
-                if let Some((done, total)) = s.download_progress {
-                    let pct = if total > 0 {
-                        format!("{}%", (done as f64 / total as f64 * 100.0) as u64)
-                    } else {
-                        "??".to_string()
-                    };
-                    format!(" ⇩{name} {pct}")
-                } else {
-                    format!(" ⇩{name}")
-                }
-            })
-            .collect();
-        if parts.is_empty() {
-            Span::raw("")
-        } else {
-            Span::styled(parts.join(" "), ThemeStyles::spinner(theme))
-        }
-    };
     // Mode indicator prefix
     let mode_prefix = match &state.mode {
         crate::AppMode::Settings { mode } => match mode {
@@ -158,7 +104,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 crate::SplitRightPane::Form { section, .. } => status_bar_section_label(*section),
                 crate::SplitRightPane::RoutingList { .. }
                 | crate::SplitRightPane::RoutingForm { .. } => " Settings > Routing",
-                crate::SplitRightPane::UpdateForm { .. } => " Settings > Updates",
                 crate::SplitRightPane::GroupList { .. }
                 | crate::SplitRightPane::GroupForm { .. } => " Settings > Subscriptions",
             },
@@ -176,7 +121,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let left_text = format!("{mode_prefix}{left_text}");
 
     // Dynamic right-side hints
-    let budget = width_available(state, area.width as usize);
+    let budget = width_available(area.width as usize);
     let right_text = fit_hints(build_hints(state), budget);
     let right_style = ThemeStyles::status_bar_hint(theme);
 
@@ -184,24 +129,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let left_len = left_text.len();
     let padding = width.saturating_sub(left_len + right_text.len());
 
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(left_text, left_style),
         Span::raw(" ".repeat(padding)),
         Span::styled(right_text, right_style),
     ];
-    // Insert indicators between left text and padding
-    let mut insert_pos = 1;
-    if !download_span.content.is_empty() {
-        spans.insert(insert_pos, Span::raw(" "));
-        insert_pos += 1;
-        spans.insert(insert_pos, download_span);
-        insert_pos += 1;
-    }
-    if !update_indicator_span.content.is_empty() {
-        spans.insert(insert_pos, Span::raw(" "));
-        insert_pos += 1;
-        spans.insert(insert_pos, update_indicator_span);
-    }
 
     let line = Line::from(spans);
 
@@ -255,7 +187,7 @@ fn build_hints(state: &AppState) -> String {
             // Pane-shell hints (spec D2): keys are pane-scoped.
             match (state.focused_pane, state.pane1_tab) {
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Profiles) => {
-                    if state.connected_core.is_some() {
+                    if state.connected {
                         " [Ctrl+D] Disconnect  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
                             .to_string()
                     } else if state.connecting {
@@ -340,9 +272,6 @@ pub(crate) fn settings_hints(state: &AppState) -> String {
             crate::SplitRightPane::RoutingForm { .. } => {
                 " [Enter] Save  [Ctrl+W] Sections  [Esc] Back ".to_string()
             }
-            crate::SplitRightPane::UpdateForm { .. } => {
-                " [C] Check  [D] Download  [Ctrl+W] Sections  [Esc] Back ".to_string()
-            }
             crate::SplitRightPane::GroupList { .. } => {
                 " [↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Sections  [Esc] Back "
                     .to_string()
@@ -352,11 +281,8 @@ pub(crate) fn settings_hints(state: &AppState) -> String {
 }
 
 /// Width left for hints after the status segment and any indicators.
-fn width_available(state: &AppState, total: usize) -> usize {
-    let mut used = 12; // status segment reserve
-    if state.update_status.values().any(|s| s.update_available) {
-        used += 18;
-    }
+fn width_available(total: usize) -> usize {
+    let used = 12; // status segment reserve
     total.saturating_sub(used).max(20)
 }
 
@@ -397,18 +323,14 @@ pub(crate) fn fit_hints(hints: String, budget: usize) -> String {
 
 const fn status_bar_section_label(section: SettingsSection) -> &'static str {
     match section {
-        SettingsSection::Core => " Settings > Core",
         SettingsSection::Gui => " Settings > GUI",
         SettingsSection::Inbound => " Settings > Inbound",
         SettingsSection::Dns => " Settings > DNS",
         SettingsSection::SystemProxy => " Settings > System Proxy",
         SettingsSection::Tun => " Settings > TUN",
         SettingsSection::Mux => " Settings > Mux",
-        SettingsSection::Stats => " Settings > Statistics",
-        SettingsSection::ProtocolCore => " Settings > Protocol Core",
         SettingsSection::SpeedTest => " Settings > Speed Test",
         SettingsSection::Logging => " Settings > Logging",
-        SettingsSection::Updates => " Settings > Updates",
         SettingsSection::Routing => " Settings > Routing",
         SettingsSection::Subscriptions => " Settings > Subscriptions",
         SettingsSection::RouteProbes => " Settings > Route Probes",

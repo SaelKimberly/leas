@@ -16,7 +16,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::AppState;
 use crate::ui::theme::ThemeStyles;
-use leas_core::{API_ENDPOINT, CoreType, format_bytes, format_uptime};
+use leas_core::{format_bytes, format_uptime};
 use ratatui::style::Style;
 
 pub use crate::ui::native_activity::{handle_key, reset_scroll};
@@ -26,7 +26,7 @@ pub fn connection_icon(state: &AppState) -> (&'static str, Style) {
     let theme = state.theme();
     if state.connecting {
         ("⠋", ThemeStyles::spinner(theme))
-    } else if state.connected_core.is_some() {
+    } else if state.connected {
         ("●", ThemeStyles::success(theme))
     } else if state.connection_error.is_some() {
         ("⏹", ThemeStyles::error(theme))
@@ -49,8 +49,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let (icon, icon_style) = connection_icon(state);
     let status_text = if state.connecting {
         format!("{icon} Connecting...")
-    } else if let Some(core) = &state.connected_core {
-        format!("{icon} Connected [{core}]")
+    } else if state.connected {
+        format!("{icon} Connected [native]")
     } else if let Some(err) = &state.connection_error {
         format!("{icon} Error: {err}")
     } else {
@@ -73,12 +73,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         .or_else(|| state.filtered_profiles().nth(state.selected_index));
     match profile {
         Some(profile) => {
-            let core = state.connected_core.map_or("", |c| c.as_str());
             lines.push(Line::from(format!(
-                "  {}:{} [{}]",
+                "  {}:{} [native]",
                 profile.endpoint.display_host(&profile.resolved_ips),
-                profile.endpoint.port,
-                core
+                profile.endpoint.port
             )));
             if let Some(link) = profile.active_link() {
                 lines.push(Line::from(format!(
@@ -99,7 +97,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // ── Native core ───────────────────────────────────────────────────────
     lines.push(section("native", theme));
-    if state.connected_core == Some(CoreType::Native) {
+    if state.connected {
         let log = &state.native_activity;
         lines.push(Line::from(format!(
             "  {} open · {} closed · {} failed",
@@ -140,11 +138,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         lines.push(hint("  no system data yet"));
     }
-    let api = match state.connected_core {
-        Some(CoreType::Native) => "  api in-process (event feed)".to_string(),
-        _ => format!("  api {API_ENDPOINT}"),
-    };
-    lines.push(Line::from(api));
+    lines.push(Line::from("  api in-process (event feed)"));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -203,7 +197,7 @@ mod tests {
         let mut state = AppState::new(db, AppConfig::default()).await;
         state.search_query = search.to_string();
         state.purgatory_view = leas_db::models::PurgatoryView::All;
-        state.connected_core = Some(CoreType::Xray);
+        state.connected = true;
         crate::ops::profiles::reload_profiles(&mut state).await;
         state
     }

@@ -181,7 +181,7 @@ the sections are flat labelled rows.
 status
   ○ Disconnected
 session
-  edge-a.example:443 [xray]
+  edge-a.example:443 [native]
   today ↑1.0KB ↓2.1KB · total ↑9.8KB ↓19.5KB
 native
   4 open · 12 closed · 1 failed
@@ -191,7 +191,7 @@ core
   api http://127.0.0.1:62789
 ```
 
-- **status**: the connection indicator (`● Connected [xray]`, `⠋ Connecting...`,
+- **status**: the connection indicator (`● Connected [native]`, `⠋ Connecting...`,
   `⏹ Error: ...`, `○ Disconnected`).
 - **session**: the connected profile's traffic (today and total, up and down from
   the link's persisted `profile_stats` plus the session delta). Shows
@@ -312,8 +312,8 @@ only the mode.
 │ │Press / to filter settings                          │ │
 │ └─────────────────────────────────────────────────────┘ │
 │ ┌ Sections · 2/20 ─────────┐ ┌ Values · 1/2 ──────────┐ │   section list / fields
-│ │  ▾ Core                  │ │›* Servers (JSON)   x█  │ │
-│ │›    Core Settings        │ │ · DNS Cache TTL    —   │ │
+│ │  ▾ Routing               │ │›* Servers (JSON)   x█  │ │
+│ │›    DNS                  │ │ · DNS Cache TTL    —   │ │
 │ └──────────────────────────┘ └────────────────────────┘ │
 │ ┌ Help · DNS ─────────────────────────────────────────┐ │   field help
 │ │Type     Text                                        │ │
@@ -348,21 +348,20 @@ moves the cursor into the fields.
 yet saved. Bools render `✓`/`✗`, an empty text field renders `—`, selects render
 `< option >`, and a focused row ends with a `█` cursor.
 
-**Selectors** (Log Level, the per-protocol core, **Theme**) advance on `Space` or
+**Selectors** (Log Level, **Theme**) advance on `Space` or
 `Enter` and wrap past the last option; `←`/`→` step one option. Because `Enter`
 belongs to the selector on those fields, `Ctrl+S` saves the section (`Enter`
 still saves every other field type). Theme lists every builtin opaline slug, is
 bound to the theme the app actually loads, and applies on save.
 
-**Section tree (15 leaves in 5 groups):**
+**Section tree (11 leaves in 4 groups):**
 
 | Group | Leaves |
 | --- | --- |
-| Core | Core Settings, Protocol Core |
 | Connection | Inbound, System Proxy, TUN, Mux |
 | Routing | Routing Rules, Probe Hosts, DNS |
 | GUI | GUI Settings |
-| Advanced | Statistics, Updates, Speed Test, Logging, Subscriptions |
+| Advanced | Speed Test, Logging, Subscriptions |
 
 **Filter.** `/` starts a case-insensitive substring filter over the section list
 (a leaf name or its group name). It never filters the Values pane. `Enter`
@@ -402,10 +401,6 @@ Two levels:
 cancels. `Ctrl+V` pastes the clipboard into the focused text field (crossterm's
 Windows backend has no bracketed paste, so `Ctrl+V` is the only paste door there).
 
-#### Updates (Settings → Advanced)
-
-Shows the current and latest version of each backend. `C` checks, `D` downloads
-every available update, `Esc` returns to the section list.
 
 ### Add and edit server
 
@@ -600,14 +595,13 @@ The bottom row. Left: mode prefix, then connection state. Right: contextual keys
 | Maintenance | `Maintenance...`, `Name: n/N`, `Comp: n/N`, or both (yellow) |
 | Error | `Error: <message>` (red bold) |
 | Disconnected | `Disconnected` (red) |
-| Connected | `Connected [xray]` / `Connected [sing-box]` / `Connected [native]` (green) |
+| Connected | `Connected [native]` (green) |
 
-Mode prefixes: none in List mode, then `Settings`, `Settings > Core`,
-`Settings > Routing`, `Settings > Updates`, `Settings > Subscriptions`,
+Mode prefixes: none in List mode, then `Settings`,
+`Settings > Routing`, `Settings > Subscriptions`,
 `Add Server`, `Edit Server`, `Speed Test`, `Export`, `Export File`,
 `Batch Import`, `Help`.
 
-Indicators: `⇧Update:xray,sing-box` (yellow bold) when installed backends have
 updates, and `⇩<name> <pct>%` while a backend downloads. The Settings popup's
 own title reads `Settings *` while a form is dirty.
 
@@ -645,7 +639,6 @@ status bar:
 | Filtering | `[type] Filter  [Enter] Apply  [Ctrl+U] Clear  [Esc] Cancel` |
 | Routing list | `[↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Sections  [Esc] Back` |
 | Routing form | `[Enter] Save  [Ctrl+W] Sections  [Esc] Back` |
-| Updates | `[C] Check  [D] Download  [Ctrl+W] Sections  [Esc] Back` |
 | Subscription list | `[↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Sections  [Esc] Back` |
 
 ## Keyboard reference
@@ -820,7 +813,7 @@ These apply wherever the popup is open and no text field owns the key:
 
 1. Select a profile and press `Ctrl+Enter` (or `Ctrl+G` where the terminal eats
    `Ctrl+Enter`).
-2. The status bar shows the spinner, then `Connected [xray]` (or `[sing-box]`,
+2. The status bar shows the spinner, then `Connected [native]`,
    `[native]`); `Metrics` starts reporting traffic.
 3. `Ctrl+D` disconnects; the status bar returns to `Disconnected`.
 

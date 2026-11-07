@@ -1,4 +1,4 @@
-use crate::core_type::CoreType;
+use crate::oracle_adapters::core_type::CoreType;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]

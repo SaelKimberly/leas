@@ -14,4 +14,5 @@
 #![forbid(unsafe_code)]
 
 pub mod e2e;
+pub mod oracle_adapters;
 pub mod pins;

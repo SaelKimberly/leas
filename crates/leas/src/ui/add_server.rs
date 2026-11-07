@@ -1,6 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use leas_config::forms::{FieldSection, FormFieldType, form_fields_for};
-use leas_core::SINGBOX_ONLY_KINDS;
 use leas_proto::proto_spec::ProtocolKind;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -16,33 +15,6 @@ use ratatui_cheese::fieldset::{Fieldset, FieldsetFill};
 use ratatui_cheese::input::{Input, InputState};
 use ratatui_cheese::select::{Select, SelectOption, SelectState};
 use tui_popup::{KnownSizeWrapper, Popup};
-
-/// Protocol picker layout groups
-const XRAY_PROTOCOLS: &[ProtocolKind] = &[
-    ProtocolKind::Vmess,
-    ProtocolKind::Vless,
-    ProtocolKind::Shadowsocks,
-    ProtocolKind::Shadowsocks2022,
-    ProtocolKind::Socks,
-    ProtocolKind::Http,
-    ProtocolKind::Trojan,
-    ProtocolKind::WireGuard,
-    ProtocolKind::Hysteria2,
-    ProtocolKind::DokodemoDoor,
-    ProtocolKind::Freedom,
-    ProtocolKind::Blackhole,
-    ProtocolKind::Dns,
-    ProtocolKind::Loopback,
-    ProtocolKind::Custom,
-];
-
-fn singbox_protocols() -> Vec<ProtocolKind> {
-    SINGBOX_ONLY_KINDS
-        .iter()
-        .filter(|p| !matches!(p, ProtocolKind::TProxy | ProtocolKind::Mixed))
-        .copied()
-        .collect()
-}
 
 const ALL_PICKER_PROTOCOLS: &[ProtocolKind] = &[
     ProtocolKind::Vmess,
@@ -163,15 +135,10 @@ fn render_protocol_picker(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
 
     // Build options with disabled separators for section headers
-    let mut item_labels: Vec<String> = Vec::new();
-    item_labels.push("=== Xray-core ===".to_string());
-    for proto in XRAY_PROTOCOLS {
-        item_labels.push(format!("  {proto}"));
-    }
-    item_labels.push("=== Sing-box ===".to_string());
-    for proto in singbox_protocols() {
-        item_labels.push(format!("  {proto}"));
-    }
+    let item_labels: Vec<String> = ALL_PICKER_PROTOCOLS
+        .iter()
+        .map(|proto| format!("  {proto}"))
+        .collect();
     let opts: Vec<SelectOption> = item_labels
         .iter()
         .map(|s| {
@@ -182,13 +149,8 @@ fn render_protocol_picker(frame: &mut Frame, area: Rect, state: &AppState) {
             }
         })
         .collect();
-    // Map AppState.selected_index (protocol-only index) to Select cursor position
-    let xray_count = XRAY_PROTOCOLS.len();
-    let cursor_pos = if state.selected_index < xray_count {
-        1 + state.selected_index
-    } else {
-        1 + xray_count + 1 + (state.selected_index - xray_count)
-    };
+    // Map AppState.selected_index (protocol-only index) to the Select cursor.
+    let cursor_pos = state.selected_index;
 
     let select =
         Select::new("Select Protocol", &opts).palette(&crate::ui::theme::widget_palette(theme));
@@ -356,7 +318,7 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
 }
 
 fn handle_picker_key(state: &mut AppState, key: &KeyEvent) {
-    let protocol_count = XRAY_PROTOCOLS.len() + singbox_protocols().len();
+    let protocol_count = ALL_PICKER_PROTOCOLS.len();
     if protocol_count == 0 {
         return;
     }

@@ -1,49 +1,13 @@
-use std::path::Path;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-
-use leas_core::grpc_client;
-use leas_core::{
-    BuildParams, CLASH_API_PORT, ConfigBuilder, CoreType, RealCoreManager,
-    config_builder::clash_mixin::parse_clash_mixin, find_binary,
-};
-use leas_db::models::{DnsSetting, EndpointId, RoutingRule};
+use leas_db::models::EndpointId;
 use leas_native::capability;
-use leas_proto::proto_spec::{CoreType as ProtoCoreType, ProtocolConfig, ProtocolKind};
 
 use super::native_connect;
 
 use crate::AppState;
-use crate::parse_core_log_line;
+use crate::try_send_or_warn;
 use crate::types::CoreEvent;
-use crate::{ClashTraffic, try_send_or_warn};
-use futures_util::StreamExt;
-use std::sync::LazyLock;
-
-/// Shared reqwest client for the sing-box Clash API stream: one connection
-/// pool per process instead of one `Client::new()` per connection session.
-static CLASH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    leas_core::ensure_tls_provider();
-    reqwest::Client::new()
-});
-
-/// Map one sing-box clash `/traffic` line to its `StatsUpdate` event.
-///
-/// sing-box emits one JSON line per second with that second's traffic delta
-/// since the previous line, so the event carries the per-line delta — the
-/// same semantics as the xray gRPC poller (`query_stats(..., reset = true)`).
-/// The events handler accumulates deltas into the persisted row; sending a
-/// cumulative session total here would double-count on every event.
-const fn clash_stats_event(protocol_id: i64, t: &ClashTraffic) -> CoreEvent {
-    CoreEvent::StatsUpdate {
-        protocol_id,
-        today_up: t.up,
-        today_down: t.down,
-        total_up: t.up,
-        total_down: t.down,
-    }
-}
 
 /// How long a new session waits for the previous session task to finish its
 /// teardown before it binds its own listeners.
@@ -57,70 +21,6 @@ const PREV_SESSION_TEARDOWN: Duration = Duration::from_secs(5);
 /// How long `disconnect` lets the session task run its own teardown
 /// (`server.shutdown()` + `Disconnected`) before aborting it.
 const DISCONNECT_TEARDOWN: Duration = Duration::from_secs(3);
-
-/// Loud downgrade lines: what refused the native core, and what runs instead.
-const REFUSED_KIND: &str =
-    "native core has no implementation for this protocol kind; using the subprocess core";
-const REFUSED_PROXY_ALL: &str =
-    "native core is proxy-all: routing rules / DNS settings need xray-core";
-const REFUSED_UNLOADED: &str = "profile config not loaded; native core skipped, using xray-core";
-const REFUSED_CAPABILITY: &str =
-    "native core does not support this profile config; using xray-core";
-
-/// True when a `protocol_core_overrides` value asks for the in-process core.
-///
-/// `auto` asks for it too: it is the config-level "prefer native" answer, and
-/// preferring native is exactly what the capability gate decides. Neither value
-/// bypasses that gate.
-const fn asks_native(forced: Option<CoreType>) -> bool {
-    matches!(forced, Some(CoreType::Native | CoreType::Auto))
-}
-
-/// Resolve the core that serves one connect, plus the gate that refused the
-/// native core when it was asked for.
-///
-/// `link_core` is the link's persisted stamp — always concrete — and the only
-/// legal *subprocess* answer: `ConfigBuilder::build` dispatches on
-/// `link.core_type`, so a runtime core that disagreed with the stamp would feed
-/// one core's JSON to the other's binary. A `protocol_core_overrides` value of
-/// `xray`/`sing-box` therefore only vetoes native; `native`/`auto` asks for
-/// native and still faces the capability gate.
-///
-/// Native is asked for by that override, or by ANY link whose kind and loaded
-/// config the engine can serve — not only an `Xray`-stamped one. A `SingBox`
-/// stamp is not a statement that native cannot serve the row: legacy
-/// Shadowsocks methods and `aes-192-gcm` are stamped `SingBox` because xray's
-/// roster lacks them, and they are exactly the rows the native codecs exist
-/// for (spec D8). A concrete `xray`/`sing-box` override still vetoes native.
-fn resolve_runtime_core(
-    link_core: CoreType,
-    kind: ProtocolKind,
-    forced: Option<CoreType>,
-    config: Option<&ProtocolConfig>,
-    proxy_all_blocked: bool,
-) -> (CoreType, Option<&'static str>) {
-    let forces_legacy = matches!(forced, Some(CoreType::Xray | CoreType::SingBox));
-    if forces_legacy {
-        return (link_core, None);
-    }
-    if !capability::kind_supported(kind) {
-        // Every xray-stamped non-native kind lands here: for those the
-        // subprocess core *is* the expected answer, so only an explicit native
-        // override earns a line.
-        return (link_core, asks_native(forced).then_some(REFUSED_KIND));
-    }
-    if proxy_all_blocked {
-        return (link_core, Some(REFUSED_PROXY_ALL));
-    }
-    let Some(config) = config else {
-        return (link_core, Some(REFUSED_UNLOADED));
-    };
-    if capability::supported(kind, config) {
-        (CoreType::Native, None)
-    } else {
-        (link_core, Some(REFUSED_CAPABILITY))
-    }
-}
 
 /// Connect to a profile by starting the appropriate core (xray-core or sing-box).
 pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
@@ -211,52 +111,16 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         return;
     };
 
-    // Runtime core selection needs the loaded config, so the task builds
-    // `BuildParams` itself from these hoisted values (flags follow the
-    // resolved core, not the stamped link value).
-    let param_log_level = state.config.core.log_level.clone();
-    let param_socks_port = state.config.inbound.socks_port;
-    let param_http_port = state.config.inbound.http_port;
-    let param_mixed_port = state.config.inbound.mixed_port;
+    // The native session binds the configured mixed inbound.
     let param_listen = state.config.inbound.listen.clone();
-    let param_sniffing = state.config.inbound.sniffing;
-    let param_clash_api_port = state.config.clash_api_port;
-    let param_mux = if state.config.mux.enabled {
-        Some(serde_json::json!({
-            "protocol": state.config.mux.protocol,
-            "max_connections": state.config.mux.max_connections,
-            "min_streams": state.config.mux.min_streams,
-            "max_streams": state.config.mux.max_streams,
-            "padding": state.config.mux.padding,
-        }))
-    } else {
-        None
-    };
-    let param_clash_mixin = state
-        .config
-        .clash_mixin
-        .as_deref()
-        .and_then(parse_clash_mixin);
-    let param_skip_cert_verify = state.config.core.skip_cert_verify;
-    let param_core_overrides = state.config.core.protocol_core_overrides.clone();
+    let param_local_port = state.config.inbound.local_port();
 
-    // Routing comes from the already-loaded rules; DNS settings are loaded
-    // inside the task (async read) with a typed default fallback.
-    let routing: Vec<RoutingRule> = state.routing_rules.clone();
-    let db = state.db.clone();
-
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| Path::new(".").to_path_buf())
-        .join("leas");
-    let bin_dir = config_dir.join("bin");
-    let bin_configs_dir = config_dir.join("binConfigs");
-
-    // Create log forwarding channel
-    let (log_line_tx, mut log_line_rx) = mpsc::channel::<String>(512);
+    // Session log sink (native telemetry writes the heed store).
     let state_log_sender = state.log_sender_tx.clone();
 
     // One core at a time: hand the previous session's task to the new one so it
     // can wait out that teardown before binding its own listeners.
+    let db = state.db.clone();
     let prev_task = state.core_task_handle.take();
     let handle = tokio::spawn(async move {
         // 0a. Wait out the previous session's teardown — the stop signal above
@@ -302,357 +166,29 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
                 return;
             }
         };
-        let dns = match db.get_dns_settings().await {
-            Ok(Some(d)) => d,
-            _ => DnsSetting {
-                id: "default".to_string(),
-                name: None,
-                servers: Vec::new(),
-                hosts: Vec::new(),
-                query_strategy: None,
-                disable_cache: false,
-                disable_fallback: false,
-                client_ip: None,
-                cache_ttl_secs: None,
-            },
-        };
-
-        // 0.5. Runtime core. The core is DERIVED (the per-pair stamp is gone,
-        //     db-rewamp D3) from the LOADED protocol — `shadowsocks_method`
-        //     needs the real config, and the page row's is unloaded, so a
-        //     legacy-cipher SS row would otherwise default to xray-core and
-        //     fail at build. Native preference is decided here too, because
-        //     only here can the capability gate run.
-        let forced = param_core_overrides
-            .get(&proto_kind.to_string())
-            .and_then(|s| s.parse::<CoreType>().ok());
-        let link_core = match leas_proto::proto_spec::core_mapping::resolve_core(
-            proto_kind,
-            match forced {
-                Some(CoreType::Xray) => Some(ProtoCoreType::Xray),
-                Some(CoreType::SingBox) => Some(ProtoCoreType::SingBox),
-                Some(CoreType::Native | CoreType::Auto) | None => None,
-            },
-            leas_core::config_builder::shadowsocks_method(&protocol).as_deref(),
-        ) {
-            ProtoCoreType::Xray => CoreType::Xray,
-            ProtoCoreType::SingBox => CoreType::SingBox,
-        };
-        // The native core is proxy-all — no routing engine, no DNS server — so
-        // a profile with routing rules or non-default DNS keeps the subprocess
-        // core. Decided before the capability gate so the `BuildParams` api
-        // flags below follow the final runtime core.
-        let proxy_all_blocked =
-            !routing.is_empty() || !dns.servers.is_empty() || !dns.hosts.is_empty();
-        let loaded_config = if protocol.config.is_unloaded() {
-            None
-        } else {
-            Some(&protocol.config.get().0)
-        };
-        let (runtime_core, refused) = resolve_runtime_core(
-            link_core,
-            proto_kind,
-            forced,
-            loaded_config,
-            proxy_all_blocked,
-        );
-        if let Some(reason) = refused {
-            tracing::warn!(
-                target: "tui::ops::connect",
-                host = %endpoint.dns_name(),
-                kind = %proto_kind,
-                core = %runtime_core,
-                rules = routing.len(),
-                dns_servers = dns.servers.len(),
-                dns_hosts = dns.hosts.len(),
-                "{reason}"
-            );
-            if asks_native(forced) {
-                tracing::warn!(
-                    target: "tui::ops::connect",
-                    host = %endpoint.dns_name(),
-                    kind = %proto_kind,
-                    core = %runtime_core,
-                    "protocol_core_overrides asked for the native core: override NOT honored"
-                );
-            }
-        }
-        let params = BuildParams {
-            v2ray_api_enabled: runtime_core == CoreType::Xray,
-            clash_api_enabled: runtime_core == CoreType::SingBox,
-            log_level: param_log_level,
-            socks_port: param_socks_port,
-            http_port: param_http_port,
-            mixed_port: param_mixed_port,
-            listen: param_listen,
-            sniffing: param_sniffing,
-            clash_api_port: param_clash_api_port,
-            mux: param_mux,
-            clash_mixin: param_clash_mixin,
-            skip_cert_verify: param_skip_cert_verify,
-        };
-        if runtime_core == CoreType::Native {
-            native_connect::run_native_session(
-                &params,
-                &endpoint,
-                &addresses,
-                &protocol,
+        // Unsupported rows stay visible and refuse with the capability
+        // reason (D16) instead of falling back to a subprocess core.
+        if let Some(reason) = capability::support_reason(proto_kind, &protocol.config.get().0) {
+            try_send_or_warn(
                 &tx,
-                &state_log_sender,
-                stop_rx,
-                protocol_id.get(),
-            )
-            .await;
+                CoreEvent::Error(reason.into_owned()),
+                "unsupported_profile",
+            );
             return;
         }
 
-        // 1. Build config
-        let backend_config = match ConfigBuilder::build(
+        native_connect::run_native_session(
+            &param_listen,
+            param_local_port,
             &endpoint,
             &addresses,
             &protocol,
-            match runtime_core {
-                CoreType::Xray => ProtoCoreType::Xray,
-                CoreType::SingBox => ProtoCoreType::SingBox,
-                CoreType::Auto | CoreType::Native => {
-                    try_send_or_warn(
-                        &tx,
-                        CoreEvent::Error(
-                            "internal: non-subprocess core reached the builder".into(),
-                        ),
-                        "config_build_error",
-                    );
-                    return;
-                }
-            },
-            &params,
-            &routing,
-            &dns,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                try_send_or_warn(
-                    &tx,
-                    CoreEvent::Error(format!("Config build failed: {e}")),
-                    "config_build_error",
-                );
-                return;
-            }
-        };
-
-        // 2. Find binary
-        let Some(bin_path) = find_binary(runtime_core, &bin_dir) else {
-            try_send_or_warn(
-                &tx,
-                CoreEvent::Error(
-                    "Core binary not found. Place it in ~/.config/leas/bin/ or install in PATH."
-                        .to_string(),
-                ),
-                "binary_not_found",
-            );
-            return;
-        };
-        // 3. Start core
-        let mut manager = RealCoreManager::new(bin_configs_dir, log_line_tx);
-        if let Err(e) = manager
-            .start(
-                runtime_core,
-                &backend_config,
-                &bin_path,
-                params.clash_mixin.as_ref(),
-            )
-            .await
-        {
-            try_send_or_warn(
-                &tx,
-                CoreEvent::Error(format!("Failed to start core: {e}")),
-                "core_start_error",
-            );
-            return;
-        }
-
-        // 3b. Readiness probe: wait for the core's proxy port to open
-        let proxy_port = params.local_port();
-        if proxy_port > 0 {
-            let probe_start = std::time::Instant::now();
-            loop {
-                if probe_start.elapsed() > std::time::Duration::from_secs(10) {
-                    break;
-                }
-                match tokio::net::TcpStream::connect(("127.0.0.1", proxy_port)).await {
-                    Ok(_) => break,
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
-                }
-            }
-        }
-
-        // 4. Signal connected
-        try_send_or_warn(&tx, CoreEvent::Connected(runtime_core), "connected");
-
-        // Forward stderr log lines as CoreEvent::LogLine
-        let log_tx = tx.clone();
-        let log_sender = state_log_sender.clone();
-        tokio::spawn(async move {
-            while let Some(line) = log_line_rx.recv().await {
-                let (level, target, message, ts_nanos) = parse_core_log_line(&line, runtime_core);
-                let timestamp_nanos = ts_nanos.unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as i64
-                });
-                // Write to log storage via bounded channel: `try_send` never
-                // blocks the executor; on a full queue the line drops (counted
-                // on the layer) instead of parking this task per line.
-                if let Some(ref sender) = log_sender {
-                    let _ = sender.try_send(leas_core::log_heed::LogMessage {
-                        level: level.clone(),
-                        target: target.clone(),
-                        message: message.clone(),
-                        timestamp_nanos: timestamp_nanos as u64,
-                    });
-                }
-                // Forward to TUI
-                try_send_or_warn(
-                    &log_tx,
-                    CoreEvent::LogLine {
-                        level,
-                        target,
-                        message,
-                        timestamp_nanos,
-                    },
-                    "log_line",
-                );
-            }
-        });
-
-        let profile_id = protocol_id.get();
-
-        if runtime_core == CoreType::Xray {
-            // === gRPC polling loop (xray-core) ===
-            let provider = match grpc_client::create_stats_provider().await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    try_send_or_warn(
-                        &tx,
-                        CoreEvent::StatsError(format!("Stats API unavailable: {e}")),
-                        "stats_api_unavailable",
-                    );
-                    None
-                }
-            };
-            let poll_interval = std::time::Duration::from_secs(3);
-            let mut ticker = tokio::time::interval(poll_interval);
-            ticker.tick().await;
-            let mut sys_tick_counter = 0u8;
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => break,
-                    _ = ticker.tick() => {
-                        if let Some(ref provider) = provider {
-                            match provider.query_stats("outbound>>>*>>>traffic>>>*", true).await {
-                                Ok(rows) => {
-                                    let mut today_up = 0i64;
-                                    let mut today_down = 0i64;
-                                    for stat in &rows {
-                                        if stat.name.contains(">>>uplink") {
-                                            today_up += stat.value;
-                                        } else if stat.name.contains(">>>downlink") {
-                                            today_down += stat.value;
-                                        }
-                                    }
-                                    try_send_or_warn(&tx, CoreEvent::StatsUpdate {
-                                        protocol_id: profile_id,
-                                        today_up,
-                                        today_down,
-                                        total_up: today_up,
-                                        total_down: today_down,
-                                    }, "stats_update");
-                                }
-                                Err(e) => {
-                                try_send_or_warn(&tx, CoreEvent::StatsError(format!("Stats query failed: {e}")), "stats_query_err");
-                                }
-                            }
-                            // sys stats every 3rd tick (~9s)
-                            sys_tick_counter += 1;
-                            if sys_tick_counter >= 3 {
-                                sys_tick_counter = 0;
-                                match provider.get_sys_stats().await {
-                                    Ok(sys) => { try_send_or_warn(&tx, CoreEvent::SysStatsUpdate(sys), "sys_stats_update"); }
-                                    Err(e) => {
-                                        try_send_or_warn(&tx, CoreEvent::StatsError(format!("Sys stats query failed: {e}")), "sys_stats_err");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // === Sing-box Clash API /traffic streaming ===
-            let clash_port = params.clash_api_port.unwrap_or(CLASH_API_PORT);
-            let url = format!("http://127.0.0.1:{clash_port}/traffic");
-            match CLASH_CLIENT.get(&url).send().await {
-                Ok(resp) => {
-                    let mut stream = Box::pin(resp.bytes_stream());
-                    // `split_to` advances the start offset without memmove; a
-                    // traffic line is ~50 B/s, so retention is one partial line.
-                    let mut buf = bytes::BytesMut::new();
-                    loop {
-                        tokio::select! {
-                            _ = &mut stop_rx => break,
-                            chunk = stream.next() => {
-                                match chunk {
-                                    Some(Ok(bytes)) => {
-                                        buf.extend_from_slice(&bytes);
-                                        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                                            let trimmed = buf[..=pos].trim_ascii();
-                                            if let Ok(t) = serde_json::from_slice::<ClashTraffic>(trimmed) {
-                                                // Per-line deltas (sing-box
-                                                // emits each second's traffic
-                                                // since the last line) — the
-                                                // same delta semantics as the
-                                                // xray gRPC poller, so the
-                                                // stats handler's accumulation
-                                                // never double-counts.
-                                                try_send_or_warn(
-                                                    &tx,
-                                                    clash_stats_event(profile_id, &t),
-                                                    "clash_stats_update",
-                                                );
-                                            }
-                                            let _ = buf.split_to(pos + 1);
-                                        }
-                                    }
-                                    Some(Err(e)) => {
-                                        try_send_or_warn(&tx, CoreEvent::StatsError(
-                                            format!("Clash API stream error: {e}")
-                                        ), "clash_stream_err");
-                                        break;
-                                    }
-                                    None => break,
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    try_send_or_warn(
-                        &tx,
-                        CoreEvent::StatsError(format!(
-                            "Clash API unavailable (is sing-box running?): {e}"
-                        )),
-                        "clash_unavailable",
-                    );
-                }
-            }
-        }
-
-        // 6. Stop core
-        let _ = manager.stop().await;
-
-        // 7. Signal disconnected
-        try_send_or_warn(&tx, CoreEvent::Disconnected, "disconnected");
+            &tx,
+            &state_log_sender,
+            stop_rx,
+            protocol_id.get(),
+        )
+        .await;
     });
     state.core_task_handle = Some(handle);
 }
@@ -663,7 +199,7 @@ pub fn disconnect(state: &mut AppState) {
     // stop can still sit in the event channel, unprocessed (the event loop
     // drains once per frame). Accumulate those deltas into the owning link
     // and persist the final row state once. Traffic since the last poll tick
-    // (≤ one poll interval — 3s xray / 1s sing-box) was never captured as an
+    // (≤ one native poll interval) was never captured as an
     // event and is dropped by design; the T21 handler already persisted
     // every processed tick, so the row is current as of the last tick.
     let flushed = crate::ops::events::drain_pending_stats_updates(state);
@@ -705,7 +241,7 @@ pub fn disconnect(state: &mut AppState) {
             }
         }));
     }
-    state.connected_core = None;
+    state.connected = false;
     state.live_proxy.clear();
     state.connected_protocol_id = None;
     state.connecting = false;
@@ -727,18 +263,14 @@ mod tests {
     use leas_db::models::{
         ErrorInfo, Latency, ProfileErr, ProfileStats, ProtocolId, Security, Transport,
     };
-    use leas_proto::proto_spec::common::TransportConfig;
     use leas_proto::proto_spec::{
-        PlaceholderConfig, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType,
-        TransportType,
+        PlaceholderConfig, ProtocolConfig, ProtocolKind, SecurityType, TransportType,
     };
     use toasty::{Deferred, Json};
 
     use crate::ops::profiles::test_support::fake_row;
 
     use super::*;
-
-    use rstest::rstest;
 
     /// A `Protocol` row whose config is a placeholder (`Redirect`): the
     /// `ConfigBuilder::build` outbound injection errors on BOTH cores, so a
@@ -852,9 +384,12 @@ mod tests {
             .connection_error
             .clone()
             .expect("connect failure surfaced as an event");
-        assert!(err.contains("Config build failed"), "got: {err}");
+        assert!(
+            err.contains("no native implementation for this protocol kind"),
+            "got: {err}"
+        );
         assert!(!state.connecting, "connecting cleared by the error event");
-        assert_eq!(state.connected_core, None);
+        assert!(!state.connected);
         assert_eq!(state.connected_protocol_id, None);
 
         // Failure surfaced as an event ONLY: latency/error markers and the
@@ -902,7 +437,7 @@ mod tests {
         // replace the rx so only this test can feed events — deterministic.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         state.core_event_rx = Some(rx);
-        state.connected_core = Some(CoreType::Xray);
+        state.connected = true;
         state.connected_protocol_id = Some(100);
         state.current_traffic_up = 42;
         state.current_traffic_down = 84;
@@ -931,7 +466,7 @@ mod tests {
             "no session task to tear down"
         );
         // Session state cleared.
-        assert_eq!(state.connected_core, None);
+        assert!(!state.connected);
         assert_eq!(state.connected_protocol_id, None);
         assert!(!state.connecting);
         assert_eq!(state.connection_error, None, "stale error cleared");
@@ -1004,137 +539,5 @@ mod tests {
             torn_down.load(Ordering::SeqCst),
             "the session task ran its own tail instead of being aborted"
         );
-    }
-
-    #[test]
-    fn clash_traffic_lines_map_to_per_line_deltas() {
-        // sing-box `/traffic` emits one JSON line per second carrying that
-        // second's delta. Two lines must produce two delta events (100, 50) —
-        // never the running session total (100, 150) — or the stats handler's
-        // accumulation would double-count on every event.
-        let lines = [
-            br#"{"up":100,"down":200}"#.as_slice(),
-            br#"{"up":50,"down":75}"#.as_slice(),
-        ];
-        let events: Vec<CoreEvent> = lines
-            .iter()
-            .filter_map(|line| serde_json::from_slice::<ClashTraffic>(line).ok())
-            .map(|t| clash_stats_event(7, &t))
-            .collect();
-        assert_eq!(events.len(), 2, "both lines parsed");
-        let fields: Vec<(i64, i64, i64, i64, i64)> = events
-            .iter()
-            .map(|e| match e {
-                CoreEvent::StatsUpdate {
-                    protocol_id,
-                    today_up,
-                    today_down,
-                    total_up,
-                    total_down,
-                } => (*protocol_id, *today_up, *today_down, *total_up, *total_down),
-                other => panic!("expected StatsUpdate, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            fields,
-            vec![(7, 100, 200, 100, 200), (7, 50, 75, 50, 75)],
-            "each event carries only that line's delta"
-        );
-    }
-
-    // ── Runtime core resolution (connect-time native selection) ───────────
-
-    /// A VLESS row over the given transport. `Tcp` passes the capability gate;
-    /// `Quic` is the capability-deferred case (native has no bare-QUIC arm).
-    fn vless_config(transport: TransportConfig) -> ProtocolConfig {
-        ProtocolConfig::Vless(leas_proto::proto_spec::VlessConfig {
-            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
-            uuid_origin: None,
-            security: SecurityConfig::default(),
-            transport,
-            encryption: None,
-            flow: None,
-            path: None,
-            splice: None,
-            remarks: None,
-            mux: None,
-        })
-    }
-
-    /// One (`link_core`, kind, forced, transport, `proxy_all_blocked`) → expected
-    /// resolution table: the ten connect-time native-selection tests, each
-    /// assertion kept as a named row. `transport: None` is the unloaded-config
-    /// case; a `Some` transport builds the VLESS config the gate inspects.
-    #[rstest]
-    #[case::xray_stamped_native_kind_selects_the_in_process_core(
-        CoreType::Xray, ProtocolKind::Vless, None, Some(TransportConfig::Tcp), false,
-        (CoreType::Native, None)
-    )]
-    #[case::routing_rules_demote_native_to_the_link_core(
-        CoreType::Xray, ProtocolKind::Vless, None, Some(TransportConfig::Tcp), true,
-        (CoreType::Xray, Some(REFUSED_PROXY_ALL))
-    )]
-    #[case::capability_deferred_config_demotes_native(
-        CoreType::Xray, ProtocolKind::Vless, None, Some(TransportConfig::Quic), false,
-        (CoreType::Xray, Some(REFUSED_CAPABILITY))
-    )]
-    #[case::unloaded_config_never_reaches_native(
-        CoreType::Xray, ProtocolKind::Vless, None, None, false,
-        (CoreType::Xray, Some(REFUSED_UNLOADED))
-    )]
-    #[case::forced_native_passes_the_capability_gate(
-        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Native), Some(TransportConfig::Tcp), false,
-        (CoreType::Native, None)
-    )]
-    #[case::forced_native_deferred_config_is_refused(
-        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Native), Some(TransportConfig::Quic), false,
-        (CoreType::Xray, Some(REFUSED_CAPABILITY))
-    )]
-    #[case::forced_auto_passes_the_capability_gate(
-        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Auto), Some(TransportConfig::Tcp), false,
-        (CoreType::Native, None)
-    )]
-    #[case::forced_auto_deferred_config_is_refused(
-        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Auto), Some(TransportConfig::Quic), false,
-        (CoreType::Xray, Some(REFUSED_CAPABILITY))
-    )]
-    // SSR, not Shadowsocks: the plain-SS kind is native now, and SSR is its
-    // closest relative that still has no native implementation, so the kind
-    // gate — not the config gate — is what fires here.
-    #[case::forced_native_on_a_non_native_kind_reports_the_kind_gate(
-        CoreType::Xray, ProtocolKind::ShadowsocksR, Some(CoreType::Native), None, false,
-        (CoreType::Xray, Some(REFUSED_KIND))
-    )]
-    #[case::forced_native_on_a_native_kind_still_needs_a_loaded_config(
-        CoreType::Xray, ProtocolKind::Shadowsocks, Some(CoreType::Native), None, false,
-        (CoreType::Xray, Some(REFUSED_UNLOADED))
-    )]
-    #[case::forced_legacy_xray_vetoes_native_and_keeps_the_stamp(
-        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::Xray), Some(TransportConfig::Tcp), false,
-        (CoreType::Xray, None)
-    )]
-    #[case::forced_legacy_singbox_vetoes_native_and_keeps_the_stamp(
-        CoreType::Xray, ProtocolKind::Vless, Some(CoreType::SingBox), Some(TransportConfig::Tcp), false,
-        (CoreType::Xray, None)
-    )]
-    #[case::singbox_stamped_link_whose_config_native_serves_runs_native(
-        CoreType::SingBox, ProtocolKind::Vless, None, Some(TransportConfig::Tcp), false,
-        (CoreType::Native, None)
-    )]
-    #[case::non_native_kind_keeps_the_link_core_silently(
-        CoreType::Xray, ProtocolKind::Socks, None, None, false,
-        (CoreType::Xray, None)
-    )]
-    fn resolve_runtime_core_over_inputs(
-        #[case] link_core: CoreType,
-        #[case] kind: ProtocolKind,
-        #[case] forced: Option<CoreType>,
-        #[case] transport: Option<TransportConfig>,
-        #[case] proxy_all_blocked: bool,
-        #[case] expected: (CoreType, Option<&'static str>),
-    ) {
-        let config = transport.map(vless_config);
-        let got = resolve_runtime_core(link_core, kind, forced, config.as_ref(), proxy_all_blocked);
-        assert_eq!(got, expected, "link_core {link_core:?}, kind {kind:?}");
     }
 }

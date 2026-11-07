@@ -13,7 +13,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use leas_core::grpc_client::SysStats;
 use leas_core::log_heed::LogMessage;
-use leas_core::{BuildParams, CoreType};
 use leas_db::models::{Endpoint, Protocol};
 use leas_native::inbound::outbound::ProxyOutbound;
 use leas_native::server::{NativeCoreServer, ServerConfig};
@@ -37,7 +36,8 @@ const TELEMETRY_CAP: usize = 16;
 /// signal (or a fatal error), having emitted `Disconnected`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_native_session(
-    params: &BuildParams,
+    listen: &str,
+    listen_port: u16,
     endpoint: &Endpoint,
     addresses: &[std::net::IpAddr],
     protocol: &Protocol,
@@ -57,9 +57,8 @@ pub async fn run_native_session(
     let config = protocol.config.get().0.clone();
 
     // The native session always speaks mixed (SOCKS5 + HTTP CONNECT on one
-    // port), on the same effective port the builders and readiness probe use.
-    let listen_port = params.local_port();
-    let listen_addr: SocketAddr = match format!("{}:{listen_port}", params.listen).parse() {
+    // port), on the same effective port the inbound settings expose.
+    let listen_addr: SocketAddr = match format!("{listen}:{listen_port}").parse() {
         Ok(addr) => addr,
         Err(e) => {
             try_send_or_warn(
@@ -98,7 +97,7 @@ pub async fn run_native_session(
         "leas_native::server",
         format!("listening mixed={}", server.listen_addr()),
     );
-    try_send_or_warn(tx, CoreEvent::Connected(CoreType::Native), "connected");
+    try_send_or_warn(tx, CoreEvent::Connected, "connected");
 
     // Telemetry adapter: 3 s traffic deltas + ~9 s sys stats + live log and
     // trace forwarding, all on the shared `CoreEvent` shapes.
@@ -177,7 +176,7 @@ pub async fn run_native_session(
 }
 
 /// Map a db `Endpoint` to the proto `EndpointEssentials` the proxy outbound
-/// consumes (mirrors `leas_core::config_builder::endpoint_essentials` —
+/// consumes (mirrors `leas_db::models::endpoint_essentials` —
 /// kept local because that helper is crate-private to leas-core).
 #[must_use]
 pub(crate) fn endpoint_essentials(

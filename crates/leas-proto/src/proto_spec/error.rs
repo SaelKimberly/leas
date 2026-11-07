@@ -1,10 +1,10 @@
-use crate::proto_spec::CoreType;
+use crate::proto_spec::CoreTarget;
 
 /// Errors surfaced by the `InjectToCoreConf` config-builder trait.
 #[derive(Debug, thiserror::Error)]
 pub enum SupportError {
     #[error("protocol {0} is not supported by core {1}")]
-    UnsupportedProtocol(String, CoreType),
+    UnsupportedProtocol(String, CoreTarget),
     #[error("config error: {0}")]
     Config(String),
     #[error("missing required field {0} for {1}")]
@@ -18,7 +18,7 @@ mod tests {
 
     #[rstest]
     #[case::unsupported_protocol(
-        SupportError::UnsupportedProtocol("tuic".into(), CoreType::SingBox),
+        SupportError::UnsupportedProtocol("tuic".into(), CoreTarget::SingBox),
         "protocol tuic is not supported by core sing-box"
     )]
     #[case::config(

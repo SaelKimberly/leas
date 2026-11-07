@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use jiff::Timestamp;
 use leas_config::forms::build_typed_config;
 use leas_config::import_export::{ParsedProfile, ValidationSettings, parse_share_url};
-use leas_core::{CoreType, resolve_core};
 
 use crate::AppState;
 use crate::state::{
@@ -15,7 +14,7 @@ use leas_db::Database;
 use leas_db::DatabaseError;
 use leas_db::models::{EndpointRow, ProfileStats, PurgatoryView};
 use leas_db::profiles_query::{PageMeta, PageRequest, PageSort, PlanScope};
-use leas_proto::proto_spec::{CoreType as ProtoCoreType, ParsedProto, ProtocolKind};
+use leas_proto::proto_spec::{ParsedProto, ProtocolKind};
 
 /// Unix-seconds now, as a `Timestamp` (the typed staleness clock).
 fn now_ts() -> Timestamp {
@@ -420,44 +419,6 @@ pub(crate) const PROFILES_PAGE_SIZE: usize = 200;
 /// deliberately not consulted: it can lag the row.
 pub(crate) const fn endpoint_dns_unresolved(_state: &AppState, row: &EndpointRow) -> bool {
     leas_db::endpoint_rank::dns_unresolved(row)
-}
-
-/// Resolve which core a profile row should use, considering (in order):
-///   1. Per-protocol config override (`config.core.protocol_core_overrides`)
-///   2. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
-///
-/// The per-pair `link.core_type` override is gone (db-rewamp D3); the core is
-/// derived from the kind, the config override and the Shadowsocks method.
-///
-/// LIMITATION: this reads a page `EndpointRow` whose `protocol.config` is
-/// UNLOADED, so `shadowsocks_method` returns `None` — a legacy-cipher SS row
-/// shows the xray default here. The connect path resolves the core from the
-/// LOADED protocol instead (`ops::connect`), which is authoritative; this
-/// label is cosmetic. Same for the UI's core column.
-pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
-    let Some((_link, protocol)) = row.active_protocol() else {
-        return CoreType::Auto;
-    };
-    let config_override = state
-        .config
-        .core
-        .protocol_core_overrides
-        .get(&protocol.proto_kind.to_string())
-        .and_then(|s| s.parse::<CoreType>().ok());
-    let override_ = match config_override {
-        Some(CoreType::Auto) | None => None,
-        Some(CoreType::Native) => return CoreType::Native,
-        Some(CoreType::Xray) => Some(ProtoCoreType::Xray),
-        Some(CoreType::SingBox) => Some(ProtoCoreType::SingBox),
-    };
-    match resolve_core(
-        protocol.proto_kind,
-        override_,
-        leas_core::shadowsocks_method(protocol).as_deref(),
-    ) {
-        ProtoCoreType::Xray => CoreType::Xray,
-        ProtoCoreType::SingBox => CoreType::SingBox,
-    }
 }
 
 pub fn start_add_server(state: &mut AppState) {
