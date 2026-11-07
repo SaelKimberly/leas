@@ -172,3 +172,9 @@ resolves locally and fails without DNS). CI has normal egress.
 - `safe_redirect_policy` and `endpoint_essentials` stayed in shared crates
   (`leas-core::http`, `leas-db::models`) because the subscription fetcher and
   the TUI export path use them; the oracle adapters re-export the same owners.
+- The native session takes `(listen, local_port)` directly instead of a
+  `SessionParams` wrapper: the struct would hold exactly those two fields and
+  nothing else, so the call site is the simpler contract.
+- `cargo run` was not smoke-run: this workstation has no interactive TTY for
+  the alternate-screen TUI. The binary is compiled by the `--all-targets`
+  clippy gate; the connect/ping/settings paths are covered by unit tests.
