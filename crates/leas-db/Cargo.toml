@@ -62,9 +62,11 @@ dashmap.workspace = true
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
 [features]
-# Measurement probes (`geo_under_mvcc_probe`, `mvcc_load_probe`, the turso
-# planner gate): they print tables of numbers and assert nothing, so they are
-# not tests. Off by default to keep them out of the test list; run with
+# Measurement probes (`geo_under_mvcc_probe`, `mvcc_load_probe`,
+# `micro_batch_mvcc_probe`, the turso planner gate) and the concurrent-staging
+# probe in `tests/partitioned_writers.rs`. They measure a path instead of
+# gating CI, so the feature keeps them out of the test list and they carry
+# `#[ignore]` on top. Run with
 # `cargo test -p leas-db --release --features perf-lab -- --ignored --nocapture`.
 perf-lab = []
 

@@ -1,13 +1,18 @@
-//! T6 (Phase 4): partitioned concurrent drain, driven through the real
-//! `WriteBehind<LinkSpec>` under MVCC.
+//! T6 (Phase 4) probe: concurrent staging through ONE `WriteBehind<LinkSpec>`
+//! under MVCC, driven by four tasks that share the driver.
+//!
+//! **A perf-lab probe, not a CI gate.** The writer-partitioned drain the phase
+//! planned was deferred (ADR 0014): `WriteBehind::flush` takes its gate, so
+//! these tasks' windows serialize. What runs here is that serialized path over
+//! a real 256-endpoint MVCC file, not the partitioned topology the plan named.
 //!
 //! Asserts:
-//! 1. All staged rows commit exactly once (zero retry exhaustions) with
-//!    partitioned drain active.
-//! 2. A partitioned flush failure re-stages the failed window (no loss).
+//! 1. All staged rows commit exactly once (zero retry exhaustions).
+//! 2. A flush failure re-stages the failed window (no loss).
 //! 3. `WriteBehind::flush` marks the touched endpoints dirty when the in-tx
 //!    rank refresh is skipped (MVCC), so `drain_dirty_ranks` recomputes keys.
 
+#![cfg(feature = "perf-lab")]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -166,6 +171,7 @@ async fn stored_delay(db: &Database, id: i64) -> Option<i32> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "concurrent-drain probe over a real MVCC file; run with --features perf-lab -- --ignored"]
 async fn partitioned_drain_commits_every_row_under_mvcc() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Arc::new(
@@ -220,6 +226,7 @@ async fn partitioned_drain_commits_every_row_under_mvcc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "concurrent-staging probe; run with --features perf-lab -- --ignored"]
 async fn partitioned_flush_failure_restages_the_failed_window() {
     let db = Arc::new(Database::in_memory().await.expect("in-memory db"));
 

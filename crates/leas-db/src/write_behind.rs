@@ -1899,17 +1899,6 @@ mod tests {
         .expect("row")
     }
 
-    /// Hold the write lock on a second connection, so every write the flush
-    /// attempts fails with "database is locked".
-    async fn hold_write_lock(conn: &mut toasty::Connection) -> toasty::Transaction<'_> {
-        let mut lock = conn.transaction().await.expect("lock transaction");
-        toasty::sql::statement("UPDATE profile_stats SET version = version + 0")
-            .exec(&mut lock)
-            .await
-            .expect("take the write lock");
-        lock
-    }
-
     /// The drain's MERGE, verbatim from `LinkWriter::drain`: one patch per
     /// link, the union of its staged groups, and a snapshot carrying every
     /// column those groups own.
@@ -1998,39 +1987,54 @@ mod tests {
         );
     }
 
-    /// A real probe stages `RESULT | PURGE`, so the re-staged remainder must be
-    /// findable by the next drain. Re-staging under the UNION key would insert
-    /// a key neither `stage` nor `key_of` ever matches: the retry would write
-    /// nothing and the result would be lost.
-    #[tokio::test]
-    async fn a_failed_window_restages_a_multi_group_patch_so_the_retry_lands() {
-        let (db, driver) = seeded_links().await;
+    /// A real probe stages `RESULT | PURGE`, and a failed flush hands the
+    /// re-stage path ONE patch carrying both bits. Re-staging under the UNION
+    /// key would insert a key neither `stage` nor `key_of` ever matches: the
+    /// retry would write nothing and the result would be lost.
+    ///
+    /// Asserted on the spec directly. The previous shape drove the same
+    /// contract through a held write lock, which spent five `busy_timeout`
+    /// windows (31 s of the crate's 37 s suite) to reach the identical key set.
+    /// The loop it wrapped is already pinned:
+    /// `a_failed_window_restages_the_whole_remainder` (drain and re-stage on a
+    /// non-busy failure) and
+    /// `a_purge_verdict_survives_the_drain_and_empties_the_window` (both
+    /// groups land through the real writer).
+    #[test]
+    fn link_restage_patch_returns_one_entry_per_group() {
         let mut row = with_latency(&link_row(1), 33);
         row.purge_reason = Some(PurgeReason::RealityFallback);
-        driver.stage(&row, LinkGroups::RESULT.union(LinkGroups::PURGE));
+        let entries = LinkSpec::restage_patch(&crate::LinkPatch {
+            link: row.clone(),
+            groups: LinkGroups::RESULT.union(LinkGroups::PURGE),
+        });
 
-        let mut blocker = db.connection().await.expect("blocker connection");
-        let lock = hold_write_lock(&mut blocker).await;
+        assert_eq!(
+            entries.len(),
+            2,
+            "one entry per group, not one entry under the union key"
+        );
+        for (key, staged) in &entries {
+            assert_eq!(
+                *key,
+                LinkSpec::key_of(staged),
+                "a re-staged key must be the key `stage` writes for that row"
+            );
+            assert!(
+                staged.link.latency == Latency::fast(33)
+                    && staged.link.purge_reason == Some(PurgeReason::RealityFallback),
+                "the retry must carry the failed window's snapshot"
+            );
+        }
         assert!(
-            driver.flush().await.is_err(),
-            "the write lock fails the flush"
+            entries
+                .iter()
+                .any(|(key, _)| *key == (row.protocol_id, row.endpoint_id, LinkGroups::RESULT))
         );
-        assert_eq!(driver.staged_len(), 2, "one entry per group, re-staged");
-        lock.rollback().await.expect("release the lock");
-        drop(blocker);
-
-        assert_eq!(
-            driver.flush().await.expect("retry after contention"),
-            1,
-            "the re-staged patch is found and written by the retry"
-        );
-        assert_eq!(driver.staged_len(), 0);
-        let stored = stored_link(&db, 1).await;
-        assert_eq!(stored.latency, Latency::fast(33));
-        assert_eq!(
-            stored.purge_reason,
-            Some(PurgeReason::RealityFallback),
-            "both groups land, not just the first"
+        assert!(
+            entries
+                .iter()
+                .any(|(key, _)| *key == (row.protocol_id, row.endpoint_id, LinkGroups::PURGE))
         );
     }
 

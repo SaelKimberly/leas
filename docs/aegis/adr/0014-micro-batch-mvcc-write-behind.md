@@ -44,7 +44,9 @@ driver switches to a micro-batch shape:
 implemented. The probe ran hand-rolled concurrent transactions, not a
 partitioned driver, and `tests/partitioned_writers.rs` exercises the existing
 single-driver path (four staging tasks sharing one `WriteBehind`; the flush
-gate serializes their windows). Partitioning is future work — the retry
+gate serializes their windows). That file is a **perf-lab probe**
+(`--features perf-lab -- --ignored`), not a CI gate: it measures a serialized
+path over a seeded MVCC file. Partitioning is future work — the retry
 budget absorbed every commit without it.
 
 ## Evidence
@@ -88,9 +90,12 @@ collision source.
 - Readers must drain `dirty_ranks` before an ordering read or they see stale
   keys. `profiles_page` drains; `WriteBehind::flush` also drains at its end.
   A bypassing reader (raw SQL outside these paths) would mis-sort.
-- `retry_on_busy` (5 attempts) still wraps every window.
-  `tests/partitioned_writers.rs` pins the single-driver concurrent-staging
-  path committing every row with zero exhaustions.
+- `retry_on_busy` (5 attempts) still wraps every window. The single-driver
+  concurrent-staging path committing every row with zero exhaustions is
+  measured by `tests/partitioned_writers.rs` — a **perf-lab probe**, not a CI
+  gate. The per-group re-stage key set that path depends on is pinned in CI by
+  `write_behind::tests::link_restage_patch_returns_one_entry_per_group`, and
+  the drain/re-stage loop by `a_failed_window_restages_the_whole_remainder`.
 
 ## Retirement
 
