@@ -10,6 +10,7 @@ Factual specifications of this repository. Each file owns one subject; the table
 | `crypto-dependencies.md` | Every non-default cryptographic site with its independent oracle, plus the dependency advisories and hazmat checklist |
 | `protocols.md` | Per-protocol share-URL and config reference, and the backend coverage matrix |
 | `clash.md` | Clash and mihomo YAML mapping |
+| `npvt.md` | NapsterV Tunnel `.npvt`/`.npvs` exchange formats: containers, key derivation, field schemas |
 | `native-core.md` | The native core and TLS engine: capability, protocol and transport roadmaps, verification tiers |
 | `tls-fingerprint-roster.md` | JA4-fidelity evidence for the TLS profile roster |
 | `glossary.md` | Domain terms, one line each |

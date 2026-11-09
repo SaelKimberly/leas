@@ -561,7 +561,7 @@ impl From<crate::app_config::ParsingSettings> for ValidationSettings {
 /// The primary endpoint supplies address/port; the credential requirement is
 /// checked per protocol variant on the typed config fields (port of the
 /// legacy `validate_required_fields` — T11).
-fn validate_required_fields(parsed: &ParsedProto) -> Result<(), String> {
+pub(crate) fn validate_required_fields(parsed: &ParsedProto) -> Result<(), String> {
     let missing = |field: &str| Err(format!("missing field: {field}"));
 
     let endpoint_ok = || {

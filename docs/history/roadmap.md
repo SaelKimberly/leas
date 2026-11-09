@@ -51,6 +51,7 @@
 - ✅ Update all/group subscriptions (HTTP download + parse)
 - ☐ Update via proxy
 - ✅ Subscription format detection (base64, plain, v2rayN, sing-box) — streaming decoder with auto-encoding detection
+- ✅ NapsterV `.npvt`/`.npvs` import — direct `ParsedProto` mapping for VLESS, VMess, Trojan, Shadowsocks, Hysteria2
 - ✅ Scheduled auto-update
 
 ## Phase 5 — Speed Testing ✅
@@ -146,6 +147,7 @@
 - ☐ Regex filtering — filter imported profiles by alias during subscription update
 - ☐ Subscription conversion target — convert between core types on import (convert_target field exists, always None)
 - ☐ SIP008 format — Shadowsocks SIP008 subscription format support
+- ✅ NapsterV `.npvt`/`.npvs` — legacy, open, and v5 passphrase containers; app-key/recipient sealed paths remain unsupported
 - ☐ SOCKS4/5 share link import — socks:// scheme with SOCKS4 auth fields
 
 ### Clash YAML

@@ -90,6 +90,8 @@ Share-URL parsing and client-config export live in `leas-config`, not here.
 
 `AppConfig` load/save (serde JSON), `import_export` (share-URL parse/export and per-batch `ValidationSummary`), `forms`, `permissive_json`, `duration_or_secs`, `base64_util`, `fast_perc`, `ip_provider`.
 
+`npvt.rs` owns the NapsterV `.npvt`/`.npvs` containers: legacy whitebox, open JSON, and sealed v1/v5. `NpvtConfig::to_parsed_proto` maps supported configs directly to `ParsedProto`; `subscription.rs` detects these containers and uses that mapper before the URL pipeline.
+
 `subscription.rs` owns the streaming decoder: bytes to base64 or raw text, to lines, to share URLs. The pipeline is chunking-invariant: output depends only on the input bytes, never on how `StreamingDecoder::feed()` splits them. Encoding detection buffers a head until the decision is safe, base64 is normalized to one alphabet with whitespace dropped, line assembly runs on bytes so a multi-byte codepoint split across feeds is never replaced with `U+FFFD`, and a single line is capped at 256 KiB (an over-long line is cut at the last scheme start and an over-long URL is dropped and counted).
 
 ### leas-proto (library)

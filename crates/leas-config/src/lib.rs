@@ -10,6 +10,7 @@ pub mod fast_perc;
 pub mod forms;
 pub mod import_export;
 pub mod ip_provider;
+pub mod npvt;
 pub mod permissive_json;
 pub mod subscription;
 

@@ -48,6 +48,7 @@ futures-util = { version = "0.3", default-features = false, features = ["async-a
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hashbrown = { version = "0.17" }
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
 http = { version = "1" }
 httparse = { version = "1" }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }
@@ -139,6 +140,7 @@ form_urlencoded = { version = "1" }
 futures-core = { version = "0.3" }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown = { version = "0.17" }
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
 http = { version = "1" }
 httparse = { version = "1" }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "zeroize"] }

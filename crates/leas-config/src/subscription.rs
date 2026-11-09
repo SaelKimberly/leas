@@ -2,7 +2,9 @@
 
 use crate::import_export::{
     ImportError, ParsedProfile, ValidationSettings, ValidationSummary, parse_share_url,
+    validate_host, validate_required_fields,
 };
+use crate::npvt;
 use base64_simd::STANDARD_NO_PAD;
 use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder, MatchKind};
 use leas_proto::proto_spec::{ProtoSpec, SecurityConfig};
@@ -583,6 +585,61 @@ pub fn parse_url_batch(
     (profiles, summary)
 }
 
+/// Parse an NPVT/NPVS container directly into typed profiles.
+///
+/// This is the direct-mapping path: no share-URL round trip. Configs the
+/// mapper does not own count as `other` errors, never as partially built rows.
+///
+/// # Errors
+///
+/// Returns the container error as text when the bytes cannot be decoded.
+pub fn parse_npvt_data(
+    data: &[u8],
+    settings: &ValidationSettings,
+) -> Result<(Vec<ParsedProfile>, ValidationSummary), String> {
+    let bundle = npvt::decode(data, None).map_err(|e| e.to_string())?;
+    let mut profiles = Vec::new();
+    let mut summary = ValidationSummary::default();
+
+    for config in bundle.typed_configs() {
+        let parsed = match config.to_parsed_proto() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                summary.other_count += 1;
+                summary.record_error(e.to_string());
+                continue;
+            }
+        };
+        if let Err(error) = validate_host(&parsed, settings) {
+            summary.host_validation_count += 1;
+            summary.record_error(error.to_string());
+            continue;
+        }
+        let validation = validate_required_fields(&parsed);
+        if let Err(msg) = &validation {
+            if msg.starts_with("missing field") {
+                summary.missing_field_count += 1;
+            } else {
+                summary.other_count += 1;
+            }
+            summary.record_error(msg.clone());
+        }
+        let insecure = parsed
+            .protocol
+            .config
+            .security()
+            .and_then(SecurityConfig::insecure)
+            == Some(true);
+        if insecure {
+            summary.security_warning_count += 1;
+        }
+        profiles.push(ParsedProfile { parsed, validation });
+    }
+    summary.total_errors =
+        summary.missing_field_count + summary.host_validation_count + summary.other_count;
+    Ok((profiles, summary))
+}
+
 /// Parse base64-encoded subscription data into a list of Profiles.
 ///
 /// Returns `(profiles, summary)` on success, where `summary` is a
@@ -595,6 +652,9 @@ pub fn parse_subscription_data(
     data: &[u8],
     settings: &ValidationSettings,
 ) -> Result<(Vec<ParsedProfile>, ValidationSummary), String> {
+    if npvt::detect(data).is_some() {
+        return parse_npvt_data(data, settings);
+    }
     let mut decoder = StreamingDecoder::new();
     let mut profiles: Vec<ParsedProfile> = Vec::new();
     let mut summary = ValidationSummary::default();

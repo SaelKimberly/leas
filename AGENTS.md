@@ -66,6 +66,7 @@ This file is auto-detected project context: commands, structure, conventions. Th
 | Raw-SQL sites and rules | `docs/reference/database-manual-sql.md` |
 | Crypto sites and dependency advisories | `docs/reference/crypto-dependencies.md` |
 | Protocol specs | `docs/reference/protocols.md`; Clash YAML: `docs/reference/clash.md` |
+| NapsterV `.npvt` / `.npvs` exchange formats | `docs/reference/npvt.md` |
 | Glossary | `docs/reference/glossary.md` |
 | Aegis specs / plans / ADRs index | `docs/aegis/INDEX.md` |
 | Reference repos (read-only) | `thirdparty/Xray-core`, `thirdparty/sing-box`, `thirdparty/v2rayN` |

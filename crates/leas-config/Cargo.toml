@@ -26,6 +26,11 @@ humantime.workspace = true
 
 # ============ Encoding ============
 base64-simd.workspace = true
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+hkdf = "0.13.0"
+pbkdf2 = "0.13.0"
+sha2.workspace = true
+zeroize.workspace = true
 escape8259.workspace = true
 urlencoding.workspace = true
 url.workspace = true
