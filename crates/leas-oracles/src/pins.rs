@@ -168,6 +168,50 @@ mod tests {
         assert!(url(Core::SingBox, "macos", "aarch64").is_none());
     }
 
+    /// Every pinned asset must route to the extractor that reads it:
+    /// `build.rs` decides by archive shape (mihomo's bare gzip, sing-box's
+    /// tarball, a zip for the rest), and a rename that changes the shape would
+    /// otherwise land in the wrong arm — or 404 at fetch time, as the missing
+    /// `v` in mihomo's asset name did.
+    #[test]
+    fn archive_shape_matches_the_extractor() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        // The container (`gz`/`zip`), then whether a `.gz` is a tarball.
+        let container = |asset: &str| {
+            Path::new(asset)
+                .extension()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let is_tarball = |asset: &str| {
+            Path::new(asset)
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .is_some_and(|stem| stem.split('.').next_back() == Some("tar"))
+        };
+
+        for (os, arch) in [("linux", "x86_64"), ("linux", "aarch64")] {
+            let mihomo = asset_name(Core::Mihomo, os, arch).expect("supported");
+            assert_eq!(container(&mihomo), "gz", "mihomo: {mihomo}");
+            assert!(
+                !is_tarball(&mihomo),
+                "mihomo's asset is the binary: {mihomo}"
+            );
+            let sing = asset_name(Core::SingBox, os, arch).expect("supported");
+            assert_eq!(container(&sing), "gz", "sing-box: {sing}");
+            assert!(is_tarball(&sing), "sing-box's asset is a tarball: {sing}");
+        }
+        for (os, arch) in [("windows", "x86_64"), ("windows", "aarch64")] {
+            for core in [Core::Xray, Core::SingBox, Core::Mihomo] {
+                let asset = asset_name(core, os, arch).expect("supported");
+                assert_eq!(container(&asset), "zip", "{core:?} on {os}/{arch}: {asset}");
+            }
+        }
+    }
+
     #[test]
     fn supported_platforms_have_a_name_hash_and_url() {
         for (os, arch) in [("linux", "x86_64"), ("windows", "aarch64")] {

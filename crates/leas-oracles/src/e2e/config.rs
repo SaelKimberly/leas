@@ -1137,8 +1137,10 @@ pub fn ss_inbound(
         "grpc" => serde_json::json!(["h2"]),
         _ => serde_json::json!(["http/1.1"]),
     };
+    // mihomo returned above; the arm exists only to keep the match exhaustive
+    // and to fail loudly if that early return is ever dropped.
     let json = match core {
-        CoreKind::Mihomo => mihomo_unsupported("shadowsocks"),
+        CoreKind::Mihomo => unreachable!("mihomo's shadowsocks listener is built above"),
         CoreKind::Xray => {
             let mut stream = serde_json::json!({ "network": network });
             if tls.tls_enabled() {
