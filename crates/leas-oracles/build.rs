@@ -79,14 +79,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         fs::create_dir_all(&bin_dir).expect("create core-bin");
-        // mihomo ships a bare gzip of the binary on linux, sing-box a
-        // tarball, and both cores a zip on windows. The pinned asset names are
-        // the source of truth, so the extension decides; only mihomo has a
-        // bare gzip, and it never ships a tarball.
-        match (core, Path::new(&asset).extension().and_then(OsStr::to_str)) {
-            (pins::Core::Mihomo, Some("gz")) => extract_gz(&bytes, &dest),
-            (_, Some("zip")) => extract_zip(&bytes, core, &dest),
-            _ => extract_tar_gz(&bytes, core, &dest),
+        // Dispatch on the asset's own shape, not on which core it belongs to:
+        // the shape is the contract `pins::tests::archive_shape_matches_the_extractor`
+        // holds (mihomo ships the bare binary as a gzip, sing-box a tarball,
+        // everything else a zip), so a future asset that changes container
+        // cannot be silently read by the wrong extractor.
+        let ext = Path::new(&asset).extension().and_then(OsStr::to_str);
+        let stem_is_tar = Path::new(&asset)
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .is_some_and(|stem| stem.split('.').next_back() == Some("tar"));
+        match ext {
+            Some("zip") => extract_zip(&bytes, core, &dest),
+            Some("gz") if stem_is_tar => extract_tar_gz(&bytes, core, &dest),
+            Some("gz") => extract_gz(&bytes, &dest),
+            _ => panic!("leas-oracles: unrecognised asset shape: {asset}"),
         }
         #[cfg(unix)]
         {
