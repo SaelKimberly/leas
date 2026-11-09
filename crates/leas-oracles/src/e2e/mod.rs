@@ -37,6 +37,7 @@ use crate::pins;
 /// Core version strings for the e2e sweep (single source of truth; tests
 /// import these instead of duplicating constants).
 pub const SINGBOX_VERSION: &str = pins::SINGBOX_VERSION;
+pub const MIHOMO_VERSION: &str = pins::MIHOMO_VERSION;
 pub const XRAY_VERSION: &str = pins::XRAY_VERSION;
 
 /// Environment handed to an [`E2eCase`]'s `server_config` builder.

@@ -7,8 +7,8 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use leas_native::NativeTunnel;
 use leas_oracles::e2e::{
     Aes128GcmVariant, CaseSpec, Certs, Chacha20Poly1305Variant, CoreKind, CoreUnderTest, E2eCase,
-    FingerprintTls, Flow, NoTls, RealityTls, SINGBOX_VERSION, ServerEnv, XRAY_VERSION,
-    generate_certs,
+    FingerprintTls, Flow, MIHOMO_VERSION, NoTls, RealityTls, SINGBOX_VERSION, ServerEnv,
+    XRAY_VERSION, generate_certs,
     harness::{
         CoreGuard, SinkServer, SourceServer, TlsEchoServer, free_port, spawn_core, spawn_sink,
         spawn_source, spawn_tls_echo,
@@ -28,6 +28,7 @@ fn resolve_or_skip(kind: CoreKind) -> Option<CoreUnderTest> {
     let want = match kind {
         CoreKind::Xray => XRAY_VERSION,
         CoreKind::SingBox => SINGBOX_VERSION,
+        CoreKind::Mihomo => MIHOMO_VERSION,
     };
     match CoreUnderTest::resolve(kind, want) {
         Ok(c) => Some(c),
@@ -282,6 +283,7 @@ fn criterion_benches(c: &mut Criterion) {
         let core = match row.core {
             CoreKind::Xray => &xray,
             CoreKind::SingBox => &sing,
+            CoreKind::Mihomo => unreachable!("no mihomo throughput row yet"),
         };
         let Some(core) = core else {
             eprintln!("SKIP throughput {}: core missing", row.name);

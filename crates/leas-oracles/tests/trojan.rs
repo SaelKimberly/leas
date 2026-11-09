@@ -11,11 +11,11 @@
 
 mod common;
 
-use common::{certs, cores, echo, fp, pick, tls_echo};
+use common::{Cores, certs, cores, echo, fp, pick, tls_echo};
 use leas_native::PacketMode;
 use leas_oracles::e2e::AppKind;
 use leas_oracles::e2e::{
-    CaseSpec, Certs, CoreKind, CoreUnderTest, E2eCase, EchoServer, TlsEchoServer, run_against,
+    CaseSpec, Certs, CoreKind, E2eCase, EchoServer, TlsEchoServer, run_against,
 };
 use rstest::rstest;
 
@@ -42,7 +42,7 @@ fn trojan_chrome(net: &'static str) -> CaseSpec {
 async fn trojan_against_cores(
     #[case] case: CaseSpec,
     #[values(CoreKind::Xray, CoreKind::SingBox)] core: CoreKind,
-    cores: &(CoreUnderTest, CoreUnderTest),
+    cores: &Cores,
     certs: &Certs,
     echo: EchoServer,
     tls_echo: TlsEchoServer,

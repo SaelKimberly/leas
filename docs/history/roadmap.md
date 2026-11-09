@@ -558,3 +558,26 @@ batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes
 - ✅ **Verification** — oracle suite 374 entries: 359 runnable, all green, 15 ignored (opt-in
   plugin/probe rows plus the three plain-into-reality-server rows). Default suite 2574 passed,
   workspace clippy `-D warnings` clean, `hakari-check` and `cargo machete` clean.
+
+## Phase 36 — Mihomo as the third oracle core ✅
+
+- ✅ **Mihomo 1.19.33 joins xray-core and sing-box as a pinned server core** — `Core::Mihomo` in
+  `crates/leas-oracles/src/pins.rs` with four asset rows and SHA-256s (linux ships a bare gzip of
+  the binary, `mihomo-linux-amd64-compatible-*` for baseline CPUs, so `build.rs` grew an
+  `.extract_gz` arm), `CoreKind::Mihomo` with `-v` as its version probe, and a spawn arm
+  (`-d <tmp> -f <config>`) because mihomo takes a home directory as well as a config file.
+  `just oracles-pins` now prints twelve rows.
+- ✅ **The config dialect is YAML** — mihomo has no outbound object (egress is the rule set), so
+  every generated server is `listeners:` plus `MATCH,DIRECT`; emitted through `yaml-rust2` from
+  one `mihomo_listener` helper so keys stay quoted by the library, not by string concatenation.
+- ✅ **The third core immediately earned its place** — it is the only pinned server whose
+  shadowsocks *inbound* accepts the legacy stream ciphers, so the ten legacy rows (`aes-*-cfb`,
+  `aes-*-ctr`, `rc4-md5`, `chacha20-ietf`, `xchacha20`, `none`, and two UDP rows) came back on
+  mihomo, and running them exposed a real client bug: the legacy codec buffered each write and
+  drained only on the next one, so a single `write_all` + read (the harness probe) parked the
+  request and the server never answered. `poll_write` drains what it queued; the regression test
+  times out without it.
+- ✅ **Verification** — oracle suite 415 entries: 400 runnable, all green, 15 ignored. Shadowsocks
+  is the three-core axis (41 entries); the rest stays on the cores that serve it, and a row
+  outside its `with_single_core` set prints why it was not dialed. The vless/vmess/trojan mihomo
+  builders are still traps (`mihomo_unsupported`), so those rows stay on the first two cores.

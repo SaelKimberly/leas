@@ -214,19 +214,26 @@ bench target='all':
 # into `crates/leas-oracles/src/pins.rs`. Print-only: no source is rewritten.
 # `curl` needs to reach api.github.com; on a workstation whose proxy breaks
 # TLS or has no DNS, set ALL_PROXY=socks5h://<host>:<port> (the proxy resolves).
-oracles-pins xray singbox:
+oracles-pins xray singbox mihomo:
     #!/usr/bin/env bash
     set -euo pipefail
-    for spec in "XTLS/Xray-core:{{xray}}" "SagerNet/sing-box:{{singbox}}"; do
+    # mihomo publishes a dozen amd64 microarchitecture variants, so its asset
+    # set is filtered against the exact pinned version rather than a prefix.
+    filter='^Xray-(linux|windows)-(64|arm64-v8a)\.zip |^sing-box-.*-(linux|windows)-(amd64|arm64)\.(tar\.gz|zip) '
+    for spec in "XTLS/Xray-core:{{xray}}" "SagerNet/sing-box:{{singbox}}" "MetaCubeX/mihomo:{{mihomo}}"; do
         repo="${spec%%:*}"
         ver="${spec##*:}"
         echo "== $repo v$ver"
+        pat="$filter"
+        if [ "$repo" = "MetaCubeX/mihomo" ]; then
+            pat="^mihomo-(linux-amd64-compatible|linux-arm64|windows-amd64|windows-arm64)-v${ver}\.(gz|zip) "
+        fi
         curl -fsSL --ssl-no-revoke "https://api.github.com/repos/$repo/releases/tags/v$ver" \
         | awk '
             /^[[:space:]]*"name":/ { n=$0; sub(/.*"name": "/,"",n); sub(/".*/,"",n) }
             /^[[:space:]]*"digest":/ { d=$0; sub(/.*"digest": "sha256:/,"",d); sub(/".*/,"",d); print n, d }
         ' \
-        | grep -E '^Xray-(linux|windows)-(64|arm64-v8a)\.zip |^sing-box-.*-(linux|windows)-(amd64|arm64)\.(tar\.gz|zip) '
+        | grep -E "$pat"
     done
 
 # ─── Tier-3b test oracle: pinned SIP003 plugin binaries ────────────

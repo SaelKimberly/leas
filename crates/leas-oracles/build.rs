@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
-    for core in [pins::Core::Xray, pins::Core::SingBox] {
+    for core in [pins::Core::Xray, pins::Core::SingBox, pins::Core::Mihomo] {
         let asset = pins::asset_name(core, os, arch).unwrap_or_else(|| {
             panic!(
                 "leas-oracles: no pinned {core:?} asset for {os}/{arch}; \
@@ -75,14 +75,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(
             got == want,
             "leas-oracles: {url}\n  sha256 mismatch: expected {want}, got {got}\n  \
-             update the table with `just oracles-pins <xray> <singbox>`"
+             update the table with `just oracles-pins <xray> <singbox> <mihomo>`"
         );
 
         fs::create_dir_all(&bin_dir).expect("create core-bin");
-        if Path::new(&asset).extension() == Some(OsStr::new("zip")) {
-            extract_zip(&bytes, core, &dest);
-        } else {
-            extract_tar_gz(&bytes, core, &dest);
+        // mihomo ships a bare gzip of the binary on linux, sing-box a
+        // tarball, and both cores a zip on windows. The pinned asset names are
+        // the source of truth, so the extension decides; only mihomo has a
+        // bare gzip, and it never ships a tarball.
+        match (core, Path::new(&asset).extension().and_then(OsStr::to_str)) {
+            (pins::Core::Mihomo, Some("gz")) => extract_gz(&bytes, &dest),
+            (_, Some("zip")) => extract_zip(&bytes, core, &dest),
+            _ => extract_tar_gz(&bytes, core, &dest),
         }
         #[cfg(unix)]
         {
@@ -105,6 +109,7 @@ fn bin_file(core: pins::Core) -> String {
     let base = match core {
         pins::Core::Xray => "xray",
         pins::Core::SingBox => "sing-box",
+        pins::Core::Mihomo => "mihomo",
     };
     format!("{base}{}", env::consts::EXE_SUFFIX)
 }
@@ -202,6 +207,13 @@ fn extract_tar_gz(bytes: &[u8], core: pins::Core, dest: &Path) {
         }
     }
     panic!("leas-oracles: {target} not found in the tarball");
+}
+
+/// A gzip asset that *is* the binary (mihomo's linux releases).
+fn extract_gz(bytes: &[u8], dest: &Path) {
+    let mut decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    let mut out = fs::File::create(dest).expect("create core binary");
+    std::io::copy(&mut decoder, &mut out).expect("write core binary");
 }
 
 fn hex(bytes: &[u8]) -> String {

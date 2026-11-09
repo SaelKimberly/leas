@@ -9,6 +9,7 @@ use leas_proto::proto_spec::ProtocolConfig;
 use leas_proto::proto_spec::endpoint::EndpointEssentials;
 use ring::rand::SecureRandom as _;
 use std::fmt::Write as _;
+use yaml_rust2::{Yaml, YamlEmitter};
 
 use super::{CoreKind, Flow, ServerEnv, TlsVariant};
 use leas_native::NativeConnectParams;
@@ -16,6 +17,58 @@ use leas_native::addr::{Host, TargetAddr};
 
 pub const UUID: &str = "00000000-0000-0000-0000-000000000000";
 pub const BODY: &str = "hello native core";
+
+// ── mihomo (third oracle core) ────────────────────────────────────────────
+
+/// mihomo's config is YAML and has no separate "outbound" object: egress is
+/// decided by the rule set, so every harness server ends in `MATCH,DIRECT` —
+/// the loopback passthrough the echo target needs.
+fn mihomo_config(listeners: Vec<yaml_rust2::yaml::Hash>) -> String {
+    let mut doc = yaml_rust2::yaml::Hash::new();
+    doc.insert(
+        Yaml::String("log-level".into()),
+        Yaml::String("warning".into()),
+    );
+    doc.insert(
+        Yaml::String("listeners".into()),
+        Yaml::Array(listeners.into_iter().map(Yaml::Hash).collect()),
+    );
+    doc.insert(
+        Yaml::String("rules".into()),
+        Yaml::Array(vec![Yaml::String("MATCH,DIRECT".into())]),
+    );
+    let mut out = String::new();
+    YamlEmitter::new(&mut out)
+        .dump(&Yaml::Hash(doc))
+        .expect("emit mihomo config");
+    out
+}
+
+/// Loud trap for a row that reaches a core with no server builder: the gate is
+/// `with_single_core`, and a row that forgets it should fail with this message
+/// rather than dial a config the core would reject.
+fn mihomo_unsupported(protocol: &str) -> ! {
+    panic!(
+        "mihomo: no {protocol} server builder yet — keep the row on the cores that serve it \
+         (with_single_core) until the builder lands"
+    )
+}
+
+/// The keys every `listeners:` entry carries.
+fn mihomo_listener(name: &str, kind: &str, env: &ServerEnv) -> yaml_rust2::yaml::Hash {
+    let mut l = yaml_rust2::yaml::Hash::new();
+    l.insert(Yaml::String("name".into()), Yaml::String(name.into()));
+    l.insert(Yaml::String("type".into()), Yaml::String(kind.into()));
+    l.insert(
+        Yaml::String("listen".into()),
+        Yaml::String("127.0.0.1".into()),
+    );
+    l.insert(
+        Yaml::String("port".into()),
+        Yaml::Integer(i64::from(env.port)),
+    );
+    l
+}
 
 // ── REALITY keypair / short-id generation ─────────────────────────────────
 
@@ -103,6 +156,7 @@ pub fn mlkem_enc_pair() -> (String, String) {
 /// the client-facing [`Flow::as_str`].
 fn set_flow(json: &mut serde_json::Value, core: CoreKind, flow: Flow) {
     match core {
+        CoreKind::Mihomo => mihomo_unsupported("flow"),
         CoreKind::Xray => {
             json["inbounds"][0]["settings"]["clients"][0]["flow"] =
                 serde_json::json!(flow.server_str());
@@ -149,6 +203,7 @@ pub fn vmess_inbound(
         _ => serde_json::json!(["http/1.1"]),
     };
     let json = match core {
+        CoreKind::Mihomo => mihomo_unsupported("vmess"),
         CoreKind::Xray => {
             let mut stream = serde_json::json!({
                 "network": network,
@@ -343,6 +398,7 @@ pub fn vless_inbound(
         _ => serde_json::json!(["http/1.1"]),
     };
     let json = match core {
+        CoreKind::Mihomo => mihomo_unsupported("vless"),
         CoreKind::Xray => {
             // `NoTls` (the kcp_plain row) emits streamSettings WITHOUT
             // tlsSettings — genuinely no security layer, not cert TLS.
@@ -476,6 +532,7 @@ fn reality_stream(
     sid: &str,
 ) -> serde_json::Value {
     match core {
+        CoreKind::Mihomo => mihomo_unsupported("vless/reality"),
         CoreKind::Xray => serde_json::json!({
             "network": "tcp", "security": "reality",
             "realitySettings": {
@@ -546,6 +603,7 @@ fn vless_reality_inbound(
         _ => {}
     }
     let json = match core {
+        CoreKind::Mihomo => mihomo_unsupported("vless/reality"),
         CoreKind::Xray => serde_json::json!({
             "inbounds": [{
                 "listen": "127.0.0.1", "port": env.port, "protocol": "vless",
@@ -622,6 +680,7 @@ fn vmess_reality_inbound(
         _ => {}
     }
     let json = match core {
+        CoreKind::Mihomo => mihomo_unsupported("vmess/reality"),
         CoreKind::Xray => serde_json::json!({
             "inbounds": [{
                 "listen": "127.0.0.1", "port": env.port, "protocol": "vmess",
@@ -886,6 +945,7 @@ pub fn trojan_inbound(core: CoreKind, env: &ServerEnv, network: &str) -> String 
         _ => serde_json::json!(["http/1.1"]),
     };
     let json = match core {
+        CoreKind::Mihomo => mihomo_unsupported("trojan"),
         CoreKind::Xray => {
             let mut stream = serde_json::json!({
                 "network": network,
@@ -1057,11 +1117,28 @@ pub fn ss_inbound(
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
     let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
     let password = ss_password(method);
+    if core == CoreKind::Mihomo {
+        // mihomo's shadowsocks listener has no plain-TLS layer (it offers
+        // `shadow-tls`, a different protocol); the TLS SS row stays xray-only.
+        assert!(
+            !tls.tls_enabled(),
+            "mihomo's shadowsocks listener cannot serve a TLS stream"
+        );
+        let mut l = mihomo_listener("ss", "shadowsocks", env);
+        l.insert(Yaml::String("cipher".into()), Yaml::String(method.into()));
+        l.insert(
+            Yaml::String("password".into()),
+            Yaml::String(password.to_owned()),
+        );
+        l.insert(Yaml::String("udp".into()), Yaml::Boolean(udp));
+        return mihomo_config(vec![l]);
+    }
     let alpn = match network {
         "grpc" => serde_json::json!(["h2"]),
         _ => serde_json::json!(["http/1.1"]),
     };
     let json = match core {
+        CoreKind::Mihomo => mihomo_unsupported("shadowsocks"),
         CoreKind::Xray => {
             let mut stream = serde_json::json!({ "network": network });
             if tls.tls_enabled() {
@@ -1474,6 +1551,7 @@ mod tests {
             let emitted = match core {
                 CoreKind::Xray => flow,
                 CoreKind::SingBox => flow_sing,
+                CoreKind::Mihomo => unreachable!("the loop covers the two JSON cores"),
             };
             assert_eq!(emitted, "xtls-rprx-vision");
         }

@@ -16,13 +16,12 @@
 mod common;
 
 use common::{
-    certs, cores, echo, fp, no_tls, pick, plain_server_reality_client, pq_tls, reality,
+    Cores, certs, cores, echo, fp, no_tls, pick, plain_server_reality_client, pq_tls, reality,
     reality_server_plain_client, reality_wrong_pbk, reality_wrong_sid, tls_echo,
 };
 use leas_native::protocol::vless::PacketMode;
 use leas_oracles::e2e::{
-    AppKind, CaseSpec, Certs, CoreKind, CoreUnderTest, EchoServer, Flow, TlsEchoServer, TlsVariant,
-    run_against,
+    AppKind, CaseSpec, Certs, CoreKind, EchoServer, Flow, TlsEchoServer, TlsVariant, run_against,
 };
 use rstest::rstest;
 
@@ -184,7 +183,7 @@ fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
 async fn vless_against_cores(
     #[case] case: CaseSpec,
     #[values(CoreKind::Xray, CoreKind::SingBox)] core: CoreKind,
-    cores: &(CoreUnderTest, CoreUnderTest),
+    cores: &Cores,
     certs: &Certs,
     echo: EchoServer,
     tls_echo: TlsEchoServer,
@@ -321,7 +320,7 @@ async fn vless_against_cores(
 async fn vless_single_core(
     #[case] case: CaseSpec,
     #[case] core: CoreKind,
-    cores: &(CoreUnderTest, CoreUnderTest),
+    cores: &Cores,
     certs: &Certs,
     echo: EchoServer,
     tls_echo: TlsEchoServer,
@@ -350,7 +349,7 @@ async fn vless_single_core(
 #[ignore = "differential: needs LEAS_CORE_BIN_DIR (26.3.27) plus LEAS_PQ_ENC / LEAS_PQ_DEC from `xray vlessenc`"]
 #[tokio::test]
 async fn vless_pq_enc_with_a_reference_pair(
-    cores: &(CoreUnderTest, CoreUnderTest),
+    cores: &Cores,
     certs: &Certs,
     echo: EchoServer,
     tls_echo: TlsEchoServer,

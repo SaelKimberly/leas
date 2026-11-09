@@ -402,7 +402,9 @@ impl SecurityVariant for Aes128GcmVariant {
             // xray inbound user security mirrors intent; sing-box rejects
             // the field outright (`json: unknown field "security"`).
             CoreKind::Xray => Some("aes-128-gcm"),
-            CoreKind::SingBox => None,
+            // mihomo's vmess listener takes the method in its own config
+            // dialect; no JSON `security` field to mirror.
+            CoreKind::SingBox | CoreKind::Mihomo => None,
         }
     }
     fn client_security(&self) -> &'static str {
@@ -423,7 +425,7 @@ impl SecurityVariant for Chacha20Poly1305Variant {
     fn server_security(&self, core: CoreKind) -> Option<&'static str> {
         match core {
             CoreKind::Xray => Some("chacha20-poly1305"),
-            CoreKind::SingBox => None,
+            CoreKind::SingBox | CoreKind::Mihomo => None,
         }
     }
     fn client_security(&self) -> &'static str {

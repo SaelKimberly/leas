@@ -8,12 +8,11 @@
 
 mod common;
 
-use common::{certs, cores, echo, pick, tls_echo};
+use common::{Cores, certs, cores, echo, pick, tls_echo};
 use leas_native::PacketMode;
 use leas_oracles::e2e::AppKind;
 use leas_oracles::e2e::{
-    CaseSpec, Certs, CoreKind, CoreUnderTest, E2eCase, EchoServer, TlsEchoServer, config,
-    run_against,
+    CaseSpec, Certs, CoreKind, E2eCase, EchoServer, TlsEchoServer, config, run_against,
 };
 use rstest::rstest;
 
@@ -28,7 +27,7 @@ use rstest::rstest;
 #[tokio::test]
 async fn hysteria2_against_singbox(
     #[case] case: CaseSpec,
-    cores: &(CoreUnderTest, CoreUnderTest),
+    cores: &Cores,
     certs: &Certs,
     echo: EchoServer,
     tls_echo: TlsEchoServer,

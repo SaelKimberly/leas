@@ -16,12 +16,12 @@
 
 mod common;
 
-use common::{certs, cores, echo, fp, pick, pq_tls, reality, tls_echo};
+use common::{Cores, certs, cores, echo, fp, pick, pq_tls, reality, tls_echo};
 use leas_native::PacketMode;
 use leas_oracles::e2e::AppKind;
 use leas_oracles::e2e::{
-    Aes128GcmVariant, CaseSpec, Certs, Chacha20Poly1305Variant, CoreKind, CoreUnderTest,
-    EchoServer, SecurityVariant, TlsEchoServer, TlsVariant, run_against,
+    Aes128GcmVariant, CaseSpec, Certs, Chacha20Poly1305Variant, CoreKind, EchoServer,
+    SecurityVariant, TlsEchoServer, TlsVariant, run_against,
 };
 use rstest::rstest;
 
@@ -85,7 +85,7 @@ fn vmess_xhttp_tls(
 async fn vmess_against_cores(
     #[case] case: CaseSpec,
     #[values(CoreKind::Xray, CoreKind::SingBox)] core: CoreKind,
-    cores: &(CoreUnderTest, CoreUnderTest),
+    cores: &Cores,
     certs: &Certs,
     echo: EchoServer,
     tls_echo: TlsEchoServer,
@@ -158,7 +158,7 @@ async fn vmess_against_cores(
 async fn vmess_single_core(
     #[case] case: CaseSpec,
     #[case] core: CoreKind,
-    cores: &(CoreUnderTest, CoreUnderTest),
+    cores: &Cores,
     certs: &Certs,
     echo: EchoServer,
     tls_echo: TlsEchoServer,

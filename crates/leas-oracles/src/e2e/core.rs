@@ -7,6 +7,7 @@ use std::time::Duration;
 pub enum CoreKind {
     Xray,
     SingBox,
+    Mihomo,
 }
 
 impl CoreKind {
@@ -16,6 +17,7 @@ impl CoreKind {
         let base = match self {
             Self::Xray => "xray",
             Self::SingBox => "sing-box",
+            Self::Mihomo => "mihomo",
         };
         format!("{base}{}", std::env::consts::EXE_SUFFIX)
     }
@@ -72,13 +74,16 @@ impl CoreUnderTest {
 }
 
 /// Probe the version string: exact probe per kind, bounded to 15s.
-/// xray: `-version`; sing-box: `version`. A hang is a bug → timeout error.
+/// xray: `-version`; sing-box: `version`; mihomo: `-v` (which prints
+/// `Mihomo Meta v1.19.33 linux amd64 …`, so the pin's substring match works).
+/// A hang is a bug → timeout error.
 /// The bound is generous because Windows AV can take seconds to scan a ~45 MB
 /// core on its first execution.
 fn probe_version(bin: &std::path::Path, kind: CoreKind) -> Result<String, String> {
     let flag = match kind {
         CoreKind::Xray => "-version",
         CoreKind::SingBox => "version",
+        CoreKind::Mihomo => "-v",
     };
     // `Command::output()` can hang; run it on a std thread and bound the wait.
     let (tx, rx) = std::sync::mpsc::channel();

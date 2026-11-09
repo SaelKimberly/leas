@@ -406,6 +406,7 @@ impl CaseSpec {
             return match kind {
                 CoreKind::Xray => &[CoreKind::Xray],
                 CoreKind::SingBox => &[CoreKind::SingBox],
+                CoreKind::Mihomo => &[CoreKind::Mihomo],
             };
         }
         if self.vless_enc.is_some() {

@@ -457,6 +457,15 @@ pub fn spawn_core(
             c.args(["-c", p]);
             c
         }
+        // mihomo takes a home directory as well as the config file: the
+        // config lives in the per-case tempdir, so its parent is that home.
+        CoreKind::Mihomo => {
+            let dir = config_path.parent().expect("config path has a parent");
+            let mut c = Command::new(bin);
+            c.arg("-d").arg(dir);
+            c.args(["-f", p]);
+            c
+        }
     };
     if std::env::var("LEAS_CORE_LOG").is_ok() {
         cmd.stdout(std::process::Stdio::inherit())

@@ -1,22 +1,30 @@
 //! Shared rstest fixtures for the e2e integration tests.
 
 use leas_oracles::e2e::{
-    Certs, CoreKind, CoreUnderTest, EchoServer, FingerprintTls, NoTls, PlainServerRealityClientTls,
-    PqTls, RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls, RealityWrongSidTls,
-    SINGBOX_VERSION, TlsEchoServer, TlsVariant, XRAY_VERSION, generate_certs, spawn_echo,
-    spawn_tls_echo,
+    Certs, CoreKind, CoreUnderTest, EchoServer, FingerprintTls, MIHOMO_VERSION, NoTls,
+    PlainServerRealityClientTls, PqTls, RealityServerPlainClientTls, RealityTls,
+    RealityWrongPbkTls, RealityWrongSidTls, SINGBOX_VERSION, TlsEchoServer, TlsVariant,
+    XRAY_VERSION, generate_certs, spawn_echo, spawn_tls_echo,
 };
 use rstest::fixture;
 
-/// Resolved core binaries, once per test binary (hard-fails when
-/// `LEAS_CORE_BIN_DIR` is missing/unversioned).
+/// The three pinned oracle cores, resolved once per test binary
+/// (hard-fails when `LEAS_CORE_BIN_DIR` is missing/unversioned).
+pub struct Cores {
+    pub xray: CoreUnderTest,
+    pub singbox: CoreUnderTest,
+    pub mihomo: CoreUnderTest,
+}
+
 #[fixture]
 #[once]
-pub fn cores() -> (CoreUnderTest, CoreUnderTest) {
-    let xray = CoreUnderTest::resolve(CoreKind::Xray, XRAY_VERSION).expect("resolve xray-core");
-    let singbox =
-        CoreUnderTest::resolve(CoreKind::SingBox, SINGBOX_VERSION).expect("resolve sing-box");
-    (xray, singbox)
+pub fn cores() -> Cores {
+    Cores {
+        xray: CoreUnderTest::resolve(CoreKind::Xray, XRAY_VERSION).expect("resolve xray-core"),
+        singbox: CoreUnderTest::resolve(CoreKind::SingBox, SINGBOX_VERSION)
+            .expect("resolve sing-box"),
+        mihomo: CoreUnderTest::resolve(CoreKind::Mihomo, MIHOMO_VERSION).expect("resolve mihomo"),
+    }
 }
 
 /// Harness CA (cert/key), generated once per test binary.
@@ -41,10 +49,11 @@ pub fn tls_echo(certs: &Certs) -> TlsEchoServer {
 
 /// Select the resolved core for a `CoreKind` case value.
 #[must_use]
-pub const fn pick(cores: &(CoreUnderTest, CoreUnderTest), kind: CoreKind) -> &CoreUnderTest {
+pub const fn pick(cores: &Cores, kind: CoreKind) -> &CoreUnderTest {
     match kind {
-        CoreKind::Xray => &cores.0,
-        CoreKind::SingBox => &cores.1,
+        CoreKind::Xray => &cores.xray,
+        CoreKind::SingBox => &cores.singbox,
+        CoreKind::Mihomo => &cores.mihomo,
     }
 }
 

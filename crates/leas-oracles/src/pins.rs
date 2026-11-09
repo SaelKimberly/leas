@@ -8,7 +8,8 @@
 //! Pinned to the newest release tag of each project (sing-box can be a
 //! pre-release: the suite tracks the current line, not the stable one).
 //! Bumping is a two-step edit: change the constants here, then run
-//! `just oracles-pins <xray> <singbox>` and paste the printed eight-row table.
+//! `just oracles-pins <xray> <singbox> <mihomo>` and paste the printed
+//! twelve-row table.
 //! A bump may red some e2e rows; that is accepted and triaged separately
 //! (spec D17).
 
@@ -17,6 +18,7 @@
 pub enum Core {
     Xray,
     SingBox,
+    Mihomo,
 }
 
 /// Pinned Xray-core release.
@@ -26,16 +28,26 @@ pub const XRAY_VERSION: &str = "26.11.9";
 /// A pre-release: the oracles track the newest upstream tag, and 1.15 is the
 /// current line (spec D17).
 pub const SINGBOX_VERSION: &str = "1.15.0-alpha.13";
+/// Pinned Mihomo (Clash Meta) release.
+///
+/// The third oracle: the only pinned core that *serves* the legacy Shadowsocks
+/// ciphers, and the reference implementation our Clash/mihomo config surface is
+/// checked against.
+pub const MIHOMO_VERSION: &str = "1.19.33";
 
 const XRAY_REPO: &str = "https://github.com/XTLS/Xray-core/releases/download";
 const SINGBOX_REPO: &str = "https://github.com/SagerNet/sing-box/releases/download";
+const MIHOMO_REPO: &str = "https://github.com/MetaCubeX/mihomo/releases/download";
 
 /// The upstream release asset filename for `(core, os, arch)`.
 ///
 /// `None` for a platform this workspace does not claim (spec D7:
 /// linux/windows × `x86_64`/`aarch64`). `Xray` publishes `Xray-<os>-<suffix>.zip`
 /// with `64`/`arm64-v8a`; sing-box publishes
-/// `sing-box-<version>-<os>-<arch>.tar.gz` (linux) or `.zip` (windows).
+/// `sing-box-<version>-<os>-<arch>.tar.gz` (linux) or `.zip` (windows);
+/// mihomo publishes a bare gzip of the binary on linux
+/// (`mihomo-linux-amd64-compatible-<version>.gz`, the baseline-CPU build) and
+/// a zip on windows.
 #[must_use]
 pub fn asset_name(core: Core, os: &str, arch: &str) -> Option<String> {
     let name = match (core, os, arch) {
@@ -55,6 +67,21 @@ pub fn asset_name(core: Core, os: &str, arch: &str) -> Option<String> {
         (Core::SingBox, "windows", "aarch64") => {
             format!("sing-box-{SINGBOX_VERSION}-windows-arm64.zip")
         }
+        // `compatible` is mihomo's baseline-CPU amd64 build: the plain
+        // `mihomo-linux-amd64-*` asset is compiled for a newer amd64 level and
+        // faults on older CI hardware.
+        (Core::Mihomo, "linux", "x86_64") => {
+            format!("mihomo-linux-amd64-compatible-{MIHOMO_VERSION}.gz")
+        }
+        (Core::Mihomo, "linux", "aarch64") => {
+            format!("mihomo-linux-arm64-{MIHOMO_VERSION}.gz")
+        }
+        (Core::Mihomo, "windows", "x86_64") => {
+            format!("mihomo-windows-amd64-{MIHOMO_VERSION}.zip")
+        }
+        (Core::Mihomo, "windows", "aarch64") => {
+            format!("mihomo-windows-arm64-{MIHOMO_VERSION}.zip")
+        }
         _ => return None,
     };
     Some(name)
@@ -66,6 +93,7 @@ pub const fn version(core: Core) -> &'static str {
     match core {
         Core::Xray => XRAY_VERSION,
         Core::SingBox => SINGBOX_VERSION,
+        Core::Mihomo => MIHOMO_VERSION,
     }
 }
 
@@ -99,6 +127,18 @@ pub fn sha256(core: Core, os: &str, arch: &str) -> Option<&'static str> {
         (Core::SingBox, "windows", "aarch64") => {
             Some("38aa9f309f1be70619e5160aa74d38a0803a5c7340be143381db8143c964f657")
         }
+        (Core::Mihomo, "linux", "x86_64") => {
+            Some("386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6")
+        }
+        (Core::Mihomo, "linux", "aarch64") => {
+            Some("ba408b317080ee265c46cb923a50018c1b82cbd708551cdd46a1e3e307396187")
+        }
+        (Core::Mihomo, "windows", "x86_64") => {
+            Some("6ab2180875f9f6fff8b19386d760daec257f66b45f72b3afc650634272fa837a")
+        }
+        (Core::Mihomo, "windows", "aarch64") => {
+            Some("a2a26869a14634c49f3fbcecc593b498ed8591fbdd7616b24475b3d60b148da3")
+        }
         _ => None,
     }
 }
@@ -109,6 +149,7 @@ pub fn url(core: Core, os: &str, arch: &str) -> Option<String> {
     let repo = match core {
         Core::Xray => XRAY_REPO,
         Core::SingBox => SINGBOX_REPO,
+        Core::Mihomo => MIHOMO_REPO,
     };
     let name = asset_name(core, os, arch)?;
     Some(format!("{repo}/v{}/{name}", version(core)))
