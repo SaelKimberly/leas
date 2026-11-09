@@ -5,10 +5,12 @@
 //! version constants, the asset naming, the checksums and the download URL
 //! cannot drift apart.
 //!
-//! Pinned to the latest stable release of each project. Bumping is a two-step
-//! edit: change the constants here, then run `just oracles-pins <xray>
-//! <singbox>` and paste the printed eight-row table. A bump may red some e2e
-//! rows; that is accepted and triaged separately (spec D17).
+//! Pinned to the newest release tag of each project (sing-box can be a
+//! pre-release: the suite tracks the current line, not the stable one).
+//! Bumping is a two-step edit: change the constants here, then run
+//! `just oracles-pins <xray> <singbox>` and paste the printed eight-row table.
+//! A bump may red some e2e rows; that is accepted and triaged separately
+//! (spec D17).
 
 /// A real server core the e2e suite can launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,9 +20,12 @@ pub enum Core {
 }
 
 /// Pinned Xray-core release.
-pub const XRAY_VERSION: &str = "26.3.27";
+pub const XRAY_VERSION: &str = "26.11.9";
 /// Pinned sing-box release.
-pub const SINGBOX_VERSION: &str = "1.13.16";
+///
+/// A pre-release: the oracles track the newest upstream tag, and 1.15 is the
+/// current line (spec D17).
+pub const SINGBOX_VERSION: &str = "1.15.0-alpha.13";
 
 const XRAY_REPO: &str = "https://github.com/XTLS/Xray-core/releases/download";
 const SINGBOX_REPO: &str = "https://github.com/SagerNet/sing-box/releases/download";
@@ -66,33 +71,33 @@ pub const fn version(core: Core) -> &'static str {
 
 /// The expected SHA-256 (lowercase hex) of the asset for `(core, os, arch)`.
 ///
-/// Read from the GitHub release API (`assets[].digest`) on 2026-11-07.
+/// Read from the GitHub release API (`assets[].digest`) on 2026-11-09.
 #[must_use]
 pub fn sha256(core: Core, os: &str, arch: &str) -> Option<&'static str> {
     match (core, os, arch) {
         (Core::Xray, "linux", "x86_64") => {
-            Some("23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae")
+            Some("b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82")
         }
         (Core::Xray, "windows", "x86_64") => {
-            Some("d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad")
+            Some("1262522266337b824f07beb8e1375786b437683b3890105469088f8e17e0a69d")
         }
         (Core::Xray, "linux", "aarch64") => {
-            Some("4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c")
+            Some("64ed6858982a7f5eb85d88b811089063bd4f17561f4c8f44e0f1dc8e6f6430be")
         }
         (Core::Xray, "windows", "aarch64") => {
-            Some("35d4ed6ec21224fb22b07c2c3f672e2350cd536f2c74d309150175a76365ea88")
+            Some("9fdd48ff890e54ffdc37f92df9037c940fe4d4f914755b70cc644b97e9678a83")
         }
         (Core::SingBox, "linux", "x86_64") => {
-            Some("e37c312859dfa84cba148f41072ff6369f08361ae91d622dc1fd3aab49611a8d")
+            Some("bfc39f643a5ecc1b702c5723ff662e61dde813f12b3af0d0cfce4f629ff74047")
         }
         (Core::SingBox, "windows", "x86_64") => {
-            Some("6cbf90ec4ee87122ffce09b73928fb31e763bc1c75a119f79c61d24734c78807")
+            Some("7cff6a39687a12d51b289bd57a203723629eb8fd42f6668601b4484456436bc9")
         }
         (Core::SingBox, "linux", "aarch64") => {
-            Some("d587fb00bdc3c044227f35d15d154f271bc75108475091eda2542e4b82bb2949")
+            Some("6347b1405ec7e1b02fbed77f3b9ae12ba494cc3eb9f47c4adb6877c807a64bf5")
         }
         (Core::SingBox, "windows", "aarch64") => {
-            Some("8412e9751a776a1cd5138fde8a6b60784af91b0fe596cba1b6efcd05144ef511")
+            Some("38aa9f309f1be70619e5160aa74d38a0803a5c7340be143381db8143c964f657")
         }
         _ => None,
     }

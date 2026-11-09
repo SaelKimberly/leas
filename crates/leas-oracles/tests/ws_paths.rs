@@ -98,7 +98,8 @@ fn spawn_xray_ws_server(
                 "wsSettings": { "path": server_path }
             }
         }],
-        "outbounds": [{ "protocol": "freedom" }]
+        // freedom blocks private targets by default since 26.10.31.
+        "outbounds": [{ "protocol": "freedom", "settings": { "finalRules": [{ "action": "allow", "ip": ["127.0.0.0/8", "::1/128"] }] } }]
     });
     let config_path = std::env::temp_dir().join(format!("leas-wspaths-{port}.json"));
     std::fs::write(

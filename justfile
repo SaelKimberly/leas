@@ -217,7 +217,7 @@ bench target='all':
 oracles-pins xray singbox:
     #!/usr/bin/env bash
     set -euo pipefail
-    for spec in "XTLS/Xray-core:$xray" "SagerNet/sing-box:$singbox"; do
+    for spec in "XTLS/Xray-core:{{xray}}" "SagerNet/sing-box:{{singbox}}"; do
         repo="${spec%%:*}"
         ver="${spec##*:}"
         echo "== $repo v$ver"

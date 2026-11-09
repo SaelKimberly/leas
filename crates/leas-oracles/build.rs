@@ -145,11 +145,18 @@ fn proxy_from_env() -> Option<ureq::Proxy> {
         "HTTP_PROXY",
         "http_proxy",
     ] {
-        if let Ok(url) = env::var(var) {
-            match ureq::Proxy::new(&url) {
-                Ok(proxy) => return Some(proxy),
-                Err(e) => eprintln!("leas-oracles: {var}={url} is not a usable proxy: {e}"),
-            }
+        // An empty value is how several shells spell "no proxy"; ureq rejects
+        // it as a URL, and treating it as a broken proxy turns a clean
+        // environment into a build failure.
+        let Ok(url) = env::var(var).map(|v| v.trim().to_owned()) else {
+            continue;
+        };
+        if url.is_empty() {
+            continue;
+        }
+        match ureq::Proxy::new(&url) {
+            Ok(proxy) => return Some(proxy),
+            Err(e) => eprintln!("leas-oracles: {var}={url} is not a usable proxy: {e}"),
         }
     }
     None

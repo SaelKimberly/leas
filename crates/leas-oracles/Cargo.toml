@@ -65,6 +65,11 @@ tempfile.workspace = true
 # The workspace feature-unification hack (hakari).
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
+# Signals for core process lifecycle (SIGTERM/SIGHUP) through a safe API —
+# the crate forbids `unsafe`, so `libc::kill` is not an option.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [build-dependencies]
 # HTTPS fetch of the pinned release assets (rustls + ring, no aws-lc-rs).
 ureq = { version = "3", features = ["socks-proxy"] }

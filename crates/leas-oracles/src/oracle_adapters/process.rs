@@ -41,6 +41,18 @@ pub trait CoreManager: Send + Sync {
     ) -> Result<(), ProcessError>;
 }
 
+/// Send `signal` to `pid` (unix only).
+///
+/// `rustix` exposes `kill` through its safe surface, so this crate keeps
+/// `#![forbid(unsafe_code)]`; the syscall FFI is the only reason `libc` would
+/// be needed here.
+#[cfg(unix)]
+fn signal(pid: u32, sig: rustix::process::Signal) -> std::io::Result<()> {
+    let pid = rustix::process::Pid::from_raw(pid.cast_signed())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    rustix::process::kill_process(pid, sig).map_err(std::io::Error::from)
+}
+
 /// Status of a running core process.
 pub struct CoreProcess {
     child: Option<Child>,
@@ -64,7 +76,7 @@ impl CoreProcess {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
                 // Send SIGTERM for graceful shutdown
-                let _ = unsafe { libc::kill(pid.cast_signed(), libc::SIGTERM) };
+                let _ = signal(pid, rustix::process::Signal::TERM);
             }
             #[cfg(not(unix))]
             {
@@ -328,11 +340,8 @@ impl RealCoreManager {
         // arm would leave a trailing `Ok(pid)` unreachable there.
         #[cfg(unix)]
         {
-            unsafe {
-                if libc::kill(pid.cast_signed(), libc::SIGHUP) != 0 {
-                    let err = std::io::Error::last_os_error();
-                    return Err(ProcessError::Startup(format!("SIGHUP failed: {err}")));
-                }
+            if let Err(err) = signal(pid, rustix::process::Signal::HUP) {
+                return Err(ProcessError::Startup(format!("SIGHUP failed: {err}")));
             }
             Ok(pid)
         }

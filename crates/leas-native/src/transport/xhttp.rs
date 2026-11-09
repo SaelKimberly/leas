@@ -175,7 +175,7 @@ fn build_request(
     url_path: &str,
     host: &str,
 ) -> Result<http::Request<()>, NativeError> {
-    let padding = x_padding();
+    let padding = encode_query_value(&x_padding());
     // xray captures `RawURL` *before* appending session/seq, so the Referer
     // carries the base URL (`{scheme}://{host}{path}`), not the session path.
     // One allocation for the whole value (`write!`, not chained `format!`).
@@ -200,6 +200,26 @@ fn build_request(
     builder
         .body(())
         .map_err(|e| NativeError::Config(format!("xhttp request build: {e}")))
+}
+
+/// Percent-encode a query value the way Go's `url.Values.Encode` does.
+///
+/// The padding alphabet contains `&`, `,` and `;`; written raw into
+/// `?x_padding=`, `&` ends the parameter and the server's `Query().Get` sees a
+/// truncated value, which fails the 100-byte minimum and answers 400
+/// (`splithttp/xpadding.go` `ExtractXPaddingFromRequest` + `IsPaddingValid`).
+/// Everything outside the unreserved set is escaped, uppercase hex, as Go
+/// escapes it.
+fn encode_query_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            write!(out, "%{b:02X}").expect("write! to String cannot fail");
+        }
+    }
+    out
 }
 
 /// Request body for the v3 protocol (transport-agnostic). The hyper arms
@@ -1579,10 +1599,24 @@ mod tests {
         let referer = req.headers()["referer"].to_str().unwrap();
         let (url, pad) = referer.split_once("?x_padding=").unwrap();
         assert_eq!(url, "http://example.com/x/");
-        assert!((100..1000).contains(&pad.len()), "len {}", pad.len());
+        // Percent-encoded: `&`, `,`, `;` and `*` are all in the padding
+        // alphabet, and a raw `&` truncates the parameter server-side
+        // (`Query().Get`), which fails the length check and answers 400.
         assert!(
-            pad.bytes().all(|b| PAD_ALPHABET.contains(&b)),
-            "outside the 8-bit alphabet"
+            !pad.bytes().any(|b| matches!(b, b'&' | b',' | b';' | b'*')),
+            "padding must be escaped: {pad}"
+        );
+        assert!(
+            pad.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'%'),
+            "outside the escaped form: {pad}"
+        );
+        // The server decodes before measuring, so the bound applies to the
+        // decoded value.
+        let decoded = percent_decode(pad);
+        assert!(
+            (100..1000).contains(&decoded.len()),
+            "len {}",
+            decoded.len()
         );
     }
 
@@ -1928,16 +1962,40 @@ mod tests {
         }
     }
 
+    /// Decode a percent-encoded query value (the client escapes the padding;
+    /// the server's `url.Query().Get` decodes it before measuring).
+    fn percent_decode(encoded: &str) -> Vec<u8> {
+        let bytes = encoded.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).expect("hex digits");
+                out.push(u8::from_str_radix(hex, 16).expect("hex value"));
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
     /// Referer = `{scheme}://{host}{base}?x_padding={…}` — the v3 padding the
     /// client sends on every request, drawn from the 8-bit Huffman alphabet
-    /// over `[PAD_MIN, PAD_MAX)`.
+    /// over `[PAD_MIN, PAD_MAX)` and percent-encoded (`&`, `,` and `;` are in
+    /// the alphabet and would otherwise truncate the query server-side).
     fn assert_referer(referer: &str) {
         let (url, pad) = referer
             .split_once("?x_padding=")
             .expect("referer carries x_padding");
         assert_eq!(url, "https://localhost/x/", "{referer}");
-        assert!(pad.bytes().all(|b| PAD_ALPHABET.contains(&b)), "{referer}");
-        assert!((PAD_MIN..PAD_MAX).contains(&pad.len()), "{referer}");
+        let decoded = percent_decode(pad);
+        assert!(
+            decoded.iter().all(|b| PAD_ALPHABET.contains(b)),
+            "{referer}"
+        );
+        assert!((PAD_MIN..PAD_MAX).contains(&decoded.len()), "{referer}");
     }
 
     /// Read an h3 request body to EOF, concatenated. The client always

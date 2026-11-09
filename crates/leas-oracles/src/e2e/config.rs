@@ -204,7 +204,8 @@ pub fn vmess_inbound(
                     }] },
                     "streamSettings": stream
                 }],
-                "outbounds": [{ "protocol": "freedom" }]
+                // freedom blocks private targets by default since 26.10.31.
+                "outbounds": [{ "protocol": "freedom", "settings": { "finalRules": [{ "action": "allow", "ip": ["127.0.0.0/8", "::1/128"] }] } }]
             })
         }
         CoreKind::SingBox => {
@@ -251,46 +252,50 @@ pub fn vmess_inbound(
 
 /// Add xray's mKCP obfuscation (`finalmask.udp`) to a kcp server config.
 ///
-/// Names are the ones the PINNED core (26.3.27) accepts: `mkcp-original`,
-/// `mkcp-aes128gcm` and `header-*`. (Xray HEAD renamed the first two to
-/// `mkcp-legacy`; 26.3.27 rejects that name, and 26.3.27 is what the suite
-/// tests against.)
+/// Since the 26.7 refactor the only mKCP UDP mask is `mkcp-legacy`
+/// (`infra/conf/transport_finalmask.go`, `MkcpLegacy.Build`): `header` names
+/// the camouflage frame (`dns`/`dtls`/`srtp`/`utp`/`wechat`/`wireguard`) and
+/// `value` is the `aes128gcm` seed, or the DNS domain when `header` is `dns`.
+/// The old `mkcp-original`, `mkcp-aes128gcm` and `header-*` types no longer
+/// decode.
 ///
-/// The array order is the wire order, outermost first: 26.3.27's
-/// `NewUdpmaskManager` does NOT reverse (HEAD's `NewFinalMask` does), so
-/// `[envelope, header]` yields `envelope(header || payload)` — exactly what
-/// `transport::kcp::mask` frames and what the oracle vectors in that module
-/// pin. `""` means the knob is absent; with no seed the envelope is the bare
-/// `original` entry.
+/// Masks are innermost first: `finalmask/finalmask.go` reverses the array and
+/// wraps the transports in that order, so `[header, envelope]` writes
+/// `envelope(header || payload)` — exactly what `transport::kcp::mask` frames
+/// and the oracle vectors in that module pin. (The pre-refactor managers took
+/// an explicit level, which is why the older config emitted the reverse.)
+/// `""` means the knob is absent; with no seed the envelope is the bare
+/// `mkcp-legacy` entry.
 #[must_use]
 pub fn apply_kcp_mask(config: &str, header: &str, seed: &str) -> String {
     let mut json: serde_json::Value =
         serde_json::from_str(config).expect("generated server config is JSON");
-    let envelope = if seed.is_empty() {
-        serde_json::json!({ "type": "mkcp-original" })
-    } else {
-        serde_json::json!({
-            "type": "mkcp-aes128gcm",
-            "settings": { "password": seed }
-        })
-    };
-    let mut masks = vec![envelope];
+    let mut masks = Vec::with_capacity(2);
     if !header.is_empty() {
-        // The core's type names are the finalmask ones: `header-wechat`, not
-        // the share-link spelling `wechat-video`.
+        // The core's names are the finalmask ones: `wechat`, not the
+        // share-link spelling `wechat-video`.
         let name = if header == "wechat-video" {
             "wechat"
         } else {
             header
         };
-        let mut entry = serde_json::json!({ "type": format!("header-{name}") });
+        let mut entry =
+            serde_json::json!({ "type": "mkcp-legacy", "settings": { "header": name } });
         if header == "dns" {
             // The client frames the core's default domain; name it so the row
             // pins the bytes instead of the default.
-            entry["settings"] = serde_json::json!({ "domain": "www.baidu.com" });
+            entry["settings"]["value"] = serde_json::json!("www.baidu.com");
         }
         masks.push(entry);
     }
+    masks.push(if seed.is_empty() {
+        serde_json::json!({ "type": "mkcp-legacy" })
+    } else {
+        serde_json::json!({
+            "type": "mkcp-legacy",
+            "settings": { "value": seed }
+        })
+    });
     let stream = &mut json["inbounds"][0]["streamSettings"];
     stream["finalmask"] = serde_json::json!({ "udp": masks });
     serde_json::to_string(&json).expect("server config serializes")
@@ -399,7 +404,8 @@ pub fn vless_inbound(
                     },
                     "streamSettings": stream
                 }],
-                "outbounds": [{ "protocol": "freedom" }]
+                // freedom blocks private targets by default since 26.10.31.
+                "outbounds": [{ "protocol": "freedom", "settings": { "finalRules": [{ "action": "allow", "ip": ["127.0.0.0/8", "::1/128"] }] } }]
             })
         }
         CoreKind::SingBox => {
@@ -546,7 +552,8 @@ fn vless_reality_inbound(
                 "settings": { "clients": [{ "id": UUID }], "decryption": "none" },
                 "streamSettings": stream
             }],
-            "outbounds": [{ "protocol": "freedom" }]
+            // freedom blocks private targets by default since 26.10.31.
+            "outbounds": [{ "protocol": "freedom", "settings": { "finalRules": [{ "action": "allow", "ip": ["127.0.0.0/8", "::1/128"] }] } }]
         }),
         CoreKind::SingBox => {
             let mut inbound = serde_json::json!({
@@ -624,7 +631,8 @@ fn vmess_reality_inbound(
                 }] },
                 "streamSettings": stream
             }],
-            "outbounds": [{ "protocol": "freedom" }]
+            // freedom blocks private targets by default since 26.10.31.
+            "outbounds": [{ "protocol": "freedom", "settings": { "finalRules": [{ "action": "allow", "ip": ["127.0.0.0/8", "::1/128"] }] } }]
         }),
         CoreKind::SingBox => {
             let mut inbound = serde_json::json!({
@@ -908,7 +916,8 @@ pub fn trojan_inbound(core: CoreKind, env: &ServerEnv, network: &str) -> String 
                     "settings": { "clients": [{ "password": TROJAN_PASSWORD }] },
                     "streamSettings": stream
                 }],
-                "outbounds": [{ "protocol": "freedom" }]
+                // freedom blocks private targets by default since 26.10.31.
+                "outbounds": [{ "protocol": "freedom", "settings": { "finalRules": [{ "action": "allow", "ip": ["127.0.0.0/8", "::1/128"] }] } }]
             })
         }
         CoreKind::SingBox => {
@@ -1074,7 +1083,8 @@ pub fn ss_inbound(
                     },
                     "streamSettings": stream
                 }],
-                "outbounds": [{ "protocol": "freedom" }]
+                // freedom blocks private targets by default since 26.10.31.
+                "outbounds": [{ "protocol": "freedom", "settings": { "finalRules": [{ "action": "allow", "ip": ["127.0.0.0/8", "::1/128"] }] } }]
             })
         }
         CoreKind::SingBox => {
@@ -1168,6 +1178,30 @@ mod tests {
         let sid = reality_sid();
         assert_eq!(sid.len(), 8);
         assert!(sid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn kcp_mask_config_is_innermost_first() {
+        // `finalmask.udp` is reversed before the transports are wrapped
+        // (`finalmask/finalmask.go`, `NewFinalMask`), so the first entry is
+        // the innermost one: the camouflage header must come before the
+        // envelope, or the server reads the header bytes as envelope framing
+        // ("mkcp/original: invalid auth") and drops every datagram.
+        let out = apply_kcp_mask(r#"{"inbounds":[{"streamSettings":{}}]}"#, "srtp", "seed");
+        let config: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let masks = config["inbounds"][0]["streamSettings"]["finalmask"]["udp"]
+            .as_array()
+            .expect("udp mask array")
+            .clone();
+        assert_eq!(masks.len(), 2);
+        assert_eq!(masks[0]["settings"]["header"], "srtp");
+        assert_eq!(masks[1]["settings"]["value"], "seed");
+        // One type for both entries: the old `mkcp-original`/`header-*` ids
+        // no longer decode.
+        assert!(
+            masks.iter().all(|m| m["type"] == "mkcp-legacy"),
+            "{masks:?}"
+        );
     }
 
     #[test]

@@ -99,6 +99,39 @@ impl ProvisionedHello {
     }
 }
 
+/// Graft the `X25519MLKEM768` key share (and its `supported_groups` entry)
+/// into a spec that lacks it.
+///
+/// Since 26.11 the REALITY server requires the `ClientHello`'s `key_share` to
+/// carry the hybrid entry at or before `X25519` — `xtls/reality` `tls.go`
+/// breaks out of the auth path when `peerPub2 == nil`, i.e. when the hello has
+/// no `X25519MLKEM768` share — and then transparently proxies to the steal
+/// target, so the client only ever sees a real certificate. The share is
+/// invisible to JA3/JA4 (neither fingerprints key shares), which is why it can
+/// be grafted onto a browser-shaped spec without changing its fingerprint.
+///
+/// The entry goes after a GREASE slot when one is present, and first
+/// otherwise: the server stops scanning at the first `X25519` share, so the
+/// hybrid entry must precede it.
+fn graft_hybrid_key_share(spec: &mut ClientHelloSpec) {
+    for ext in &mut spec.extensions {
+        match ext {
+            ExtensionSpec::SupportedGroups(groups) if !groups.contains(&0x11EC) => {
+                let at = usize::from(matches!(
+                    groups.first(),
+                    Some(&crate::spec::grease::GREASE_PLACEHOLDER)
+                ));
+                groups.insert(at, 0x11EC); // x25519mlkem768
+            }
+            ExtensionSpec::KeyShare(groups) if !groups.contains(&KeyShareGroup::X25519Mlkem768) => {
+                let at = usize::from(matches!(groups.first(), Some(KeyShareGroup::Grease)));
+                groups.insert(at, KeyShareGroup::X25519Mlkem768);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The wire-exact `chrome_130` spec with the X25519MLKEM768 key share (and
 /// its `supported_groups` entry) restored. Real Chrome 130+ sends the
 /// hybrid share; the JA4-driven profile omits it because JA3/JA4 do not
@@ -106,17 +139,7 @@ impl ProvisionedHello {
 /// path alive after the roster reduction dropped the Chrome-133 preset.
 fn chrome_130_hybrid_spec() -> ClientHelloSpec {
     let mut spec = crate::profiles::hand_selected::chrome_130();
-    for ext in &mut spec.extensions {
-        match ext {
-            ExtensionSpec::SupportedGroups(groups) => {
-                groups.insert(1, 0x11EC); // x25519mlkem768, after GREASE
-            }
-            ExtensionSpec::KeyShare(groups) => {
-                groups.insert(1, KeyShareGroup::X25519Mlkem768);
-            }
-            _ => {}
-        }
-    }
+    graft_hybrid_key_share(&mut spec);
     spec
 }
 
@@ -193,10 +216,10 @@ impl HelloProvisioner for RandomEligible {
     }
 
     fn offers_hybrid_key_share(&self) -> bool {
-        // Whether the picked spec carries PQ is a per-dial fact; report the
-        // conservative answer (no PQ) so callers never assume a hybrid share
-        // this provisioner cannot guarantee.
-        false
+        // Every candidate is `reality_eligible` (it carries a real key share),
+        // and `SpecProvisioner::provision` grafts the hybrid entry in, so the
+        // caller must always supply the ML-KEM-768 encapsulation key.
+        true
     }
 }
 
@@ -241,6 +264,9 @@ impl HelloProvisioner for SpecProvisioner {
     fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello> {
         let mut spec = self.spec.clone();
         spec.session_id = SessionIdSpec::AuthPayload { len: 32 };
+        // The REALITY server rejects a hello without the hybrid share (see
+        // [`graft_hybrid_key_share`]), so every provisioned spec carries it.
+        graft_hybrid_key_share(&mut spec);
         let built = build_hello(
             &spec,
             &BuildParams {
@@ -261,18 +287,13 @@ impl HelloProvisioner for SpecProvisioner {
     }
 
     fn offers_hybrid_key_share(&self) -> bool {
-        self.spec.extensions.iter().any(|ext| {
-            matches!(
-                ext,
-                ExtensionSpec::KeyShare(groups)
-                    if groups.iter().any(|g| matches!(
-                        g,
-                        KeyShareGroup::X25519Mlkem768
-                            | KeyShareGroup::Secp256r1Mlkem768
-                            | KeyShareGroup::Secp384r1Mlkem1024
-                    ))
-            )
-        })
+        // `provision` grafts the hybrid entry into any spec that carries a
+        // `key_share` extension, so the answer follows the extension's
+        // presence: the caller must supply the ML-KEM-768 encapsulation key.
+        self.spec
+            .extensions
+            .iter()
+            .any(|ext| matches!(ext, ExtensionSpec::KeyShare(_)))
     }
 }
 
@@ -496,10 +517,16 @@ mod tests {
     /// The provisioner holds the resolved spec, so the hybrid question and
     /// the built hello cannot disagree — the invariant that the old
     /// per-call closure re-resolve could break.
+    ///
+    /// Every REALITY hello carries the hybrid share, whatever browser the
+    /// spec imitates: the 26.11 server stops at the first `X25519` key share
+    /// and silently proxies the connection to the steal target when no
+    /// `X25519MLKEM768` share came first (`xtls/reality` `tls.go`), so a
+    /// browser-accurate hello without it can never authenticate.
     #[test]
     fn spec_provisioner_share_report_matches_its_hello() {
         let rng = ring::rand::SystemRandom::new();
-        for (version, expected_hybrid) in [(130_u16, false), (143, true)] {
+        for version in [130_u16, 143] {
             let fp = Fingerprint::new(Browser::Chrome).with_version(version);
             let provisioner = match SpecProvisioner::try_from(&fp) {
                 Ok(p) => p,
@@ -523,7 +550,29 @@ mod tests {
                 hello_offers_hybrid,
                 "chrome v{version}: the report and the hello must agree"
             );
-            assert_eq!(hello_offers_hybrid, expected_hybrid, "chrome v{version}");
+            assert!(hello_offers_hybrid, "chrome v{version}");
+            // Order is the whole point: the server scans the entries in order
+            // and stops at the first X25519 one.
+            let mut groups = Vec::new();
+            let mut off = 2usize;
+            while off + 4 <= key_share.len() {
+                let group = u16::from_be_bytes([key_share[off], key_share[off + 1]]);
+                let len = u16::from_be_bytes([key_share[off + 2], key_share[off + 3]]) as usize;
+                groups.push(group);
+                off += 4 + len;
+            }
+            let hybrid_at = groups
+                .iter()
+                .position(|g| *g == 0x11EC)
+                .expect("hybrid entry");
+            let x25519_at = groups
+                .iter()
+                .position(|g| *g == 0x001d)
+                .expect("x25519 entry");
+            assert!(
+                hybrid_at < x25519_at,
+                "chrome v{version}: {groups:04x?} — the hybrid share must come first"
+            );
             assert_eq!(hello.session_id_range.len(), 32);
         }
     }

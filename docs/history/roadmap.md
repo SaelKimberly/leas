@@ -521,3 +521,34 @@ batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes
   matrix on both funnels, pin wiring end-to-end against a self-signed rustls origin (same key
   accepted, different key refused), and ten sing-box-only `native-e2e` rows (opt-in).
   Workspace gate: 2747 passed, clippy `-D warnings` clean.
+
+## Phase 35 — Oracle parity on the current mainstream (pin bump) ✅
+
+- ✅ **Pins moved to the newest release tags** — xray-core `26.3.27 → 26.11.9`, sing-box
+  `1.13.16 → 1.15.0-alpha.13`, eight fresh SHA-256 rows in `crates/leas-oracles/src/pins.rs`.
+  `just oracles-pins <xray> <singbox>` now actually runs (the shebang recipe referenced
+  `$xray`, which just never exports; `{{xray}}` interpolation does).
+- ✅ **REALITY offers the hybrid key share on every hello** — the 26.11 server abandons its auth
+  path at the first `X25519` key share, so a hello without `X25519MLKEM768` is proxied to the
+  steal target and can never authenticate. `SpecProvisioner` grafts the share into whatever spec
+  it provisions (`graft_hybrid_key_share`), which is invisible to JA3/JA4 because neither
+  fingerprints key shares; before the graft every Xray REALITY row failed as `RealityFallback`
+  while sing-box accepted the same hellos.
+- ✅ **XHTTP padding is percent-encoded** — `&`, `,` and `;` sit in the 8-bit Huffman alphabet and
+  a raw `&` ends the Referer query, so the server measured a truncated `x_padding`, failed the
+  `[100, 1000)` bound and answered 400 to every session-open GET.
+- ✅ **mKCP masks follow the 26.7 refactor** — `mkcp-original`/`mkcp-aes128gcm`/`header-*` no
+  longer decode; one `mkcp-legacy` entry carries `header` and `value`, and `finalmask.udp` is
+  innermost-first, so the harness emits `[header, envelope]`.
+- ✅ **The oracle crate compiles again** — `oracle_adapters/process.rs` still called
+  `unsafe { libc::kill }` under `#![forbid(unsafe_code)]` with no `libc` dependency; signals now
+  go through `rustix` (`cfg(unix)` dep), and `build.rs` no longer treats an empty `https_proxy=`
+  as a broken proxy.
+- ✅ **Harness accounts for Xray's new egress policy** — since 26.10.31 a `freedom` outbound
+  blocks private destinations by default for vless/vmess/trojan/shadowsocks inbounds, so every
+  generated server config carries an explicit `allow` final rule for loopback.
+- ✅ **Verification** — oracle suite 380 entries: 368 green, 13 ignored, 12 red; all 12 reds
+  reproduce on the previous pins (ten sing-box legacy-cipher shadowsocks inbound rows — its
+  inbound offers only `none`/AEAD/2022 — and the two tcp plain-into-reality-server entries).
+  Default suite 2574 passed, workspace clippy `-D warnings` clean, `hakari-check` and
+  `cargo machete` clean.
