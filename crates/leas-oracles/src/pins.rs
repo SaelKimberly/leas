@@ -46,7 +46,8 @@ const MIHOMO_REPO: &str = "https://github.com/MetaCubeX/mihomo/releases/download
 /// with `64`/`arm64-v8a`; sing-box publishes
 /// `sing-box-<version>-<os>-<arch>.tar.gz` (linux) or `.zip` (windows);
 /// mihomo publishes a bare gzip of the binary on linux
-/// (`mihomo-linux-amd64-compatible-<version>.gz`, the baseline-CPU build) and
+/// (`mihomo-linux-amd64-compatible-v<version>.gz` — the `v` is part of the
+/// asset name, not just the tag — the baseline-CPU build) and
 /// a zip on windows.
 #[must_use]
 pub fn asset_name(core: Core, os: &str, arch: &str) -> Option<String> {
@@ -71,16 +72,16 @@ pub fn asset_name(core: Core, os: &str, arch: &str) -> Option<String> {
         // `mihomo-linux-amd64-*` asset is compiled for a newer amd64 level and
         // faults on older CI hardware.
         (Core::Mihomo, "linux", "x86_64") => {
-            format!("mihomo-linux-amd64-compatible-{MIHOMO_VERSION}.gz")
+            format!("mihomo-linux-amd64-compatible-v{MIHOMO_VERSION}.gz")
         }
         (Core::Mihomo, "linux", "aarch64") => {
-            format!("mihomo-linux-arm64-{MIHOMO_VERSION}.gz")
+            format!("mihomo-linux-arm64-v{MIHOMO_VERSION}.gz")
         }
         (Core::Mihomo, "windows", "x86_64") => {
-            format!("mihomo-windows-amd64-{MIHOMO_VERSION}.zip")
+            format!("mihomo-windows-amd64-v{MIHOMO_VERSION}.zip")
         }
         (Core::Mihomo, "windows", "aarch64") => {
-            format!("mihomo-windows-arm64-{MIHOMO_VERSION}.zip")
+            format!("mihomo-windows-arm64-v{MIHOMO_VERSION}.zip")
         }
         _ => return None,
     };
