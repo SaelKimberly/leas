@@ -472,6 +472,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_older_snapshot_cannot_replace_a_newer_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let cell = new_cell();
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let inputs = |generation: u64| RouteInputs {
+            cell: Arc::clone(&cell),
+            lock: Arc::clone(&lock),
+            cfg: AppConfig::default(),
+            rules: Vec::new(),
+            geo_ip: None,
+            dns: None,
+            dir: dir.path().to_path_buf(),
+            generation,
+        };
+        rebuild(&inputs(2), false).await;
+        assert_eq!(cell.read().generation, 2);
+        rebuild(&inputs(1), false).await;
+        assert_eq!(
+            cell.read().generation,
+            2,
+            "an out-of-order rebuild must not resurrect older rules"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_forced_refresh_keeps_a_working_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("geo.dat");
