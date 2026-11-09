@@ -89,10 +89,21 @@ fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
 #[case::tcp_reality(vless_tls("tcp", reality()))]
 #[case::tcp_reality_wrong_pbk(vless_tls("tcp", reality_wrong_pbk()))]
 #[case::tcp_reality_wrong_sid(vless_tls("tcp", reality_wrong_sid()))]
+// Both pinned REALITY servers drop a non-authenticated client: they replay the
+// destination's server flight (so the probe does see a real certificate) and
+// then close instead of proxying. xray's `xtls/reality` `Server` finishes its
+// copy loops and returns `REALITY: processed invalid connection from <addr>:
+// authentication failed or validation criteria not met`; sing-box's
+// metacubex/utls fork only starts the upload copy when the destination has not
+// answered yet (`tls.go`, `handshakeLen[0] == 0`), so a proxied probe is a
+// timing win, not a contract. A stock `curl` reproduces both: 000 against the
+// xray inbound, a racy 200 against the sing-box one. Asserting a working tunnel
+// here would assert upstream behaviour that no longer exists.
 #[cfg_attr(
     windows,
     ignore = "Windows: the REALITY fallback dest handshake does not complete within the probe window"
 )]
+#[ignore = "plain client into reality server: upstream replays the dest flight then drops the connection"]
 #[case::tcp_plain_into_reality_server(vless_tls("tcp", reality_server_plain_client()))]
 #[case::tcp_reality_into_plain_server(vless_tls("tcp", plain_server_reality_client()))]
 #[case::ws_plain(vless("ws"))]

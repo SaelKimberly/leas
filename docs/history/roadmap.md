@@ -547,8 +547,14 @@ batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes
 - ✅ **Harness accounts for Xray's new egress policy** — since 26.10.31 a `freedom` outbound
   blocks private destinations by default for vless/vmess/trojan/shadowsocks inbounds, so every
   generated server config carries an explicit `allow` final rule for loopback.
-- ✅ **Verification** — oracle suite 380 entries: 368 green, 13 ignored, 12 red; all 12 reds
-  reproduce on the previous pins (ten sing-box legacy-cipher shadowsocks inbound rows — its
-  inbound offers only `none`/AEAD/2022 — and the two tcp plain-into-reality-server entries).
-  Default suite 2574 passed, workspace clippy `-D warnings` clean, `hakari-check` and
-  `cargo machete` clean.
+- ✅ **The 12 reds, decided by upstream behaviour rather than by our client** — four were
+  upstream changes the client had to follow (above). The last twelve entries had no upstream
+  server to pass against at all, so the expectation moved: ten legacy-cipher shadowsocks rows were deleted (xray's
+  `cipherFromString` and sing-box's shadowsocks *inbound* both stop at AEAD/2022; the legacy
+  ciphers survive only on sing-box's outbound, so no server can be configured — the client
+  codecs keep their NIST/RFC KATs), and the tcp plain-into-reality-server row is `#[ignore]`d
+  beside its ws/grpc siblings (both pinned REALITY servers replay the destination's server
+  flight and then close instead of proxying; a stock `curl` reproduces it on both).
+- ✅ **Verification** — oracle suite 374 entries: 359 runnable, all green, 15 ignored (opt-in
+  plugin/probe rows plus the three plain-into-reality-server rows). Default suite 2574 passed,
+  workspace clippy `-D warnings` clean, `hakari-check` and `cargo machete` clean.

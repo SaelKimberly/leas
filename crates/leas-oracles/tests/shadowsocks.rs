@@ -65,31 +65,17 @@ fn ss(method: &'static str) -> CaseSpec {
 #[case::udp_2022_chacha20(
     ss("2022-blake3-chacha20-poly1305").with_app(AppKind::Udp).with_udp(PacketMode::Raw)
 )]
-// ── legacy stream ciphers (spec D1) ─────────────────────────────────────
-// SING-BOX ONLY: xray-core's CipherType enum has no legacy entry at all (v5
-// speaks AEAD; `none` was dropped after 4.x), so the server side can only be
-// sing-box. Each row is a real dial: IV prefix, one continuous keystream, no
-// chunk framing.
-#[case::legacy_aes256_cfb(ss("aes-256-cfb").with_single_core(CoreKind::SingBox))]
-#[case::legacy_aes192_cfb(ss("aes-192-cfb").with_single_core(CoreKind::SingBox))]
-#[case::legacy_aes128_ctr(ss("aes-128-ctr").with_single_core(CoreKind::SingBox))]
-#[case::legacy_aes256_ctr(ss("aes-256-ctr").with_single_core(CoreKind::SingBox))]
-// RC4 keyed by `MD5(master ‖ IV)` — the one legacy method whose session key is
-// not the master key.
-#[case::legacy_rc4_md5(ss("rc4-md5").with_single_core(CoreKind::SingBox))]
-#[case::legacy_chacha20_ietf(ss("chacha20-ietf").with_single_core(CoreKind::SingBox))]
-#[case::legacy_xchacha20(ss("xchacha20").with_single_core(CoreKind::SingBox))]
-// `none`: no IV, no keystream. This row bypasses the import gate (which refuses
-// a cleartext `none`) because the harness builds the config directly; it proves
-// the codec, not the admission policy.
-#[case::legacy_none(ss("none").with_single_core(CoreKind::SingBox))]
-// Legacy UDP: `[IV] cipher(addr ‖ payload)` per datagram.
-#[case::udp_legacy_aes256_cfb(
-    ss("aes-256-cfb").with_app(AppKind::Udp).with_udp(PacketMode::Raw).with_single_core(CoreKind::SingBox)
-)]
-#[case::udp_legacy_rc4_md5(
-    ss("rc4-md5").with_app(AppKind::Udp).with_udp(PacketMode::Raw).with_single_core(CoreKind::SingBox)
-)]
+// No live row exists for the legacy stream ciphers (`aes-*-cfb`, `aes-*-ctr`,
+// `rc4-md5`, `chacha20-ietf`, `xchacha20`) or for `none`: neither pinned server
+// speaks them. xray-core's `cipherFromString` maps only the AEAD set plus the
+// 2022 methods (`infra/conf/shadowsocks.go`), and sing-box's shadowsocks
+// **inbound** enum is the same set (`option/shadowsocks.go`,
+// `ShadowsocksInboundOptions.Method`) — its legacy ciphers survive only on the
+// **outbound**, so no server can serve the row. The client side is proven
+// hermetically instead: NIST SP 800-38A CFB vectors and RFC 6229 RC4 vectors in
+// `crypto/legacy_stream.rs`, the per-method stream framing (IV prefix, one
+// continuous keystream, no chunking) in `protocol/ss/stream_legacy.rs`, and the
+// per-datagram `[IV] cipher(addr ‖ payload)` UDP arm.
 #[tokio::test]
 async fn shadowsocks_against_cores(
     #[case] case: CaseSpec,
