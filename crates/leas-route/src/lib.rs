@@ -7,6 +7,7 @@ pub mod dns_adapter;
 pub mod engine;
 pub mod error;
 pub mod events;
+pub mod geo;
 pub mod ir;
 pub mod matchers;
 pub mod resolve;

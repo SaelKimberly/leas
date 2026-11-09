@@ -12,15 +12,18 @@ use leas_route::ir::{Action, Cond, MatchItem, NetworkMask, Rule, SniffedProtocol
 ///
 /// Mapping (fixed item order `Domain`, `IpCidr`, `Ports`, `SourcePorts`,
 /// `Network`, `Protocol`, `InboundTag`; only non-empty fields produce items):
-/// - `domains` + `domain_matcher` `Some("exact")` ⇒ `Domain.exact`;
-///   otherwise (None or "domain") ⇒ `Domain.suffix`.
+/// - `domains`: plain entries + `domain_matcher` ⇒ `Domain.exact`/`.suffix`;
+///   `geosite:<code>` tokens ⇒ `Domain.geosite` (resolved by the engine).
 /// - `ips`: CIDR entries ⇒ `IpCidr.cidrs`; `geoip:private` ⇒ `private`;
-///   `geoip:<cc>` ⇒ `geo_country`; unparseable entries are skipped and
-///   reported by [`warnings_from_row`].
+///   `geoip:<cc>` / `!geoip:<cc>` ⇒ `geo_country` (leading `!` = reverse);
+///   unparseable entries are skipped and reported by [`warnings_from_row`].
 /// - `ports`/`source_ports` ⇒ `Ports`/`SourcePorts` (one `PortRange` per
 ///   port); `network` comma-able `"tcp,udp"` ⇒ one `NetworkMask` item;
 ///   IANA `http`/`tls`/`dns`/`quic` protocols ⇒ AND-ed `Protocol` items;
-///   `inbound_tags` ⇒ `InboundTag`; `outbound_tag` ⇒ `Action::Route`.
+///   `inbound_tags` ⇒ `InboundTag`; `rule_set_file`/`rule_set_url` ⇒
+///   `RuleSet` (OR'ed sources).
+/// - `outbound_tag` is normalized to the native vocabulary: `proxy`,
+///   `direct`/`bypass`, `block`/`reject`; anything else is a parse error.
 ///
 /// # Errors
 /// - [`RouteError::Unsupported`] when `balancer_tag` is set (balancers
@@ -29,7 +32,7 @@ use leas_route::ir::{Action, Cond, MatchItem, NetworkMask, Rule, SniffedProtocol
 /// - [`RouteError::Parse`] on `field: "row"` when the row yields no match
 ///   conditions — including the bare catch-all (only `outbound_tag`), which
 ///   xray-core 26+ likewise rejects; on `field: "outbound_tag"` when the row
-///   has conditions but nothing to route to.
+///   has conditions but nothing to route to, or names an unknown outbound.
 pub fn rule_from_row(row: &RoutingRule, index: usize) -> Result<Rule, RouteError> {
     if row.balancer_tag.is_some() {
         return Err(RouteError::Unsupported(
@@ -44,12 +47,26 @@ pub fn rule_from_row(row: &RoutingRule, index: usize) -> Result<Rule, RouteError
             message: "rule has no match conditions (bare catch-all rejected)".to_owned(),
         });
     }
-    let Some(tag) = row.outbound_tag.clone() else {
+    let Some(raw_tag) = row.outbound_tag.as_deref() else {
         return Err(RouteError::Parse {
             rule_index: index,
             field: "outbound_tag",
             message: "rule has match conditions but no outbound_tag".to_owned(),
         });
+    };
+    let tag = match raw_tag.to_ascii_lowercase().as_str() {
+        "proxy" => leas_route::ir::PROXY_TAG.to_owned(),
+        "direct" | "bypass" => leas_route::ir::DIRECT_TAG.to_owned(),
+        "block" | "reject" => leas_route::ir::BLOCK_TAG.to_owned(),
+        _ => {
+            return Err(RouteError::Parse {
+                rule_index: index,
+                field: "outbound_tag",
+                message: format!(
+                    "unknown outbound tag `{raw_tag}`; native routing supports proxy/direct/block"
+                ),
+            });
+        }
     };
     let cond = match split_protocol_alternation(items) {
         Ok(any) => any,
@@ -103,14 +120,17 @@ fn split_protocol_alternation(items: Vec<MatchItem>) -> Result<Cond, Vec<MatchIt
 /// - unparseable `ips` entries that are neither CIDRs nor `geoip:` prefixes;
 /// - `protocols` names outside IANA `http`/`tls`/`dns`/`quic`;
 /// - `network` tokens outside `tcp`/`udp`;
-/// - legacy per-row `domain_strategy` (xray noise; ignored);
-/// - `rule_set_file`/`rule_set_url` ruleset references (no native
-///   equivalent yet).
+/// - legacy per-row `domain_strategy` (xray noise; ignored).
 #[must_use]
 pub fn warnings_from_row(row: &RoutingRule) -> Vec<String> {
     let mut out = Vec::new();
     for ip in &row.ips {
-        if Cidr::parse(ip).is_err() && !ip.starts_with("geoip:") {
+        let (reverse, rest) = strip_reverse(ip);
+        if rest.starts_with("geoip:") {
+            if rest.trim_start_matches("geoip:").is_empty() {
+                out.push(format!("geoip entry `{ip}` has an empty code"));
+            }
+        } else if reverse || Cidr::parse(rest).is_err() {
             out.push(format!("ips entry `{ip}` is not a CIDR or geoip: prefix"));
         }
     }
@@ -135,16 +155,6 @@ pub fn warnings_from_row(row: &RoutingRule) -> Vec<String> {
             "per-row domain_strategy `{ds}` is xray legacy noise; ignored"
         ));
     }
-    if let Some(f) = &row.rule_set_file {
-        out.push(format!(
-            "rule_set_file `{f}` has no native equivalent; ruleset refs deferred"
-        ));
-    }
-    if let Some(u) = &row.rule_set_url {
-        out.push(format!(
-            "rule_set_url `{u}` has no native equivalent; ruleset refs deferred"
-        ));
-    }
     out
 }
 
@@ -155,17 +165,26 @@ fn match_items(row: &RoutingRule) -> Vec<MatchItem> {
     let mut items = Vec::new();
 
     if !row.domains.is_empty() {
+        let mut plain = Vec::new();
+        let mut geosite = Vec::new();
+        for domain in &row.domains {
+            match domain.strip_prefix("geosite:") {
+                Some(code) => geosite.push(code.to_owned()),
+                None => plain.push(domain.clone()),
+            }
+        }
         let exact = row.domain_matcher.as_deref() == Some("exact");
         let (exact, suffix) = if exact {
-            (row.domains.clone(), Vec::new())
+            (plain, Vec::new())
         } else {
-            (Vec::new(), row.domains.clone())
+            (Vec::new(), plain)
         };
         items.push(MatchItem::Domain {
             exact,
             suffix,
             keywords: Vec::new(),
             regexes: Vec::new(),
+            geosite,
         });
     }
 
@@ -173,13 +192,17 @@ fn match_items(row: &RoutingRule) -> Vec<MatchItem> {
     let mut geo_country = Vec::new();
     let mut private = false;
     for ip in &row.ips {
-        if let Some(cc) = ip.strip_prefix("geoip:") {
+        let (reverse, rest) = strip_reverse(ip);
+        if let Some(cc) = rest.strip_prefix("geoip:") {
             if cc.eq_ignore_ascii_case("private") {
                 private = true;
+            } else if cc.is_empty() {
+                // Reported by warnings_from_row; the empty code never matches.
             } else {
-                geo_country.push(cc.to_owned());
+                let bang = if reverse { "!" } else { "" };
+                geo_country.push(format!("{bang}{cc}"));
             }
-        } else if let Ok(c) = Cidr::parse(ip) {
+        } else if !reverse && let Ok(c) = Cidr::parse(ip) {
             cidrs.push(c);
         }
     }
@@ -238,7 +261,25 @@ fn match_items(row: &RoutingRule) -> Vec<MatchItem> {
         });
     }
 
+    if row.rule_set_file.is_some() || row.rule_set_url.is_some() {
+        items.push(MatchItem::RuleSet {
+            files: row.rule_set_file.clone().into_iter().collect(),
+            urls: row.rule_set_url.clone().into_iter().collect(),
+        });
+    }
+
     items
+}
+
+/// Strips every leading `!`, flipping the reverse flag for each.
+fn strip_reverse(raw: &str) -> (bool, &str) {
+    let mut reverse = false;
+    let mut rest = raw;
+    while let Some(stripped) = rest.strip_prefix('!') {
+        reverse = !reverse;
+        rest = stripped;
+    }
+    (reverse, rest)
 }
 
 /// IANA protocol name → sniffable whitelisted protocol.
@@ -383,6 +424,7 @@ mod tests {
                     suffix: vec![],
                     keywords: vec![],
                     regexes: vec![],
+                    geosite: Vec::new(),
                 },
                 MatchItem::IpCidr {
                     cidrs: vec![Cidr::parse("10.0.0.0/8").unwrap()],
@@ -407,16 +449,75 @@ mod tests {
                 MatchItem::InboundTag {
                     tags: vec!["socks-in".to_string()],
                 },
+                MatchItem::RuleSet {
+                    files: vec!["/etc/geosite.dat".to_string()],
+                    urls: vec!["https://example.com/rs.json".to_string()],
+                },
             ]
         );
-        // Warnings: "nope" ip, domain_strategy, rule_set_file, rule_set_url.
-        // "quic" is a valid sniffed protocol (no warning since T-QUIC).
+        // Warnings: "nope" ip and the legacy domain_strategy. "quic" is a
+        // valid sniffed protocol; rule-set refs are now supported.
         let ws = warnings_from_row(&r);
-        assert_eq!(ws.len(), 4, "warnings: {ws:?}");
+        assert_eq!(ws.len(), 2, "warnings: {ws:?}");
         assert!(ws.iter().any(|w| w.contains("nope")));
         assert!(ws.iter().any(|w| w.contains("AsIs")));
-        assert!(ws.iter().any(|w| w.contains("/etc/geosite.dat")));
-        assert!(ws.iter().any(|w| w.contains("https://example.com/rs.json")));
+    }
+
+    #[test]
+    fn geosite_tokens_and_reverse_geoip_map_to_ir() {
+        let mut r = row();
+        r.domains = vec!["geosite:cn".into(), "plain.test".into()];
+        r.ips = vec![
+            "!geoip:ir".into(),
+            "geoip:!de".into(),
+            "geoip:private".into(),
+        ];
+        let rule = rule_from_row(&r, 0).unwrap();
+        assert_eq!(
+            items_of(&rule),
+            &vec![
+                MI::Domain {
+                    exact: Vec::new(),
+                    suffix: vec!["plain.test".to_string()],
+                    keywords: Vec::new(),
+                    regexes: Vec::new(),
+                    geosite: vec!["cn".to_string()],
+                },
+                MI::IpCidr {
+                    cidrs: Vec::new(),
+                    private: true,
+                    geo_country: vec!["!ir".to_string(), "!de".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn outbound_tags_normalize_and_unknown_is_an_error() {
+        for (raw, expected) in [
+            ("Direct", leas_route::ir::DIRECT_TAG),
+            ("bypass", leas_route::ir::DIRECT_TAG),
+            ("Block", leas_route::ir::BLOCK_TAG),
+            ("reject", leas_route::ir::BLOCK_TAG),
+            ("PROXY", leas_route::ir::PROXY_TAG),
+        ] {
+            let mut r = row();
+            r.outbound_tag = Some(raw.to_string());
+            let rule = rule_from_row(&r, 0).unwrap();
+            assert!(
+                matches!(&rule.action, Action::Route { tag, .. } if tag == expected),
+                "{raw} -> {expected}"
+            );
+        }
+        let mut r = row();
+        r.outbound_tag = Some("out-1".to_string());
+        assert!(matches!(
+            rule_from_row(&r, 0),
+            Err(RouteError::Parse {
+                field: "outbound_tag",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -430,6 +531,7 @@ mod tests {
                 suffix: vec!["example.com".to_string()],
                 keywords: vec![],
                 regexes: vec![],
+                geosite: Vec::new(),
             }
         );
 
@@ -442,6 +544,7 @@ mod tests {
                 suffix: vec!["example.com".to_string()],
                 keywords: vec![],
                 regexes: vec![],
+                geosite: Vec::new(),
             }
         );
 
@@ -454,6 +557,7 @@ mod tests {
                 suffix: vec![],
                 keywords: vec![],
                 regexes: vec![],
+                geosite: Vec::new(),
             }
         );
     }
@@ -544,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn warnings_report_rule_set_and_legacy_fields() {
+    fn warnings_report_legacy_fields() {
         let mut r = row();
         assert!(
             warnings_from_row(&r).is_empty(),
@@ -559,13 +663,7 @@ mod tests {
         r.network = Some("tcp,banana".to_string());
 
         let ws = warnings_from_row(&r);
-        assert_eq!(
-            ws.len(),
-            6,
-            "ip+protocol+network+domain_strategy+file+url: {ws:?}"
-        );
-        assert!(ws.iter().any(|w| w.contains("geosite.dat")));
-        assert!(ws.iter().any(|w| w.contains("https://example.com/rs.json")));
+        assert_eq!(ws.len(), 4, "ip+protocol+network+domain_strategy: {ws:?}");
         assert!(ws.iter().any(|w| w.contains("IPIfNonMatch")));
         assert!(ws.iter().any(|w| w.contains("snmp")));
         assert!(ws.iter().any(|w| w.contains("999.1.2.3/8")));

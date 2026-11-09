@@ -22,6 +22,6 @@
         "action": "bypass"
       }
     ],
-    "rule_set": [{ "type": "local", "tag": "geo" }]
+    "rule_set": [{ "type": "local", "tag": "geo", "path": "geo.srs" }]
   }
 }

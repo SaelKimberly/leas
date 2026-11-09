@@ -3279,11 +3279,14 @@ name = "leas-geoip"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
+ "hex",
  "leas-hakari",
  "maxminddb",
  "moka",
  "reqwest",
  "rustls",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tracing",
@@ -3566,6 +3569,7 @@ dependencies = [
  "compact_str 0.10.0",
  "criterion",
  "daachorse",
+ "flate2",
  "jiff",
  "leas-dns",
  "leas-geoip",
@@ -3580,6 +3584,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
 ]

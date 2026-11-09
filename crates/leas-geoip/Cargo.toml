@@ -29,6 +29,12 @@ rustls = { workspace = true, features = ["ring"] }
 # ============ Error Handling ============
 anyhow.workspace = true
 
+# ============ Geo data formats ============
+# zlib for sing-box binary rule-sets; sha2/hex for the URL cache key.
+flate2.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
 # ============ Logging ============
 tracing.workspace = true
 

@@ -45,6 +45,7 @@ fn block_domain(domain: &str) -> Rule {
             suffix: Vec::new(),
             keywords: Vec::new(),
             regexes: Vec::new(),
+            geosite: Vec::new(),
         }]),
         action: Action::Route {
             tag: "block".to_owned(),
@@ -405,6 +406,7 @@ async fn override_addr_rewrites_target() {
             suffix: Vec::new(),
             keywords: Vec::new(),
             regexes: Vec::new(),
+            geosite: Vec::new(),
         }]),
         action: Action::Route {
             tag: "direct".into(),

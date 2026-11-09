@@ -9,10 +9,10 @@
 //! | `keyword:x`                   | `Domain.keywords`                          |
 //! | `regexp:x`                    | `Domain.regexes`                           |
 //! | `ext:`                        | [`RouteError::Parse`] (file lists deferred)|
-//! | `geosite:`                    | [`RouteError::Parse`] (.dat loader deferred)|
+//! | `geosite:`                    | `Domain.geosite` (resolved by the engine)   |
 //! | CIDR entry in `ip`            | `IpCidr.cidrs`                             |
 //! | `geoip:private`               | `IpCidr.private = true`                    |
-//! | `geoip:<cc>`                  | `IpCidr.geo_country` (inert until Engine)  |
+//! | `geoip:<cc>` / `!geoip:<cc>`  | `IpCidr.geo_country` (`!` = reverse)       |
 //! | `ports` `"80,443,1000-2000"`  | `Ports`                                    |
 //! | `protocol` http/tls/dns/quic| `Protocol`; anything else is unsupported   |
 //! | `outboundTag`                 | `Action::Route { tag }`                    |
@@ -112,6 +112,7 @@ pub fn compile_xray(json_text: &str) -> Result<CompileOutput, RouteError> {
                 suffix: vec![],
                 keywords: vec![],
                 regexes: vec![],
+                geosite: vec![],
             };
             let mut ip = IpCidr::default();
             let mut ports: Vec<PortRange> = vec![];
@@ -157,18 +158,21 @@ pub fn compile_xray(json_text: &str) -> Result<CompileOutput, RouteError> {
                 || !domains.suffix.is_empty()
                 || !domains.keywords.is_empty()
                 || !domains.regexes.is_empty()
+                || !domains.geosite.is_empty()
             {
                 let DomainBucket {
                     exact,
                     suffix,
                     keywords,
                     regexes,
+                    geosite,
                 } = domains;
                 items.push(MatchItem::Domain {
                     exact,
                     suffix,
                     keywords,
                     regexes,
+                    geosite,
                 });
             }
             if !ip.cidrs.is_empty() || ip.private || !ip.geo_country.is_empty() {
@@ -283,6 +287,7 @@ struct DomainBucket {
     suffix: Vec<String>,
     keywords: Vec<String>,
     regexes: Vec<String>,
+    geosite: Vec<String>,
 }
 
 #[derive(Default)]
@@ -295,11 +300,11 @@ struct IpCidr {
 fn collect_domain(v: &Value, i: usize, d: &mut DomainBucket) -> Result<(), RouteError> {
     for tok in field_strings(v, i, "domain")? {
         if let Some(rest) = tok.strip_prefix("geosite:") {
-            return Err(parse_err(
-                i,
-                "domain",
-                format!("geosite lists (.dat loaders) are not supported yet: geosite:{rest}"),
-            ));
+            if rest.is_empty() {
+                return Err(parse_err(i, "domain", "geosite token has an empty code"));
+            }
+            d.geosite.push(rest.to_owned());
+            continue;
         }
         if let Some(rest) = tok.strip_prefix("ext:") {
             return Err(parse_err(
@@ -325,12 +330,25 @@ fn collect_domain(v: &Value, i: usize, d: &mut DomainBucket) -> Result<(), Route
 
 fn collect_ip(v: &Value, i: usize, out: &mut IpCidr) -> Result<(), RouteError> {
     for tok in field_strings(v, i, "ip")? {
-        if let Some(cc) = tok.strip_prefix("geoip:") {
-            if cc.eq_ignore_ascii_case("private") {
+        let (reverse, rest) = cut_reverse(&tok);
+        if let Some(cc) = rest.strip_prefix("geoip:") {
+            let (code_reverse, code) = cut_reverse(cc);
+            if code.eq_ignore_ascii_case("private") {
                 out.private = true;
+            } else if code.is_empty() {
+                return Err(parse_err(i, "ip", "geoip token has an empty code"));
             } else {
-                out.geo_country.push(cc.to_owned());
+                let bang = if reverse ^ code_reverse { "!" } else { "" };
+                out.geo_country.push(format!("{bang}{code}"));
             }
+        } else if reverse {
+            // Reversed custom CIDRs have no IR encoding; refuse instead of
+            // silently dropping the negation.
+            return Err(parse_err(
+                i,
+                "ip",
+                format!("reversed CIDR {tok:?} is not supported; use geoip: reverse"),
+            ));
         } else {
             // Single addresses have no prefix length; treat them as full hosts.
             let spec = if tok.contains('/') {
@@ -344,6 +362,17 @@ fn collect_ip(v: &Value, i: usize, out: &mut IpCidr) -> Result<(), RouteError> {
         }
     }
     Ok(())
+}
+
+/// Strips every leading `!`, flipping the reverse flag for each.
+fn cut_reverse(raw: &str) -> (bool, &str) {
+    let mut reverse = false;
+    let mut rest = raw;
+    while let Some(stripped) = rest.strip_prefix('!') {
+        reverse = !reverse;
+        rest = stripped;
+    }
+    (reverse, rest)
 }
 
 const fn remap_rule(mut e: RouteError, rule_index: usize, field: &'static str) -> RouteError {
@@ -491,7 +520,8 @@ mod tests {
                 suffix: vec!["doubleclick.net".into()],
                 keywords: vec!["adservice".into()],
                 regexes: vec![],
-            }
+                geosite: Vec::new(),
+            },
         );
         assert_eq!(
             r0.action,
@@ -547,8 +577,9 @@ mod tests {
                 exact: vec!["example.com".into()],
                 suffix: vec!["example.com".into()],
                 keywords: vec![],
-                regexes: vec![]
-            }
+                regexes: vec![],
+                geosite: Vec::new(),
+            },
         );
         assert_eq!(
             items[1],
@@ -651,13 +682,23 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_dat_geosite_is_positional_error() {
+    fn geosite_and_reverse_geoip_map_to_ir() {
         let txt = r#"{ "routing": { "rules": [{ "type":"field","outboundTag":"x",
-            "domain":["geosite:cn"] }] } }"#;
-        match compile_xray(txt) {
-            Err(RouteError::Parse { rule_index: 0, .. }) => {}
-            other => panic!("{other:?}"),
-        }
+            "domain":["geosite:cn","geosite:google@cn"], "ip":["!geoip:ir","geoip:!de","geoip:private"] }] } }"#;
+        let out = compile_xray(txt).unwrap();
+        let crate::ir::Cond::All(items) = &out.ruleset.rules[0].cond else {
+            panic!()
+        };
+        assert!(matches!(
+            &items[0],
+            MatchItem::Domain { geosite, .. }
+                if geosite == &["cn".to_owned(), "google@cn".to_owned()]
+        ));
+        assert!(matches!(
+            &items[1],
+            MatchItem::IpCidr { geo_country, private: true, .. }
+                if geo_country == &["!ir".to_owned(), "!de".to_owned()]
+        ));
     }
 
     #[test]
@@ -692,7 +733,8 @@ mod tests {
                     .into_iter()
                     .map(Into::into)
                     .collect(),
-            }
+                geosite: Vec::new(),
+            },
         );
         assert!(matches!(
             &items[1],

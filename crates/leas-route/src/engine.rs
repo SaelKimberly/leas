@@ -2,7 +2,9 @@
 //! (`All`/`Any`/`Invert`) and synchronous pure first-match evaluation.
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::{Arc, LazyLock},
 };
 
@@ -15,6 +17,7 @@ use crate::{
     addr::{NetAddr, NetHost, PortRange},
     error::RouteError,
     events::RouteEvent,
+    geo::{CountryLookup, GeoSource},
     ir::{Action, Cond, DefaultRoute, NetworkMask, SniffedProtocol},
     matchers::{CidrSet, CidrSetBuilder, CompiledDomain, DomainRulesSpec},
     resolve::{DnsSink, ProbeTracker, ResolvedCache},
@@ -67,26 +70,74 @@ pub enum Decision {
     HijackDns,
 }
 
+/// A destination-domain matcher: positive sets OR'ed, plus one matcher per
+/// reverse (`geosite:!code`) token, each of which holds when the host is NOT
+/// in that set.
+struct CompiledDomainItem {
+    positive: CompiledDomain,
+    negated: Vec<CompiledDomain>,
+}
+
+impl CompiledDomainItem {
+    fn matches(&self, host: &str) -> bool {
+        self.positive.matches_domain(host)
+            || self.negated.iter().any(|set| !set.matches_domain(host))
+    }
+}
+
+/// Resolved geoip matcher for destination or source addresses.
+enum GeoMatcher {
+    /// No geo condition.
+    None,
+    /// `geoip.dat`: positive CIDR sets plus reverse sets (`!code`).
+    Dat {
+        positive: CidrSet,
+        negated: Vec<CidrSet>,
+    },
+    /// `GeoLite2` mmdb: country membership.
+    Mmdb {
+        db: Arc<dyn CountryLookup>,
+        positive: Vec<Arc<str>>,
+        negated: Vec<Arc<str>>,
+    },
+}
+
+impl GeoMatcher {
+    fn matches(&self, ip: &IpAddr) -> bool {
+        match self {
+            Self::None => false,
+            Self::Dat { positive, negated } => {
+                positive.contains(ip) || negated.iter().any(|set| !set.contains(ip))
+            }
+            Self::Mmdb {
+                db,
+                positive,
+                negated,
+            } => {
+                let country = db.country(*ip);
+                positive
+                    .iter()
+                    .any(|code| country.as_deref() == Some(code.as_ref()))
+                    || negated
+                        .iter()
+                        .any(|code| country.as_deref() != Some(code.as_ref()))
+            }
+        }
+    }
+}
+
 /// A match item compiled once at build time.
-///
-/// `geo_country` entries are carried verbatim but evaluate `false` this task:
-/// the geoip feature resolves them later, and erasing them here would let a
-/// CN-routing config compile clean while silently routing through default.
 enum ItemMatcher {
-    Domain(CompiledDomain),
+    Domain(CompiledDomainItem),
     IpCidr {
         cidrs: CidrSet,
         private: bool,
-        // Retained verbatim for the geoip feature's later resolution pass.
-        #[allow(dead_code)]
-        geo_country: Vec<String>,
+        geo: GeoMatcher,
     },
     SourceIpCidr {
         cidrs: CidrSet,
         private: bool,
-        // Retained verbatim for the geoip feature's later resolution pass.
-        #[allow(dead_code)]
-        geo_country: Vec<String>,
+        geo: GeoMatcher,
     },
     Ports(Vec<PortRange>),
     SourcePorts(Vec<PortRange>),
@@ -95,39 +146,50 @@ enum ItemMatcher {
     InboundTag(RapidHashSet<Arc<str>>),
     /// Inert until `ConnMeta` gains an outbound-tag field (Task 12).
     OutboundTag,
+    /// sing-box rule-set domain set, kept succinct.
+    #[cfg(feature = "geoip")]
+    SrsDomain {
+        set: Option<Arc<leas_geoip::geodata::srs::DomainSet>>,
+        extras: CompiledDomain,
+    },
+    /// Compiled external rule-set subtree.
+    Sub(Box<CompiledCond>),
 }
 
 impl ItemMatcher {
     /// Evaluates one compiled item against connection metadata.
     fn matches(&self, meta: &ConnMeta) -> bool {
         match self {
-            Self::Domain(c) => match &meta.target.host {
-                NetHost::Domain(d) => c.matches_domain(d.as_str()),
-                // IP targets fail domain items for now; Task 12 wires
-                // SNI/DNS enrichment as the reverse-lookup path.
-                NetHost::Ip(_) => false,
-            },
-            Self::IpCidr { cidrs, private, .. } => {
+            Self::Domain(item) => domain_host(meta).is_some_and(|host| item.matches(host)),
+            Self::IpCidr {
+                cidrs,
+                private,
+                geo,
+            } => {
                 let literal_hit = match &meta.target.host {
-                    NetHost::Ip(ip) => ip_candidate_matches(cidrs, *private, ip),
+                    NetHost::Ip(ip) => ip_candidate_matches(cidrs, *private, geo, ip),
                     NetHost::Domain(_) => false,
                 };
                 literal_hit
                     || meta
                         .resolved_host_ips
                         .iter()
-                        .any(|ip| ip_candidate_matches(cidrs, *private, ip))
+                        .any(|ip| ip_candidate_matches(cidrs, *private, geo, ip))
             }
-            Self::SourceIpCidr { cidrs, private, .. } => {
+            Self::SourceIpCidr {
+                cidrs,
+                private,
+                geo,
+            } => {
                 let socket_hit = meta
                     .source
                     .as_ref()
-                    .is_some_and(|s| ip_candidate_matches(cidrs, *private, &s.ip()));
+                    .is_some_and(|s| ip_candidate_matches(cidrs, *private, geo, &s.ip()));
                 socket_hit
                     || meta
                         .source_resolved_ips
                         .iter()
-                        .any(|ip| ip_candidate_matches(cidrs, *private, ip))
+                        .any(|ip| ip_candidate_matches(cidrs, *private, geo, ip))
             }
             Self::Ports(ranges) => ranges.iter().any(|r| r.contains(meta.target.port)),
             // Absent source information can never satisfy source items.
@@ -139,19 +201,37 @@ impl ItemMatcher {
             Self::Protocol(p) => meta.sniffed == Some(*p),
             Self::InboundTag(tags) => meta.inbound_tag.as_ref().is_some_and(|t| tags.contains(t)),
             Self::OutboundTag => false,
+            #[cfg(feature = "geoip")]
+            Self::SrsDomain { set, extras } => domain_host(meta).is_some_and(|host| {
+                set.as_ref().is_some_and(|set| set.matches(host)) || extras.matches_domain(host)
+            }),
+            Self::Sub(cond) => cond.eval(meta),
         }
     }
 
     /// True for matchers whose outcome can change once destination/source
     /// IPs become known (used by [`Engine::needs_resolve`]).
-    const fn is_ip_bearing(&self) -> bool {
-        matches!(self, Self::IpCidr { .. } | Self::SourceIpCidr { .. })
+    fn is_ip_bearing(&self) -> bool {
+        match self {
+            Self::IpCidr { .. } | Self::SourceIpCidr { .. } => true,
+            Self::Sub(cond) => cond.walk_items(&mut |m| m.is_ip_bearing()),
+            _ => false,
+        }
     }
 }
 
-/// CIDR or private-range membership for one candidate IP.
-fn ip_candidate_matches(cidrs: &CidrSet, private: bool, ip: &IpAddr) -> bool {
-    cidrs.contains(ip) || (private && private_contains(ip))
+/// The domain a domain item evaluates: the literal target, or the sniffed
+/// SNI/host when the target is an IP.
+fn domain_host(meta: &ConnMeta) -> Option<&str> {
+    match &meta.target.host {
+        NetHost::Domain(domain) => Some(domain.as_str()),
+        NetHost::Ip(_) => meta.sni_host.as_deref(),
+    }
+}
+
+/// CIDR, private-range, or geo membership for one candidate IP.
+fn ip_candidate_matches(cidrs: &CidrSet, private: bool, geo: &GeoMatcher, ip: &IpAddr) -> bool {
+    cidrs.contains(ip) || (private && private_contains(ip)) || geo.matches(ip)
 }
 
 /// True when `ip` falls inside the shared compiled private-address set.
@@ -187,10 +267,8 @@ const MAX_COND_DEPTH: u32 = 64;
 /// Interior nodes mirror [`Cond`]'s `All`/`Any`/`Invert` logic; leaves are
 /// [`ItemMatcher`]s. An empty `All` evaluates to `true` (vacuous
 /// conjunction, mirroring upstream's empty-rule catch-all); empty `Any` is
-/// `false`. The vacuous `All` cannot arise from real configs: the xray and
-/// sing-box producers skip condition-less rules outright and `merge`
-/// synthesizes none — it passes existing rules through verbatim. Only a
-/// hand-built `RuleSet` can hand one to the engine.
+/// `false`. `merge` synthesizes no empty `All`; hand-built rule sets and
+/// sing-box rule-set logical groups may legitimately produce one.
 enum CompiledCond {
     All(Vec<ItemMatcher>),
     Any(Vec<Self>),
@@ -201,7 +279,12 @@ impl CompiledCond {
     /// Compiles a condition tree with a build-time depth guard. The root
     /// sits at depth 1; a node deeper than [`MAX_COND_DEPTH`] is rejected.
     /// `rule_idx` attributes leaf-matcher parse errors to their rule.
-    fn build(cond: crate::ir::Cond, rule_idx: usize, depth: u32) -> Result<Self, RouteError> {
+    fn build(
+        cond: crate::ir::Cond,
+        rule_idx: usize,
+        depth: u32,
+        geo: &mut GeoCompiler<'_>,
+    ) -> Result<Self, RouteError> {
         if depth > MAX_COND_DEPTH {
             return Err(RouteError::Unsupported("condition nesting deeper than 64"));
         }
@@ -209,17 +292,17 @@ impl CompiledCond {
             Cond::All(items) => Self::All(
                 items
                     .into_iter()
-                    .map(|item| compile_item(item, rule_idx))
+                    .map(|item| compile_item(item, rule_idx, geo))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
             Cond::Any(children) => Self::Any(
                 children
                     .into_iter()
-                    .map(|c| Self::build(c, rule_idx, depth + 1))
+                    .map(|c| Self::build(c, rule_idx, depth + 1, geo))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
             Cond::Invert(inner) => {
-                Self::Invert(Box::new(Self::build(*inner, rule_idx, depth + 1)?))
+                Self::Invert(Box::new(Self::build(*inner, rule_idx, depth + 1, geo)?))
             }
         })
     }
@@ -271,18 +354,35 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Compiles a [`RuleSet`] into an evaluation-ready engine.
+    /// Compiles a [`RuleSet`] with no geo data: any geo reference is an
+    /// error. Delegates to [`Engine::build_with_geo`].
+    ///
+    /// # Errors
+    /// Same as [`Engine::build_with_geo`].
+    pub fn build(rs: crate::ir::RuleSet) -> Result<Self, RouteError> {
+        Self::build_with_geo(rs, &GeoSource::default())
+    }
+
+    /// Compiles a [`RuleSet`] into an evaluation-ready engine, resolving
+    /// `geoip:`/`geosite:`/`rule_set` references from `geo`.
     ///
     /// Regexes and keyword automata compile once here; port ranges are
     /// sanity-checked so evaluation cannot encounter inverted bounds, and
     /// the full `Cond` tree (`All`/`Any`/`Invert`) is lowered to
     /// [`CompiledCond`]. Conditions nesting deeper than 64 levels are
-    /// rejected here at build time, never at evaluation time.
+    /// rejected here at build time, never at evaluation time. A geo
+    /// reference with no matching dataset is a [`RouteError::Parse`] naming
+    /// the category and file — never a silent false matcher.
     ///
     /// # Errors
-    /// Returns [`RouteError::Parse`] when any rule fails to compile, and
-    /// [`RouteError::Unsupported`] when conditions nest deeper than 64.
-    pub fn build(rs: crate::ir::RuleSet) -> Result<Self, RouteError> {
+    /// Returns [`RouteError::Parse`] when any rule or geo reference fails to
+    /// compile, and [`RouteError::Unsupported`] when conditions nest deeper
+    /// than 64.
+    pub fn build_with_geo(
+        rs: crate::ir::RuleSet,
+        geo_source: &GeoSource,
+    ) -> Result<Self, RouteError> {
+        let mut geo = GeoCompiler::new(geo_source);
         let mut rules = Vec::with_capacity(rs.rules.len());
         for (idx, rule) in rs.rules.into_iter().enumerate() {
             // Built once, here: at runtime a match only clones it. The tag is
@@ -300,7 +400,7 @@ impl Engine {
             };
             rules.push(CompiledRule {
                 name: rule.name,
-                cond: CompiledCond::build(rule.cond, idx, 1)?,
+                cond: CompiledCond::build(rule.cond, idx, 1, &mut geo)?,
                 decision,
             });
         }
@@ -541,7 +641,11 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
 }
 
 /// Compiles one [`crate::ir::MatchItem`] with rule-index attribution on errors.
-fn compile_item(item: crate::ir::MatchItem, idx: usize) -> Result<ItemMatcher, RouteError> {
+fn compile_item(
+    item: crate::ir::MatchItem,
+    idx: usize,
+    geo: &mut GeoCompiler<'_>,
+) -> Result<ItemMatcher, RouteError> {
     use crate::ir::MatchItem as M;
     Ok(match item {
         M::Domain {
@@ -549,15 +653,10 @@ fn compile_item(item: crate::ir::MatchItem, idx: usize) -> Result<ItemMatcher, R
             suffix,
             keywords,
             regexes,
-        } => ItemMatcher::Domain(
-            CompiledDomain::build(&DomainRulesSpec {
-                exact,
-                suffix,
-                keywords,
-                regexes,
-            })
-            .map_err(|e| reindex(e, idx))?,
-        ),
+            geosite,
+        } => ItemMatcher::Domain(compile_domain_item(
+            exact, suffix, keywords, regexes, &geosite, idx, geo,
+        )?),
         M::IpCidr {
             cidrs,
             private,
@@ -565,7 +664,7 @@ fn compile_item(item: crate::ir::MatchItem, idx: usize) -> Result<ItemMatcher, R
         } => ItemMatcher::IpCidr {
             cidrs: build_cidr_set(cidrs, idx)?,
             private,
-            geo_country,
+            geo: compile_geo_country(geo, &geo_country, idx, "geoip")?,
         },
         M::SourceIpCidr {
             cidrs,
@@ -574,7 +673,7 @@ fn compile_item(item: crate::ir::MatchItem, idx: usize) -> Result<ItemMatcher, R
         } => ItemMatcher::SourceIpCidr {
             cidrs: build_cidr_set(cidrs, idx)?,
             private,
-            geo_country,
+            geo: compile_geo_country(geo, &geo_country, idx, "geoip")?,
         },
         M::Ports(ranges) => ItemMatcher::Ports(check_ranges(ranges, idx, "ports")?),
         M::SourcePorts(ranges) => {
@@ -586,7 +685,419 @@ fn compile_item(item: crate::ir::MatchItem, idx: usize) -> Result<ItemMatcher, R
             ItemMatcher::InboundTag(tags.into_iter().map(Arc::from).collect())
         }
         M::OutboundTag { .. } => ItemMatcher::OutboundTag,
+        M::RuleSet { files, urls } => compile_rule_sets(geo, files, urls, idx)?,
     })
+}
+
+/// Per-build geo resolver: dataset paths plus a rule-set parse cache.
+struct GeoCompiler<'a> {
+    source: &'a GeoSource,
+    #[cfg(feature = "geoip")]
+    srs: HashMap<PathBuf, Arc<leas_geoip::geodata::srs::RuleSet>>,
+}
+
+impl<'a> GeoCompiler<'a> {
+    fn new(source: &'a GeoSource) -> Self {
+        Self {
+            source,
+            #[cfg(feature = "geoip")]
+            srs: HashMap::new(),
+        }
+    }
+
+    #[cfg(feature = "geoip")]
+    fn load_rule_set(
+        &mut self,
+        path: &std::path::Path,
+        idx: usize,
+    ) -> Result<Arc<leas_geoip::geodata::srs::RuleSet>, RouteError> {
+        if let Some(cached) = self.srs.get(path) {
+            return Ok(Arc::clone(cached));
+        }
+        let set = Arc::new(
+            leas_geoip::geodata::srs::load_rule_set(path)
+                .map_err(|e| geo_err(idx, "rule_set", format!("{e:#}")))?,
+        );
+        self.srs.insert(path.to_path_buf(), Arc::clone(&set));
+        Ok(set)
+    }
+}
+
+fn geo_err(rule_index: usize, field: &'static str, message: impl Into<String>) -> RouteError {
+    RouteError::Parse {
+        rule_index,
+        field,
+        message: message.into(),
+    }
+}
+
+fn split_reverse(raw: &str) -> (bool, &str) {
+    let mut reverse = false;
+    let mut rest = raw;
+    while let Some(stripped) = rest.strip_prefix('!') {
+        reverse = !reverse;
+        rest = stripped;
+    }
+    (reverse, rest)
+}
+
+fn dedup_strings(list: &mut Vec<String>) {
+    list.sort_unstable();
+    list.dedup();
+}
+
+fn compile_domain_item(
+    mut exact: Vec<String>,
+    mut suffix: Vec<String>,
+    mut keywords: Vec<String>,
+    mut regexes: Vec<String>,
+    geosite: &[String],
+    idx: usize,
+    geo: &GeoCompiler<'_>,
+) -> Result<CompiledDomainItem, RouteError> {
+    let mut negated_specs: Vec<DomainRulesSpec> = Vec::new();
+    if !geosite.is_empty() {
+        #[cfg(feature = "geoip")]
+        {
+            let path = geo.source.geosite.clone().ok_or_else(|| {
+                geo_err(
+                    idx,
+                    "geosite",
+                    format!("geosite:{} needs geosite.dat", geosite.join(",")),
+                )
+            })?;
+            let loaded = leas_geoip::geodata::load_geosite(&path, geosite)
+                .map_err(|e| geo_err(idx, "geosite", format!("{e:#}")))?;
+            for (token, domains) in loaded {
+                let mut spec = DomainRulesSpec {
+                    exact: domains.exact,
+                    suffix: domains.suffix,
+                    keywords: domains.keywords,
+                    regexes: domains.regexes,
+                };
+                // `Domain` entries match the bare host as well as subdomains.
+                spec.exact.extend(spec.suffix.iter().cloned());
+                let (reverse, _) = split_reverse(token.trim());
+                if reverse {
+                    negated_specs.push(spec);
+                } else {
+                    exact.extend(spec.exact);
+                    suffix.extend(spec.suffix);
+                    keywords.extend(spec.keywords);
+                    regexes.extend(spec.regexes);
+                }
+            }
+        }
+        #[cfg(not(feature = "geoip"))]
+        {
+            return Err(RouteError::Unsupported(
+                "geosite matching requires the geoip feature",
+            ));
+        }
+    }
+    dedup_strings(&mut keywords);
+    dedup_strings(&mut regexes);
+    let positive = CompiledDomain::build(&DomainRulesSpec {
+        exact,
+        suffix,
+        keywords,
+        regexes,
+    })
+    .map_err(|e| reindex(e, idx))?;
+    let mut negated = Vec::with_capacity(negated_specs.len());
+    for spec in negated_specs {
+        negated.push(CompiledDomain::build(&spec).map_err(|e| reindex(e, idx))?);
+    }
+    Ok(CompiledDomainItem { positive, negated })
+}
+
+fn compile_geo_country(
+    geo: &GeoCompiler<'_>,
+    tokens: &[String],
+    idx: usize,
+    field: &'static str,
+) -> Result<GeoMatcher, RouteError> {
+    if tokens.is_empty() {
+        return Ok(GeoMatcher::None);
+    }
+    #[cfg(feature = "geoip")]
+    {
+        if let Some(path) = &geo.source.geoip {
+            let loaded = leas_geoip::geodata::load_geoip(path, tokens)
+                .map_err(|e| geo_err(idx, field, format!("{e:#}")))?;
+            let mut positive = CidrSetBuilder::default();
+            let mut negated = Vec::new();
+            for (_token, nets) in loaded {
+                let mut reverse = CidrSetBuilder::default();
+                let mut has_reverse = false;
+                for net in nets {
+                    let cidr = crate::addr::Cidr {
+                        addr: net.addr,
+                        bits: net.prefix,
+                    };
+                    if net.reverse {
+                        has_reverse = true;
+                        reverse.insert(cidr).map_err(|e| reindex(e, idx))?;
+                    } else {
+                        positive.insert(cidr).map_err(|e| reindex(e, idx))?;
+                    }
+                }
+                if has_reverse {
+                    negated.push(reverse.build());
+                }
+            }
+            return Ok(GeoMatcher::Dat {
+                positive: positive.build(),
+                negated,
+            });
+        }
+        if let Some(db) = &geo.source.country {
+            let mut positive = Vec::new();
+            let mut negated = Vec::new();
+            for token in tokens {
+                let (reverse, code) = split_reverse(token);
+                let code = code.trim();
+                if code.is_empty() {
+                    return Err(geo_err(
+                        idx,
+                        field,
+                        format!("empty geo code in token {token:?}"),
+                    ));
+                }
+                let code: Arc<str> = Arc::from(code.to_ascii_lowercase());
+                if reverse {
+                    negated.push(code);
+                } else {
+                    positive.push(code);
+                }
+            }
+            return Ok(GeoMatcher::Mmdb {
+                db: Arc::clone(db),
+                positive,
+                negated,
+            });
+        }
+        Err(geo_err(
+            idx,
+            field,
+            format!(
+                "geoip:{} needs geoip.dat or a loaded GeoLite2 database (geoip_mode)",
+                tokens.join(",")
+            ),
+        ))
+    }
+    #[cfg(not(feature = "geoip"))]
+    {
+        Err(RouteError::Unsupported(
+            "geoip matching requires the geoip feature",
+        ))
+    }
+}
+
+fn compile_rule_sets(
+    geo: &mut GeoCompiler<'_>,
+    files: Vec<String>,
+    urls: Vec<String>,
+    idx: usize,
+) -> Result<ItemMatcher, RouteError> {
+    #[cfg(feature = "geoip")]
+    {
+        let mut conditions = Vec::new();
+        for key in files.into_iter().chain(urls) {
+            let path = geo.source.rule_sets.get(&key).cloned().ok_or_else(|| {
+                geo_err(
+                    idx,
+                    "rule_set",
+                    format!("rule-set `{key}` was not prepared by the caller"),
+                )
+            })?;
+            let set = geo.load_rule_set(&path, idx)?;
+            conditions.push(compile_srs_rule_set(&set, idx)?);
+        }
+        let cond = match conditions.len() {
+            0 => {
+                return Err(geo_err(
+                    idx,
+                    "rule_set",
+                    "rule-set reference has no sources",
+                ));
+            }
+            1 => conditions.remove(0),
+            _ => CompiledCond::Any(conditions),
+        };
+        Ok(ItemMatcher::Sub(Box::new(cond)))
+    }
+    #[cfg(not(feature = "geoip"))]
+    {
+        let _ = (geo, files, urls);
+        Err(RouteError::Unsupported(
+            "rule_set matching requires the geoip feature",
+        ))
+    }
+}
+
+#[cfg(feature = "geoip")]
+fn compile_srs_rule_set(
+    set: &leas_geoip::geodata::srs::RuleSet,
+    idx: usize,
+) -> Result<CompiledCond, RouteError> {
+    let mut rules = Vec::with_capacity(set.rules.len());
+    for rule in &set.rules {
+        rules.push(compile_srs_rule(rule, idx)?);
+    }
+    Ok(match rules.len() {
+        0 => CompiledCond::Any(Vec::new()),
+        1 => rules.remove(0),
+        _ => CompiledCond::Any(rules),
+    })
+}
+
+#[cfg(feature = "geoip")]
+fn compile_srs_rule(
+    rule: &leas_geoip::geodata::srs::Rule,
+    idx: usize,
+) -> Result<CompiledCond, RouteError> {
+    use leas_geoip::geodata::srs::Rule;
+    match rule {
+        Rule::Default(default) => compile_srs_default(default, idx),
+        Rule::Logical { and, rules, invert } => {
+            let mut children = Vec::with_capacity(rules.len());
+            for child in rules {
+                children.push(compile_srs_rule(child, idx)?);
+            }
+            let base = if *and {
+                if children.len() == 1 {
+                    children.remove(0)
+                } else {
+                    // AND over condition trees: every child is one operand.
+                    CompiledCond::All(
+                        children
+                            .into_iter()
+                            .map(|cond| ItemMatcher::Sub(Box::new(cond)))
+                            .collect(),
+                    )
+                }
+            } else {
+                match children.len() {
+                    0 => CompiledCond::Any(Vec::new()),
+                    1 => children.remove(0),
+                    _ => CompiledCond::Any(children),
+                }
+            };
+            Ok(if *invert {
+                CompiledCond::Invert(Box::new(base))
+            } else {
+                base
+            })
+        }
+    }
+}
+
+#[cfg(feature = "geoip")]
+fn compile_srs_default(
+    default: &leas_geoip::geodata::srs::DefaultRule,
+    idx: usize,
+) -> Result<CompiledCond, RouteError> {
+    let mut groups: Vec<CompiledCond> = Vec::new();
+
+    // sing-box: destination domains and destination `ip_cidr` are ONE OR
+    // group; every other group is ANDed.
+    let has_domains =
+        default.domains.is_some() || !default.keywords.is_empty() || !default.regexes.is_empty();
+    if has_domains || !default.ips.is_empty() {
+        let mut alternatives = Vec::new();
+        if has_domains {
+            let extras = CompiledDomain::build(&DomainRulesSpec {
+                exact: Vec::new(),
+                suffix: Vec::new(),
+                keywords: default.keywords.clone(),
+                regexes: default.regexes.clone(),
+            })
+            .map_err(|e| reindex(e, idx))?;
+            alternatives.push(CompiledCond::All(vec![ItemMatcher::SrsDomain {
+                set: default.domains.clone().map(Arc::new),
+                extras,
+            }]));
+        }
+        if !default.ips.is_empty() {
+            alternatives.push(CompiledCond::All(vec![ItemMatcher::IpCidr {
+                cidrs: cidr_set_from_ranges(&default.ips, idx)?,
+                private: false,
+                geo: GeoMatcher::None,
+            }]));
+        }
+        groups.push(any_of(alternatives));
+    }
+    if !default.source_ips.is_empty() {
+        groups.push(CompiledCond::All(vec![ItemMatcher::SourceIpCidr {
+            cidrs: cidr_set_from_ranges(&default.source_ips, idx)?,
+            private: false,
+            geo: GeoMatcher::None,
+        }]));
+    }
+    if !default.source_ports.is_empty() {
+        groups.push(CompiledCond::All(vec![ItemMatcher::SourcePorts(
+            default
+                .source_ports
+                .iter()
+                .map(|&(start, end)| PortRange { start, end })
+                .collect(),
+        )]));
+    }
+    if !default.ports.is_empty() {
+        groups.push(CompiledCond::All(vec![ItemMatcher::Ports(
+            default
+                .ports
+                .iter()
+                .map(|&(start, end)| PortRange { start, end })
+                .collect(),
+        )]));
+    }
+    if let Some(network) = default.network {
+        groups.push(CompiledCond::All(vec![ItemMatcher::Network(NetworkMask {
+            tcp: network.tcp,
+            udp: network.udp,
+        })]));
+    }
+
+    let base = match groups.len() {
+        0 => CompiledCond::All(Vec::new()),
+        1 => groups.remove(0),
+        _ => CompiledCond::All(
+            groups
+                .into_iter()
+                .map(|cond| ItemMatcher::Sub(Box::new(cond)))
+                .collect(),
+        ),
+    };
+    Ok(if default.invert {
+        CompiledCond::Invert(Box::new(base))
+    } else {
+        base
+    })
+}
+
+#[cfg(feature = "geoip")]
+fn any_of(mut conditions: Vec<CompiledCond>) -> CompiledCond {
+    match conditions.len() {
+        0 => CompiledCond::All(Vec::new()),
+        1 => conditions.remove(0),
+        _ => CompiledCond::Any(conditions),
+    }
+}
+
+#[cfg(feature = "geoip")]
+fn cidr_set_from_ranges(
+    ranges: &[leas_geoip::geodata::srs::GeoRange],
+    idx: usize,
+) -> Result<CidrSet, RouteError> {
+    let mut builder = CidrSetBuilder::default();
+    for range in ranges {
+        builder
+            .insert_range(range.from, range.to)
+            .map_err(|e| reindex(e, idx))?;
+    }
+    Ok(builder.build())
 }
 
 /// Builds a CIDR set, attributing out-of-range prefixes to their rule.
@@ -697,6 +1208,7 @@ mod tests {
             suffix: suffix.iter().map(ToString::to_string).collect(),
             keywords: vec![],
             regexes: vec![],
+            geosite: Vec::new(),
         }
     }
 
@@ -881,6 +1393,7 @@ mod tests {
             suffix: vec![],
             keywords: vec![],
             regexes: vec![r"\.cdn\d*\.net$".to_owned()],
+            geosite: Vec::new(),
         };
         let e = Engine::build(rs(vec![(item, route("fast"))])).unwrap();
         assert!(
@@ -921,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn private_cidr_matches_private_ranges_and_geo_country_is_inert() {
+    fn private_cidr_matches_private_ranges() {
         let e = Engine::build(rs(vec![(
             MatchItem::IpCidr {
                 cidrs: vec![],
@@ -939,48 +1452,6 @@ mod tests {
             !e.decide(&meta("8.8.8.8", 22, NetworkMask::TCP))
                 .is_routed_to("home")
         );
-
-        // geo_country is carried verbatim through compilation but evaluates
-        // false this task; the geoip feature resolves it later.
-        let geo = Engine::build(rs(vec![(
-            MatchItem::IpCidr {
-                cidrs: vec![],
-                private: false,
-                geo_country: vec!["CN".into()],
-            },
-            route("cn"),
-        )]))
-        .unwrap();
-        assert!(
-            !geo.decide(&meta("1.2.3.4", 80, NetworkMask::TCP))
-                .is_routed_to("cn")
-        );
-        // Entries survive compilation verbatim (no silent erasure): a later
-        // task's geoip feature finds them right where it needs them.
-        let CompiledCond::All(items) = &geo.rules[0].cond else {
-            panic!("expected compiled All condition");
-        };
-        let ItemMatcher::IpCidr { geo_country, .. } = &items[0] else {
-            panic!("expected compiled IpCidr item");
-        };
-        assert_eq!(geo_country, &["CN".to_owned()]);
-        // Source-side mirror carries them too.
-        let src_geo = Engine::build(rs(vec![(
-            MatchItem::SourceIpCidr {
-                cidrs: vec![],
-                private: false,
-                geo_country: vec!["DE".into()],
-            },
-            route("de"),
-        )]))
-        .unwrap();
-        let CompiledCond::All(items) = &src_geo.rules[0].cond else {
-            panic!("expected compiled All condition");
-        };
-        let ItemMatcher::SourceIpCidr { geo_country, .. } = &items[0] else {
-            panic!("expected compiled SourceIpCidr item");
-        };
-        assert_eq!(geo_country, &["DE".to_owned()]);
     }
 
     #[test]
@@ -1099,6 +1570,7 @@ mod tests {
             suffix: vec![],
             keywords: vec![],
             regexes: vec!["[".to_owned()],
+            geosite: Vec::new(),
         };
         let res = Engine::build(rs(vec![(bad_regex, route("x"))]));
         assert!(res.is_err(), "invalid regex must fail at build time");
@@ -1372,6 +1844,7 @@ mod tests {
             suffix: vec![],
             keywords: vec![],
             regexes: vec!["[".to_owned()],
+            geosite: Vec::new(),
         };
         let set = RuleSet {
             rules: vec![
@@ -1433,5 +1906,460 @@ mod tests {
         fn is_routed_to(&self, tag: &str) -> bool {
             matches!(self, Self::Route { tag: t, .. } if &**t == tag)
         }
+    }
+}
+
+#[cfg(all(test, feature = "geoip"))]
+mod geo_tests {
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::geo::{CountryLookup, GeoSource};
+    use crate::ir::{Action, Cond, DefaultRoute, MatchItem, ResolveStrategy, Rule, RuleSet};
+
+    fn meta(host: &str, port: u16) -> ConnMeta {
+        ConnMeta {
+            target: NetAddr {
+                host: NetHost::new(host),
+                port,
+            },
+            network: NetworkMask::TCP,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: Vec::new(),
+            payload_prefix: None,
+            sniffed: None,
+            sni_host: None,
+            resolved_host_ips: Vec::new(),
+        }
+    }
+
+    fn route(tag: &str) -> Action {
+        Action::Route {
+            tag: tag.to_owned(),
+            override_addr: None,
+        }
+    }
+
+    fn rs(rules: Vec<(MatchItem, Action)>) -> RuleSet {
+        RuleSet {
+            rules: rules
+                .into_iter()
+                .map(|(cond, action)| Rule {
+                    name: None,
+                    cond: Cond::All(vec![cond]),
+                    action,
+                })
+                .collect(),
+            default: DefaultRoute::Route {
+                tag: "default".to_owned(),
+            },
+            resolve_strategy: ResolveStrategy::AsIs,
+            probes: Vec::new(),
+        }
+    }
+
+    fn routed(decision: &Decision, tag: &str) -> bool {
+        matches!(decision, Decision::Route { tag: t, .. } if &**t == tag)
+    }
+
+    // ── dat fixtures ────────────────────────────────────────────────
+
+    fn uvarint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push(u8::try_from(value & 0x7f).unwrap() | 0x80);
+            value >>= 7;
+        }
+        out.push(u8::try_from(value & 0x7f).unwrap());
+    }
+
+    fn field_bytes(num: u64, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        uvarint((num << 3) | 2, &mut out);
+        uvarint(bytes.len() as u64, &mut out);
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    fn field_varint(num: u64, value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        uvarint(num << 3, &mut out);
+        uvarint(value, &mut out);
+        out
+    }
+
+    fn domain(kind: u64, value: &str) -> Vec<u8> {
+        let mut out = field_varint(1, kind);
+        out.extend(field_bytes(2, value.as_bytes()));
+        out
+    }
+
+    fn site_entry(code: &str, domains: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = field_bytes(1, code.as_bytes());
+        for domain in domains {
+            out.extend(field_bytes(2, domain));
+        }
+        out
+    }
+
+    fn geoip_entry(code: &str, cidrs: &[(&str, u8)], reverse: bool) -> Vec<u8> {
+        let mut out = field_bytes(1, code.as_bytes());
+        for (addr, prefix) in cidrs {
+            let addr: IpAddr = addr.parse().unwrap();
+            let octets: Vec<u8> = match addr {
+                IpAddr::V4(a) => a.octets().to_vec(),
+                IpAddr::V6(a) => a.octets().to_vec(),
+            };
+            let mut cidr = field_bytes(1, &octets);
+            cidr.extend(field_varint(2, u64::from(*prefix)));
+            out.extend(field_bytes(2, &cidr));
+        }
+        if reverse {
+            out.extend(field_varint(3, 1));
+        }
+        out
+    }
+
+    fn list(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for entry in entries {
+            out.extend(field_bytes(1, entry));
+        }
+        out
+    }
+
+    fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    struct FakeCountry(HashMap<IpAddr, Arc<str>>);
+    impl CountryLookup for FakeCountry {
+        fn country(&self, ip: IpAddr) -> Option<Arc<str>> {
+            self.0.get(&ip).cloned()
+        }
+    }
+
+    #[test]
+    fn geosite_dat_tokens_and_reverse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "geosite.dat",
+            &list(&[site_entry(
+                "cn",
+                &[domain(2, "example.cn"), domain(3, "exact.cn")],
+            )]),
+        );
+        let source = GeoSource {
+            geosite: Some(path),
+            ..GeoSource::default()
+        };
+        let engine = Engine::build_with_geo(
+            rs(vec![(
+                MatchItem::Domain {
+                    exact: vec![],
+                    suffix: vec![],
+                    keywords: vec![],
+                    regexes: vec![],
+                    geosite: vec!["cn".into()],
+                },
+                route("cn"),
+            )]),
+            &source,
+        )
+        .unwrap();
+        assert!(routed(&engine.decide(&meta("sub.example.cn", 443)), "cn"));
+        assert!(routed(&engine.decide(&meta("example.cn", 443)), "cn"));
+        assert!(routed(&engine.decide(&meta("exact.cn", 443)), "cn"));
+        assert!(!routed(&engine.decide(&meta("other.cn", 443)), "cn"));
+
+        let reversed = Engine::build_with_geo(
+            rs(vec![(
+                MatchItem::Domain {
+                    exact: vec![],
+                    suffix: vec![],
+                    keywords: vec![],
+                    regexes: vec![],
+                    geosite: vec!["!cn".into()],
+                },
+                route("not-cn"),
+            )]),
+            &source,
+        )
+        .unwrap();
+        assert!(routed(&reversed.decide(&meta("other.cn", 443)), "not-cn"));
+        assert!(!routed(
+            &reversed.decide(&meta("sub.example.cn", 443)),
+            "not-cn"
+        ));
+    }
+
+    #[test]
+    fn geoip_dat_positive_reverse_and_mmdb() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "geoip.dat",
+            &list(&[
+                geoip_entry("cn", &[("1.0.1.0", 24)], false),
+                geoip_entry("rev", &[("10.0.0.0", 8)], true),
+            ]),
+        );
+        let source = GeoSource {
+            geoip: Some(path),
+            ..GeoSource::default()
+        };
+        let engine = Engine::build_with_geo(
+            rs(vec![
+                (
+                    MatchItem::IpCidr {
+                        cidrs: vec![],
+                        private: false,
+                        geo_country: vec!["cn".into()],
+                    },
+                    route("cn"),
+                ),
+                (
+                    MatchItem::IpCidr {
+                        cidrs: vec![],
+                        private: false,
+                        geo_country: vec!["rev".into()],
+                    },
+                    route("rev"),
+                ),
+            ]),
+            &source,
+        )
+        .unwrap();
+        assert!(routed(&engine.decide(&meta("1.0.1.5", 80)), "cn"));
+        assert!(!routed(&engine.decide(&meta("8.8.8.8", 80)), "cn"));
+        assert!(routed(&engine.decide(&meta("8.8.4.4", 80)), "rev"));
+        assert!(!routed(&engine.decide(&meta("10.1.2.3", 80)), "rev"));
+
+        let mut countries = HashMap::new();
+        countries.insert("1.2.3.4".parse::<IpAddr>().unwrap(), Arc::<str>::from("cn"));
+        let mmdb = GeoSource {
+            country: Some(Arc::new(FakeCountry(countries))),
+            ..GeoSource::default()
+        };
+        let engine = Engine::build_with_geo(
+            rs(vec![
+                (
+                    MatchItem::IpCidr {
+                        cidrs: vec![],
+                        private: false,
+                        geo_country: vec!["cn".into()],
+                    },
+                    route("cn"),
+                ),
+                (
+                    MatchItem::IpCidr {
+                        cidrs: vec![],
+                        private: false,
+                        geo_country: vec!["!cn".into()],
+                    },
+                    route("not-cn"),
+                ),
+            ]),
+            &mmdb,
+        )
+        .unwrap();
+        assert!(routed(&engine.decide(&meta("1.2.3.4", 80)), "cn"));
+        assert!(routed(&engine.decide(&meta("8.8.8.8", 80)), "not-cn"));
+        assert!(!routed(&engine.decide(&meta("1.2.3.4", 80)), "not-cn"));
+    }
+
+    #[test]
+    fn missing_geo_data_or_code_is_a_parse_error() {
+        let err = Engine::build(rs(vec![(
+            MatchItem::IpCidr {
+                cidrs: vec![],
+                private: false,
+                geo_country: vec!["cn".into()],
+            },
+            route("cn"),
+        )]))
+        .err()
+        .expect("expected an error");
+        assert!(
+            matches!(err, RouteError::Parse { field: "geoip", .. }),
+            "{err:?}"
+        );
+
+        let err = Engine::build(rs(vec![(
+            MatchItem::Domain {
+                exact: vec![],
+                suffix: vec![],
+                keywords: vec![],
+                regexes: vec![],
+                geosite: vec!["cn".into()],
+            },
+            route("cn"),
+        )]))
+        .err()
+        .expect("expected an error");
+        assert!(
+            matches!(
+                err,
+                RouteError::Parse {
+                    field: "geosite",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "geosite.dat", &list(&[site_entry("cn", &[])]));
+        let source = GeoSource {
+            geosite: Some(path),
+            ..GeoSource::default()
+        };
+        let err = Engine::build_with_geo(
+            rs(vec![(
+                MatchItem::Domain {
+                    exact: vec![],
+                    suffix: vec![],
+                    keywords: vec![],
+                    regexes: vec![],
+                    geosite: vec!["typo".into()],
+                },
+                route("x"),
+            )]),
+            &source,
+        )
+        .err()
+        .expect("expected an error");
+        assert!(format!("{err}").contains("typo"), "{err}");
+    }
+
+    #[test]
+    fn domain_rules_use_sni_host_for_ip_targets() {
+        let engine = Engine::build(rs(vec![(
+            MatchItem::Domain {
+                exact: vec!["sni.test".into()],
+                suffix: vec![],
+                keywords: vec![],
+                regexes: vec![],
+                geosite: vec![],
+            },
+            route("sni"),
+        )]))
+        .unwrap();
+        let mut with_sni = meta("1.2.3.4", 443);
+        with_sni.sni_host = Some(compact_str::CompactString::new("sni.test"));
+        assert!(routed(&engine.decide(&with_sni), "sni"));
+        assert!(!routed(&engine.decide(&meta("1.2.3.4", 443)), "sni"));
+    }
+
+    // ── srs fixtures ────────────────────────────────────────────────
+
+    fn ip_set(ranges: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = vec![1u8];
+        out.extend_from_slice(&(ranges.len() as u64).to_be_bytes());
+        for (from, to) in ranges {
+            for addr in [*from, *to] {
+                let addr: IpAddr = addr.parse().unwrap();
+                let bytes: Vec<u8> = match addr {
+                    IpAddr::V4(a) => a.octets().to_vec(),
+                    IpAddr::V6(a) => a.octets().to_vec(),
+                };
+                uvarint(bytes.len() as u64, &mut out);
+                out.extend_from_slice(&bytes);
+            }
+        }
+        out
+    }
+
+    fn string_item(id: u8, values: &[&str]) -> Vec<u8> {
+        let mut out = vec![id];
+        uvarint(values.len() as u64, &mut out);
+        for value in values {
+            uvarint(value.len() as u64, &mut out);
+            out.extend_from_slice(value.as_bytes());
+        }
+        out
+    }
+
+    fn pack_srs(rules: &[Vec<u8>]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+        let mut body = Vec::new();
+        uvarint(rules.len() as u64, &mut body);
+        for rule in rules {
+            body.extend_from_slice(rule);
+        }
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&body).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut out = b"SRS".to_vec();
+        out.push(5);
+        out.extend_from_slice(&compressed);
+        out
+    }
+
+    #[test]
+    fn srs_rule_set_ip_and_port_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut items: Vec<u8> = vec![0u8];
+        items.extend(
+            vec![6]
+                .into_iter()
+                .chain(ip_set(&[("10.0.0.0", "10.255.255.255")])),
+        );
+        items.extend(string_item(10, &["443:443"]));
+        items.push(0xFF);
+        items.push(0);
+        let rule = items;
+        let path = write(dir.path(), "set.srs", &pack_srs(&[rule]));
+        let mut rule_sets = HashMap::new();
+        rule_sets.insert("set".to_owned(), path);
+        let source = GeoSource {
+            rule_sets,
+            ..GeoSource::default()
+        };
+        let engine = Engine::build_with_geo(
+            rs(vec![(
+                MatchItem::RuleSet {
+                    files: vec!["set".into()],
+                    urls: vec![],
+                },
+                route("internal"),
+            )]),
+            &source,
+        )
+        .unwrap();
+        assert!(routed(&engine.decide(&meta("10.1.2.3", 443)), "internal"));
+        assert!(!routed(&engine.decide(&meta("10.1.2.3", 80)), "internal"));
+        assert!(!routed(&engine.decide(&meta("8.8.8.8", 443)), "internal"));
+    }
+
+    #[test]
+    fn rule_set_without_a_prepared_source_is_an_error() {
+        let err = Engine::build(rs(vec![(
+            MatchItem::RuleSet {
+                files: vec!["ghost".into()],
+                urls: vec![],
+            },
+            route("x"),
+        )]))
+        .err()
+        .expect("expected an error");
+        assert!(
+            matches!(
+                err,
+                RouteError::Parse {
+                    field: "rule_set",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }

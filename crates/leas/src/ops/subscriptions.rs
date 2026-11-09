@@ -8,8 +8,8 @@ use dashmap::DashSet;
 use leas_config::import_export::{ValidationSettings, ValidationSummary};
 use leas_db::Database;
 use leas_db::models::{Group, GroupStatus, RoutingRule};
-use leas_route::ir::{DefaultRoute, NetworkMask, ResolveStrategy, RuleSet, SniffedProtocol};
-use leas_route::{ConnMeta, Decision, Engine, NetAddr, NetHost};
+use leas_route::ir::{NetworkMask, SniffedProtocol};
+use leas_route::{ConnMeta, Decision, NetAddr, NetHost};
 
 use crate::AppState;
 use crate::ops::stream_import::ImportOutcome;
@@ -265,7 +265,12 @@ enum FetchRoute {
 /// Rules are consulted only while a live tunnel exists. Domain/IP-literal,
 /// port, network and protocol items apply; hostnames are not pre-resolved, so
 /// an IP-CIDR-only rule matches an IP-literal URL only.
-fn plan_http_route(url: &str, live: Option<ProxyEndpoint>, rules: &[RoutingRule]) -> FetchRoute {
+fn plan_http_route(
+    url: &str,
+    live: Option<ProxyEndpoint>,
+    rules: &[RoutingRule],
+    engine: &crate::ops::geodata::EngineCell,
+) -> FetchRoute {
     let Some(live) = live else {
         return FetchRoute::Direct;
     };
@@ -288,33 +293,15 @@ fn plan_http_route(url: &str, live: Option<ProxyEndpoint>, rules: &[RoutingRule]
         ));
     };
 
-    let mut compiled = Vec::new();
-    for (index, row) in rules.iter().enumerate() {
-        match crate::route_compile::rule_from_row(row, index) {
-            Ok(rule) => compiled.push(rule),
-            Err(error) => tracing::warn!(
-                target: "tui::ops::subscriptions",
-                "routing rule {index} is not usable for source routing: {error}"
-            ),
-        }
-    }
-    let ruleset = RuleSet {
-        rules: compiled,
-        default: DefaultRoute::Route {
-            tag: "proxy".to_owned(),
-        },
-        resolve_strategy: ResolveStrategy::AsIs,
-        probes: Vec::new(),
+    let (compiled, error) = {
+        let slot = engine.read();
+        (slot.engine.clone(), slot.error.clone())
     };
-    let engine = match Engine::build(ruleset) {
-        Ok(engine) => engine,
-        Err(error) => {
-            tracing::error!(
-                target: "tui::ops::subscriptions",
-                "routing rules failed to compile for source routing; using the live tunnel: {error}"
-            );
-            return FetchRoute::Tunnel(live);
-        }
+    if let Some(error) = error {
+        return FetchRoute::Refused(format!("routing rules failed to compile: {error}"));
+    }
+    let Some(engine) = compiled else {
+        return FetchRoute::Refused("routing rules are still compiling".to_owned());
     };
     let https = scheme == "https";
     let meta = ConnMeta {
@@ -396,12 +383,24 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     let user_agent = group.user_agent.unwrap_or_else(|| "leas/0.1".into());
     let db = state.db.clone();
     let live_proxy = state.live_proxy.clone();
+    let routing_engine = Arc::clone(&state.routing_engine);
     let validation: ValidationSettings = state.config.parsing.clone().into();
     // The feed ceilings are configuration, not constants baked into the import
     // path (`specs/2026-10-02-import-budget-design.md`).
     let budget = state.config.import;
     tokio::spawn(async move {
-        update_one_group(url, user_agent, gid, db, validation, budget, live_proxy, tx).await;
+        update_one_group(
+            url,
+            user_agent,
+            gid,
+            db,
+            validation,
+            budget,
+            live_proxy,
+            routing_engine,
+            tx,
+        )
+        .await;
     });
 }
 
@@ -420,6 +419,7 @@ async fn update_one_group(
     // path (`specs/2026-10-02-import-budget-design.md`).
     import_budget: leas_config::app_config::ImportConfig,
     live_proxy: Arc<LiveProxy>,
+    engine: crate::ops::geodata::EngineCell,
     tx: Option<tokio::sync::mpsc::Sender<CoreEvent>>,
 ) {
     let live = live_proxy.get();
@@ -444,6 +444,7 @@ async fn update_one_group(
             validation,
             import_budget,
             live,
+            &engine,
             &flight,
         ),
     )
@@ -488,6 +489,7 @@ async fn do_update_subscription(
     validation: ValidationSettings,
     budget: leas_config::app_config::ImportConfig,
     live: Option<ProxyEndpoint>,
+    engine: &crate::ops::geodata::EngineCell,
     _flight: &InFlightGuard,
 ) -> (String, usize, ValidationSummary, Option<String>) {
     // Warn on HTTP (non-HTTPS) subscription URLs
@@ -511,7 +513,7 @@ async fn do_update_subscription(
     } else {
         Vec::new()
     };
-    let outcome = match plan_http_route(&url, live, &rules) {
+    let outcome = match plan_http_route(&url, live, &rules, engine) {
         FetchRoute::Direct => {
             tracing::info!(
                 target: "tui::ops::subscriptions",
@@ -777,6 +779,7 @@ pub fn update_all_subscriptions(state: &mut AppState) {
     let tx = state.core_event_tx.clone();
     let db = state.db.clone();
     let live_proxy = state.live_proxy.clone();
+    let routing_engine = Arc::clone(&state.routing_engine);
     let validation: ValidationSettings = state.config.parsing.clone().into();
     let budget = state.config.import;
     for (gid, _url, _ua) in &groups {
@@ -793,6 +796,7 @@ pub fn update_all_subscriptions(state: &mut AppState) {
                 validation.clone(),
                 budget,
                 live_proxy.clone(),
+                Arc::clone(&routing_engine),
                 tx.clone(),
             )
             .await;
@@ -807,6 +811,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
     };
     let db = state.db.clone();
     let live_proxy = state.live_proxy.clone();
+    let routing_engine = Arc::clone(&state.routing_engine);
     let validation: ValidationSettings = state.config.parsing.clone().into();
     let shutdown = state.shutdown_token.clone();
     tokio::spawn(async move {
@@ -858,6 +863,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
                     validation.clone(),
                     leas_config::app_config::ImportConfig::default(),
                     live_proxy.get(),
+                    &routing_engine,
                     &flight,
                 )
                 .await;
@@ -929,6 +935,64 @@ mod tests {
         }
     }
 
+    /// A cell holding an engine compiled from `rules` with the production
+    /// subscription defaults (proxy fallback, `AsIs`).
+    fn engine_cell(rules: &[RoutingRule]) -> crate::ops::geodata::EngineCell {
+        use leas_route::ir::{DefaultRoute, ResolveStrategy, RuleSet};
+        let compiled = rules
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| crate::route_compile::rule_from_row(row, index).ok())
+            .collect();
+        let engine = leas_route::Engine::build(RuleSet {
+            rules: compiled,
+            default: DefaultRoute::Route {
+                tag: leas_route::ir::PROXY_TAG.to_owned(),
+            },
+            resolve_strategy: ResolveStrategy::AsIs,
+            probes: Vec::new(),
+        })
+        .expect("test rule set compiles");
+        let cell = crate::ops::geodata::new_cell();
+        *cell.write() = crate::ops::geodata::EngineSlot {
+            engine: Some(std::sync::Arc::new(engine)),
+            error: None,
+            generation: 0,
+        };
+        cell
+    }
+
+    fn failed_cell(error: &str) -> crate::ops::geodata::EngineCell {
+        let cell = crate::ops::geodata::new_cell();
+        *cell.write() = crate::ops::geodata::EngineSlot {
+            engine: None,
+            error: Some(error.to_owned()),
+            generation: 0,
+        };
+        cell
+    }
+
+    #[test]
+    fn an_uncompiled_engine_refuses_rather_than_tunneling() {
+        let endpoint = ProxyEndpoint::from_inbound("127.0.0.1", 10808);
+        let rules = [route_rule(&["example.com"], "direct")];
+        for (cell, needle) in [
+            (failed_cell("geosite:typo"), "geosite:typo"),
+            (crate::ops::geodata::new_cell(), "still compiling"),
+        ] {
+            let route = plan_http_route(
+                "https://example.com/feed",
+                Some(endpoint.clone()),
+                &rules,
+                &cell,
+            );
+            let FetchRoute::Refused(message) = route else {
+                panic!("an unusable engine must refuse, not tunnel");
+            };
+            assert!(message.contains(needle), "{message}");
+        }
+    }
+
     #[rstest]
     #[case::no_live_ignores_rules(false, vec![route_rule(&["example.com"], "block")], "https://example.com/feed", RouteKind::Direct)]
     #[case::live_no_rules(true, vec![], "https://example.com/feed", RouteKind::Tunnel)]
@@ -945,7 +1009,8 @@ mod tests {
         #[case] expected: RouteKind,
     ) {
         let endpoint = ProxyEndpoint::from_inbound("127.0.0.1", 10808);
-        let route = plan_http_route(url, live.then(|| endpoint.clone()), &rules);
+        let engine = engine_cell(&rules);
+        let route = plan_http_route(url, live.then(|| endpoint.clone()), &rules, &engine);
         assert_eq!(route_kind(&route), expected);
         if expected == RouteKind::Tunnel {
             assert!(
@@ -958,10 +1023,13 @@ mod tests {
     #[test]
     fn block_route_names_the_source_host() {
         let endpoint = ProxyEndpoint::from_inbound("127.0.0.1", 10808);
+        let rules = [route_rule(&["example.com"], "block")];
+        let engine = engine_cell(&rules);
         let route = plan_http_route(
             "https://sub.example.com/feed",
             Some(endpoint),
-            &[route_rule(&["example.com"], "block")],
+            &rules,
+            &engine,
         );
         let FetchRoute::Refused(message) = route else {
             panic!("a block rule must refuse the fetch");

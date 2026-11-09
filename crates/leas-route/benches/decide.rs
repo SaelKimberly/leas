@@ -42,6 +42,7 @@ const fn domain_item(suffix: Vec<String>, keywords: Vec<String>) -> MatchItem {
         suffix,
         keywords,
         regexes: Vec::new(),
+        geosite: Vec::new(),
     }
 }
 

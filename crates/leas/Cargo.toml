@@ -15,7 +15,7 @@ leas-core = { path = "../leas-core", version = "0.1.0" }
 leas-db = { path = "../leas-db", version = "0.1.0" }
 leas-config = { path = "../leas-config", version = "0.1.0" }
 leas-proto = { path = "../leas-proto", version = "0.1.0" }
-leas-route = { path = "../leas-route", version = "0.1" }
+leas-route = { path = "../leas-route", version = "0.1", features = ["dns"] }
 leas-geoip = { path = "../leas-geoip", version = "0.1.0" }
 leas-dns = { path = "../leas-dns", version = "0.1.0" }
 leas-host-features = { path = "../leas-host-features", version = "0.1.0" }

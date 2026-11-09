@@ -899,6 +899,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                             },
                         );
                     }
+                    "Update Geo Data" => crate::ops::geodata::refresh_geo(state),
                     "Compact Duplicate Endpoints" => {
                         job_scheduler::enqueue(
                             state,
@@ -1896,6 +1897,7 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Fill Exit IPs (Successful)"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Item("Retry Failed DNS Lookups"),
+    SpeedTestMenuItem::Item("Update Geo Data"),
     SpeedTestMenuItem::Item("Compact Duplicate Endpoints"),
     SpeedTestMenuItem::Separator,
     SpeedTestMenuItem::Item("Stop Testing"),

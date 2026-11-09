@@ -222,6 +222,7 @@ mod merge_tests {
                 suffix: vec![],
                 keywords: vec![],
                 regexes: vec![],
+                geosite: Vec::new(),
             }]),
             action: route_to(tag),
         }

@@ -45,6 +45,7 @@ pub async fn run_native_session(
     log_sender: &Option<std::sync::mpsc::SyncSender<LogMessage>>,
     mut stop_rx: oneshot::Receiver<()>,
     protocol_id: i64,
+    engine: std::sync::Arc<leas_route::Engine>,
 ) {
     if protocol.config.is_unloaded() {
         try_send_or_warn(
@@ -77,20 +78,24 @@ pub async fn run_native_session(
         resolved_ip: None,
     };
     let (telemetry, mut events_rx) = Telemetry::new(TELEMETRY_CAP);
-    let server =
-        match NativeCoreServer::start(ServerConfig::new(listen_addr, proxy, telemetry.clone()))
-            .await
-        {
-            Ok(server) => server,
-            Err(e) => {
-                try_send_or_warn(
-                    tx,
-                    CoreEvent::Error(format!("Failed to start native core: {e}")),
-                    "native_start_error",
-                );
-                return;
-            }
-        };
+    let server = match NativeCoreServer::start(ServerConfig::new(
+        listen_addr,
+        proxy,
+        telemetry.clone(),
+        engine,
+    ))
+    .await
+    {
+        Ok(server) => server,
+        Err(e) => {
+            try_send_or_warn(
+                tx,
+                CoreEvent::Error(format!("Failed to start native core: {e}")),
+                "native_start_error",
+            );
+            return;
+        }
+    };
 
     telemetry.log(
         "info",

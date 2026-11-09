@@ -1,11 +1,12 @@
 //! Server mode: the in-process equivalent of a spawned proxy core.
 //!
 //! [`NativeCoreServer`] binds one local mixed listener (SOCKS5 + HTTP CONNECT
-//! on the same port, selected by the first byte) whose routing engine defaults
-//! every connection to a single proxy outbound dialing the connected profile
-//! through the native client — the composition a TUI session needs
-//! (proxy-all, one profile), layered on the same `inbound → router → outbound`
-//! machinery the [`crate::inbound`] module provides.
+//! on the same port, selected by the first byte) and routes through the
+//! caller-supplied [`leas_route::Engine`]. Three outbounds exist: `proxy`
+//! (the connected profile through the native client), `direct`, and `block`;
+//! a caller with no rules passes a proxy-all engine. The layout mirrors the
+//! `inbound → router → outbound` machinery the [`crate::inbound`] module
+//! provides.
 //!
 //! Shutdown is cooperative: [`NativeCoreServer::stop`] fires a watch signal
 //! every listener and in-flight connection task selects on, so a disconnect
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use leas_proto::proto_spec::common::TransportConfig;
 use leas_proto::proto_spec::{ProtocolConfig, TlsConfig};
 use leas_route::Engine;
-use leas_route::ir::{DefaultRoute, ResolveStrategy, RuleSet};
+use leas_route::ir::{BLOCK_TAG, DIRECT_TAG, PROXY_TAG};
 use tokio::sync::watch;
 
 use crate::error::NativeError;
@@ -30,11 +31,8 @@ use crate::inbound::outbound::{Outbound, OutboundKind, ProxyOutbound};
 use crate::inbound::{Socks5InboundConfig, TraceCtx};
 use crate::telemetry::{Telemetry, TraceKind, TraceSecurity};
 
-/// Routing tag of the single proxy outbound.
-const PROXY_TAG: &str = "proxy";
-
 /// Configuration for a [`NativeCoreServer`] session.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Local mixed (SOCKS5 + HTTP CONNECT) listener address.
     pub listen: SocketAddr,
@@ -44,18 +42,27 @@ pub struct ServerConfig {
     pub telemetry: Telemetry,
     /// Accept UDP ASSOCIATE on the mixed listener (defaults on).
     pub udp: bool,
+    /// Compiled routing engine. Callers pass a proxy-all engine when no rules
+    /// exist; the server never compiles rules itself.
+    pub engine: Arc<Engine>,
 }
 
 impl ServerConfig {
-    /// Proxy-all server: one mixed (SOCKS5 + HTTP CONNECT) listener with UDP
-    /// ASSOCIATE on.
+    /// One mixed (SOCKS5 + HTTP CONNECT) listener with UDP ASSOCIATE on,
+    /// routing through `engine`.
     #[must_use]
-    pub const fn new(listen: SocketAddr, proxy: ProxyOutbound, telemetry: Telemetry) -> Self {
+    pub const fn new(
+        listen: SocketAddr,
+        proxy: ProxyOutbound,
+        telemetry: Telemetry,
+        engine: Arc<Engine>,
+    ) -> Self {
         Self {
             listen,
             proxy,
             telemetry,
             udp: true,
+            engine,
         }
     }
 }
@@ -90,23 +97,22 @@ impl NativeCoreServer {
             );
         }
 
-        // Proxy-all engine: no rules, default route → the proxy outbound.
-        let engine = Arc::new(
-            Engine::build(RuleSet {
-                rules: Vec::new(),
-                default: DefaultRoute::Route {
-                    tag: PROXY_TAG.to_owned(),
-                },
-                resolve_strategy: ResolveStrategy::AsIs,
-                probes: Vec::new(),
-            })
-            .map_err(|error| NativeError::Config(error.to_string()))?,
-        );
         let (protocol_name, transport, security) = trace_meta_of_protocol(&cfg.proxy.protocol);
-        let outbounds = vec![Outbound {
-            tag: PROXY_TAG.to_owned(),
-            kind: OutboundKind::Proxy(Box::new(cfg.proxy)),
-        }];
+        let engine = cfg.engine;
+        let outbounds = vec![
+            Outbound {
+                tag: DIRECT_TAG.to_owned(),
+                kind: OutboundKind::Direct,
+            },
+            Outbound {
+                tag: BLOCK_TAG.to_owned(),
+                kind: OutboundKind::Block,
+            },
+            Outbound {
+                tag: PROXY_TAG.to_owned(),
+                kind: OutboundKind::Proxy(Box::new(cfg.proxy)),
+            },
+        ];
 
         // One mixed listener: SOCKS5 and HTTP CONNECT share the port, chosen
         // by the first byte. Bind before spawning so a bind failure leaves
@@ -244,6 +250,9 @@ mod tests {
     use leas_proto::proto_spec::{
         Hysteria2Config, ProtocolConfig, SecurityConfig, TrojanConfig, VlessConfig,
     };
+    use leas_route::Engine;
+    use leas_route::ir::{DefaultRoute, PROXY_TAG, ResolveStrategy, RuleSet};
+    use std::sync::Arc;
 
     #[test]
     fn trace_meta_vless_defaults() {
@@ -322,6 +331,21 @@ mod tests {
                 resolved_ip: None,
             },
             telemetry,
+            proxy_all_engine(),
+        )
+    }
+
+    fn proxy_all_engine() -> Arc<Engine> {
+        Arc::new(
+            Engine::build(RuleSet {
+                rules: Vec::new(),
+                default: DefaultRoute::Route {
+                    tag: PROXY_TAG.to_owned(),
+                },
+                resolve_strategy: ResolveStrategy::AsIs,
+                probes: Vec::new(),
+            })
+            .expect("proxy-all engine"),
         )
     }
 
@@ -373,5 +397,46 @@ mod tests {
             port_accepts(bound.port()).await,
             "mixed port {bound} still held after shutdown"
         );
+    }
+
+    /// The server routes through the engine it is given, and the `block`
+    /// outbound exists: a default-block engine answers SOCKS5 0x02.
+    #[tokio::test]
+    async fn supplied_engine_and_block_outbound_are_live() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listen = ephemeral_addr().await;
+        let (telemetry, _events) = Telemetry::new(16);
+        let engine = Arc::new(
+            Engine::build(RuleSet {
+                rules: Vec::new(),
+                default: DefaultRoute::Route {
+                    tag: leas_route::ir::BLOCK_TAG.to_owned(),
+                },
+                resolve_strategy: ResolveStrategy::AsIs,
+                probes: Vec::new(),
+            })
+            .expect("block engine"),
+        );
+        let mut config = config_for(listen);
+        config.engine = engine;
+        // config_for already carries a proxy outbound; only telemetry is reused.
+        config.telemetry = telemetry;
+        let server = NativeCoreServer::start(config).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(server.listen_addr())
+            .await
+            .unwrap();
+        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut handshake = [0u8; 2];
+        stream.read_exact(&mut handshake).await.unwrap();
+        assert_eq!(handshake, [0x05, 0x00]);
+        stream
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x02, "blocked CONNECT answers 0x02");
+        server.shutdown().await;
     }
 }

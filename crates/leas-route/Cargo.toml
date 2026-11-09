@@ -47,7 +47,7 @@ bytes.workspace = true
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
 [features]
-default = []
+default = ["geoip"]
 dns = ["dep:leas-dns"]
 geoip = ["dep:leas-geoip"]
 
@@ -75,12 +75,8 @@ leas-tls.workspace = true
 # the engine's decide path is synchronous, so no async feature is needed.
 criterion = { workspace = true }
 rstest.workspace = true
-
-[package.metadata.cargo-machete]
-# `leas-geoip` is wired by the `geoip` feature only, and geo matching is
-# not implemented yet — the IR already carries `geo_country` fields, but no
-# matcher consults the crate, so machete cannot see the dependency.
-ignored = ["leas-geoip"]
+flate2.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

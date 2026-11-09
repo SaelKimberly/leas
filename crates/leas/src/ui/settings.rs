@@ -1207,6 +1207,7 @@ const fn form_field_defs_for_section(
             ),
             ("geoip_url", "GeoIP URL", "Url"),
             ("geosite_url", "GeoSite URL", "Url"),
+            ("geoip_mode", "GeoIP Mode", "Select:dat,mmdb"),
             ("geo_auto_update", "Geo Auto Update", "Boolean"),
             ("geo_update_interval", "Geo Update Interval Hours", "Number"),
         ],

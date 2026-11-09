@@ -277,6 +277,15 @@ pub async fn build_settings_fields(
                         .to_string(),
                 ),
                 ("geosite_url".into(), state.config.geo.geosite_url.clone()),
+                ("geoip_url".into(), state.config.geo.geoip_url.clone()),
+                (
+                    "geoip_mode".into(),
+                    match state.config.geo.geoip_mode {
+                        leas_config::app_config::GeoIpMode::Dat => "dat",
+                        leas_config::app_config::GeoIpMode::Mmdb => "mmdb",
+                    }
+                    .to_string(),
+                ),
                 (
                     "geo_auto_update".into(),
                     state.config.geo.auto_update.to_string(),
@@ -480,15 +489,33 @@ fn apply_settings_fields(
             if let Ok(d) = humantime::parse_duration(get_str("speed_test_max_duration")) {
                 *state.config.speed_test.speed_test_max_duration = d;
             }
+            let old_geoip_url = state.config.geo.geoip_url.clone();
+            let old_geosite_url = state.config.geo.geosite_url.clone();
+            let old_geoip_mode = state.config.geo.geoip_mode;
             if !get_str("geoip_url").is_empty() {
                 state.config.geo.geoip_url = get("geoip_url");
             }
             if !get_str("geosite_url").is_empty() {
                 state.config.geo.geosite_url = get("geosite_url");
             }
+            state.config.geo.geoip_mode = if get_str("geoip_mode").eq_ignore_ascii_case("mmdb") {
+                leas_config::app_config::GeoIpMode::Mmdb
+            } else {
+                leas_config::app_config::GeoIpMode::Dat
+            };
             state.config.geo.auto_update = get_str("geo_auto_update") == "true";
             if let Ok(v) = get_str("geo_update_interval").parse::<u64>() {
                 state.config.geo.update_interval_hours = v;
+            }
+            // A URL/mode change must fetch the new artifact; an unrelated save
+            // only recompiles. A forced refresh keeps the old file on failure.
+            if state.config.geo.geoip_url != old_geoip_url
+                || state.config.geo.geosite_url != old_geosite_url
+                || state.config.geo.geoip_mode != old_geoip_mode
+            {
+                crate::ops::geodata::refresh_geo(state);
+            } else {
+                state.spawn_routing_engine_rebuild();
             }
         }
         // Dns, Routing and RouteProbes are handled separately (DB-backed)

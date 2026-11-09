@@ -637,6 +637,17 @@ fn default_log_file_path() -> String {
     "leas.log".into()
 }
 
+/// Which dataset answers `geoip:<cc>`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeoIpMode {
+    /// `geoip.dat` CIDR lists (xray/mihomo geodata).
+    #[default]
+    Dat,
+    /// `GeoLite2` `MaxMind` database country lookup.
+    Mmdb,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoConfig {
     #[serde(default = "default_geoip_url")]
@@ -647,6 +658,9 @@ pub struct GeoConfig {
     pub auto_update: bool,
     #[serde(default = "default_geo_update_interval")]
     pub update_interval_hours: u64,
+    /// Source of `geoip:<cc>` matching.
+    #[serde(default)]
+    pub geoip_mode: GeoIpMode,
 }
 
 impl Default for GeoConfig {
@@ -656,6 +670,7 @@ impl Default for GeoConfig {
             geosite_url: default_geosite_url(),
             auto_update: false,
             update_interval_hours: 24,
+            geoip_mode: GeoIpMode::Dat,
         }
     }
 }

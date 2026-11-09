@@ -29,7 +29,9 @@
 //! | action `reject` `method`          | `Action::Reject` (default/drop/reply per     |
 //! |                                   |   sing-box `rule_action.go`)                 |
 //! | action `sniff`/`resolve`/…        | [`RouteError::Unsupported`]                  |
-//! | `rule_set` refs, `dns-router`     | [`RouteError::Unsupported`] (T9+ accelerators)|
+//! | `rule_set` refs (local/remote binary)| `MatchItem::RuleSet` (sources OR'ed)        |
+//! | `rule_set` source/inline format    | [`RouteError::Unsupported`]                  |
+//! | `dns-router`                       | [`RouteError::Unsupported`]                  |
 //! | `invert: true`                    | `Cond::Invert` over the rule's condition     |
 //! | logical `mode:"and"`              | children flattened into `Cond::All`          |
 //! | logical `mode:"or"`               | genuine `Cond::Any` over child conditions    |
@@ -75,7 +77,7 @@ fn parse_err(rule_index: usize, field: &'static str, message: impl Into<String>)
 }
 
 /// Keys understood on a sing-box rule; anything else warns but passes.
-const KNOWN_RULE_KEYS: [&str; 18] = [
+const KNOWN_RULE_KEYS: [&str; 19] = [
     "inbound",
     "network",
     "protocol",
@@ -94,6 +96,7 @@ const KNOWN_RULE_KEYS: [&str; 18] = [
     "action",
     "outbound",
     "method",
+    "rule_set",
 ];
 
 /// Keys understood only on a logical (`mode`) rule.
@@ -116,23 +119,16 @@ pub fn compile_singbox(json_text: &str) -> Result<CompileOutput, RouteError> {
         None | Some("") => DEFAULT_SINGBOX_FALLBACK_TAG.to_owned(),
         Some(tag) => tag.to_owned(),
     };
-    // A config-level `rule_set` *declaration* is tolerable (referencing
-    // rules hit Unsupported at their own positions); record a warning.
     let mut rules: Vec<Rule> = Vec::new();
     let mut warnings: Vec<(usize, String)> = Vec::new();
-    if let Some(rs) = route.get("rule_set") {
-        warnings.push((
-            CONFIG_WARNING_INDEX,
-            format!("ignoring rule_set declarations: {rs} (accelerators await T9+)"),
-        ));
-    }
+    let rule_sets = parse_rule_set_declarations(route, &mut warnings)?;
 
     if let Some(rules_v) = route.get("rules") {
         let arr = rules_v
             .as_array()
             .ok_or_else(|| parse_err(CONFIG_WARNING_INDEX, "rules", "rules must be an array"))?;
         for (i, rv) in arr.iter().enumerate() {
-            compile_rule(rv, i, &mut rules, &mut warnings)?;
+            compile_rule(rv, i, &mut rules, &mut warnings, &rule_sets)?;
         }
     } else {
         warnings.push((
@@ -152,6 +148,127 @@ pub fn compile_singbox(json_text: &str) -> Result<CompileOutput, RouteError> {
     })
 }
 
+/// One `route.rule_set` declaration, reduced to the sources it names.
+#[derive(Clone, Debug, Default)]
+struct RuleSetRef {
+    files: Vec<String>,
+    urls: Vec<String>,
+}
+
+/// Parses the config-level `route.rule_set` declarations.
+///
+/// Only binary `local`/`remote` sets are supported: `source` JSON and
+/// `inline` sets are refused with a positional error rather than silently
+/// dropped.
+fn parse_rule_set_declarations(
+    route: &serde_json::Map<String, Value>,
+    warnings: &mut Vec<(usize, String)>,
+) -> Result<std::collections::HashMap<String, RuleSetRef>, RouteError> {
+    let mut out = std::collections::HashMap::new();
+    let Some(value) = route.get("rule_set") else {
+        return Ok(out);
+    };
+    let declarations = value.as_array().ok_or_else(|| {
+        parse_err(
+            CONFIG_WARNING_INDEX,
+            "rule_set",
+            "rule_set must be an array",
+        )
+    })?;
+    for declaration in declarations {
+        let obj = declaration.as_object().ok_or_else(|| {
+            parse_err(
+                CONFIG_WARNING_INDEX,
+                "rule_set",
+                "declaration must be an object",
+            )
+        })?;
+        for key in obj.keys() {
+            if !matches!(
+                key.as_str(),
+                "tag" | "type" | "format" | "path" | "url" | "download_detour"
+            ) {
+                warnings.push((
+                    CONFIG_WARNING_INDEX,
+                    format!("ignored unknown rule_set key `{key}`"),
+                ));
+            }
+        }
+        let tag = obj
+            .get("tag")
+            .and_then(Value::as_str)
+            .filter(|tag| !tag.is_empty())
+            .ok_or_else(|| {
+                parse_err(CONFIG_WARNING_INDEX, "rule_set", "declaration needs a tag")
+            })?;
+        match obj.get("format").and_then(Value::as_str) {
+            None | Some("binary") => {}
+            Some("source") => {
+                return Err(RouteError::Unsupported(
+                    "source rule-sets are not supported; use binary .srs",
+                ));
+            }
+            Some(other) => {
+                return Err(parse_err(
+                    CONFIG_WARNING_INDEX,
+                    "rule_set",
+                    format!("unknown rule_set format {other:?}"),
+                ));
+            }
+        }
+        let mut reference = RuleSetRef::default();
+        match obj.get("type").and_then(Value::as_str) {
+            Some("local") => {
+                let path = obj
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .ok_or_else(|| {
+                        parse_err(CONFIG_WARNING_INDEX, "rule_set", "local set needs a path")
+                    })?;
+                reference.files.push(path.to_owned());
+            }
+            Some("remote") => {
+                let url = obj
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|url| !url.is_empty())
+                    .ok_or_else(|| {
+                        parse_err(CONFIG_WARNING_INDEX, "rule_set", "remote set needs a url")
+                    })?;
+                reference.urls.push(url.to_owned());
+            }
+            Some("inline") => {
+                return Err(RouteError::Unsupported(
+                    "inline rule-sets are not supported; use local/remote binary .srs",
+                ));
+            }
+            Some(other) => {
+                return Err(parse_err(
+                    CONFIG_WARNING_INDEX,
+                    "rule_set",
+                    format!("unknown rule_set type {other:?}"),
+                ));
+            }
+            None => {
+                return Err(parse_err(
+                    CONFIG_WARNING_INDEX,
+                    "rule_set",
+                    "declaration needs a type",
+                ));
+            }
+        }
+        if out.insert(tag.to_owned(), reference.clone()).is_some() {
+            return Err(parse_err(
+                CONFIG_WARNING_INDEX,
+                "rule_set",
+                format!("duplicate rule_set tag `{tag}`"),
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// Compiles one sing-box rule (default or logical shape) into zero or more IR
 /// rules appended to `out`.
 fn compile_rule(
@@ -159,6 +276,7 @@ fn compile_rule(
     i: usize,
     out: &mut Vec<Rule>,
     warnings: &mut Vec<(usize, String)>,
+    rule_sets: &std::collections::HashMap<String, RuleSetRef>,
 ) -> Result<(), RouteError> {
     let obj = rv
         .as_object()
@@ -168,14 +286,14 @@ fn compile_rule(
     let action = parse_action(obj, i)?;
 
     let arms: Vec<Vec<MatchItem>> = if mode.is_empty() {
-        let arms = collect_items(obj, i, warnings)?;
+        let arms = collect_items(obj, i, warnings, rule_sets)?;
         if arms[0].is_empty() {
             warnings.push((i, "rule has no matchable condition; skipped".to_owned()));
             return Ok(());
         }
         arms
     } else {
-        let cond = match logical_cond(obj, i, mode, warnings)? {
+        let cond = match logical_cond(obj, i, mode, warnings, rule_sets)? {
             Some(Cond::All(items)) if items.is_empty() => None,
             other => other,
         };
@@ -232,12 +350,6 @@ fn check_rule(
         }
     }
 
-    // Deferred-accelerator arms fail positionally before any expansion.
-    if obj.contains_key("rule_set") {
-        return Err(RouteError::Unsupported(
-            "rule_set references await accelerator support (T9+); inline fields only for now",
-        ));
-    }
     if obj.contains_key("dns-router") {
         return Err(RouteError::Unsupported("dns-router action awaits T9+"));
     }
@@ -270,7 +382,7 @@ fn check_rule(
 /// children.
 ///
 /// Children get the same `check_rule` vetting as top-level rules: unknown
-/// keys warn, `rule_set`/`dns-router` are positionally Unsupported, and
+/// keys warn, `dns-router` is positionally Unsupported, and
 /// `mode:"xor"` is Unsupported. An `action` key on a child is tolerated but
 /// ignored — the parent rule's action applies. A child with genuinely no
 /// conditions is skipped with a warning; a catch-all (`Cond::All([])`) arm
@@ -287,6 +399,7 @@ fn logical_cond(
     i: usize,
     mode: &str,
     warnings: &mut Vec<(usize, String)>,
+    rule_sets: &std::collections::HashMap<String, RuleSetRef>,
 ) -> Result<Option<Cond>, RouteError> {
     let children = obj
         .get("rules")
@@ -305,7 +418,7 @@ fn logical_cond(
         let cond = if cmode.is_empty() {
             // Flat child: arms are its alternatives (multi-protocol
             // whitelists produce several; see `collect_items`).
-            let mut arms = collect_items(cobj, i, warnings)?;
+            let mut arms = collect_items(cobj, i, warnings, rule_sets)?;
             // An empty child arm means the child matched nothing; dropping
             // it keeps the parent's semantics (an empty condition can never
             // gate a catch-all through) and must never survive as
@@ -327,7 +440,7 @@ fn logical_cond(
             }
         } else {
             // Nested logical child: already a condition tree.
-            logical_cond(cobj, i, cmode, warnings)?
+            logical_cond(cobj, i, cmode, warnings, rule_sets)?
         };
         let Some(cond) = cond else {
             continue;
@@ -487,6 +600,7 @@ fn collect_items(
     obj: &serde_json::Map<String, Value>,
     i: usize,
     warnings: &mut Vec<(usize, String)>,
+    rule_sets: &std::collections::HashMap<String, RuleSetRef>,
 ) -> Result<Vec<Vec<MatchItem>>, RouteError> {
     let mut domains = DomainBucket::default();
     let mut ip = IpBucket::default();
@@ -499,6 +613,8 @@ fn collect_items(
     };
     let mut inbound_tags: Vec<String> = Vec::new();
     let mut protocols = Vec::<SniffedProtocol>::new();
+    let mut rule_files: Vec<String> = Vec::new();
+    let mut rule_urls: Vec<String> = Vec::new();
 
     for (field, v) in obj {
         match field.as_str() {
@@ -550,6 +666,15 @@ fn collect_items(
             "network" => network = parse_network(v, i)?,
             "inbound" => inbound_tags = field_strings(v, i, "inbound")?,
             "protocol" => collect_protocols(v, i, &mut protocols)?,
+            "rule_set" => {
+                for tag in field_strings(v, i, "rule_set")? {
+                    let reference = rule_sets.get(&tag).ok_or_else(|| {
+                        parse_err(i, "rule_set", format!("unknown rule_set tag `{tag}`"))
+                    })?;
+                    rule_files.extend(reference.files.iter().cloned());
+                    rule_urls.extend(reference.urls.iter().cloned());
+                }
+            }
             // action/outbound/method keys are action-side; a stray `rules`
             // key on a flat rule would silently drop its children, so warn.
             "rules" => warnings.push((
@@ -578,6 +703,7 @@ fn collect_items(
             suffix: domains.suffix,
             keywords: domains.keywords,
             regexes: domains.regexes,
+            geosite: Vec::new(),
         });
     }
     if !ip.is_empty() {
@@ -585,6 +711,12 @@ fn collect_items(
             cidrs: ip.cidrs,
             private: ip.private,
             geo_country: Vec::new(),
+        });
+    }
+    if !rule_files.is_empty() || !rule_urls.is_empty() {
+        items.push(MatchItem::RuleSet {
+            files: rule_files,
+            urls: rule_urls,
         });
     }
     if !source_ip.is_empty() {
@@ -823,42 +955,56 @@ mod tests {
       { "mode": "and", "rules": [
           { "ip_cidr": ["10.0.0.0/8"] }, { "inbound": ["tun-in"] } ],
         "action": "route", "outbound": "local-bypass" } ],
-    "rule_set": [{ "type": "local", "tag": "geo" }] }
+    "rule_set": [{ "type": "local", "tag": "geo", "path": "geo.srs" }] }
 }"#;
 
-    /// A rule *referencing* `rule_set` is Unsupported (T9+ accelerator); a
-    /// config-level declaration alone is a warning. Both asserted here.
+    /// A rule referencing a declared `rule_set` becomes one `RuleSet` item.
     #[test]
-    fn brief_sample_rule_set_ref_is_unsupported() {
-        match compile_singbox(BRIEF_SAMPLE) {
-            Ok(out) => {
-                assert!(
-                    out.warnings.iter().any(|(_, m)| m.contains("rule_set")),
-                    "config-level declaration warns: {:?}",
-                    out.warnings
-                );
-                assert_ne!(out.ruleset.rules.len(), 0);
-            }
-            other => panic!("expected tolerated declaration, got {other:?}"),
-        }
-        let with_ref = r#"{"route":{"rules":[
-            {"rule_set":["geo"],"action":"route","outbound":"o"}]}}"#;
-        match compile_singbox(with_ref) {
-            Err(RouteError::Unsupported(msg)) => {
-                assert!(msg.contains("rule_set"), "msg: {msg}");
-            }
-            other => panic!("expected Unsupported for rule_set ref, got {other:?}"),
+    fn brief_sample_rule_set_ref_maps_to_ir() {
+        let out = compile_singbox(BRIEF_SAMPLE).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_ne!(out.ruleset.rules.len(), 0);
+
+        let with_ref = r#"{"route":{"rule_set":[
+            {"type":"local","tag":"geo","path":"geo.srs"},
+            {"type":"remote","tag":"net","url":"https://example.com/net.srs"}],
+            "rules":[{"rule_set":["geo","net"],"action":"route","outbound":"o"}]}}"#;
+        let out = compile_singbox(with_ref).unwrap();
+        let Cond::All(items) = &out.ruleset.rules[0].cond else {
+            panic!()
+        };
+        assert!(matches!(
+            &items[0],
+            MatchItem::RuleSet { files, urls }
+                if files == &["geo.srs".to_owned()]
+                    && urls == &["https://example.com/net.srs".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn rule_set_source_and_inline_formats_are_unsupported() {
+        for declaration in [
+            r#"{"type":"local","tag":"g","path":"g.json","format":"source"}"#,
+            r#"{"type":"inline","tag":"g","rules":[]}"#,
+        ] {
+            let txt = format!(
+                r#"{{"route":{{"rule_set":[{declaration}],"rules":[
+                    {{"rule_set":["g"],"action":"route","outbound":"o"}}]}}}}"#
+            );
+            assert!(matches!(
+                compile_singbox(&txt),
+                Err(RouteError::Unsupported(_))
+            ));
         }
     }
     #[test]
     fn fixture_parses_to_golden_ir() {
         let out = compile_singbox(FIXTURE).unwrap();
         // 4 source rules: hijack + and-flatten + reject + 3-way protocol
-        // expansion = 6 flat rules. The config-level rule_set *declaration*
-        // is tolerated as a warning (referencing rules would be Unsupported).
+        // expansion = 6 flat rules. The config-level rule_set declaration is
+        // consumed, not warned about.
         assert_eq!(out.ruleset.rules.len(), 6, "one flat rule per protocol");
-        assert_eq!(out.warnings.len(), 1, "rule_set declaration warning");
-        assert!(out.warnings[0].1.contains("rule_set"));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
         assert!(
             matches!(&out.ruleset.default, DefaultRoute::Route { tag } if tag == "proxy-main"),
             "final: proxy-main maps to RuleSet.default"
@@ -879,7 +1025,8 @@ mod tests {
                 suffix: vec![".google.com".into()],
                 keywords: vec![],
                 regexes: vec![],
-            }
+                geosite: Vec::new(),
+            },
         );
         assert_eq!(r0.action, Action::HijackDns);
 
@@ -991,8 +1138,9 @@ mod tests {
                 exact: vec![],
                 suffix: vec![".a.com".into()],
                 keywords: vec![],
-                regexes: vec![]
-            }
+                regexes: vec![],
+                geosite: Vec::new(),
+            },
         );
         let Cond::All(items1) = &children[1] else {
             panic!()
@@ -1252,14 +1400,17 @@ mod tests {
     }
 
     #[test]
-    fn child_rule_set_ref_inside_logical_rule_is_unsupported() {
-        // Child rule_set ref ⇒ Unsupported, positionally.
+    fn unknown_rule_set_tag_is_a_positional_parse_error() {
         let rule_set_child = r#"{"route":{"rules":[{"mode":"and","rules":[
             {"rule_set":["geo"]},{"domain_suffix":[".a.com"]}],
             "action":"route","outbound":"o"}]}}"#;
         match compile_singbox(rule_set_child) {
-            Err(RouteError::Unsupported(msg)) => assert!(msg.contains("rule_set"), "{msg}"),
-            other => panic!("child rule_set must be Unsupported, got {other:?}"),
+            Err(RouteError::Parse {
+                rule_index: 0,
+                field: "rule_set",
+                ..
+            }) => {}
+            other => panic!("child rule_set must be a Parse error, got {other:?}"),
         }
     }
 
@@ -1536,8 +1687,9 @@ mod tests {
                 exact: vec!["test.com".into()],
                 suffix: vec![],
                 keywords: vec![],
-                regexes: vec![]
-            }
+                regexes: vec![],
+                geosite: Vec::new(),
+            },
         );
         // Engine-path proof: exact host routes, subdomain falls through.
         let engine = Engine::build(out.ruleset).unwrap();
@@ -1587,6 +1739,7 @@ mod tests {
             suffix,
             keywords: _,
             regexes: _,
+            geosite: _,
         } = &items[0]
         else {
             panic!()

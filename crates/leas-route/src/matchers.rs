@@ -210,6 +210,47 @@ impl CidrSetBuilder {
         Ok(())
     }
 
+    /// Adds an inclusive address range (sing-box rule sets store ranges, not
+    /// prefixes).
+    ///
+    /// # Errors
+    /// Returns [`RouteError::Parse`] when the ends are from different families
+    /// or inverted.
+    pub fn insert_range(&mut self, from: IpAddr, to: IpAddr) -> Result<(), RouteError> {
+        match (from, to) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                let (start, end) = (u32::from(a), u32::from(b));
+                if start > end {
+                    return Err(RouteError::Parse {
+                        rule_index: 0,
+                        field: "ip_range",
+                        message: format!("inverted range {from}-{to}"),
+                    });
+                }
+                self.v4.push((start, end));
+            }
+            (IpAddr::V6(a), IpAddr::V6(b)) => {
+                let (start, end) = (u128::from(a), u128::from(b));
+                if start > end {
+                    return Err(RouteError::Parse {
+                        rule_index: 0,
+                        field: "ip_range",
+                        message: format!("inverted range {from}-{to}"),
+                    });
+                }
+                self.v6.push((start, end));
+            }
+            _ => {
+                return Err(RouteError::Parse {
+                    rule_index: 0,
+                    field: "ip_range",
+                    message: format!("range {from}-{to} mixes address families"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Builds the [`CidrSet`], merging overlapping ranges.
     #[must_use]
     pub fn build(self) -> CidrSet {

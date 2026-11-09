@@ -29,13 +29,13 @@ leas (binary)
   │     ├── leas-dns       optional, feature `dns`
   │     └── leas-geoip     optional, feature `geoip`
   ├── leas-dns              DNSCrypt-stamp resolver
-  ├── leas-geoip            GeoLite2-City lookup
+  ├── leas-geoip            geo data: GeoLite2, .dat, .srs
   └── leas-host-features    SNI / exact-IP / CIDR whitelist membership
 ```
 
 Notes that the manifests enforce:
 
-- `leas-route`'s `dns` and `geoip` dependencies are optional and `default = []`; no member enables either feature today, so the adapters in `dns_adapter.rs` are not part of a default build. `leas-route`'s `leas-tls` edge is a dev-dependency for benches and tests.
+- `leas-route`'s `geoip` feature is on by default (geo token resolution needs it), and `leas` enables `dns` for the production `DnsSinkAdapter`; the `engine` test suites run with both. `leas-route`'s `leas-tls` edge is a dev-dependency for benches and tests.
 - `leas-native` does not depend on `leas-core`; it takes typed configs straight from `leas-proto` and returns `leas-native` types.
 - `leas-core` carries only native-shared glue: ping adapters, speed tests, the heed log store, `SysStats`/formatters and `ensure_tls_provider`. The oracle adapters (config builders, subprocess lifecycle, updater, gRPC stats client, `CoreType`, `core_mapping`) live in the dev-only `leas-oracles::oracle_adapters`; the client graph has no tonic/prost edge.
 - `leas` depends on `leas-proto` and `leas-route` directly, in addition to the crates listed above.
@@ -125,7 +125,7 @@ Why the backend is in-process, its seams and open work: [`native-core-integratio
 
 ### leas-route (library)
 
-First-match routing engine used by the native inbound: `Engine::decide_async` maps a connection (optionally after TLS/HTTP/QUIC sniffing) to `Decision::Direct`, `Block` or a tagged outbound. Also owns the address primitives, the sing-box and xray rule compilers, the DNS sink seam and probe tracking. The `dns` and `geoip` adapters are feature-gated and currently off by default.
+First-match routing engine used by the native inbound: `Engine::decide_async` maps a connection (optionally after TLS/HTTP/QUIC sniffing) to `Decision::Direct`, `Block` or a tagged outbound. `Engine::build_with_geo` resolves `geoip:`, `geosite:` and sing-box `rule_set` references from a caller-supplied `GeoSource`; a missing dataset or code is a build error, never a silent false matcher. Also owns the address primitives, the sing-box and xray rule compilers, the DNS sink seam and probe tracking. The `dns` and `geoip` features are default-on/consumer-enabled as noted above.
 
 ### leas-tls (library)
 
@@ -136,7 +136,7 @@ Ring-only TLS client engine: TLS 1.3 with a TLS 1.2 ECDHE+AEAD client path reach
 These three are consumers of network data, not owners of state.
 
 - `leas-dns` resolves through DNSCrypt stamps (DoH, DoT, DoQ) with hickory-resolver. `DnsResolver` performs the lookup; caching and TTL policy belong to the caller (`ops/enrich.rs`, `dns_cache_ttl_secs`).
-- `leas-geoip` looks up country and city from a GeoLite2-City database with `maxminddb` and a small per-IP cache.
+- `leas-geoip` owns every geo artifact: country/city lookups from a GeoLite2-City database (`maxminddb`, small per-IP caches, sync `country_sync` for the router), the v2ray `.dat` reader (`geodata::dat`), the sing-box binary rule-set reader (`geodata::srs`), and the validated atomic downloader (`fetch_validated`).
 - `leas-host-features` answers SNI, exact-IP and CIDR whitelist membership with `fastbloom`, downloading the whitelist files when missing.
 
 ## Runtime boundaries

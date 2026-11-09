@@ -54,17 +54,23 @@ pub enum MatchItem {
         suffix: Vec<String>,
         keywords: Vec<String>,
         regexes: Vec<String>,
+        /// Geosite category tokens (`[!]code[@attr...]`), resolved by the
+        /// engine from `geosite.dat`. Reverse tokens are matched as
+        /// "domain not in the category".
+        geosite: Vec<String>,
     },
     /// Destination CIDR / private-range / geo-country matchers.
     IpCidr {
         cidrs: Vec<Cidr>,
         private: bool,
+        /// Geoip category codes, optional leading `!` for reverse.
         geo_country: Vec<String>,
     },
     /// Source-side payload mirrors [`MatchItem::IpCidr`].
     SourceIpCidr {
         cidrs: Vec<Cidr>,
         private: bool,
+        /// Geoip category codes, optional leading `!` for reverse.
         geo_country: Vec<String>,
     },
     /// Destination port ranges.
@@ -79,7 +85,21 @@ pub enum MatchItem {
     InboundTag { tags: Vec<String> },
     /// Outbound tag membership.
     OutboundTag { tags: Vec<String> },
+    /// External sing-box rule-set sources, OR'ed. Keys are exactly the raw
+    /// `file`/`url` strings; the caller resolves each to a local path in
+    /// `GeoSource.rule_sets` before the engine is built.
+    RuleSet {
+        files: Vec<String>,
+        urls: Vec<String>,
+    },
 }
+
+/// Routing tag of the proxy outbound (the connected profile).
+pub const PROXY_TAG: &str = "proxy";
+/// Routing tag of the direct (no-proxy) outbound.
+pub const DIRECT_TAG: &str = "direct";
+/// Routing tag of the block/refuse outbound.
+pub const BLOCK_TAG: &str = "block";
 
 /// Routing outcome for a matched rule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -186,6 +206,7 @@ mod tests {
                             suffix: vec!["google.com".to_owned()],
                             keywords: vec!["github".to_owned()],
                             regexes: vec![r"^ads\.".to_owned()],
+                            geosite: Vec::new(),
                         },
                         MatchItem::IpCidr {
                             cidrs: vec![

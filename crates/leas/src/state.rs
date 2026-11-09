@@ -308,6 +308,13 @@ pub struct AppState {
     pub current_memory: u64,
     pub term_height: Cell<u16>,
     pub routing_rules: Vec<RoutingRule>,
+    /// Shared compiled routing engine (native connects + subscription fetches).
+    pub routing_engine: crate::ops::geodata::EngineCell,
+    /// Serializes routing-engine rebuilds (downloads + swap).
+    pub routing_rebuild: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic snapshot id; a rebuild installs only if it is not older than
+    /// the installed engine (out-of-order rebuilds cannot resurrect old rules).
+    pub routing_generation: Arc<std::sync::atomic::AtomicU64>,
     pub shutdown_token: Arc<AtomicBool>,
     /// Handle to the core process task, used for clean shutdown.
     pub core_task_handle: Option<JoinHandle<()>>,
@@ -836,6 +843,9 @@ impl AppState {
             current_traffic_down: 0,
             current_memory: 0,
             routing_rules: Vec::new(),
+            routing_engine: crate::ops::geodata::new_cell(),
+            routing_rebuild: Arc::new(tokio::sync::Mutex::new(())),
+            routing_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             core_task_handle: None,
             shutdown_token: Arc::new(AtomicBool::new(false)),
             speed_test_stop: Arc::new(AtomicBool::new(false)),
@@ -891,6 +901,17 @@ impl AppState {
         state.reload_profiles().await;
         state.reload_groups().await;
         state.spawn_auto_update();
+        // Routing rules + the shared engine (no downloads unless a rule
+        // references geo data).
+        state.reload_routing_rules().await;
+        if state.config.geo.auto_update {
+            let inputs = crate::ops::geodata::RouteInputs::from_state(&state);
+            crate::ops::geodata::spawn_auto_update(
+                inputs,
+                Arc::clone(&state.db),
+                Arc::clone(&state.shutdown_token),
+            );
+        }
         // Background whitelist load (downloads missing files). Result arrives
         // via CoreEvent::HostFeaturesLoaded → state.host_features.
         let tx = state.core_event_tx.clone();
@@ -966,6 +987,18 @@ impl AppState {
     }
     pub async fn reload_routing_rules(&mut self) {
         profiles::reload_routing_rules(self).await;
+    }
+
+    /// Spawns a background rebuild of the shared routing engine from the
+    /// current rows/config. Failures land in the slot's `error` (fail closed).
+    pub fn spawn_routing_engine_rebuild(&self) {
+        let inputs = crate::ops::geodata::RouteInputs::from_state(self);
+        // Fail closed while the new snapshot compiles: no consumer may route
+        // with the engine built for the previous rows/config.
+        *inputs.cell.write() = crate::ops::geodata::EngineSlot::default();
+        tokio::spawn(async move {
+            crate::ops::geodata::rebuild(&inputs, false).await;
+        });
     }
 
     /// The filtered total across all pages (the page holds one window of it).

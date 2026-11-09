@@ -114,6 +114,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     // The native session binds the configured mixed inbound.
     let param_listen = state.config.inbound.listen.clone();
     let param_local_port = state.config.inbound.local_port();
+    let route_inputs = crate::ops::geodata::RouteInputs::from_state(state);
 
     // Session log sink (native telemetry writes the heed store).
     let state_log_sender = state.log_sender_tx.clone();
@@ -177,6 +178,19 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             return;
         }
 
+        // 0c. The shared routing engine (fail closed: no rules -> error).
+        let engine = match crate::ops::geodata::engine_for_connect(&route_inputs).await {
+            Ok(engine) => engine,
+            Err(error) => {
+                try_send_or_warn(
+                    &tx,
+                    CoreEvent::Error(format!("Routing rules failed to compile: {error}")),
+                    "routing_engine_error",
+                );
+                return;
+            }
+        };
+
         native_connect::run_native_session(
             &param_listen,
             param_local_port,
@@ -187,6 +201,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             &state_log_sender,
             stop_rx,
             protocol_id.get(),
+            engine,
         )
         .await;
     });

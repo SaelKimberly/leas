@@ -392,7 +392,18 @@ pub async fn reload_groups(state: &mut AppState) {
 }
 
 pub async fn reload_routing_rules(state: &mut AppState) {
-    state.routing_rules = state.db.get_all_routing_rules().await.unwrap_or_default();
+    match state.db.get_all_routing_rules().await {
+        Ok(rules) => state.routing_rules = rules,
+        Err(error) => {
+            // A transient read error must not wipe routing (fail closed).
+            tracing::warn!(
+                target: "tui::ops::profiles",
+                "routing rules unavailable; keeping the previous snapshot: {error}"
+            );
+            return;
+        }
+    }
+    state.spawn_routing_engine_rebuild();
 }
 
 /// The loaded page, in display order. The page IS the filtered list: the query

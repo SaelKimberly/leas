@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use maxminddb::Reader;
 use tokio::io::AsyncWriteExt;
 
+pub mod geodata;
+
 const GEOLITE_DOWNLOAD: &str =
     "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb";
 
@@ -38,6 +40,9 @@ pub struct GeoIp {
     /// another mmdb walk or string decode. `moka` evicts by admission
     /// (`TinyLFU`), so churn cannot flush the hot set the way strict LRU can.
     cache: moka::sync::Cache<IpAddr, Option<Arc<Location>>>,
+    /// Country-only cache for sync routing lookups. Separate from `cache`
+    /// so a routing decode can never poison a cached `city_en`.
+    country_cache: moka::sync::Cache<IpAddr, Option<Arc<str>>>,
     /// Cross-lookup latch for a persistently-unopenable artifact. Without it
     /// every cache-missing lookup deletes + re-downloads the database, since a
     /// failed heal latches nothing (finding f5).
@@ -73,6 +78,7 @@ impl GeoIp {
             init_lock: tokio::sync::Mutex::new(()),
             fetch: Arc::new(fetcher),
             cache: moka::sync::Cache::builder().max_capacity(1024).build(),
+            country_cache: moka::sync::Cache::builder().max_capacity(4096).build(),
             heal_latch: Mutex::new(HealLatch::default()),
         }
     }
@@ -89,16 +95,7 @@ impl GeoIp {
                 city_en: loc.city_en.clone(),
             }));
         }
-        if self.reader.get().is_none() {
-            // Serialize first init so concurrent lookups can't race the
-            // download and observe a partially-written database.
-            let _guard = self.init_lock.lock().await;
-            // Re-check under the lock: an earlier task may have initialized.
-            if self.reader.get().is_none() {
-                let reader = self.open_reader_healing().await?;
-                let _ = self.reader.set(Arc::new(reader));
-            }
-        }
+        self.ensure_loaded().await?;
         let reader = Arc::clone(self.reader.get().expect("reader set above"));
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Location>> {
             let result = reader.lookup(ip)?;
@@ -127,6 +124,57 @@ impl GeoIp {
         self.cache
             .insert(ip, result.as_ref().map(|loc| Arc::new(loc.clone())));
         Ok(result)
+    }
+
+    /// Ensure the mmdb is on disk and open. Serialized like the first lookup,
+    /// so a routing engine can prove availability before a sync decode.
+    ///
+    /// # Errors
+    /// Returns the download or open error (after the heal latch allows it).
+    pub async fn ensure_loaded(&self) -> anyhow::Result<()> {
+        if self.reader.get().is_some() {
+            return Ok(());
+        }
+        // Serialize first init so concurrent lookups can't race the
+        // download and observe a partially-written database.
+        let _guard = self.init_lock.lock().await;
+        // Re-check under the lock: an earlier task may have initialized.
+        if self.reader.get().is_none() {
+            let reader = self.open_reader_healing().await?;
+            let _ = self.reader.set(Arc::new(reader));
+        }
+        Ok(())
+    }
+
+    /// Whether the database is open (a sync lookup can succeed).
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        self.reader.get().is_some()
+    }
+
+    /// Sync, cached country ISO code (lowercase) for a routing decision.
+    ///
+    /// Returns `None` when the database is not loaded or the IP has no
+    /// country. A cache miss decodes only `country.iso_code` inline — the
+    /// mmdb lookup is a few microseconds, and this path is the hot router.
+    #[must_use]
+    pub fn country_sync(&self, ip: IpAddr) -> Option<Arc<str>> {
+        if let Some(hit) = self.country_cache.get(&ip) {
+            return hit;
+        }
+        let reader = self.reader.get()?;
+        let country = reader
+            .lookup(ip)
+            .ok()
+            .and_then(|result| {
+                result
+                    .decode_path::<&str>(&maxminddb::path!["country", "iso_code"])
+                    .ok()
+                    .flatten()
+            })
+            .map(|code| Arc::<str>::from(code.to_ascii_lowercase()));
+        self.country_cache.insert(ip, country.clone());
+        country
     }
 
     fn open_reader(path: &Path) -> anyhow::Result<Reader<Vec<u8>>> {
@@ -230,26 +278,9 @@ impl GeoIp {
         {
             tokio::fs::create_dir_all(parent).await?;
         }
-        // Download to a temp path and rename into place, so a crash or a
-        // concurrent reader can never observe a partially-written database.
-        let tmp_path = self.db_path.with_file_name(format!(
-            "{}.tmp{}",
-            self.db_path
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default(),
-            std::process::id()
-        ));
-        let write = async {
-            // Streamed straight to disk — no 70 MB `Vec` in memory.
-            (self.fetch)(&tmp_path).await?;
-            tokio::fs::rename(&tmp_path, &self.db_path).await?;
-            Ok::<(), anyhow::Error>(())
-        };
-        if let Err(e) = write.await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(e);
-        }
+        // The default fetcher writes atomically (temp + rename); a custom
+        // test fetcher writes the destination directly.
+        (self.fetch)(&self.db_path).await?;
         Ok(())
     }
 }
@@ -261,19 +292,81 @@ fn ensure_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Streams the `GeoLite` database to `dest`: each body chunk is written as it
-/// arrives (bounded memory), then fsync'd before the caller's atomic rename.
+/// Streams the `GeoLite` database to `dest` atomically.
 async fn fetch_geolite_to(dest: &Path) -> anyhow::Result<()> {
+    fetch_validated(GEOLITE_DOWNLOAD, dest, MAX_GEOLITE_BYTES, |_| Ok(())).await
+}
+
+/// Ordinary geo artifact ceiling (`geoip.dat`, `geosite.dat`).
+pub const MAX_GEO_DAT_BYTES: u64 = 64 * 1024 * 1024;
+/// sing-box binary rule-set ceiling.
+pub const MAX_RULE_SET_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Stable cache file name for a remote asset: lowercase hex SHA-256 of `url`.
+#[must_use]
+pub fn url_cache_key(url: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    hex::encode(Sha256::digest(url.as_bytes()))
+}
+
+/// Downloads `url` to `dest` atomically (temp file + rename).
+///
+/// Refuses a non-2xx status, a body over `max_bytes`, an empty body, and a
+/// body that `validate` rejects. The validator runs on the temp file before
+/// the rename, so a bad download can never replace a good artifact.
+///
+/// # Errors
+/// Returns the HTTP, I/O, cap, emptiness, or validator error.
+pub async fn fetch_validated<F>(
+    url: &str,
+    dest: &Path,
+    max_bytes: u64,
+    validate: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&Path) -> anyhow::Result<()> + Send + 'static,
+{
     ensure_tls_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
     let response = client
-        .get(GEOLITE_DOWNLOAD)
+        .get(url)
+        .header("User-Agent", "leas")
+        .header("Accept", "application/octet-stream")
         .send()
         .await?
         .error_for_status()?;
-    stream_capped(response, dest, MAX_GEOLITE_BYTES).await
+    let tmp_path = temp_path(dest);
+    let write = async {
+        stream_capped(response, &tmp_path, max_bytes).await?;
+        let written = tokio::fs::metadata(&tmp_path).await?.len();
+        if written == 0 {
+            anyhow::bail!(
+                "empty download: refusing to write a tombstone file {}",
+                dest.display()
+            );
+        }
+        validate(&tmp_path)?;
+        tokio::fs::rename(&tmp_path, dest).await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    if let Err(e) = write.await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// `dest`'s sibling temp path, unique per process.
+fn temp_path(dest: &Path) -> std::path::PathBuf {
+    dest.with_file_name(format!(
+        "{}.tmp{}",
+        dest.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id()
+    ))
 }
 
 /// Stream `response` into `dest`, refusing a body larger than `cap` — both a
@@ -539,8 +632,156 @@ mod tests {
     async fn test_location_by_ip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let geo = GeoIp::new(dir.path().join("GeoLite2-City.mmdb"));
+        geo.ensure_loaded().await?;
+        assert!(geo.is_loaded());
         let result = geo.location_by_ip("193.29.139.235".parse()?).await?;
         assert!(result.is_some());
+        assert!(geo.country_sync("193.29.139.235".parse()?).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn country_sync_is_none_before_and_url_key_is_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let geo = GeoIp::new(dir.path().join("absent.mmdb"));
+        assert!(!geo.is_loaded());
+        assert!(geo.country_sync("1.1.1.1".parse().unwrap()).is_none());
+
+        let key = url_cache_key("https://example.com/geo.srs");
+        assert_eq!(key.len(), 64);
+        assert!(
+            key.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_ne!(key, url_cache_key("https://example.com/other.srs"));
+    }
+
+    /// One-shot HTTP server: returns the request path as a response body, or
+    /// `body` when given. `status` lets a test serve a failure.
+    async fn serve_once(status: u16, body: Vec<u8>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = [0u8; 4096];
+                let _ = stream.read(&mut head).await;
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn fetch_validated_writes_atomically_and_rejects_both_bad_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("geo.dat");
+
+        let addr = serve_once(200, b"good".to_vec()).await;
+        fetch_validated(&format!("http://{addr}/geo.dat"), &dest, 1024, |path| {
+            assert_eq!(std::fs::read(path)?, b"good");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"good");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from("geo.dat")]);
+
+        // A rejecting validator must keep the previous artifact.
+        let addr = serve_once(200, b"bad".to_vec()).await;
+        let err = fetch_validated(&format!("http://{addr}/geo.dat"), &dest, 1024, |_| {
+            anyhow::bail!("not a geodata file")
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not a geodata file"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"good");
+
+        // Over-cap and empty bodies write nothing.
+        let addr = serve_once(200, vec![b'a'; 2048]).await;
+        assert!(
+            fetch_validated(&format!("http://{addr}/geo.dat"), &dest, 1024, |_| Ok(()))
+                .await
+                .is_err()
+        );
+        let addr = serve_once(200, Vec::new()).await;
+        let err = fetch_validated(&format!("http://{addr}/geo.dat"), &dest, 1024, |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty download"), "{err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"good");
+    }
+}
+
+#[cfg(test)]
+mod real_assets_tests {
+    use super::*;
+    use crate::geodata;
+
+    const GEOIP_URL: &str =
+        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat";
+    const GEOSITE_URL: &str =
+        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat";
+
+    fn contains(nets: &[geodata::GeoNet], ip: std::net::IpAddr) -> bool {
+        nets.iter().any(|net| {
+            !net.reverse
+                && match (net.addr, ip) {
+                    (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+                        let mask = u32::MAX.checked_shr(u32::from(net.prefix)).unwrap_or(0);
+                        (u32::from(a) & !mask) == (u32::from(b) & !mask)
+                    }
+                    (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+                        let mask = u128::MAX.checked_shr(u32::from(net.prefix)).unwrap_or(0);
+                        (u128::from(a) & !mask) == (u128::from(b) & !mask)
+                    }
+                    _ => false,
+                }
+        })
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the default geoip.dat/geosite.dat over network"]
+    async fn real_assets_parse_and_match() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let geoip = dir.path().join("geoip.dat");
+        let geosite = dir.path().join("geosite.dat");
+        fetch_validated(GEOIP_URL, &geoip, MAX_GEO_DAT_BYTES, |tmp| {
+            geodata::validate(tmp).map(drop)
+        })
+        .await?;
+        fetch_validated(GEOSITE_URL, &geosite, MAX_GEO_DAT_BYTES, |tmp| {
+            geodata::validate(tmp).map(drop)
+        })
+        .await?;
+
+        let domains = geodata::load_geosite(&geosite, &["cn".to_owned()])?;
+        let cn = &domains[0].1;
+        let count = cn.exact.len() + cn.suffix.len() + cn.keywords.len() + cn.regexes.len();
+        assert!(count > 10_000, "geosite:cn has {count} entries");
+        assert!(
+            cn.suffix.iter().chain(&cn.exact).any(|d| d == "baidu.com"),
+            "geosite:cn must contain baidu.com"
+        );
+        assert!(
+            !cn.suffix.iter().chain(&cn.exact).any(|d| d == "google.com"),
+            "geosite:cn must not contain google.com"
+        );
+
+        let nets = geodata::load_geoip(&geoip, &["cn".to_owned()])?;
+        let nets = &nets[0].1;
+        assert!(nets.len() > 1_000, "geoip:cn has {} prefixes", nets.len());
+        assert!(contains(nets, "1.0.1.0".parse()?));
+        assert!(!contains(nets, "8.8.8.8".parse()?));
         Ok(())
     }
 }
