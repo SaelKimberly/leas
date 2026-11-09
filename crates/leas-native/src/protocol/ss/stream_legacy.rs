@@ -369,16 +369,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsLegacyStream<S> 
         if data.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let this = &mut *self;
-        if !this.write_started {
-            this.start_write(None, &[])?;
+        {
+            let this = &mut *self;
+            if !this.write_started {
+                this.start_write(None, &[])?;
+            }
+            // Accept at most one buffer-sized slice per call: `poll_drain`
+            // emptied `out` above, so the queued ciphertext is bounded by this
+            // constant regardless of how large a single `write_all`/`copy`
+            // buffer is.
+            let take = data.len().min(MAX_WRITE_CHUNK);
+            this.queue(&data[..take]);
         }
-        // Accept at most one buffer-sized slice per call: `poll_drain` emptied
-        // `out` above, so the queued ciphertext is bounded by this constant
-        // regardless of how large a single `write_all`/`copy` buffer is.
-        let take = data.len().min(MAX_WRITE_CHUNK);
-        this.queue(&data[..take]);
-        Poll::Ready(Ok(take))
+        // Push what was just queued: a caller that writes once and then reads
+        // (one HTTP request, no `flush`) must not leave the ciphertext parked
+        // in `out`. A transport that is not ready keeps the bytes queued —
+        // they are still counted as accepted, and the next write/flush drains
+        // them in order.
+        let _ = self.poll_drain(cx);
+        Poll::Ready(Ok(data.len().min(MAX_WRITE_CHUNK)))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -448,6 +457,41 @@ mod tests {
             host: Host::Domain("example.com".into()),
             port: 443,
         }
+    }
+
+    /// One `write_all` with **no** `flush` must put its bytes on the wire.
+    ///
+    /// The write half queues into a buffer and drains it inside
+    /// `poll_write`; before that drain existed, a caller that wrote a request
+    /// and then read (one HTTP exchange, no explicit flush — the harness probe)
+    /// left the ciphertext parked, so a real server saw the address header and
+    /// nothing else. A legacy server cannot answer a request it never got, and
+    /// the symptom is a silent stall, not an error.
+    #[tokio::test]
+    async fn a_write_reaches_the_transport_without_an_explicit_flush() {
+        let method = SsMethod::from_method("aes-256-cfb").unwrap();
+        let key = password_key(method, "password").unwrap();
+        let cipher = method.stream().unwrap();
+        let (client, mut server) = duplex(4096);
+        let mut stream = SsLegacyStream::new(client, cipher, key);
+        let iv = [0x22u8; 16];
+        stream
+            .start_write(Some(&iv), &[0x01, 1, 2, 3, 4, 0, 80])
+            .unwrap();
+        stream.flush_out().await.unwrap();
+        // The handshake bytes are out; drain them so the next read is the
+        // payload alone.
+        let mut first = [0u8; 64];
+        let n = server.read(&mut first).await.unwrap();
+        assert_eq!(n, 16 + 7);
+
+        stream.write_all(b"payload").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), server.read(&mut buf))
+            .await
+            .expect("the write must reach the transport without an explicit flush")
+            .unwrap();
+        assert_eq!(n, 7, "the queued ciphertext must be drained on write");
     }
 
     /// The request direction is `[IV] cipher(addr ‖ payload)` — a golden
