@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, hash_map::Entry};
 
 use rapidhash::{HashMapExt as _, HashSetExt as _, RapidHashMap, RapidHashSet};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -907,7 +907,21 @@ trait BatchProbeRunner: Send + Sync {
 /// The subprocess pool is gone: a real probe dials the native engine directly,
 /// so there is no warm process to share and no `batch_active` flag to raise
 /// against concurrent single pings.
-struct EngineProbeRunner;
+struct EngineProbeRunner {
+    /// One registry of fast-ping adapters for the batch. Building a
+    /// `FastPingManager` per LINK allocated a `Vec` plus one boxed adapter per
+    /// transport, ~13 k times on a feed-wide run, for a registry that never
+    /// changes.
+    fast: leas_core::FastPingManager,
+}
+
+impl EngineProbeRunner {
+    fn new(fast_timeout: Duration) -> Self {
+        Self {
+            fast: leas_core::FastPingManager::new(fast_timeout),
+        }
+    }
+}
 
 impl BatchProbeRunner for EngineProbeRunner {
     fn fast<'a>(
@@ -915,13 +929,10 @@ impl BatchProbeRunner for EngineProbeRunner {
         config_type: i32,
         addr: &'a str,
         port: u16,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
         Box::pin(async move {
-            match leas_core::FastPingManager::new(timeout)
-                .ping(config_type, addr, port)
-                .await
-            {
+            match self.fast.ping(config_type, addr, port).await {
                 Ok(dur) => ProbeOutcome::Ok {
                     latency_ms: Some(dur.as_millis() as u64),
                     // The fast probe IS a transport measurement: its span is
@@ -1052,7 +1063,7 @@ pub(crate) struct BatchShared {
     dns_cache_ttl_secs: i64,
     /// Where `run_batch` publishes the batch's shared state — `AppState::batch`
     /// holds the same slot and the UI reads the summary through it.
-    batch_slot: Arc<OnceLock<Arc<Self>>>,
+    batch_slot: Arc<OnceLock<Weak<Self>>>,
     /// Fast config type per link (`proto_kind`), filled by the plan walk.
     fast_config: DashMap<(ProtocolId, EndpointId), i32>,
     /// Endpoint rows by id (real probes need the full endpoint). `Arc` so a
@@ -1233,7 +1244,7 @@ pub(crate) struct BatchParams {
     /// Where `run_batch` publishes the batch's shared state as soon as it is
     /// built — `AppState::batch` holds the same slot and the UI reads the
     /// summary through it.
-    batch_slot: Arc<OnceLock<Arc<BatchShared>>>,
+    batch_slot: Arc<OnceLock<Weak<BatchShared>>>,
 }
 
 impl BatchShared {
@@ -1371,7 +1382,11 @@ pub(crate) async fn run_batch(mut params: BatchParams) {
     // Publish the handle before the first probe: a batch's record has to exist
     // for as long as the batch can be interrupted, and the shared state
     // (counters + class histograms + meters) is what the quit path renders.
-    let _ = shared.batch_slot.set(Arc::clone(&shared));
+    // A `Weak` on purpose: the shared state OWNS this slot, so an `Arc` here
+    // is a reference cycle — every finished batch's maps (per-link, per-protocol
+    // configs) would live until the process exits. Measured as +59 MiB of
+    // settled RSS per repeated batch before this fix.
+    let _ = shared.batch_slot.set(Arc::downgrade(&shared));
 
     // ── Walk and dispatch: the plan is consumed page by page ──────────
     let walk_started = Instant::now();
@@ -1435,9 +1450,11 @@ pub(crate) async fn run_batch(mut params: BatchParams) {
         let _ = shared.tx.try_send(CoreEvent::BatchEnded);
         return;
     }
-    if shared.real_phase {
-        warn_if_real_phase_is_slow(shared.real_concurrency, shared.plan_len() as usize);
-    }
+    // Both levels are bounded by `real_ping_concurrency`: the real phase by
+    // its native handshakes, the fast-only phase by the same permit (see
+    // `dispatch_fast_link`). A low value therefore throttles a feed-wide Fast
+    // Test too, and the warning must say so.
+    warn_if_slow_concurrency(shared.real_concurrency, shared.plan_len() as usize);
 
     // Wait for every chain and deferral retry to settle, then join them: the
     // counters say when work is settled, the join makes the batch's end a hard
@@ -1684,6 +1701,10 @@ async fn finish_batch(shared: &BatchShared) {
     // record a reader (and the next investigation) works from.
     tracing::info!(target: "tui::ops::ping", "{}", summary_line(shared));
     let _ = shared.tx.try_send(CoreEvent::BatchEnded);
+    // The batch's peak (in-flight probes plus the plan's per-link maps) is far
+    // above the idle set; the allocator would keep those pages committed
+    // because nothing allocates enough afterwards to fire its purge timer.
+    crate::alloc::release_freed_heap();
 }
 
 /// The plan's own record: the pages and links the walk produced and how long it
@@ -1799,13 +1820,13 @@ pub(crate) fn interrupted_summary_line(shared: &BatchShared) -> String {
 /// `concurrency / timeout` — the measured run held a 34,562-link plan at 2.45
 /// results/s with a saved override of 5 (default [`REAL_CONCURRENCY_DEFAULT`]),
 /// which is ~4 h. The value is the user's to set; this only says what it costs.
-fn warn_if_real_phase_is_slow(real_concurrency: usize, plan_len: usize) {
+fn warn_if_slow_concurrency(real_concurrency: usize, plan_len: usize) {
     if real_concurrency >= REAL_CONCURRENCY_WARN_BELOW as usize {
         return;
     }
     tracing::warn!(
         target: "tui::ops::ping",
-        "real ping concurrency {real_concurrency} is below {REAL_CONCURRENCY_WARN_BELOW} (code default {REAL_CONCURRENCY_DEFAULT}): a real probe holds its slot for a dial plus the full timeout, so the real phase is throughput-bound (~2.45 results/s at 5 on the 2026-09-16 run) and this {plan_len}-link plan will not finish in a session — raise speed_test.real_ping_concurrency"
+        "concurrency {real_concurrency} is below {REAL_CONCURRENCY_WARN_BELOW} (code default {REAL_CONCURRENCY_DEFAULT}) and bounds BOTH levels — the fast half takes the same permit as the real phase: a probe holds its slot for a dial plus the full timeout, so this {plan_len}-link plan is throughput-bound (~2.45 real results/s at 5 on the 2026-09-16 run) and will not finish in a session — raise speed_test.real_ping_concurrency"
     );
 }
 
@@ -1851,10 +1872,13 @@ async fn run_task_chain(
         }
         match kind {
             TaskKind::FastPing => {
-                // The fast half takes NO permit of its own (spec D14): it is a
-                // TCP handshake, not a native handshake, and the one limit
-                // that matters — the one that bounds native handshakes — is
-                // `real_ping_concurrency`.
+                // One concurrency limit (spec D14). The fast ONLY half takes
+                // the `real_ping_concurrency` permit further below, at the
+                // probe itself: a feed-wide batch used to dispatch every link
+                // at once (measured 1,475-4,928 sockets, 315-539 MiB peak,
+                // and it exhausted a default `ulimit -n`). The merged real
+                // phase needs no fast permit — its transport stage IS the
+                // native probe and already rides the same limit.
                 shared.mark_started(&shared.started_ms);
                 // The MERGED pipeline (spec D1): in a real-phase batch there is
                 // NO separate TCP ping. The probe's own TRANSPORT stage
@@ -1899,6 +1923,9 @@ async fn run_task_chain(
                     // `pending_real` never draining, and the batch waiting out
                     // the whole deferral budget before it could end.
                 } else {
+                    // The concurrency permit is held by the DISPATCH (see
+                    // `dispatch_fast_link`): the walk stops at the limit, so the
+                    // batch never spawns one chain per link.
                     let outcome = shared.fast_probe(&link).await;
                     shared.emit_result(&link, TestType::TcpPing, &outcome);
                     shared.sched.complete(&link, id, TaskKind::FastPing).await;
@@ -2118,18 +2145,45 @@ impl BatchShared {
     /// would depend on `task_queue_limit` and a `DnsDeferred` link has no gate
     /// entry to queue behind (`schedule` answers before the lock).
     async fn dispatch_fast_link(self: &Arc<Self>, link: ProfileStats) -> bool {
+        // One concurrency limit (spec D14): a fast ONLY batch takes the same
+        // `real_ping_concurrency` permit the real phase uses, and it takes it
+        // HERE so the walk stops at the limit. Acquiring it inside the spawned
+        // chain instead still spawned one future per link (13.8 k of them) and
+        // that queue was most of the run's live heap. A real-phase batch needs
+        // no fast permit: its transport stage IS the native probe, bounded by
+        // `dispatch_real_probe`.
+        let permit = if self.real_phase {
+            None
+        } else {
+            // A closed semaphore must NOT degrade the bound to "unlimited":
+            // hand the link back to the deferral path instead.
+            let Ok(permit) = Arc::clone(&self.real_sem).acquire_owned().await else {
+                return false;
+            };
+            Some(permit)
+        };
         match self.sched.schedule(&link, TaskKind::FastPing).await {
             ScheduleOutcome::Started(id) => {
                 self.pending_fast.fetch_add(1, Ordering::Relaxed);
                 let shared = Arc::clone(self);
                 self.spawn_tracked(async move {
+                    let _permit = permit;
                     run_task_chain(shared, link, id, TaskKind::FastPing).await;
                 });
                 true
             }
             ScheduleOutcome::Queued(_) => {
-                self.pending_fast.fetch_add(1, Ordering::Relaxed);
-                true
+                // No fast-only batch may queue: it dispatches each link once.
+                // The promoted chain would run from the gate holder's
+                // `complete` turn WITHOUT this permit, silently unbounding the
+                // concurrency limit the permit exists for — hand the link to
+                // the deferral path, which re-enters this dispatch.
+                // A warn, not an assert: the deferral path below recovers.
+                tracing::warn!(
+                    target: "tui::ops::ping",
+                    "fast-only batch queued a link; re-dispatching it under the permit"
+                );
+                false
             }
             ScheduleOutcome::DnsDeferred => {
                 self.counters.deferred.fetch_add(1, Ordering::Relaxed);
@@ -2513,7 +2567,22 @@ impl BatchShared {
             .addrs
             .get(&link.endpoint_id)
             .map_or_else(Vec::new, |v| v.value().clone());
-        let key = (dial_host(&endpoint, &addrs), endpoint.port);
+        // The fast half is a TRANSPORT measurement, and the plan already
+        // resolved this endpoint (`DnsResolveRequest`), so dial the address it
+        // resolved. Dialing the hostname instead sends every probe through
+        // `getaddrinfo` on tokio's blocking pool: measured 262 threads / 303
+        // mimalloc heaps during one feed-wide batch, and the retained pages of
+        // those heaps are most of the RSS that never came back afterwards.
+        let name = dial_host(&endpoint, &addrs);
+        let primary = addrs
+            .first()
+            .map_or_else(|| name.clone(), ToString::to_string);
+        // Dedup by the endpoint's own identity, NOT by the address dialed: two
+        // names can resolve to the same first address (routine on a CDN feed)
+        // and a fallback verdict measured through one name must never be
+        // published to the other — a hard failure there retires the other
+        // endpoint's real half without probing it.
+        let key = (name.clone(), endpoint.port);
         let (is_owner, notify) = {
             let mut inner = self.fast_dedup.lock();
             if let Some(outcome) = inner.cache.get(&key) {
@@ -2537,11 +2606,21 @@ impl BatchShared {
             .fast_config
             .get(&(link.protocol_id, link.endpoint_id))
             .map_or(0, |v| *v.value());
-        // The dial host: a DNS name (resolved below) or an IP literal.
-        let addr = dial_host(&endpoint, &addrs);
         let port = endpoint.port;
         if is_owner {
-            let outcome = self.runner.fast(config_type, &addr, port, timeout).await;
+            let outcome = self.runner.fast(config_type, &primary, port, timeout).await;
+            // A stale resolved address must not become a hard `[fast]` marker
+            // that retires the real half: one hostname dial is the fallback.
+            let outcome = match outcome {
+                // Only a TRANSPORT failure justifies a second dial: a soft
+                // (config/not-supported) failure is not about the address, and
+                // retrying it would replace its own class and text with the
+                // hostname dial's verdict.
+                ProbeOutcome::Failed { hard: true, .. } if primary != name => {
+                    self.runner.fast(config_type, &name, port, timeout).await
+                }
+                other => other,
+            };
             let mut inner = self.fast_dedup.lock();
             inner.cache.insert(key.clone(), outcome.clone());
             inner.in_flight.remove(&key);
@@ -3345,7 +3424,6 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     let Some(tx) = state.core_event_tx.clone() else {
         return;
     };
-    let runner: Arc<dyn BatchProbeRunner> = Arc::new(EngineProbeRunner);
     let db = state.db.clone();
     let writer = state.link_stage.clone();
     let scheduler = state.scheduler.clone();
@@ -3355,9 +3433,10 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     // them is what says a batch is alive.
     let meters = Arc::new(crate::types::BatchMeters::default());
     state.batch_progress = Some(Arc::clone(&meters));
-    let batch_slot: Arc<OnceLock<Arc<BatchShared>>> = Arc::new(OnceLock::new());
+    let batch_slot: Arc<OnceLock<Weak<BatchShared>>> = Arc::new(OnceLock::new());
     state.batch = Some(batch_slot.clone());
     let fast_timeout = *state.config.speed_test.tcp_timeout_secs;
+    let runner: Arc<dyn BatchProbeRunner> = Arc::new(EngineProbeRunner::new(fast_timeout));
     let real_timeout = *state.config.speed_test.real_ping_timeout_secs;
     // The TRANSPORT stage's budget is the FAST level's timeout: the transport
     // stage measures the same thing the fast probe measures (the time to
@@ -3615,6 +3694,13 @@ mod tests {
         fast_delay_by_addr: Mutex<rapidhash::RapidHashMap<String, Duration>>,
         /// Endpoint ids in the order their real probe STARTED.
         real_endpoint_order: Mutex<Vec<i64>>,
+        /// Addresses each fast probe dialed, in call order — the resolved
+        /// address first, the hostname only on the fallback dial.
+        fast_addrs: Mutex<Vec<String>>,
+        /// Concurrent fast probes, and the high-water mark: the fast half must
+        /// stay inside the one concurrency limit.
+        fast_in_flight: AtomicUsize,
+        fast_max_in_flight: AtomicUsize,
         /// When set, the real outcome is chosen by the CALL INDEX instead of
         /// the fixed one — the tests that need the first protocol to fail and
         /// the second to succeed (the group-entry barrier's deferral case).
@@ -3644,6 +3730,9 @@ mod tests {
                 fast_by_addr: Mutex::new(rapidhash::RapidHashMap::new()),
                 fast_delay_by_addr: Mutex::new(rapidhash::RapidHashMap::new()),
                 real_endpoint_order: Mutex::new(Vec::new()),
+                fast_addrs: Mutex::new(Vec::new()),
+                fast_in_flight: AtomicUsize::new(0),
+                fast_max_in_flight: AtomicUsize::new(0),
                 real_by_call: Mutex::new(None),
             }
         }
@@ -3669,6 +3758,10 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
             Box::pin(async move {
                 self.fast_calls.fetch_add(1, Ordering::Relaxed);
+                self.fast_addrs.lock().push(addr.to_string());
+                let in_flight = self.fast_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.fast_max_in_flight
+                    .fetch_max(in_flight, Ordering::SeqCst);
                 if let Some((sched, eid)) = &*self.dns_mark_on_fast.lock() {
                     sched.mark_dns_failure(*eid);
                 }
@@ -3676,10 +3769,13 @@ mod tests {
                 if let Some(delay) = delay {
                     tokio::time::sleep(delay).await;
                 }
-                if let Some(outcome) = self.fast_by_addr.lock().get(addr) {
-                    return outcome.clone();
-                }
-                self.fast_outcome.clone()
+                let outcome = self
+                    .fast_by_addr
+                    .lock()
+                    .get(addr)
+                    .map_or_else(|| self.fast_outcome.clone(), Clone::clone);
+                self.fast_in_flight.fetch_sub(1, Ordering::SeqCst);
+                outcome
             })
         }
 
@@ -4209,22 +4305,42 @@ mod tests {
 
         let rows = vec![first, second];
         let mut h = harness(rows.clone()).await;
+        // Gate both real probes: the batch cannot finish before the slot's
+        // `Weak` is upgraded, and a batch that ended first would leave nothing
+        // to hold.
+        let gate = Arc::new(Notify::new());
+        *h.runner.real_gate.lock() = Some(gate.clone());
         let plan = plan_from_rows(&rows);
-        start_test_batch(&mut h, plan, true, false)
-            .await
-            .expect("batch");
+        let handle = start_test_batch(&mut h, plan, true, false);
+
+        let shared = loop {
+            if let Some(shared) = h
+                .state
+                .batch
+                .as_ref()
+                .and_then(|slot| slot.get())
+                .and_then(std::sync::Weak::upgrade)
+            {
+                break shared;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Both real probes are now parked on the gate (concurrency 8 > 2).
+        for _ in 0..300 {
+            if h.runner.real_calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        gate.notify_waiters();
+        handle.await.expect("batch");
+        await_batch_done(&mut h.state).await;
 
         assert_eq!(
             h.runner.real_calls.load(Ordering::Relaxed),
             2,
             "both links got their real probe"
         );
-        let shared = h
-            .state
-            .batch
-            .as_ref()
-            .and_then(|slot| slot.get())
-            .expect("run_batch publishes its shared state");
         assert_eq!(
             shared.protocols.len(),
             1,
@@ -5804,5 +5920,135 @@ mod tests {
         ] {
             assert!(line.contains(expected), "missing {expected:?} in: {line}");
         }
+    }
+
+    /// The batch's shared state must die with the batch. It owns the slot that
+    /// publishes it, so an `Arc` in that slot is a reference cycle: every
+    /// finished batch's per-link maps and per-protocol config cache would stay
+    /// resident for the process's life (measured +59 MiB settled per repeated
+    /// batch). The slot holds a `Weak`; this pins it.
+    #[tokio::test]
+    async fn a_finished_batch_releases_its_shared_state() {
+        let rows = vec![fake_row(1, "10.0.9.1", 1)];
+        let mut h = harness(rows.clone()).await;
+        let handle = start_test_batch_with(&mut h, plan_from_rows(&rows), false, false, 8);
+
+        // Wait until `run_batch` publishes the handle, then keep a weak witness.
+        // The WEAK is the witness, not an upgrade: a one-link batch can finish
+        // before this loop runs, and an upgrade-based loop would then spin
+        // forever.
+        let weak = loop {
+            if let Some(weak) = h.state.batch.as_ref().and_then(|slot| slot.get()) {
+                break weak.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        await_batch_done(&mut h.state).await;
+        handle.await.expect("batch");
+
+        assert!(
+            weak.upgrade().is_none(),
+            "a finished batch must not keep its shared state alive (reference cycle)"
+        );
+    }
+
+    /// The fast ONLY half takes the one concurrency limit (spec D14). Before
+    /// this, a feed-wide Fast Test dispatched every link at once: measured
+    /// 1,475-4,928 sockets, 315-539 MiB peak, and a default `ulimit -n` was
+    /// exhausted. The permit bounds probes, sockets and the batch's peak.
+    #[tokio::test]
+    async fn a_fast_only_batch_never_exceeds_the_concurrency_limit() {
+        let rows: Vec<EndpointRow> = (1..=6)
+            .map(|i| fake_row(i, &format!("10.0.1.{i}"), 1))
+            .collect();
+        let mut h = harness(rows.clone()).await;
+        for i in 1..=6 {
+            h.runner
+                .fast_delay_by_addr
+                .lock()
+                .insert(format!("10.0.1.{i}"), Duration::from_millis(40));
+        }
+        let plan = plan_from_rows(&rows);
+        let handle = start_test_batch_with(&mut h, plan, false, false, 2);
+        handle.await.expect("batch");
+
+        assert_eq!(
+            h.runner.fast_calls.load(Ordering::Relaxed),
+            6,
+            "every link is probed exactly once"
+        );
+        assert!(
+            h.runner.fast_in_flight.load(Ordering::Relaxed) == 0,
+            "all permits released"
+        );
+        assert!(
+            h.runner.fast_max_in_flight.load(Ordering::Relaxed) <= 2,
+            "in flight peaked at {} with real_concurrency = 2",
+            h.runner.fast_max_in_flight.load(Ordering::Relaxed)
+        );
+    }
+
+    /// A batch already resolved every endpoint, so the fast probe dials that
+    /// address; a failed dial (a stale address) retries the hostname ONCE so a
+    /// cached address cannot become a hard `[fast]` marker that retires the
+    /// real half.
+    #[tokio::test]
+    async fn the_fast_probe_dials_the_resolved_address_then_falls_back_to_the_name() {
+        let mut row = fake_row(1, "probe.example", 1);
+        // A resolved DNS endpoint: the plan waits a fresh resolution (a stale
+        // one is deferred until the resolver answers, and this harness has no
+        // resolver event loop).
+        row.endpoint.resolved_at = Some(jiff::Timestamp::now().as_second());
+        let rows = vec![row];
+        let mut h = harness(rows.clone()).await;
+        // `fake_row` resolves a named host to 10.0.0.1; that address fails and
+        // the hostname path (the stub's default) succeeds.
+        // A HARD (transport) failure: the only class that justifies the
+        // hostname fallback.
+        h.runner.fast_by_addr.lock().insert(
+            "10.0.0.1".to_string(),
+            ProbeOutcome::Failed {
+                class: ProbeClass::Refused,
+                hard: true,
+                transport_failed: true,
+                text: "stale address".to_string(),
+                evidence: None,
+                transport_ms: None,
+                auth_ack: None,
+            },
+        );
+
+        let handle = start_test_batch_with(&mut h, plan_from_rows(&rows), false, false, 8);
+        handle.await.expect("batch");
+
+        assert_eq!(
+            h.runner.fast_addrs.lock().clone(),
+            vec!["10.0.0.1".to_string(), "probe.example".to_string()],
+            "dial the resolved address first, the hostname only as the fallback"
+        );
+    }
+
+    /// A soft fast failure (no adapter, config gate) is not a statement about
+    /// the address, so it must NOT trigger the hostname retry: that would spend
+    /// a second dial and replace the row's own class/text with the dial's.
+    #[tokio::test]
+    async fn a_soft_fast_failure_does_not_retry_by_name() {
+        let mut row = fake_row(1, "soft.example", 1);
+        row.endpoint.resolved_at = Some(jiff::Timestamp::now().as_second());
+        let rows = vec![row];
+        let mut h = harness(rows.clone()).await;
+        h.runner.fast_by_addr.lock().insert(
+            "10.0.0.1".to_string(),
+            ProbeOutcome::soft_failure("no fast adapter"),
+        );
+
+        let handle = start_test_batch_with(&mut h, plan_from_rows(&rows), false, false, 8);
+        handle.await.expect("batch");
+
+        assert_eq!(
+            h.runner.fast_addrs.lock().clone(),
+            vec!["10.0.0.1".to_string()],
+            "a soft failure keeps its class and dials once"
+        );
     }
 }

@@ -1041,6 +1041,11 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     state,
                     crate::ops::job_scheduler::TerminalEvent::BatchEnded,
                 );
+                // The dropped `BatchShared` (per-link maps, the per-protocol
+                // config cache) and the batch task's temporaries are free but
+                // still committed: hand them back now, while the session is
+                // idle.
+                crate::alloc::release_freed_heap();
             }
             CoreEvent::HostFeaturesLoaded(checker) => {
                 state.host_features = Some(checker);

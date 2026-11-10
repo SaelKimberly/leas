@@ -16,7 +16,7 @@ rust-version.workspace = true
 # 0.32 REMOVED the `simdutf8` feature outright (upstream measured no win on
 # production GeoIP2 databases), so the whole feature list is deleted rather
 # than renamed. Every read API this crate uses is source-identical.
-maxminddb = "0.32"
+maxminddb = { version = "0.32", features = ["mmap"] }
 
 # ============ Async Runtime & I/O ============
 tokio = { workspace = true, features = ["sync", "fs", "io-util", "rt"] }

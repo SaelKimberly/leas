@@ -10,9 +10,10 @@
 //! mean is unusable: the first sample of a section pays page-cache, statement
 //! compilation and pool setup that steady state never pays).
 //!
-//! Allocation COUNTS are not available in-process: `turso` installs a
-//! `#[global_allocator]` (its default `mimalloc` feature) and a second one is a
-//! compile error, while `valgrind --tool=dhat` on the test binary dies with
+//! Allocation COUNTS are not available in-process: this crate installs the
+//! process-wide `#[global_allocator]` (`src/alloc.rs`, mimalloc), and a second
+//! one is a compile error — a counting allocator would have to REPLACE it
+//! there for the run. `valgrind --tool=dhat` on the test binary dies with
 //! SIGILL at startup under that same allocator. Allocation figures in the lab
 //! report are therefore derived from the code path (one `String::clone` is one
 //! allocation) and backed by A/B timing of the allocation-free variant.
@@ -638,8 +639,8 @@ async fn flow_cost_report() {
             run_batch(params).await;
             let elapsed = started.elapsed();
             drop(rx);
-            if let Some(shared) = slot.get() {
-                println!("[summary] {}", summary_line(shared));
+            if let Some(shared) = slot.get().and_then(std::sync::Weak::upgrade) {
+                println!("[summary] {}", summary_line(&shared));
             }
             let label = if real_phase { "fast+real" } else { "fast only" };
             let pass_label = if pass == 0 { "pass 1" } else { "pass 2" };
@@ -1405,7 +1406,7 @@ async fn flow_cost_network() {
         plan,
         true,
         PROFILES_PAGE_SIZE,
-        Arc::new(EngineProbeRunner),
+        Arc::new(EngineProbeRunner::new(Duration::from_secs(5))),
     );
     params.real_concurrency = concurrency;
     params.real_timeout = budget;
@@ -1419,9 +1420,9 @@ async fn flow_cost_network() {
     drop(rx);
     // The batch's own summary line, not a re-derivation: the lab and the app
     // then report the same numbers by construction.
-    if let Some(shared) = slot.get() {
+    if let Some(shared) = slot.get().and_then(std::sync::Weak::upgrade) {
         use std::sync::atomic::Ordering;
-        println!("[summary] {}", summary_line(shared));
+        println!("[summary] {}", summary_line(&shared));
         let done = u64::from(shared.counters.probe_ok.load(Ordering::Relaxed))
             + u64::from(shared.counters.probe_failed.load(Ordering::Relaxed));
         println!(

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::future_not_send,
+    reason = "single-threaded TUI: `AppState` holds `Rc` display caches and the runtime drives it from one thread; the future is never sent"
+)]
+
 use anyhow::Result;
 use leas::{AppState, CoreEvent};
 use leas_config::AppConfig;
@@ -231,8 +236,26 @@ fn stderr_mirror_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false"))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Cap on tokio's blocking pool.
+///
+/// `getaddrinfo` (hostname dials), `tokio::fs` and the log reader all run
+/// there, and every blocking thread keeps its own mimalloc heap. The default
+/// (512) grew to 262 threads during a feed-wide test batch; 64 is far above the
+/// app's real concurrency of blocking work and keeps the per-thread heaps'
+/// retained pages bounded.
+const BLOCKING_THREADS: usize = 64;
+
+fn main() -> Result<()> {
+    // Allocator policy before any real work (see `alloc.rs`).
+    leas::alloc::configure();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(BLOCKING_THREADS)
+        .build()?;
+    runtime.block_on(run_app())
+}
+
+async fn run_app() -> Result<()> {
     // 0. Install rustls CryptoProvider first — every later TLS consumer
     //    (reqwest, QUIC ping adapter, hickory DoH) needs it.
     install_tls_provider();

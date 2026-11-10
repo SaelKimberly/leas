@@ -352,11 +352,16 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     // they are a live view, not a record, so the fallback names only what is
     // known without the handle.
     if let Some(meters) = &state.batch_progress {
-        if let Some(shared) = state.batch.as_ref().and_then(|slot| slot.get()) {
+        if let Some(shared) = state
+            .batch
+            .as_ref()
+            .and_then(|slot| slot.get())
+            .and_then(std::sync::Weak::upgrade)
+        {
             tracing::info!(
                 target: "tui::ops::ping",
                 "{}",
-                crate::ops::ping::interrupted_summary_line(shared),
+                crate::ops::ping::interrupted_summary_line(&shared),
             );
         } else {
             let (main_done, main_total) = (

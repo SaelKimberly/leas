@@ -85,6 +85,9 @@ structural query cost the tab pays on every result-driven refetch:
    the test binary with `valgrind --tool=dhat` dies with SIGILL at startup under that
    allocator. Allocation figures are therefore derived from the code path and backed by A/B
    timing of the allocation-free variant.
+   **Superseded 2026-11-10:** `leas-db` no longer requests turso's `mimalloc` feature and the
+   single `#[global_allocator]` now lives in `crates/leas/src/alloc.rs`, so a counting or
+   tracing allocator is installable by replacing that one static.
 
 ## Consequences
 

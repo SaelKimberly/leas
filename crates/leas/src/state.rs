@@ -291,7 +291,8 @@ pub struct AppState {
     /// is the only way the interrupted run's classification is reported
     /// (`crate::ops::ping::interrupted_summary_line`). `pub(crate)` because its
     /// type is the batch internals, not state anyone outside the crate may hold.
-    pub(crate) batch: Option<Arc<std::sync::OnceLock<Arc<crate::ops::ping::BatchShared>>>>,
+    pub(crate) batch:
+        Option<Arc<std::sync::OnceLock<std::sync::Weak<crate::ops::ping::BatchShared>>>>,
     pub last_test_real: Option<u64>,
     pub last_test_speed: Option<u64>,
     /// When the last result-driven Profiles page refetch was scheduled.

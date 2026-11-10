@@ -10,6 +10,7 @@
     reason = "single-threaded TUI: futures are spawned onto one local runtime and never cross threads"
 )]
 
+pub mod alloc;
 pub mod ops;
 pub mod route_compile;
 pub mod state;

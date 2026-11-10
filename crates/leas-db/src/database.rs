@@ -313,7 +313,8 @@ async fn configure_journal_mode(
 }
 
 impl Database {
-    /// Opens existing DB or creates fresh. Recovers from corruption by recreating.
+    /// Opens an existing database, or creates one. A failed open propagates and
+    /// leaves the file alone; only an explicitly incompatible schema is wiped.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_concurrent_writes(path, concurrent_writes_enabled()).await
     }
@@ -342,16 +343,19 @@ impl Database {
         let mut db = match Self::try_open_db(driver).await {
             Ok(db) => db,
             Err(e) => {
-                // DB might be corrupted — log warning, delete, recreate
-                tracing::warn!(error = %e, "DB open failed, attempting recovery by recreating");
-                if Path::new(path_str).exists() {
-                    remove_stale_mvcc_log_for_wal(Path::new(path_str))?;
-                    std::fs::remove_file(path_str)?;
-                }
-                remove_all_db_sidecars(Path::new(path_str))?;
-                concurrent_writes = requested_mvcc;
-                let driver = file_driver(path_str, concurrent_writes);
-                Self::try_open_db(driver).await?
+                // This branch used to DELETE the database and recreate it. Any
+                // transient failure then became silent data loss: a second
+                // instance opening a live file (writer lock held) hit it on
+                // 2026-11-10 and wiped a 12 MB feed. A failed open now
+                // propagates; the only wipe left is the explicit
+                // `IncompatibleSchema` verdict below, which AGENTS decision 4
+                // documents.
+                tracing::error!(
+                    path = %path_str,
+                    error = %e,
+                    "database open failed; the file was left untouched"
+                );
+                return Err(e);
             }
         };
 
@@ -3339,6 +3343,31 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(endpoint.expect("endpoint").domain, "");
+    }
+
+    /// A file the engine cannot open must NOT be deleted.
+    ///
+    /// The old recovery branch wiped and recreated the file on ANY open
+    /// failure, which destroyed a live 12 MB feed when a second instance
+    /// opened it (2026-11-10 incident). The only wipe left is the explicit
+    /// incompatible-schema verdict; a corrupt file must surface as an error
+    /// with its bytes intact.
+    #[tokio::test]
+    async fn a_failed_open_leaves_the_file_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("garbage.db");
+        let garbage = b"this is not a sqlite database".to_vec();
+        std::fs::write(&path, &garbage).expect("write garbage");
+
+        let opened = Database::open(&path).await;
+        assert!(opened.is_err(), "a corrupt file must fail to open");
+        drop(opened);
+
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            garbage,
+            "a failed open must leave the file bytes untouched"
+        );
     }
 
     #[tokio::test]

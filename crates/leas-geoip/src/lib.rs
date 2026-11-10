@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use maxminddb::Reader;
+use maxminddb::{Mmap, Reader};
 use tokio::io::AsyncWriteExt;
 
 pub mod geodata;
@@ -32,7 +32,7 @@ pub struct Location {
 
 pub struct GeoIp {
     db_path: PathBuf,
-    reader: tokio::sync::OnceCell<Arc<Reader<Vec<u8>>>>,
+    reader: tokio::sync::OnceCell<Arc<Reader<Mmap>>>,
     init_lock: tokio::sync::Mutex<()>,
     fetch: Arc<Fetcher>,
     /// Per-IP decode cache (misses cached too), bounded at 1024 entries: a
@@ -177,8 +177,14 @@ impl GeoIp {
         country
     }
 
-    fn open_reader(path: &Path) -> anyhow::Result<Reader<Vec<u8>>> {
-        Reader::open_readfile(path)
+    fn open_reader(path: &Path) -> anyhow::Result<Reader<Mmap>> {
+        // `open_mmap` turns the 48 MB artifact into a file mapping instead of a
+        // heap `Vec`: the pages stay file-backed (evictable, shareable) and the
+        // idle floor drops by the artifact's size. SAFETY: the only writer is
+        // `fetch_geolite_to`, which writes a temp file and renames it over the
+        // destination — the mapping's inode is never truncated or modified in
+        // place. A heal unlinks a corrupt artifact, which also leaves it valid.
+        unsafe { Reader::open_mmap(path) }
             .map_err(|e| anyhow::anyhow!("Invalid geolite file: {} ({e})", path.display()))
     }
 
@@ -186,7 +192,7 @@ impl GeoIp {
     /// re-downloading once before giving up. A failed heal is LATCHED with a
     /// growing backoff so a persistently-unopenable artifact is not deleted and
     /// re-downloaded on every cache-missing lookup (finding f5).
-    async fn open_reader_healing(&self) -> anyhow::Result<Reader<Vec<u8>>> {
+    async fn open_reader_healing(&self) -> anyhow::Result<Reader<Mmap>> {
         if let Some(wait) = self.heal_backoff_remaining() {
             anyhow::bail!(
                 "GeoLite artifact {} unavailable; retrying in {}s",
@@ -240,7 +246,7 @@ impl GeoIp {
 
     /// The heal itself: ensure the file, open it, and on an open failure
     /// delete + re-download once before giving up.
-    async fn try_open_healing(&self) -> anyhow::Result<Reader<Vec<u8>>> {
+    async fn try_open_healing(&self) -> anyhow::Result<Reader<Mmap>> {
         self.ensure_db().await?;
         // The 70 MB read is blocking — never on the async runtime.
         let path = self.db_path.clone();
