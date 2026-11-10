@@ -26,27 +26,33 @@ with mimalloc 3.3.2; 360/292 MB with stats instrumentation).
 | mimalloc 3.6.1 A/B, same feed | peak 396 / settle 392 (untuned), 347 / 309 (pd=0, mult=1, thp=0) |
 | settled RSS across repeated batches | +59 MB per batch before D11 |
 | mimalloc 3.3.2 A/B, same feed | peak 374 / settle 275 (default); 358 / 264 with `purge_delay=0` |
+| allocator lab, 3.3.2 + `purge_delay=0` (13,803 burst + 262 heaps) | burst 112–135 ms, 262-phase 245–279 ms, settle 41 MiB |
+| allocator lab, 3.6.1 default purge | burst 40–48 ms, 262-phase 37–38 ms, settle 8 MiB |
 
 ## Decisions
 
-**D1 — Allocator stays mimalloc 3.3.2, owned by `leas`.** The 3.6.1 upgrade
-(`mimalloc-safe` + `v3`) was measured on the identical feed and is worse for
-this workload in every configuration tested (settle 392 untuned, 309 tuned vs
-275). `[global_allocator]` remains in `crates/leas/src/alloc.rs`, `leas-db`
-keeps turso's `mimalloc` feature off. Revisit when a newer crates.io sys crate
-appears or the workload changes.
+**D1 — Allocator is mimalloc 3.6.1, owned by `leas`.** `mimalloc-safe`
+0.1.70 with the `v3` feature (the latest 3.x) replaces `mimalloc` 0.1.52
+(3.3.2). The original A/B rejected 3.6.1 on feed RSS (settle 392 untuned / 309
+tuned vs 275), but the allocator lab (`crates/leas/src/alloc/lab.rs`, the
+13,803-link burst plus 262 blocking-thread heaps) re-measured the allocator in
+isolation: burst 40–48 ms vs 112–135 ms and 262-thread phase 37–38 ms vs
+245–279 ms for 3.3.2, with post-collect RSS 8 MiB vs 41 MiB. `[global_allocator]`
+remains in `crates/leas/src/alloc.rs`; `leas-db` keeps turso's `mimalloc`
+feature off.
 
-**D2 — `purge_delay=0` at startup.** mimalloc returns free pages only when a
-later allocation fires the timer; eager purge measured 374→358 MB peak and
-275→264 MB settled on the pristine feed (an earlier, differently-warmed copy
-showed 360→308 / 292→253). Small but consistent, and it removes the timer from
-the reclaim path. Set
-programmatically through `mi_option_set(mi_option_purge_delay, 0)`; a unit test
-pins the enum index (15 in the 3.3.2 header) so a dependency bump cannot
-silently retarget the option.
+**D2 — Keep the default purge delay; do not set `purge_delay=0`.** On 3.3.2
+the override was free. On 3.6.x a freed page takes the purge path, so 0 turns
+every free into a purge: the same lab burst went 40–48 → 56–67 ms and the
+262-thread phase 37 → 66 ms, while the job-end `mi_collect(true)` already
+settles the heap to ~8 MiB (27–31 MiB before the collect). The app leaves the
+1 s default and relies on D3. (The earlier 3.3.2 measurement — 374→358 MB peak,
+275→264 MB settle — is superseded.)
 
-**D3 — Keep the job-end reclaim** (`mi_collect(true)`), which purges arena
-ranges process-wide; the thread-local limit is documented, not worked around.
+**D3 — Keep the job-end reclaim** (`mi_collect(true)`) and rely on it for the
+settle. 3.6.1's collect also reclaims abandoned heaps: the lab's 262-thread
+phase left 27–31 MiB before the collect and 8 MiB after, where 3.3.2 left
+41 MiB before and after.
 
 **D4 — mmap the mmdb.** `maxminddb`'s `mmap` feature (off by default) with
 `Reader<Mmap>`: 48.4 MB moves from anonymous heap to a file mapping the kernel

@@ -29,9 +29,9 @@ tokio.features = ["fs", "io-util", "rt-multi-thread", "macros", "signal", "sync"
 dashmap.workspace = true
 
 # Process-wide allocator — owned here, not by a dependency (see `src/alloc.rs`).
-# `mimalloc-safe` + `v3` vendors mimalloc 3.6.1 (the newest release); the
-# legacy `mimalloc` crate pins 3.3.2 and lacks `mi_arenas_purge()`.
-mimalloc = { version = "0.1.52", default-features = false }
+# `mimalloc-safe` + `v3` vendors mimalloc 3.6.1; the older `mimalloc` crate's
+# 3.3.2 is slower on the batch shape and cannot reclaim abandoned thread heaps.
+mimalloc = { package = "mimalloc-safe", version = "0.1.70", default-features = false, features = ["v3"] }
 
 # ============ Serialization ============
 serde_json.workspace = true

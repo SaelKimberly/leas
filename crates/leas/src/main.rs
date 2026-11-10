@@ -246,8 +246,6 @@ fn stderr_mirror_enabled(value: Option<&str>) -> bool {
 const BLOCKING_THREADS: usize = 64;
 
 fn main() -> Result<()> {
-    // Allocator policy before any real work (see `alloc.rs`).
-    leas::alloc::configure();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(BLOCKING_THREADS)

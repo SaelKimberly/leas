@@ -18,8 +18,8 @@ paths and no data-loss path on database open.
 ## Architecture
 
 - `crates/leas/src/alloc.rs` owns the single `#[global_allocator]` (mimalloc
-  3.3.2) plus the programmatic purge configuration; `leas-db` keeps turso's
-  `mimalloc` feature off.
+  3.6.1) with the default purge policy; `leas-db` keeps turso's `mimalloc`
+  feature off.
 - `leas-geoip` reads the mmdb through a file mapping (`Reader<Mmap>`).
 - `ops/ping.rs`: the fast-only half takes a `real_ping_concurrency` permit;
   the fast probe dials the plan's resolved address with one hostname fallback;
@@ -30,11 +30,16 @@ paths and no data-loss path on database open.
 ## Tasks
 
 **T1 — allocator ownership and purge policy.**
-`mimalloc = "0.1.52"` direct dependency (turso feature off, done), `alloc.rs`
-declares the global allocator, `configure()` sets `mi_option_purge_delay = 0`
-through `mi_option_set`, `release_freed_heap()` keeps `mi_collect(true)`.
-Unit test pins the option index by reading `mi_option_get` back.
+`mimalloc-safe` 0.1.70 + `v3` (mimalloc 3.6.1) direct dependency (turso feature
+off, done), `alloc.rs` declares the global allocator, `release_freed_heap()`
+keeps `mi_collect(true)`. No `purge_delay` override: on 3.x the job-end collect
+already settles the heap and eager purge costs ~1.7–3x on the burst (spec D2).
 Verify: `cargo nextest run -p leas alloc`, `nm` shows `mi_collect`.
+
+> Superseded 2026-11-10: the original T1 pinned `mimalloc` 0.1.52 (3.3.2) and
+> set `purge_delay=0`; the allocator lab showed 3.6.1 at default purge is
+> 2–4x faster on the same shape, so the pin and the override changed. The
+> option-index unit test is gone with the override.
 
 **T2 — mmap the GeoLite database.**
 Enable `maxminddb`'s `mmap` feature, switch `GeoIp::reader` to
