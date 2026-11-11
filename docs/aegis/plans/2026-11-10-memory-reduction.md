@@ -34,6 +34,9 @@ paths and no data-loss path on database open.
 off, done), `alloc.rs` declares the global allocator, `release_freed_heap()`
 keeps `mi_collect(true)`. No `purge_delay` override: on 3.x the job-end collect
 already settles the heap and eager purge costs ~1.7–3x on the burst (spec D2).
+Linux retention tuning added after the e2e A/B on the 14,675-link snapshot:
+default 3.6.1 settles 354 MB against 221 MB with `configure()`'s option set
+(spec D1b), so the tuning is part of T1, not an optional knob.
 Verify: `cargo nextest run -p leas alloc`, `nm` shows `mi_collect`.
 
 > Superseded 2026-11-10: the original T1 pinned `mimalloc` 0.1.52 (3.3.2) and

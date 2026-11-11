@@ -28,6 +28,9 @@ with mimalloc 3.3.2; 360/292 MB with stats instrumentation).
 | mimalloc 3.3.2 A/B, same feed | peak 374 / settle 275 (default); 358 / 264 with `purge_delay=0` |
 | allocator lab, 3.3.2 + `purge_delay=0` (13,803 burst + 262 heaps) | burst 112–135 ms, 262-phase 245–279 ms, settle 41 MiB |
 | allocator lab, 3.6.1 default purge | burst 40–48 ms, 262-phase 37–38 ms, settle 8 MiB |
+| 3.6.1 e2e, same feed (13,803 links): Linux defaults | idle 124–127 MB, peak 371 MB, settle 307 MB |
+| 3.6.1 e2e, same feed, tuned (`configure()`) | idle 93 MB, peak 284 MB, settle 183 MB |
+| 3.6.1 e2e, 14,675-link snapshot: defaults vs tuned | peak 385→349, settle 354→221 MB (same build, same feed) |
 
 ## Decisions
 
@@ -40,6 +43,21 @@ isolation: burst 40–48 ms vs 112–135 ms and 262-thread phase 37–38 ms vs
 245–279 ms for 3.3.2, with post-collect RSS 8 MiB vs 41 MiB. `[global_allocator]`
 remains in `crates/leas/src/alloc.rs`; `leas-db` keeps turso's `mimalloc`
 feature off.
+
+**D1b — Linux needs retention tuning; Windows does not.** 3.6.1's Linux
+defaults target throughput: `allow_thp=2` lifts the minimal purge size to
+2 MiB, and the v3 page reclaimers are effectively unlimited. Measured on the
+same feed, the defaults cost ~30 MB idle and ~125–135 MB settled versus the
+tuned set. `alloc::configure()` therefore sets `allow_thp=0`,
+`page_full_retain=0`, `page_max_reclaim=0`,
+`page_cross_thread_max_reclaim=0` and `generic_collect=512` (each index pinned
+by a readback test, restored after the test so the process-wide options do not
+slow other tests). The set is a measured local optimum: `page_full_retain=0`
+alone is WORSE (181 MB idle) because each size class then commits a fresh page,
+so only drop options with a fresh measurement. The Windows cross-check (same
+commit, default options, x86_64-pc-windows-gnu) measured better without any
+tuning — v3's commit reductions are Windows-specific, so the tuning is applied
+unconditionally but is only load-bearing on Linux.
 
 **D2 — Keep the default purge delay; do not set `purge_delay=0`.** On 3.3.2
 the override was free. On 3.6.x a freed page takes the purge path, so 0 turns
