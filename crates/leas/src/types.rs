@@ -854,6 +854,7 @@ mod tests {
                     down: *down,
                     conns: 1,
                     failed: 0,
+                    outbound: None,
                 })
                 .collect::<SmallVec<[HostStat; 16]>>(),
             ..SnifferSnapshot::default()

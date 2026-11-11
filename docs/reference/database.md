@@ -41,7 +41,7 @@ for the tables, and `schema/ddl.rs` owns everything toasty cannot express.
 | --- | --- |
 | Modelled tables | 11 |
 | Raw tables | 2 (`rank_weight_meta`, `__toasty_migrations`) |
-| Schema cursor | `PRAGMA user_version`; current value 19 (`SCHEMA_VERSION` 19, `schema::LATEST` = `SCHEMA_VERSION`) |
+| Schema cursor | `PRAGMA user_version`; current value 20 (`SCHEMA_VERSION` 20, `schema::LATEST` = `SCHEMA_VERSION`) |
 | References | none: toasty emits no SQL `REFERENCES`, so the arrows in the entity map are ownership, not constraints |
 
 ## Table inventory
@@ -151,6 +151,7 @@ erDiagram
     routing_rules {
         TEXT id PK
         TEXT group_id "NULL = global"
+        TEXT ruleset "cn|ir|ru; NULL = pre-ruleset row"
         INTEGER type "opaque"
         TEXT domain_matcher
         TEXT domains "JSON array"
@@ -451,10 +452,10 @@ flowchart TD
     E -- yes --> F[delete the file and sidecars, rebuild]
     E -- no --> G[schema::migrate]
     F --> G
-    G --> H{"cursor vs LATEST (19)"}
-    H -- "== 19" --> J["ensure idempotent raw DDL<br/>+ day-one stability seed (once, stamped)"]
-    H -- "== 0" --> I["push_schema + raw DDL, stamp the seed,<br/>set cursor 19"]
-    H -- "0 < cursor < 19" --> S["apply the pending steps in one transaction, advance cursor"]
+    G --> H{"cursor vs LATEST (20)"}
+    H -- "== 20" --> J["ensure idempotent raw DDL<br/>+ day-one stability seed (once, stamped)"]
+    H -- "== 0" --> I["push_schema + raw DDL, stamp the seed,<br/>set cursor 20"]
+    H -- "0 < cursor < 20" --> S["apply the pending steps in one transaction, advance cursor"]
     H -- unknown --> W["IncompatibleSchema: wipe and rebuild"]
     I --> K[pragmas: journal_mode, busy_timeout, synchronous, foreign_keys]
     J --> K
@@ -593,7 +594,7 @@ flowchart LR
    produces, and bump `SCHEMA_VERSION` in `database.rs`; `schema::LATEST` is
    defined as `SCHEMA_VERSION`, and a test pins that they agree. The step and the
    cursor advance in ONE transaction, so a kill cannot leave a half-migrated
-   file. The cursor currently reads 19, so the next version is 20.
+   file. The cursor currently reads 20, so the next version is 21.
 3. **Leave identity alone.** If the change touches any field a protocol's
    `write_identity` writes, bump `IDENTITY_VERSION` in `leas-proto` and re-pin
    the identity goldens, but do not bump `SCHEMA_VERSION`: the schema did not

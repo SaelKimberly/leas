@@ -393,9 +393,14 @@ pub async fn reload_groups(state: &mut AppState) {
 
 pub async fn reload_routing_rules(state: &mut AppState) {
     match state.db.get_all_routing_rules().await {
-        Ok(rules) => state.routing_rules = rules,
+        Ok(rules) => {
+            state.routing_rules = rules;
+            state.routing_rules_load_failed = false;
+        }
         Err(error) => {
-            // A transient read error must not wipe routing (fail closed).
+            // A transient read error must not wipe routing (fail closed), and
+            // must not switch the effective ruleset to the shipped table.
+            state.routing_rules_load_failed = true;
             tracing::warn!(
                 target: "tui::ops::profiles",
                 "routing rules unavailable; keeping the previous snapshot: {error}"

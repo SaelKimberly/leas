@@ -32,6 +32,8 @@ pub struct EngineSlot {
     pub error: Option<String>,
     /// Snapshot id of the inputs this engine was built from.
     pub generation: u64,
+    /// Category inventory of the datasets the last successful build used.
+    pub inventory: Option<GeoInventory>,
 }
 
 /// Shared handle to the routing engine.
@@ -132,7 +134,7 @@ impl RouteInputs {
             cell: Arc::clone(&state.routing_engine),
             lock: Arc::clone(&state.routing_rebuild),
             cfg: state.config.clone(),
-            rules: state.routing_rules.clone(),
+            rules: state.active_rules(),
             geo_ip: state.geo_ip.clone(),
             dns: state.dns_resolver.clone(),
             dir: config_dir(),
@@ -151,7 +153,7 @@ impl RouteInputs {
 pub async fn rebuild(inputs: &RouteInputs, force_refresh: bool) {
     let _guard = inputs.lock.lock().await;
     match compile_routing_engine(inputs, force_refresh).await {
-        Ok(engine) => {
+        Ok((engine, inventory)) => {
             // An out-of-order older rebuild must not resurrect old rules.
             if inputs.generation < inputs.cell.read().generation {
                 tracing::debug!(
@@ -166,6 +168,7 @@ pub async fn rebuild(inputs: &RouteInputs, force_refresh: bool) {
                 engine: Some(engine),
                 error: None,
                 generation: inputs.generation,
+                inventory: Some(inventory),
             };
             tracing::info!(
                 target: "tui::ops::geodata",
@@ -182,6 +185,7 @@ pub async fn rebuild(inputs: &RouteInputs, force_refresh: bool) {
                 engine: None,
                 error: Some(message.clone()),
                 generation: inputs.generation,
+                inventory: None,
             };
             tracing::error!(
                 target: "tui::ops::geodata",
@@ -246,7 +250,13 @@ pub fn spawn_auto_update(
             }
             let mut inputs = inputs.clone();
             match db.get_all_routing_rules().await {
-                Ok(rules) => inputs.rules = rules,
+                // One predicate with the interactive rebuild: the auto-update
+                // must not recompile another country's rules, and in `default`
+                // mode it must not read the DB rows at all.
+                Ok(rules) => {
+                    inputs.rules =
+                        crate::ops::routing_defaults::effective_rules(&inputs.cfg, &rules);
+                }
                 Err(error) => {
                     tracing::warn!(
                         target: "tui::ops::geodata",
@@ -259,17 +269,83 @@ pub fn spawn_auto_update(
     });
 }
 
+/// The category inventory of the compiled datasets.
+///
+/// The pane marks a rule whose codes the active dataset cannot serve, and the
+/// build skips exactly those rows instead of failing the whole engine.
+#[derive(Debug, Clone, Default)]
+pub struct GeoInventory {
+    /// `geosite.dat` category codes (lowercased by the loader).
+    pub geosite: std::collections::HashSet<String>,
+    /// `geoip.dat` category codes (lowercased by the loader).
+    pub geoip: std::collections::HashSet<String>,
+    /// A `GeoLite2` country database is attached, so a two-letter `geoip:<cc>`
+    /// code is servable even when the dataset lacks it.
+    pub mmdb: bool,
+}
+
+/// Why `rule` cannot be served by the active datasets, if it cannot.
+///
+/// Mirrors the engine's resolution rules: `geosite:<code>` needs a dataset
+/// category, `geoip:private` is the built-in range set, and a two-letter
+/// `geoip:<cc>` may resolve through the `GeoLite2` fallback.
+#[must_use]
+pub fn incompatibility(rule: &RoutingRule, inventory: &GeoInventory) -> Option<String> {
+    for domain in &rule.domains {
+        let Some(code) = domain.strip_prefix("geosite:") else {
+            continue;
+        };
+        let code = code.trim_start_matches('!');
+        // `load_geosite` rejects an empty attribute, which fails the WHOLE
+        // engine build; the gate must catch it first, or one trailing `@`
+        // defeats the gate it exists to provide.
+        if code.split('@').skip(1).any(|attr| attr.trim().is_empty()) {
+            return Some(format!("geosite:{code} has an empty attribute"));
+        }
+        let code = code
+            .split('@')
+            .next()
+            .unwrap_or(code)
+            .trim()
+            .to_ascii_lowercase();
+        if code.is_empty() {
+            return Some("empty geosite code".to_string());
+        }
+        if !inventory.geosite.contains(&code) {
+            return Some(format!("geosite:{code} is not in the selected dataset"));
+        }
+    }
+    for ip in &rule.ips {
+        let rest = ip.trim_start_matches('!');
+        let Some(code) = rest.strip_prefix("geoip:") else {
+            continue;
+        };
+        let code = code.trim_start_matches('!').trim().to_ascii_lowercase();
+        // An empty code is dropped by the compiler (with a warning), so it
+        // must not disable the row's other, servable conditions.
+        if code.is_empty() || code == "private" {
+            continue;
+        }
+        let country_ok =
+            inventory.mmdb && code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic());
+        if !country_ok && !inventory.geoip.contains(&code) {
+            return Some(format!("geoip:{code} is not in the selected dataset"));
+        }
+    }
+    None
+}
+
 async fn compile_routing_engine(
     inputs: &RouteInputs,
     force_refresh: bool,
-) -> anyhow::Result<Arc<Engine>> {
+) -> anyhow::Result<(Arc<Engine>, GeoInventory)> {
     let needs = scan_rules(&inputs.rules);
     let mut source = GeoSource::default();
 
     if needs.geosite {
         let path = inputs.dir.join("geosite.dat");
         ensure_download(
-            &inputs.cfg.geo.geosite_url,
+            inputs.cfg.geo.dataset.geosite_url(),
             &path,
             force_refresh,
             leas_geoip::MAX_GEO_DAT_BYTES,
@@ -280,27 +356,42 @@ async fn compile_routing_engine(
     }
 
     if needs.geoip {
-        match inputs.cfg.geo.geoip_mode {
-            GeoIpMode::Dat => {
-                let path = inputs.dir.join("geoip.dat");
-                ensure_download(
-                    &inputs.cfg.geo.geoip_url,
-                    &path,
-                    force_refresh,
-                    leas_geoip::MAX_GEO_DAT_BYTES,
-                    |tmp| leas_geoip::geodata::validate(tmp).map(drop),
-                )
-                .await?;
-                source.geoip = Some(path);
-            }
-            GeoIpMode::Mmdb => {
-                let db = inputs
-                    .geo_ip
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("geoip_mode=mmdb needs the GeoLite2 database handle"))?;
+        if inputs.cfg.geo.geoip_mode == GeoIpMode::Dat {
+            let path = inputs.dir.join("geoip.dat");
+            ensure_download(
+                inputs.cfg.geo.dataset.geoip_url(),
+                &path,
+                force_refresh,
+                leas_geoip::MAX_GEO_DAT_BYTES,
+                |tmp| leas_geoip::geodata::validate(tmp).map(drop),
+            )
+            .await?;
+            source.geoip = Some(path);
+        }
+        // The mmdb is attached in BOTH modes: it is the per-token fallback for
+        // `geoip:<cc>` codes the selected dataset does not carry (RoscomVPN's
+        // geoip ships only `direct`/`private`/`whitelist`).
+        //
+        // In `dat` mode it is OPTIONAL — `ensure_loaded` downloads a ~70 MB
+        // artifact, and a dat-only install must not lose routing because that
+        // fetch failed. Only `mmdb` mode, which has no dat, treats it as
+        // required.
+        match &inputs.geo_ip {
+            Some(db) if inputs.cfg.geo.geoip_mode == GeoIpMode::Mmdb => {
                 db.ensure_loaded().await.context("GeoLite2 database")?;
                 source.country = Some(Arc::clone(db) as Arc<dyn CountryLookup>);
             }
+            Some(db) => match db.ensure_loaded().await {
+                Ok(()) => source.country = Some(Arc::clone(db) as Arc<dyn CountryLookup>),
+                Err(error) => tracing::warn!(
+                    target: "tui::ops::geodata",
+                    "GeoLite2 fallback unavailable ({error:#}); geoip.dat only"
+                ),
+            },
+            None if inputs.cfg.geo.geoip_mode == GeoIpMode::Mmdb => {
+                anyhow::bail!("geoip_mode=mmdb needs the GeoLite2 database handle");
+            }
+            None => {}
         }
     }
 
@@ -323,8 +414,35 @@ async fn compile_routing_engine(
         source.rule_sets.insert(file.clone(), PathBuf::from(file));
     }
 
+    let inventory = GeoInventory {
+        geosite: source
+            .geosite
+            .as_ref()
+            .map(|path| leas_geoip::geodata::validate(path))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        geoip: source
+            .geoip
+            .as_ref()
+            .map(|path| leas_geoip::geodata::validate(path))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        mmdb: source.country.is_some(),
+    };
+
     let mut compiled = Vec::with_capacity(inputs.rules.len());
     for (index, row) in inputs.rules.iter().enumerate() {
+        if let Some(reason) = incompatibility(row, &inventory) {
+            tracing::warn!(
+                target: "tui::ops::geodata",
+                "routing rule {index} disabled: {reason}"
+            );
+            continue;
+        }
         for warning in crate::route_compile::warnings_from_row(row) {
             tracing::warn!(
                 target: "tui::ops::geodata",
@@ -359,7 +477,7 @@ async fn compile_routing_engine(
     } else {
         engine
     };
-    Ok(Arc::new(engine))
+    Ok((Arc::new(engine), inventory))
 }
 
 async fn ensure_download<F>(
@@ -407,6 +525,7 @@ mod tests {
         RoutingRule {
             id: "r".into(),
             group_id: None,
+            ruleset: None,
             r#type: 0,
             domain_matcher: None,
             domains: Vec::new(),
@@ -423,6 +542,55 @@ mod tests {
             rule_set_url: None,
             sort_order: None,
         }
+    }
+
+    /// The pane's disabled state and the build's skip use one predicate: a
+    /// code the datasets cannot serve, `geoip:private`'s built-in exemption,
+    /// and the `GeoLite2` fallback for two-letter country codes.
+    #[test]
+    fn inventory_marks_only_unsourceable_codes() {
+        let mut inventory = GeoInventory::default();
+        inventory.geosite.insert("category-ru".into());
+        inventory.geoip.insert("direct".into());
+        inventory.mmdb = true;
+
+        let with = |domains: &[&str], ips: &[&str]| {
+            let mut rule = row();
+            rule.domains = domains.iter().map(|d| (*d).to_string()).collect();
+            rule.ips = ips.iter().map(|i| (*i).to_string()).collect();
+            rule
+        };
+
+        assert!(incompatibility(&with(&["geosite:category-ru"], &[]), &inventory).is_none());
+        assert!(
+            incompatibility(&with(&["geosite: category-ru"], &[]), &inventory).is_none(),
+            "the loader trims the code"
+        );
+        assert!(
+            incompatibility(&with(&["geosite:category-ru@"], &[]), &inventory).is_some(),
+            "an empty attribute fails the whole build, so the gate must catch it"
+        );
+        assert!(incompatibility(&with(&["geosite:whitelist"], &[]), &inventory).is_some());
+        assert!(
+            incompatibility(&with(&["geosite:!category-ru"], &[]), &inventory).is_none(),
+            "a reverse token names the same category"
+        );
+        assert!(incompatibility(&with(&[], &["geoip:direct"]), &inventory).is_none());
+        assert!(
+            incompatibility(&with(&[], &["geoip:ru"]), &inventory).is_none(),
+            "a country code may resolve through the mmdb"
+        );
+        assert!(incompatibility(&with(&[], &["geoip:private"]), &inventory).is_none());
+
+        inventory.mmdb = false;
+        assert!(
+            incompatibility(&with(&[], &["geoip:ru"]), &inventory).is_some(),
+            "without the mmdb a dat-missing country code is not servable"
+        );
+        assert!(
+            incompatibility(&with(&[], &["geoip:direct"]), &inventory).is_none(),
+            "a dat category stays servable"
+        );
     }
 
     #[test]
@@ -578,6 +746,7 @@ mod real_engine_tests {
         RoutingRule {
             id: "r".into(),
             group_id: None,
+            ruleset: None,
             r#type: 0,
             domain_matcher: None,
             domains,
@@ -633,16 +802,18 @@ mod real_engine_tests {
             "direct",
         )];
         rebuild(&typo, false).await;
-        let error = {
+        let engine = {
             let slot = typo.cell.read();
-            assert!(slot.engine.is_none());
-            slot.error.clone()
+            slot.engine.clone().unwrap_or_else(|| {
+                panic!(
+                    "the incompatible row must be skipped, not fatal: {:?}",
+                    slot.error
+                )
+            })
         };
         assert!(
-            error
-                .as_deref()
-                .is_some_and(|e| e.contains("not-a-real-code")),
-            "{error:?}"
+            !routed(&engine, "www.baidu.com", "direct"),
+            "a row naming an absent category is skipped"
         );
     }
 }

@@ -309,6 +309,10 @@ pub struct AppState {
     pub current_memory: u64,
     pub term_height: Cell<u16>,
     pub routing_rules: Vec<RoutingRule>,
+    /// The last `reload_routing_rules` hit a read error (the snapshot is the
+    /// previous one). Pins the ruleset to `custom` so a failed read cannot
+    /// substitute the shipped table.
+    pub routing_rules_load_failed: bool,
     /// Shared compiled routing engine (native connects + subscription fetches).
     pub routing_engine: crate::ops::geodata::EngineCell,
     /// Serializes routing-engine rebuilds (downloads + swap).
@@ -844,6 +848,7 @@ impl AppState {
             current_traffic_down: 0,
             current_memory: 0,
             routing_rules: Vec::new(),
+            routing_rules_load_failed: false,
             routing_engine: crate::ops::geodata::new_cell(),
             routing_rebuild: Arc::new(tokio::sync::Mutex::new(())),
             routing_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -988,6 +993,34 @@ impl AppState {
     }
     pub async fn reload_routing_rules(&mut self) {
         profiles::reload_routing_rules(self).await;
+    }
+
+    /// The ruleset mode in effect: the explicit choice, or `custom` when the
+    /// database already holds rows (a config written before the ruleset model
+    /// must not silently start ignoring them).
+    #[must_use]
+    pub fn ruleset_mode(&self) -> leas_config::RulesetMode {
+        match self.config.geo.ruleset {
+            // An explicit choice needs no database row: a failed read must
+            // never override it.
+            Some(mode) => mode,
+            // Derived mode: a failed read keeps the previous snapshot (fail
+            // closed) instead of substituting the shipped table.
+            None if self.routing_rules_load_failed => leas_config::RulesetMode::Custom,
+            None => crate::ops::routing_defaults::effective_mode(&self.config, &self.routing_rules),
+        }
+    }
+
+    /// The rows the engine and the Routing pane use: the active country's
+    /// shipped default table, or its custom rows (`ruleset` NULL counts as
+    /// custom, so pre-ruleset rows stay reachable).
+    #[must_use]
+    pub fn active_rules(&self) -> Vec<leas_db::models::RoutingRule> {
+        crate::ops::routing_defaults::effective_rules_for(
+            &self.config,
+            &self.routing_rules,
+            self.ruleset_mode(),
+        )
     }
 
     /// Spawns a background rebuild of the shared routing engine from the

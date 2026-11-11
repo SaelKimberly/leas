@@ -99,7 +99,11 @@ use rapidhash::{HashMapExt as _, RapidHashMap};
 // was DROPPED — a row's provenance is now carried by which delay column is
 // populated. This is the crate's FIRST real migration step: a version-18
 // database migrates in place, and only an unknown cursor still wipes.
-pub const SCHEMA_VERSION: i64 = 19;
+//
+// 20 = `routing_rules.ruleset` (country ruleset, spec
+// `2026-11-11-country-rulesets-design` D3): nullable, so a pre-ruleset row
+// stays readable and is treated as custom under every country.
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
 /// geo step wrote (`None` until it does).

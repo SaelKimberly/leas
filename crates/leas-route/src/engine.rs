@@ -89,38 +89,48 @@ impl CompiledDomainItem {
 enum GeoMatcher {
     /// No geo condition.
     None,
-    /// `geoip.dat`: positive CIDR sets plus reverse sets (`!code`).
-    Dat {
-        positive: CidrSet,
-        negated: Vec<CidrSet>,
+    /// One entry per positive/negated token, each resolved from the `geoip.dat`
+    /// CIDR set or — when the selected dataset does not carry that code — the
+    /// `GeoLite2` country lookup.
+    Nets {
+        db: Option<Arc<dyn CountryLookup>>,
+        positive: Vec<GeoNet>,
+        negated: Vec<GeoNet>,
     },
-    /// `GeoLite2` mmdb: country membership.
-    Mmdb {
-        db: Arc<dyn CountryLookup>,
-        positive: Vec<Arc<str>>,
-        negated: Vec<Arc<str>>,
-    },
+}
+
+/// One `geoip:` token, resolved from the dataset or the country database.
+enum GeoNet {
+    /// The token's CIDR set from `geoip.dat`; the token and record reverse
+    /// flags are already folded in.
+    Cidrs(CidrSet),
+    /// The token's country code, answered by the `GeoLite2` fallback.
+    Country(Arc<str>),
+}
+
+impl GeoNet {
+    fn matches(&self, ip: &IpAddr, db: Option<&dyn CountryLookup>) -> bool {
+        match self {
+            Self::Cidrs(set) => set.contains(ip),
+            Self::Country(code) => {
+                db.and_then(|db| db.country(*ip)).as_deref() == Some(code.as_ref())
+            }
+        }
+    }
 }
 
 impl GeoMatcher {
     fn matches(&self, ip: &IpAddr) -> bool {
         match self {
             Self::None => false,
-            Self::Dat { positive, negated } => {
-                positive.contains(ip) || negated.iter().any(|set| !set.contains(ip))
-            }
-            Self::Mmdb {
+            Self::Nets {
                 db,
                 positive,
                 negated,
             } => {
-                let country = db.country(*ip);
-                positive
-                    .iter()
-                    .any(|code| country.as_deref() == Some(code.as_ref()))
-                    || negated
-                        .iter()
-                        .any(|code| country.as_deref() != Some(code.as_ref()))
+                let db = db.as_deref();
+                positive.iter().any(|net| net.matches(ip, db))
+                    || negated.iter().any(|net| !net.matches(ip, db))
             }
         }
     }
@@ -731,6 +741,14 @@ fn geo_err(rule_index: usize, field: &'static str, message: impl Into<String>) -
     }
 }
 
+/// Whether `code` can name a country in the `GeoLite2` fallback: two ASCII
+/// letters, so a longer non-country code stays a named build error. A
+/// two-letter typo of a real code is NOT caught here — the compatibility gate
+/// marks such a row, which is the only place it can be seen.
+fn is_country_code(code: &str) -> bool {
+    code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
 fn split_reverse(raw: &str) -> (bool, &str) {
     let mut reverse = false;
     let mut rest = raw;
@@ -822,69 +840,112 @@ fn compile_geo_country(
     }
     #[cfg(feature = "geoip")]
     {
-        if let Some(path) = &geo.source.geoip {
-            let loaded = leas_geoip::geodata::load_geoip(path, tokens)
+        let db = geo.source.country.clone();
+        let mut positive = Vec::new();
+        let mut negated = Vec::new();
+        let fallback: Vec<String> = if let Some(path) = &geo.source.geoip {
+            let load = leas_geoip::geodata::load_geoip_lenient(path, tokens)
                 .map_err(|e| geo_err(idx, field, format!("{e:#}")))?;
-            let mut positive = CidrSetBuilder::default();
-            let mut negated = Vec::new();
-            for (_token, nets) in loaded {
-                let mut reverse = CidrSetBuilder::default();
-                let mut has_reverse = false;
+            for (_raw, nets) in load.loaded {
+                let mut pos = CidrSetBuilder::default();
+                let mut neg = CidrSetBuilder::default();
+                let mut has_pos = false;
+                let mut has_neg = false;
                 for net in nets {
                     let cidr = crate::addr::Cidr {
                         addr: net.addr,
                         bits: net.prefix,
                     };
                     if net.reverse {
-                        has_reverse = true;
-                        reverse.insert(cidr).map_err(|e| reindex(e, idx))?;
+                        has_neg = true;
+                        neg.insert(cidr).map_err(|e| reindex(e, idx))?;
                     } else {
-                        positive.insert(cidr).map_err(|e| reindex(e, idx))?;
+                        has_pos = true;
+                        pos.insert(cidr).map_err(|e| reindex(e, idx))?;
                     }
                 }
-                if has_reverse {
-                    negated.push(reverse.build());
+                if has_pos {
+                    positive.push(GeoNet::Cidrs(pos.build()));
+                }
+                if has_neg {
+                    negated.push(GeoNet::Cidrs(neg.build()));
                 }
             }
-            return Ok(GeoMatcher::Dat {
-                positive: positive.build(),
-                negated,
-            });
-        }
-        if let Some(db) = &geo.source.country {
-            let mut positive = Vec::new();
-            let mut negated = Vec::new();
+            // Codes the dataset does not carry are the mmdb's job — but only
+            // when they can BE a country code: a typo must stay a named build
+            // error instead of a rule that silently never matches.
+            if let Some(missing) = load
+                .missing
+                .iter()
+                .find(|code| db.is_none() || !is_country_code(code))
+            {
+                return Err(geo_err(
+                    idx,
+                    field,
+                    format!("{}: no geoip category {:?}", path.display(), missing),
+                ));
+            }
+            load.missing
+        } else if db.is_none() {
+            return Err(geo_err(
+                idx,
+                field,
+                format!(
+                    "geoip:{} needs geoip.dat or a loaded GeoLite2 database (geoip_mode)",
+                    tokens.join(",")
+                ),
+            ));
+        } else {
+            // No dataset: every token must be a code the mmdb can answer, or
+            // the build fails instead of leaving a matcher that never matches.
             for token in tokens {
-                let (reverse, code) = split_reverse(token);
-                let code = code.trim();
-                if code.is_empty() {
+                let code = split_reverse(token.trim()).1.trim().to_ascii_lowercase();
+                if !is_country_code(&code) {
                     return Err(geo_err(
                         idx,
                         field,
-                        format!("empty geo code in token {token:?}"),
+                        format!("geoip:{code} is not an ISO-3166 alpha-2 country code"),
                     ));
                 }
-                let code: Arc<str> = Arc::from(code.to_ascii_lowercase());
-                if reverse {
-                    negated.push(code);
-                } else {
-                    positive.push(code);
-                }
             }
-            return Ok(GeoMatcher::Mmdb {
-                db: Arc::clone(db),
+            tokens
+                .iter()
+                .map(|token| split_reverse(token.trim()).1.trim().to_ascii_lowercase())
+                .collect()
+        };
+
+        let Some(db) = db else {
+            return Ok(GeoMatcher::Nets {
+                db: None,
                 positive,
                 negated,
             });
+        };
+        for token in tokens {
+            let (reverse, rest) = split_reverse(token.trim());
+            let code = rest.trim().to_ascii_lowercase();
+            if !fallback.iter().any(|missing| missing == &code) {
+                continue;
+            }
+            if code.is_empty() {
+                return Err(geo_err(
+                    idx,
+                    field,
+                    format!("empty geo code in token {token:?}"),
+                ));
+            }
+            let code: Arc<str> = Arc::from(code);
+            if reverse {
+                negated.push(GeoNet::Country(code));
+            } else {
+                positive.push(GeoNet::Country(code));
+            }
         }
-        Err(geo_err(
-            idx,
-            field,
-            format!(
-                "geoip:{} needs geoip.dat or a loaded GeoLite2 database (geoip_mode)",
-                tokens.join(",")
-            ),
-        ))
+        Ok(GeoMatcher::Nets {
+            db: Some(db),
+            positive,
+            negated,
+        })
     }
     #[cfg(not(feature = "geoip"))]
     {
@@ -2172,6 +2233,189 @@ mod geo_tests {
         assert!(routed(&engine.decide(&meta("1.2.3.4", 80)), "cn"));
         assert!(routed(&engine.decide(&meta("8.8.8.8", 80)), "not-cn"));
         assert!(!routed(&engine.decide(&meta("1.2.3.4", 80)), "not-cn"));
+    }
+
+    /// Without a dataset, every token must be a country code the mmdb can
+    /// answer; a category name cannot silently become a never-matching rule.
+    #[test]
+    fn the_mmdb_only_path_rejects_a_non_country_code() {
+        let mut countries = HashMap::new();
+        countries.insert("8.8.8.8".parse::<IpAddr>().unwrap(), Arc::<str>::from("ru"));
+        let source = GeoSource {
+            country: Some(Arc::new(FakeCountry(countries))),
+            ..GeoSource::default()
+        };
+        let err = Engine::build_with_geo(
+            rs(vec![(
+                MatchItem::IpCidr {
+                    cidrs: vec![],
+                    private: false,
+                    geo_country: vec!["direct".into()],
+                },
+                route("x"),
+            )]),
+            &source,
+        )
+        .err()
+        .expect("a category name is not a country code");
+        assert!(
+            matches!(err, RouteError::Parse { field: "geoip", .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A `geoip:<cc>` code the selected dataset lacks resolves through the
+    /// mmdb (per-token fallback), while codes the dataset carries stay on it —
+    /// the `RoscomVPN` case, whose geoip ships no country categories.
+    #[test]
+    fn a_missing_geoip_code_falls_back_to_the_mmdb() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "geoip.dat",
+            &list(&[geoip_entry("cn", &[("1.0.1.0", 24)], false)]),
+        );
+        let mut countries = HashMap::new();
+        countries.insert("8.8.8.8".parse::<IpAddr>().unwrap(), Arc::<str>::from("ru"));
+        countries.insert("1.2.3.4".parse::<IpAddr>().unwrap(), Arc::<str>::from("us"));
+        let source = GeoSource {
+            geoip: Some(path),
+            country: Some(Arc::new(FakeCountry(countries))),
+            ..GeoSource::default()
+        };
+        let engine = Engine::build_with_geo(
+            rs(vec![
+                (
+                    MatchItem::IpCidr {
+                        cidrs: vec![],
+                        private: false,
+                        geo_country: vec!["cn".into()],
+                    },
+                    route("cn"),
+                ),
+                (
+                    MatchItem::IpCidr {
+                        cidrs: vec![],
+                        private: false,
+                        geo_country: vec!["ru".into()],
+                    },
+                    route("ru"),
+                ),
+            ]),
+            &source,
+        )
+        .unwrap();
+        assert!(
+            routed(&engine.decide(&meta("1.0.1.5", 80)), "cn"),
+            "the dataset still serves its own codes"
+        );
+        assert!(
+            routed(&engine.decide(&meta("8.8.8.8", 80)), "ru"),
+            "a code the dataset lacks is answered by the mmdb"
+        );
+
+        let reversed = Engine::build_with_geo(
+            rs(vec![(
+                MatchItem::IpCidr {
+                    cidrs: vec![],
+                    private: false,
+                    geo_country: vec!["!ru".into()],
+                },
+                route("not-ru"),
+            )]),
+            &source,
+        )
+        .unwrap();
+        assert!(routed(&reversed.decide(&meta("1.2.3.4", 80)), "not-ru"));
+        assert!(
+            !routed(&reversed.decide(&meta("8.8.8.8", 80)), "not-ru"),
+            "a reverse token keeps its polarity through the fallback"
+        );
+
+        // One item, one token served by the dataset and one by the mmdb: the
+        // split must happen per token, not per item (the strict loader failed
+        // the whole item before).
+        let mixed = Engine::build_with_geo(
+            rs(vec![(
+                MatchItem::IpCidr {
+                    cidrs: vec![],
+                    private: false,
+                    geo_country: vec!["cn".into(), "ru".into()],
+                },
+                route("mixed"),
+            )]),
+            &source,
+        )
+        .unwrap();
+        assert!(routed(&mixed.decide(&meta("1.0.1.5", 80)), "mixed"));
+        assert!(routed(&mixed.decide(&meta("8.8.8.8", 80)), "mixed"));
+        assert!(!routed(&mixed.decide(&meta("9.9.9.9", 80)), "mixed"));
+
+        // A dataset path that cannot be read is not silently replaced by the
+        // mmdb: the download owning that path must fail first, loudly.
+        let broken = GeoSource {
+            geoip: Some(dir.path().join("absent.dat")),
+            country: Some(Arc::new(FakeCountry(HashMap::new()))),
+            ..GeoSource::default()
+        };
+        assert!(
+            Engine::build_with_geo(
+                rs(vec![(
+                    MatchItem::IpCidr {
+                        cidrs: vec![],
+                        private: false,
+                        geo_country: vec!["cn".into()],
+                    },
+                    route("x"),
+                )]),
+                &broken,
+            )
+            .is_err(),
+            "an unreadable dataset must fail, not fall back"
+        );
+
+        // A token with leading whitespace before `!` still resolves through
+        // the fallback (the dat loader trims, so this loop must too).
+        let spaced = Engine::build_with_geo(
+            rs(vec![(
+                MatchItem::IpCidr {
+                    cidrs: vec![],
+                    private: false,
+                    geo_country: vec![" !ru".into()],
+                },
+                route("not-ru-spaced"),
+            )]),
+            &source,
+        )
+        .unwrap();
+        assert!(routed(
+            &spaced.decide(&meta("1.2.3.4", 80)),
+            "not-ru-spaced"
+        ));
+        assert!(!routed(
+            &spaced.decide(&meta("8.8.8.8", 80)),
+            "not-ru-spaced"
+        ));
+
+        // A typo cannot be a country code, so it stays a named build error
+        // even with the mmdb attached.
+        let err = Engine::build_with_geo(
+            rs(vec![(
+                MatchItem::IpCidr {
+                    cidrs: vec![],
+                    private: false,
+                    geo_country: vec!["whitelst".into()],
+                },
+                route("x"),
+            )]),
+            &source,
+        )
+        .err()
+        .expect("a non-country code must not fall back");
+        assert!(
+            matches!(err, RouteError::Parse { field: "geoip", .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

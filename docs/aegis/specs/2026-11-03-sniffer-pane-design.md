@@ -46,7 +46,7 @@ One bucket over two event classes, split in the summary line:
 - UDP datagrams dropped at any branch (`malformed`, `fragmented`, `Reject`, `HijackDns`, proxy byte cap, queue full, proxy leg gone, unresolvable destination, carrier refusal, direct send error) — counted with payload bytes.
 - TCP legs that failed or were refused — counted as events; bytes exist only when the leg relayed first.
 
-Host attribution uses the request destination. A failure that never yielded a destination lands in a `(unknown)` row and never contributes bytes.
+Host attribution uses the request destination. A failure that never yielded a destination has no host to attribute: it increments the session `failed` total (the pane header and the trace log keep the reason) and creates **no** host row — there is no `(unknown)` row.
 
 ### D4 — Live bytes come from an open-leg registry
 
@@ -70,7 +70,7 @@ The summary is textual: current rates, session totals, host count, failures, dro
 
 ### D9 — Table: fixed columns, fixed order
 
-`host · ↓ bytes · ↑ bytes · conns · failed`, sorted by `up + down` descending. No sort keys, no row selection.
+`host · via · ↓ bytes · ↑ bytes · conns · failed`, sorted by `up + down` descending. No sort keys, no row selection. `via` is one cell in a width-3 column (header `via`), centered.
 
 ### D10 — Sampler ownership: the native session pushes
 
@@ -100,18 +100,37 @@ Per the user directive, avoid avoidable allocations:
 
 `compact_str` and `smallvec` are added as explicit dependencies (`smallvec` already workspace-declared; `compact_str` is already in the lock). Host, open-leg, and pending maps use `rapidhash::RapidHashMap` (the fast hasher the workspace already pins) so the per-datagram lookup pays a cheap hash. No allocation is introduced on the TCP relay hot path — the registry insert happens once per leg. Promoting `compact_str` to a direct dependency changes `Cargo.lock` inputs, so `leas-hakari` is regenerated (`cargo hakari`) in the same change.
 
+### D14 — Per-host outbound marker (`via`)
+
+The route's chosen outbound is recorded per host and rendered as one glyph:
+
+| tag | glyph | style | meaning |
+|---|---|---|---|
+| `direct` | `→` | `hint` | the route chose the direct outbound |
+| `proxy` | `⇄` | `container_title` | the route chose the proxy outbound |
+| `block` | `⊘` | `error` | the route chose the block outbound |
+| none | blank | — | routing named no outbound (`Reject`, `HijackDns`, `NoOutbound`) |
+
+Semantics:
+
+- The marker is the outbound the **route chose**, not where bytes landed: a failed dial still shows its tag; a `Block` row exists only because of the refusal, and carries `failed += 1` with zero bytes.
+- **Last-wins, written at leg open only.** `guard()`, `failed()`, and `udp_conn()` set the tag; the close fold and `snapshot()` never do. A stale leg closing cannot rewrite the marker, so the glyph is stable between opens (no 1 Hz flicker).
+- One host may legitimately take both `direct` and `proxy` legs: `IfNonMatch` resolves a domain mid-decision and IP rules can split a multi-answer name, with the engine's 300 s resolve cache bounding the change. The aggregated row then shows the most recent leg's tag. Not normalized: the pane reports the route.
+- `udp_conn` is deduped per association, so an association's tag is fixed at its first datagram to the host.
+
 ## 4. Native data model — `telemetry.rs`
 
 ```rust
 struct HostRow {
-    host: CompactString, // also the map key
     up: u64,
     down: u64,
     conns: u64,
     failed: u64,
-    last: Instant,       // LRU eviction key
+    outbound: Option<CompactString>, // last-wins tag, set at leg open
+    last_seq: u64,       // LRU eviction key: a monotonic activity counter
 }
-type HostTable = HashMap<CompactString, HostRow>; // cap 1000, LRU by `last`
+// The host string is the map KEY (no copy in the row); the live table is
+// `parking_lot::Mutex<RapidHashMap<CompactString, HostRow>>`, cap 1000, LRU by `last_seq`.
 
 struct OpenLeg {
     host: CompactString,
@@ -125,6 +144,7 @@ pub struct HostStat {
     pub down: u64,
     pub conns: u64,
     pub failed: u64,
+    pub outbound: Option<CompactString>,
 }
 
 pub struct SnifferSnapshot {
@@ -137,9 +157,11 @@ pub struct SnifferSnapshot {
 
 - `Telemetry` gains `hosts: Arc<parking_lot::Mutex<HostTable>>` and `open: Arc<parking_lot::Mutex<HashMap<u64, OpenLeg>>>`; both are `Arc` so the cloned `Telemetry` handles share them.
 - `opened()` derives the host key from `dest` (strip `:port`, unbracket IPv6) and records it as `pending[conn_id]`; it cannot register the leg yet because the atomics do not exist at emit time.
-- `guard(conn_id, up, down)` moves `pending[conn_id]` into `open` with those atomics (`(unknown)` if the pending row is missing). `TraceGuard::emit()` folds `up`/`down` into the host row, increments `conns`, and removes the open leg before emitting `Closed`.
-- UDP never enters `open` (its bytes are live in the host table by construction). Four methods keep the association off the registry: `udp_sent(host, bytes)`, `udp_received(host, bytes)`, `udp_dropped(host: Option<&str>, bytes)`, `udp_conn(host)` — each one map lookup, no allocation unless the host is new.
-- `snapshot()` walks the table and the open map once, merges open bytes, sorts, and returns.
+- `guard(conn_id, up, down, outbound)` moves `pending[conn_id]` into `open` with those atomics and stamps the row's marker. A missing pending row falls back to the `(unknown)` host; that fallback exists so an accounting bug cannot lose the leg, and is unreachable from the single `opened` → `guard` pair in the inbound.
+- `failed(dest, reason, outbound)` bumps the host row and `failed_total`; with `dest == UNKNOWN_HOST` it bumps **only** `failed_total` and creates no row (D3). `TraceGuard::emit()` folds `up`/`down` into the host row, increments `conns`, and removes the open leg before emitting `Closed`.
+- UDP never enters `open` (its bytes are live in the host table by construction). Four methods keep the association off the registry: `udp_sent(host, bytes)`, `udp_received(host, bytes)`, `udp_dropped(host: Option<&str>, bytes)`, `udp_conn(host, outbound)` — each one map lookup, no allocation unless the host is new.
+- `snapshot()` walks the table and the open map once, merges open bytes, sorts, and returns. A live-only host (its row was evicted) is restored with `outbound: None`.
+- `outbound` values crossing the seam are the three route tags (`direct`/`block`/`proxy`, from `leas_route::ir`); the pane maps exactly those and blanks anything else, so a future tag would render as "no outbound" rather than an unrecognised glyph.
 - `NativeActivityLog`, `TraceOpened`, `TraceClosed`, and the 3 s traffic poller are unchanged.
 
 ## 5. Failure tracing
@@ -160,7 +182,7 @@ pub struct TraceFailed {
 }
 ```
 
-Emitted through one helper, `TraceCtx::failed(kind, host, reason)`, from every pre-relay exit in `handle_connect`, the HTTP CONNECT handler, and the UDP forwarding branches. `TraceEvent::Failed` increments `HostRow.failed` and the snapshot's `failed` total; it never touches byte totals.
+Emitted through one helper, `TraceCtx::failed(dest, reason, outbound)`, from every pre-relay exit in `handle_connect`, the HTTP CONNECT handler, and the UDP forwarding branches. `TraceEvent::Failed` always increments the snapshot's `failed` total; it increments `HostRow.failed` only when a destination parsed (D3), never creates an `(unknown)` row, and never touches byte totals.
 
 ## 6. UDP accounting
 
@@ -208,7 +230,7 @@ No persistence, no schema change, no per-host history, no port dimension, no uni
 | id | observable |
 |---|---|
 | A1 | With a native session connected, proxying a TCP request to `example.com:443` shows one `example.com` row whose ↓/↑ grow while the transfer runs. |
-| A2 | A blocked destination produces a `failed += 1` (and a `(unknown)` row only when no destination parsed); no byte total changes. |
+| A2 | A blocked destination produces a `failed += 1` on that host's row with `via` showing `⊘`; no byte total changes. A failure that parsed no destination increments only the session `failed` total and adds no row. |
 | A3 | A UDP association carrying DNS/QUIC shows the destination host with accumulated up/down bytes and exactly one connection increment per association. |
 | A4 | A dropped datagram (proxy queue cap or unresolvable destination) increments `dropped_datagrams`/`dropped_bytes` and no host byte total. |
 | A5 | The two sparklines move within ~1 s of traffic starting and share one scale; a small non-zero uplink still renders. |
@@ -217,12 +239,13 @@ No persistence, no schema change, no per-host history, no port dimension, no uni
 | A8 | With an xray/sing-box session, the tab shows the empty-state hint. |
 | A9 | The pane is allocation-free per snapshot for ≤16 hosts (verified by a counting-allocator test in `leas-native`). |
 | A10 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo nextest run --workspace` green. |
+| A11 | A proxied host shows `⇄`, a direct-routed host `→`, a blocked host `⊘`, and a `Reject`ed host stays blank in `via`; the marker does not change when a leg closes. |
 
 ## 12. Testing
 
-`leas-native` (unit): open-leg fold with no double count; snapshot sums live bytes mid-leg; failure emission per pre-relay branch; UDP up/down/drop counters; unknown-destination row; 1000-row LRU eviction; association `conns` dedupe; `SmallVec`/`CompactString` snapshot allocation count.
+`leas-native` (unit): open-leg fold with no double count; snapshot sums live bytes mid-leg; failure emission per pre-relay branch; UDP up/down/drop counters; unattributable failure creates no row (total only); marker set at open, last-wins across legs, untouched by the close fold; blocked failure tagged `block` with zero bytes; 1000-row LRU eviction; association `conns` dedupe; `SmallVec`/`CompactString` snapshot allocation count.
 
-`leas` (unit): tab cycle; `record()` rate math and the 60-sample ring; sort order; reset/freeze lifecycle; empty state; `CoreEvent::SnifferSample` handling.
+`leas` (unit): tab cycle; `record()` rate math and the 60-sample ring; sort order; reset/freeze lifecycle; empty state; `CoreEvent::SnifferSample` handling; `via` renders `→`/`⇄`/`⊘` per tag.
 
 Smoke (manual, before completion): run the app against a native profile, drive a TCP download and a UDP DNS lookup through the mixed port, observe rows, rates, failures, and the frozen post-disconnect table.
 

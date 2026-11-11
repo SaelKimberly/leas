@@ -388,6 +388,9 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     // The feed ceilings are configuration, not constants baked into the import
     // path (`specs/2026-10-02-import-budget-design.md`).
     let budget = state.config.import;
+    // The exclusive ruleset, not the raw table: the fetch's route gate must
+    // agree with the engine the connection uses.
+    let rules = state.active_rules();
     tokio::spawn(async move {
         update_one_group(
             url,
@@ -398,6 +401,7 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
             budget,
             live_proxy,
             routing_engine,
+            rules,
             tx,
         )
         .await;
@@ -420,6 +424,7 @@ async fn update_one_group(
     import_budget: leas_config::app_config::ImportConfig,
     live_proxy: Arc<LiveProxy>,
     engine: crate::ops::geodata::EngineCell,
+    rules: Vec<RoutingRule>,
     tx: Option<tokio::sync::mpsc::Sender<CoreEvent>>,
 ) {
     let live = live_proxy.get();
@@ -445,6 +450,7 @@ async fn update_one_group(
             import_budget,
             live,
             &engine,
+            rules,
             &flight,
         ),
     )
@@ -490,6 +496,7 @@ async fn do_update_subscription(
     budget: leas_config::app_config::ImportConfig,
     live: Option<ProxyEndpoint>,
     engine: &crate::ops::geodata::EngineCell,
+    rules: Vec<RoutingRule>,
     _flight: &InFlightGuard,
 ) -> (String, usize, ValidationSummary, Option<String>) {
     // Warn on HTTP (non-HTTPS) subscription URLs
@@ -499,20 +506,9 @@ async fn do_update_subscription(
             "Subscription URL uses HTTP, traffic is not encrypted"
         );
     }
-    let rules = if live.is_some() {
-        match db.get_all_routing_rules().await {
-            Ok(rules) => rules,
-            Err(error) => {
-                tracing::warn!(
-                    target: "tui::ops::subscriptions",
-                    "routing rules unavailable; sending the subscription fetch through the live tunnel: {error}"
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
+    // The caller passes the ACTIVE ruleset (`AppState::active_rules`); a
+    // read failure there already kept the previous snapshot.
+    let rules = if live.is_some() { rules } else { Vec::new() };
     let outcome = match plan_http_route(&url, live, &rules, engine) {
         FetchRoute::Direct => {
             tracing::info!(
@@ -782,6 +778,7 @@ pub fn update_all_subscriptions(state: &mut AppState) {
     let routing_engine = Arc::clone(&state.routing_engine);
     let validation: ValidationSettings = state.config.parsing.clone().into();
     let budget = state.config.import;
+    let rules = state.active_rules();
     for (gid, _url, _ua) in &groups {
         state.updating_groups.insert(gid.clone());
     }
@@ -797,6 +794,7 @@ pub fn update_all_subscriptions(state: &mut AppState) {
                 budget,
                 live_proxy.clone(),
                 Arc::clone(&routing_engine),
+                rules.clone(),
                 tx.clone(),
             )
             .await;
@@ -814,6 +812,9 @@ pub fn spawn_auto_update(state: &mut AppState) {
     let routing_engine = Arc::clone(&state.routing_engine);
     let validation: ValidationSettings = state.config.parsing.clone().into();
     let shutdown = state.shutdown_token.clone();
+    // Snapshot for the loop's route gate; the selection changes rarely and
+    // the gate only decides whether the fetch uses the tunnel.
+    let rules = state.active_rules();
     tokio::spawn(async move {
         // Check shutdown before first sleep
         tokio::select! {
@@ -864,6 +865,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
                     leas_config::app_config::ImportConfig::default(),
                     live_proxy.get(),
                     &routing_engine,
+                    rules.clone(),
                     &flight,
                 )
                 .await;
@@ -903,6 +905,7 @@ mod tests {
         RoutingRule {
             id: format!("rule-{outbound}"),
             group_id: None,
+            ruleset: None,
             r#type: 0,
             domain_matcher: None,
             domains: domains.iter().map(|domain| (*domain).to_owned()).collect(),
@@ -958,6 +961,7 @@ mod tests {
             engine: Some(std::sync::Arc::new(engine)),
             error: None,
             generation: 0,
+            inventory: None,
         };
         cell
     }
@@ -968,6 +972,7 @@ mod tests {
             engine: None,
             error: Some(error.to_owned()),
             generation: 0,
+            inventory: None,
         };
         cell
     }

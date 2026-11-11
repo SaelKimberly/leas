@@ -249,10 +249,13 @@ Top to bottom:
 3. **Two mirrored sparklines**: down grows downward from the top line, up grows
    upward from the bottom line, over the last 60 s. Both share one scale, so the
    directions are comparable and a non-zero sample is never invisible.
-4. **Host table**: `host · ↓ · ↑ · conns · failed`, sorted by total bytes
+4. **Host table**: `host · via · ↓ · ↑ · conns · failed`, sorted by total bytes
    descending. A host is the destination as the client sent it (domain or IP
    literal, no port); a proxied domain keeps its domain because the remote proxy
-   resolves it.
+   resolves it. `via` shows the outbound the route chose for the host's most
+   recent leg: `→` direct, `⇄` proxy, `⊘` blocked; blank when routing named no
+   outbound (`Reject`, `HijackDns`). The marker follows the route even when the
+   leg then failed.
 
 Bytes only: TCP has no packet boundary, so a packet count would mean different
 things per row. Totals are session-only and in memory; disconnecting freezes the
@@ -374,11 +377,20 @@ subscription list panes.
 
 #### Routing Rules (Settings → Routing)
 
-Two levels:
+Three levels:
 
+- **Ruleset header** (top two lines): `D` cycles the geo dataset
+  (`loyalsoldier` / `roscomvpn`, refetched on change), `C` cycles the country
+  ruleset (`ru` / `cn` / `ir`), `M` toggles `default` / `custom`. Exactly one
+  ruleset is active; other countries' custom rows stay stored. Switching to
+  `custom` with no rows for that country seeds it from the shipped table, so
+  custom starts identical to default. A rule whose `geosite:`/`geoip:` codes
+  the active dataset cannot serve renders dimmed with `off` and is skipped at
+  compile instead of failing the engine.
 - **Routing list**: `↑`/`↓` navigate, `a` adds, `e` edits, `d` deletes (no
   confirmation), `Ctrl+↑`/`Ctrl+↓` move the selected rule one place and persist
-  the whole order immediately.
+  the whole order immediately. In `default` mode the list is read-only
+  (`M` switches to custom first).
 - **Routing rule form**: `Tab`/`Shift+Tab` and `↑`/`↓` move between fields,
   `Enter` saves, `Esc` returns to the list.
 
@@ -637,7 +649,7 @@ status bar:
 | Section list | `[↑↓] Navigate  [←] Collapse  [→] Fields  [/] Filter  [Enter] Open  [Esc] Close` |
 | Values pane (form, group form) | `[Tab/Shift+Tab] Field  [Space] Advance  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back` |
 | Filtering | `[type] Filter  [Enter] Apply  [Ctrl+U] Clear  [Esc] Cancel` |
-| Routing list | `[↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Sections  [Esc] Back` |
+| Routing list | `[↑/↓] Navigate  [a] Add  [e] Edit  [d] Delete  [D]ataset  [C]ountry  [M]ode  [Ctrl+W] Sections  [Esc] Back` |
 | Routing form | `[Enter] Save  [Ctrl+W] Sections  [Esc] Back` |
 | Subscription list | `[↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Sections  [Esc] Back` |
 

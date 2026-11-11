@@ -13,4 +13,6 @@
 pub mod dat;
 pub mod srs;
 
-pub use dat::{GeoDomains, GeoNet, load_geoip, load_geosite, validate};
+pub use dat::{
+    GeoDomains, GeoIpLoad, GeoNet, load_geoip, load_geoip_lenient, load_geosite, validate,
+};

@@ -163,3 +163,10 @@ pub const V19_LATENCY_RESHAPE: &[&str] = &[
     "ALTER TABLE profile_stats RENAME COLUMN latency_delay TO latency_real_delay",
     "ALTER TABLE profile_stats DROP COLUMN latency",
 ];
+
+/// v20: the country ruleset a routing row belongs to (`cn`/`ir`/`ru`).
+///
+/// Nullable on purpose: rows written before the ruleset model carry `NULL`,
+/// and the pane treats them as belonging to whichever country's custom set is
+/// active until an edit stamps them.
+pub const V20_ROUTING_RULESET: &[&str] = &["ALTER TABLE routing_rules ADD COLUMN ruleset TEXT"];

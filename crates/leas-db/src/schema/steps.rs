@@ -56,10 +56,16 @@ pub struct Step {
 /// Each entry's `version` is the version it produces, so the list is the
 /// authority for "which versions exist" and the cursor's arm is the only
 /// place that decides which of them to apply.
-pub const STEPS: &[Step] = &[Step {
-    version: 19,
-    kind: StepKind::Sql(crate::schema::ddl::V19_LATENCY_RESHAPE),
-}];
+pub const STEPS: &[Step] = &[
+    Step {
+        version: 19,
+        kind: StepKind::Sql(crate::schema::ddl::V19_LATENCY_RESHAPE),
+    },
+    Step {
+        version: 20,
+        kind: StepKind::Sql(crate::schema::ddl::V20_ROUTING_RULESET),
+    },
+];
 
 /// The steps a cursor at `cursor` must apply, in order.
 ///
@@ -107,14 +113,28 @@ mod tests {
 
     #[test]
     fn a_cursor_at_the_latest_has_no_steps() {
-        assert!(steps_after(19).is_none());
+        assert!(steps_after(crate::schema::LATEST).is_none());
     }
 
     #[test]
     fn a_cursor_below_the_first_step_gets_it() {
-        let steps = steps_after(18).expect("the v19 step");
-        assert_eq!(steps.len(), 1);
+        let steps = steps_after(18).expect("the v19 and v20 steps");
+        assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].version, 19);
+        assert_eq!(steps[1].version, 20);
+    }
+
+    /// The migration this change depends on: a v19 database gets exactly the
+    /// ruleset column, and nothing else.
+    #[test]
+    fn a_v19_cursor_gets_only_the_ruleset_step() {
+        let steps = steps_after(19).expect("the v20 step");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].version, 20);
+        assert!(matches!(
+            steps[0].kind,
+            StepKind::Sql(statements) if statements.iter().any(|s| s.contains("ruleset"))
+        ));
     }
 
     #[test]
@@ -127,7 +147,8 @@ mod tests {
 
     #[test]
     fn the_version_after_a_step_is_that_step() {
-        assert_eq!(version_after(18), 19);
-        assert_eq!(version_after(19), 19);
+        assert_eq!(version_after(18), 20);
+        assert_eq!(version_after(19), 20);
+        assert_eq!(version_after(20), 20);
     }
 }

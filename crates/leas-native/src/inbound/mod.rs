@@ -78,8 +78,11 @@ pub struct TraceCtx {
 
 impl TraceCtx {
     /// Report a leg refused before it could reach a relay.
-    pub fn failed(&self, dest: &str, reason: TraceFailReason) {
-        self.telemetry.failed(self.kind, dest, reason);
+    ///
+    /// `outbound` is the tag the route chose when it named one (`block`,
+    /// `proxy`, …); `None` for `Reject`/`HijackDns`, which name no outbound.
+    pub fn failed(&self, dest: &str, reason: TraceFailReason, outbound: Option<&str>) {
+        self.telemetry.failed(self.kind, dest, reason, outbound);
     }
 }
 
@@ -307,7 +310,7 @@ pub(super) async fn handle_conn(
     match negotiated {
         Err(_) => {
             if let Some(trace) = &config.trace {
-                trace.failed(UNKNOWN_HOST, TraceFailReason::Auth);
+                trace.failed(UNKNOWN_HOST, TraceFailReason::Auth, None);
             }
             return Err(NativeError::Timeout {
                 step: "socks5 negotiate",
@@ -316,7 +319,7 @@ pub(super) async fn handle_conn(
         }
         Ok(Err(error)) => {
             if let Some(trace) = &config.trace {
-                trace.failed(UNKNOWN_HOST, TraceFailReason::Auth);
+                trace.failed(UNKNOWN_HOST, TraceFailReason::Auth, None);
             }
             return Err(error.into());
         }
@@ -328,7 +331,7 @@ pub(super) async fn handle_conn(
         match tokio::time::timeout(timeouts::PROTOCOL, socks5::read_request(&mut conn)).await {
             Err(_) => {
                 if let Some(trace) = &config.trace {
-                    trace.failed(UNKNOWN_HOST, TraceFailReason::Malformed);
+                    trace.failed(UNKNOWN_HOST, TraceFailReason::Malformed, None);
                 }
                 return Err(NativeError::Timeout {
                     step: "socks5 request",
@@ -337,7 +340,7 @@ pub(super) async fn handle_conn(
             }
             Ok(Err(error)) => {
                 if let Some(trace) = &config.trace {
-                    trace.failed(UNKNOWN_HOST, TraceFailReason::Malformed);
+                    trace.failed(UNKNOWN_HOST, TraceFailReason::Malformed, None);
                 }
                 return Err(error.into());
             }
@@ -370,9 +373,9 @@ async fn handle_connect(
 ) -> Result<(), NativeError> {
     // Route the destination.
     let dest = dest_str(&request.target);
-    let fail = |reason: TraceFailReason| {
+    let fail = |reason: TraceFailReason, outbound: Option<&str>| {
         if let Some(trace) = &config.trace {
-            trace.failed(&dest, reason);
+            trace.failed(&dest, reason, outbound);
         }
     };
     let mut meta = ConnMeta {
@@ -392,14 +395,14 @@ async fn handle_connect(
         Decision::Route { tag, override_addr } => {
             let Some(outbound) = config.outbounds.iter().find(|o| o.tag.as_str() == &*tag) else {
                 tracing::warn!(%tag, "socks5 inbound: routing decision named an unknown outbound");
-                fail(TraceFailReason::NoOutbound);
+                fail(TraceFailReason::NoOutbound, None);
                 socks5::write_reply(&mut conn, socks5::ReplyCode::GeneralFailure, &BIND_ZERO)
                     .await?;
                 return Ok(());
             };
             match &outbound.kind {
                 OutboundKind::Block => {
-                    fail(TraceFailReason::Blocked);
+                    fail(TraceFailReason::Blocked, Some(&outbound.tag));
                     socks5::write_reply(
                         &mut conn,
                         socks5::ReplyCode::ConnectionNotAllowed,
@@ -421,7 +424,7 @@ async fn handle_connect(
                                 %error,
                                 "socks5 inbound: outbound dial failed"
                             );
-                            fail(TraceFailReason::Dial);
+                            fail(TraceFailReason::Dial, Some(&outbound.tag));
                             socks5::write_reply(&mut conn, reply_for(&error), &BIND_ZERO).await?;
                             return Ok(());
                         }
@@ -429,14 +432,16 @@ async fn handle_connect(
                     socks5::write_reply(&mut conn, socks5::ReplyCode::Succeeded, &BIND_ZERO)
                         .await?;
                     match &config.trace {
-                        Some(trace) => traced_relay(trace, conn, upstream, &target, &[]).await,
+                        Some(trace) => {
+                            traced_relay(trace, conn, upstream, &target, &[], &outbound.tag).await
+                        }
                         None => Box::pin(outbound::relay(conn, upstream)).await,
                     }
                 }
             }
         }
         Decision::Reject { .. } => {
-            fail(TraceFailReason::Rejected);
+            fail(TraceFailReason::Rejected, None);
             socks5::write_reply(
                 &mut conn,
                 socks5::ReplyCode::ConnectionNotAllowed,
@@ -449,7 +454,7 @@ async fn handle_connect(
             // The inbound has no built-in DNS interceptor; refuse explicitly
             // (explicit absence beats silent fallthrough).
             tracing::warn!("socks5 inbound: HijackDns decision is not implemented; rejecting");
-            fail(TraceFailReason::HijackDns);
+            fail(TraceFailReason::HijackDns, None);
             socks5::write_reply(
                 &mut conn,
                 socks5::ReplyCode::ConnectionNotAllowed,
@@ -482,6 +487,7 @@ async fn traced_relay(
     upstream: BoxStream,
     target: &TargetAddr,
     prefix: &[u8],
+    outbound: &str,
 ) -> Result<(), NativeError> {
     let dest = dest_str(target);
     let peer = conn
@@ -496,9 +502,10 @@ async fn traced_relay(
         trace.security,
     );
     let (up, down) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-    let mut guard: TraceGuard = trace
-        .telemetry
-        .guard(conn_id, Arc::clone(&up), Arc::clone(&down));
+    let mut guard: TraceGuard =
+        trace
+            .telemetry
+            .guard(conn_id, Arc::clone(&up), Arc::clone(&down), Some(outbound));
     let mut counted = trace.telemetry.counted(Counted::new(upstream, up, down));
     if !prefix.is_empty()
         && let Err(error) = counted.write_all(prefix).await
@@ -821,13 +828,13 @@ impl UdpRelay {
     }
 
     /// Count this host once per association — the Sniffer `conns` column.
-    fn note_conn(&mut self, host: &str) {
+    fn note_conn(&mut self, host: &str, outbound: &str) {
         if self.seen.iter().any(|seen| seen == host) {
             return;
         }
         self.seen.push(CompactString::new(host));
         if let Some(trace) = &self.config.trace {
-            trace.telemetry.udp_conn(host);
+            trace.telemetry.udp_conn(host, outbound);
         }
     }
 
@@ -983,12 +990,12 @@ impl UdpRelay {
         match &outbound.kind {
             OutboundKind::Block => self.drop_datagram(Some(&host), payload.len()),
             OutboundKind::Direct => {
-                self.note_conn(&host);
+                self.note_conn(&host, &outbound.tag);
                 self.forward_direct(dest, payload, owned_payload.as_ref(), &host)
                     .await;
             }
             OutboundKind::Proxy(proxy) => {
-                self.note_conn(&host);
+                self.note_conn(&host, &outbound.tag);
                 self.forward_proxy(&tag, proxy, dest, payload, owned_payload.as_ref(), &host);
             }
         }

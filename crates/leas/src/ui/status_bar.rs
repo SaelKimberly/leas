@@ -266,7 +266,7 @@ pub(crate) fn settings_hints(state: &AppState) -> String {
                     .to_string()
             }
             crate::SplitRightPane::RoutingList { .. } => {
-                " [↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Sections  [Esc] Back "
+                " [↑/↓] Nav  [a] Add  [e] Edit  [d] Delete  [D]ataset  [C]ountry  [M]ode  [Ctrl+W] Sections  [Esc] Back "
                     .to_string()
             }
             crate::SplitRightPane::RoutingForm { .. } => {

@@ -75,8 +75,7 @@
     "reject_insecure": false
   },
   "geo": {
-    "geoip_url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
-    "geosite_url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+    "dataset": "loyalsoldier",
     "auto_update": false,
     "update_interval_hours": 24
   },

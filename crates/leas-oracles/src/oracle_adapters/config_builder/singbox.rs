@@ -310,6 +310,7 @@ mod tests {
         RoutingRule {
             id: "r1".to_string(),
             group_id: None,
+            ruleset: None,
             r#type: 0,
             domain_matcher: None,
             domains: vec!["example.com".to_string()],
@@ -635,6 +636,7 @@ mod tests {
         let rule = RoutingRule {
             id: "r1".to_string(),
             group_id: None,
+            ruleset: None,
             r#type: 0,
             domain_matcher: None,
             domains: Vec::new(),
@@ -660,6 +662,7 @@ mod tests {
         let rule = RoutingRule {
             id: "r2".to_string(),
             group_id: None,
+            ruleset: None,
             r#type: 0,
             domain_matcher: Some("linear".to_string()),
             domains: vec!["example.com".to_string()],
@@ -690,6 +693,7 @@ mod tests {
         let rule = RoutingRule {
             id: "r3".to_string(),
             group_id: None,
+            ruleset: None,
             r#type: 0,
             domain_matcher: None,
             domains: Vec::new(),

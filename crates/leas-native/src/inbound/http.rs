@@ -230,7 +230,7 @@ pub(super) async fn handle_conn(
     .await
     {
         Err(_) => {
-            trace_failure(&config, UNKNOWN_HOST, TraceFailReason::Malformed);
+            trace_failure(&config, UNKNOWN_HOST, TraceFailReason::Malformed, None);
             return Err(NativeError::Timeout {
                 step: "http request",
                 limit: timeouts::PROTOCOL,
@@ -242,7 +242,7 @@ pub(super) async fn handle_conn(
                 Refusal::AuthRequired => TraceFailReason::Auth,
                 _ => TraceFailReason::Malformed,
             };
-            trace_failure(&config, UNKNOWN_HOST, reason);
+            trace_failure(&config, UNKNOWN_HOST, reason, None);
             // Best effort: a client that hung up mid-head cannot be told, and
             // that is its own fault, not a server failure.
             if let Err(error) = write_refusal(reader.into_inner(), refusal).await {
@@ -256,9 +256,14 @@ pub(super) async fn handle_conn(
 }
 
 /// Report a pre-relay refusal when the inbound is traced.
-fn trace_failure(config: &HttpInboundConfig, dest: &str, reason: TraceFailReason) {
+fn trace_failure(
+    config: &HttpInboundConfig,
+    dest: &str,
+    reason: TraceFailReason,
+    outbound: Option<&str>,
+) {
     if let Some(trace) = &config.trace {
-        trace.failed(dest, reason);
+        trace.failed(dest, reason, outbound);
     }
 }
 
@@ -290,12 +295,12 @@ async fn handle_connect(
         Decision::Route { tag, override_addr } => {
             let Some(outbound) = config.outbounds.iter().find(|o| o.tag.as_str() == &*tag) else {
                 tracing::warn!(%tag, "http inbound: routing decision named an unknown outbound");
-                trace_failure(config, &dest, TraceFailReason::NoOutbound);
+                trace_failure(config, &dest, TraceFailReason::NoOutbound, None);
                 return write_refusal(&mut conn, Refusal::BadGateway).await;
             };
             match &outbound.kind {
                 OutboundKind::Block => {
-                    trace_failure(config, &dest, TraceFailReason::Blocked);
+                    trace_failure(config, &dest, TraceFailReason::Blocked, Some(&outbound.tag));
                     write_refusal(&mut conn, Refusal::Blocked).await
                 }
                 kind => {
@@ -309,7 +314,12 @@ async fn handle_connect(
                                 %error,
                                 "http inbound: outbound dial failed"
                             );
-                            trace_failure(config, &dest, TraceFailReason::Dial);
+                            trace_failure(
+                                config,
+                                &dest,
+                                TraceFailReason::Dial,
+                                Some(&outbound.tag),
+                            );
                             return write_refusal(&mut conn, Refusal::BadGateway).await;
                         }
                     };
@@ -317,7 +327,7 @@ async fn handle_connect(
                     if let Some(trace) = &config.trace {
                         // The traced path replays `pending` inside its byte
                         // counters, so pipelined bytes are attributed `up`.
-                        traced_relay(trace, conn, upstream, &target, &pending).await
+                        traced_relay(trace, conn, upstream, &target, &pending, &outbound.tag).await
                     } else {
                         if !pending.is_empty() {
                             upstream
@@ -334,9 +344,9 @@ async fn handle_connect(
         Decision::Reject { .. } | Decision::HijackDns => {
             if matches!(decision, Decision::HijackDns) {
                 tracing::warn!("http inbound: HijackDns decision is not implemented; rejecting");
-                trace_failure(config, &dest, TraceFailReason::HijackDns);
+                trace_failure(config, &dest, TraceFailReason::HijackDns, None);
             } else {
-                trace_failure(config, &dest, TraceFailReason::Rejected);
+                trace_failure(config, &dest, TraceFailReason::Rejected, None);
             }
             write_refusal(&mut conn, Refusal::Blocked).await
         }

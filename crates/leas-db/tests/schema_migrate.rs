@@ -545,6 +545,12 @@ async fn seed_a_v18_database(path: &std::path::Path) {
         .exec(&mut conn)
         .await
         .expect("drop auth");
+    //   5. and the v20 column the current models create: a v18 file predates
+    //      the ruleset model, so the v20 step must add it back.
+    toasty::sql::statement("ALTER TABLE routing_rules DROP COLUMN ruleset")
+        .exec(&mut conn)
+        .await
+        .expect("drop the v20 ruleset column");
     toasty::sql::query("PRAGMA user_version = 18")
         .exec(&mut conn)
         .await
@@ -591,6 +597,30 @@ async fn a_v18_database_migrates_and_keeps_its_numbers() {
         vec![(1, Some(140), None), (2, None, Some(12))],
         "the 'real' row's delay moved to latency_real_delay and the 'fast' row's \
          to latency_fast_delay — the numbers themselves are unchanged"
+    );
+}
+
+/// The v20 step really adds the ruleset column to a v18-era file: the fixture
+/// drops it, so a no-op step would leave the column missing.
+#[tokio::test]
+async fn the_migrated_routing_table_has_the_ruleset_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v18-ruleset.db");
+    seed_a_v18_database(&path).await;
+
+    let db = Database::open(&path).await.expect("migrating open");
+    let mut conn = db.connection().await.expect("conn");
+
+    let rows = toasty::sql::query(
+        "SELECT COUNT(*) FROM pragma_table_info('routing_rules') WHERE name = 'ruleset'",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("table_info");
+    assert_eq!(
+        first_i64(&rows),
+        Some(1),
+        "migration 20 must add routing_rules.ruleset"
     );
 }
 

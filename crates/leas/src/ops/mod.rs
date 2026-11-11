@@ -12,6 +12,7 @@ pub mod ping;
 pub mod ping_native;
 pub mod profiles;
 pub mod purge;
+pub mod routing_defaults;
 pub mod scheduler;
 pub mod settings;
 pub mod speed_test;

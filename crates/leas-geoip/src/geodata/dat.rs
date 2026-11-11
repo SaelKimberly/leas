@@ -169,13 +169,27 @@ pub fn load_geosite(path: &Path, tokens: &[String]) -> anyhow::Result<Vec<(Strin
     Ok(out)
 }
 
-/// Loads the requested geoip categories, one entry per token in request order.
-/// A token is `[!]code`; the returned `GeoNet.reverse` is the token flag XOR
-/// the record's `reverse_match` (xray semantics).
+/// One lenient geoip load: the categories the file served, plus the requested
+/// codes it does not carry (in request order).
+#[derive(Debug, Default)]
+pub struct GeoIpLoad {
+    /// One entry per served token: the raw token and its ranges.
+    pub loaded: Vec<(String, Vec<GeoNet>)>,
+    /// Codes the file has no category for; the caller decides the fallback.
+    pub missing: Vec<String>,
+}
+
+/// Loads the requested geoip categories, reporting the codes the file does not
+/// carry instead of failing.
+///
+/// The engine uses the split to resolve an unknown country code from the
+/// `GeoLite2` database (a per-token fallback), so a dataset that lacks country
+/// categories still serves `geoip:<cc>` rules.
 ///
 /// # Errors
-/// I/O, malformed-protobuf, empty token, and unknown-code errors.
-pub fn load_geoip(path: &Path, tokens: &[String]) -> anyhow::Result<Vec<(String, Vec<GeoNet>)>> {
+/// I/O, malformed-protobuf, and empty-token errors. An unknown code is NOT an
+/// error here (see [`load_geoip`] for the strict form).
+pub fn load_geoip_lenient(path: &Path, tokens: &[String]) -> anyhow::Result<GeoIpLoad> {
     let parsed = tokens
         .iter()
         .map(|t| parse_ip_token(t))
@@ -193,12 +207,12 @@ pub fn load_geoip(path: &Path, tokens: &[String]) -> anyhow::Result<Vec<(String,
         slot.1 |= reverse;
         Ok(())
     })?;
-    if let Some(missing) = parsed.iter().find(|t| !raw.contains_key(&t.code)) {
-        bail!("{}: no geoip category {:?}", path.display(), missing.code);
-    }
-    let mut out = Vec::with_capacity(parsed.len());
+    let mut out = GeoIpLoad::default();
     for token in parsed {
-        let (cidrs, record_reverse) = &raw[&token.code];
+        let Some((cidrs, record_reverse)) = raw.get(&token.code) else {
+            out.missing.push(token.code);
+            continue;
+        };
         let reverse = token.reverse ^ record_reverse;
         let nets = cidrs
             .iter()
@@ -208,9 +222,23 @@ pub fn load_geoip(path: &Path, tokens: &[String]) -> anyhow::Result<Vec<(String,
                 reverse,
             })
             .collect();
-        out.push((token.raw, nets));
+        out.loaded.push((token.raw, nets));
     }
     Ok(out)
+}
+
+/// Loads the requested geoip categories, one entry per token in request order.
+/// A token is `[!]code`; the returned `GeoNet.reverse` is the token flag XOR
+/// the record's `reverse_match` (xray semantics).
+///
+/// # Errors
+/// I/O, malformed-protobuf, empty token, and unknown-code errors.
+pub fn load_geoip(path: &Path, tokens: &[String]) -> anyhow::Result<Vec<(String, Vec<GeoNet>)>> {
+    let load = load_geoip_lenient(path, tokens)?;
+    if let Some(missing) = load.missing.first() {
+        bail!("{}: no geoip category {:?}", path.display(), missing);
+    }
+    Ok(load.loaded)
 }
 
 /// Every top-level category code; also the download validator (an empty,
@@ -666,6 +694,31 @@ mod tests {
         assert_eq!(loaded[0].1[0].addr, "1.0.1.0".parse::<IpAddr>().unwrap());
         assert_eq!(loaded[0].1[0].prefix, 24);
         assert!(load_geoip(&path, &tokens(&["zz"])).is_err());
+    }
+
+    /// The lenient split is what lets an unknown country code be answered by
+    /// the mmdb fallback; the strict form keeps its named error.
+    #[test]
+    fn geoip_lenient_splits_loaded_from_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "geoip.dat",
+            &list(&[geoip_entry(
+                "CN",
+                &[("1.0.1.0".parse().unwrap(), 24)],
+                false,
+            )]),
+        );
+        let load = load_geoip_lenient(&path, &tokens(&["cn", "ir", "ru"])).unwrap();
+        assert_eq!(load.loaded.len(), 1);
+        assert_eq!(load.loaded[0].0, "cn");
+        assert_eq!(load.missing, ["ir", "ru"]);
+        let err = load_geoip(&path, &tokens(&["cn", "ir"])).unwrap_err();
+        assert!(
+            err.to_string().contains("no geoip category \"ir\""),
+            "{err}"
+        );
     }
 
     #[test]

@@ -1330,6 +1330,16 @@ async fn a_blocked_connect_emits_a_failure_trace_and_no_traffic() {
         0,
         "a refusal carries no bytes"
     );
+    let row = snap
+        .hosts
+        .iter()
+        .find(|h| h.host == "blocked.example")
+        .expect("the blocked host keeps its row");
+    assert_eq!(
+        row.outbound.as_deref(),
+        Some("block"),
+        "the marker names the outbound the route chose"
+    );
 
     handle.abort();
 }
@@ -1392,6 +1402,11 @@ async fn udp_datagrams_are_accounted_per_host_and_one_conn_per_association() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     assert_eq!(row.conns, 1, "one association, two ports: one conn");
+    assert_eq!(
+        row.outbound.as_deref(),
+        Some("direct"),
+        "the association carries the route's outbound tag"
+    );
     assert_eq!(row.up, 8, "both client payloads counted");
     assert!(row.down > 0, "reply bytes counted");
     drop(stream);

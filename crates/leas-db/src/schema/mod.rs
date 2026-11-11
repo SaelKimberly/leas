@@ -194,6 +194,9 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
 /// advanced — which would re-run the non-idempotent RENAME/DROP and fail).
 /// The cursor stamp is what makes the steps safe to apply at all.
 async fn apply_steps(conn: &mut toasty::Connection, steps: &[steps::Step]) -> Result<()> {
+    // The version this run reaches: the last step applied (each step's version
+    // is what it PRODUCES), logged after the commit.
+    let target_version = steps.last().map(|step| step.version).unwrap_or_default();
     let mut tx = conn
         .transaction_builder()
         .mode(TransactionMode::Immediate)
@@ -227,8 +230,11 @@ async fn apply_steps(conn: &mut toasty::Connection, steps: &[steps::Step]) -> Re
     match result {
         Ok(()) => {
             tx.commit().await?;
-            tracing::info!(target: "leas_db",
-                "profile_stats: applied the latency reshape (schema 19)");
+            tracing::info!(
+                target: "leas_db",
+                version = target_version,
+                "schema migration applied"
+            );
             Ok(())
         }
         Err(e) => Err(e),

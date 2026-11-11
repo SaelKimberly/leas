@@ -650,10 +650,18 @@ pub enum GeoIpMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoConfig {
-    #[serde(default = "default_geoip_url")]
-    pub geoip_url: String,
-    #[serde(default = "default_geosite_url")]
-    pub geosite_url: String,
+    /// Which release artifacts answer `geosite:` / `geoip:` references. Each
+    /// variant carries both URLs; a code the selected dataset cannot serve
+    /// disables its row (skipped at build), never failing the engine.
+    #[serde(default)]
+    pub dataset: crate::GeoDataset,
+    /// Which country ruleset is active.
+    #[serde(default)]
+    pub country: crate::GeoCountry,
+    /// `None` = never chosen: `custom` when the database already holds rows,
+    /// otherwise `default`. An explicit value is the user's choice.
+    #[serde(default)]
+    pub ruleset: Option<crate::RulesetMode>,
     #[serde(default)]
     pub auto_update: bool,
     #[serde(default = "default_geo_update_interval")]
@@ -666,21 +674,14 @@ pub struct GeoConfig {
 impl Default for GeoConfig {
     fn default() -> Self {
         Self {
-            geoip_url: default_geoip_url(),
-            geosite_url: default_geosite_url(),
+            dataset: crate::GeoDataset::default(),
+            country: crate::GeoCountry::default(),
+            ruleset: None,
             auto_update: false,
             update_interval_hours: 24,
             geoip_mode: GeoIpMode::Dat,
         }
     }
-}
-
-fn default_geoip_url() -> String {
-    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat".into()
-}
-
-fn default_geosite_url() -> String {
-    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat".into()
 }
 
 const fn default_geo_update_interval() -> u64 {

@@ -191,6 +191,7 @@ fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
     };
     let header = Row::new([
         Cell::from("host"),
+        Cell::from("via").style(ThemeStyles::hint(theme)),
         Cell::from("↓").style(ThemeStyles::hint(theme)),
         Cell::from("↑").style(ThemeStyles::hint(theme)),
         Cell::from("conns").style(ThemeStyles::hint(theme)),
@@ -204,6 +205,7 @@ fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
         .map(|host| {
             Row::new([
                 Cell::from(host.host.to_string()),
+                outbound_cell(host.outbound.as_deref(), theme),
                 Cell::from(format_bytes(saturating_i64(host.down))),
                 Cell::from(format_bytes(saturating_i64(host.up))),
                 Cell::from(host.conns.to_string()),
@@ -216,6 +218,7 @@ fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
         rows,
         [
             Constraint::Min(20),
+            Constraint::Length(3),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(6),
@@ -228,6 +231,24 @@ fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
     let mut table_state =
         ratatui::widgets::TableState::default().with_offset(scroll_offset(snapshot.hosts.len()));
     frame.render_stateful_widget(table, area, &mut table_state);
+}
+
+/// Marker for the outbound the route chose for a host: `direct`, `proxy`,
+/// `block`, or blank when routing named no outbound (a refused `Reject` /
+/// `HijackDns` leg).
+///
+/// The three tags are the whole `leas_route::ir` route set, and the inbound
+/// records `Outbound.tag` verbatim; an unknown tag therefore renders blank
+/// rather than an unrecognised glyph.
+fn outbound_cell(outbound: Option<&str>, theme: &opaline::Theme) -> Cell<'static> {
+    use leas_route::ir::{BLOCK_TAG, DIRECT_TAG, PROXY_TAG};
+    let (glyph, style) = match outbound {
+        Some(DIRECT_TAG) => ("→", ThemeStyles::hint(theme)),
+        Some(PROXY_TAG) => ("⇄", ThemeStyles::container_title(theme)),
+        Some(BLOCK_TAG) => ("⊘", ThemeStyles::error(theme)),
+        _ => ("", ThemeStyles::hint(theme)),
+    };
+    Cell::from(Line::from(glyph).alignment(Alignment::Center)).style(style)
 }
 
 /// Scroll keys for the host table; mirrors the Native Activity conventions.
@@ -304,13 +325,20 @@ mod tests {
 
     fn sample_snapshot() -> leas_native::telemetry::SnifferSnapshot {
         let mut snapshot = leas_native::telemetry::SnifferSnapshot::default();
-        snapshot.hosts.push(leas_native::telemetry::HostStat {
-            host: compact_str::CompactString::new("example.com"),
-            up: 1_024,
-            down: 4_096,
-            conns: 2,
-            failed: 1,
-        });
+        for (host, outbound, up, down, conns, failed) in [
+            ("example.com", Some("proxy"), 1_024, 4_096, 2, 1),
+            ("direct.example", Some("direct"), 512, 128, 1, 0),
+            ("blocked.example", Some("block"), 0, 0, 0, 1),
+        ] {
+            snapshot.hosts.push(leas_native::telemetry::HostStat {
+                host: compact_str::CompactString::new(host),
+                up,
+                down,
+                conns,
+                failed,
+                outbound: outbound.map(compact_str::CompactString::new),
+            });
+        }
         snapshot.failed = 1;
         snapshot.dropped_datagrams = 3;
         snapshot
@@ -338,8 +366,21 @@ mod tests {
             .draw(|frame| render(frame, frame.area(), &state))
             .expect("draw");
         let text = screen_text(&terminal);
-        for expected in ["example.com", "conns", "failed", "dropped 3"] {
+        for expected in ["conns", "failed", "dropped 3", "via"] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        // The glyph must sit on ITS host's row: asserting mere presence would
+        // stay green with the direct/proxy arms swapped.
+        for (host, glyph) in [
+            ("example.com", "⇄"),
+            ("direct.example", "→"),
+            ("blocked.example", "⊘"),
+        ] {
+            let row = text
+                .lines()
+                .find(|line| line.contains(host))
+                .unwrap_or_else(|| panic!("missing {host:?} row in:\n{text}"));
+            assert!(row.contains(glyph), "{host} row missing {glyph:?}: {row:?}");
         }
     }
 }

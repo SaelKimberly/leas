@@ -210,6 +210,10 @@ pub struct HostStat {
     pub conns: u64,
     /// Refused or failed legs attributed to this host.
     pub failed: u64,
+    /// Outbound tag the route named for this host's most recent routed event
+    /// (a leg open, a refusal, or a UDP association); `None` until one names
+    /// it. A later `Reject`/`HijackDns` does not clear it.
+    pub outbound: Option<CompactString>,
 }
 
 /// One session's per-host accounting, sorted by total bytes descending.
@@ -233,6 +237,9 @@ struct HostRow {
     conns: u64,
     failed: u64,
     last_seq: u64,
+    /// Last-wins: the tag of the most recent routed event for the host (leg
+    /// open, refusal, or association); never rewritten by a close.
+    outbound: Option<CompactString>,
 }
 
 /// A relayed leg whose bytes are still in flight (folded into [`HostRow`] on
@@ -387,13 +394,24 @@ impl Telemetry {
     /// The guard emits the row even when the relay future is dropped mid-leg
     /// (an inbound shutdown, a cancelled task) — see [`TraceGuard`].
     #[must_use]
-    pub fn guard(&self, conn_id: u64, up: Arc<AtomicU64>, down: Arc<AtomicU64>) -> TraceGuard {
+    pub fn guard(
+        &self,
+        conn_id: u64,
+        up: Arc<AtomicU64>,
+        down: Arc<AtomicU64>,
+        outbound: Option<&str>,
+    ) -> TraceGuard {
         let host = self
             .pending
             .lock()
             .remove(&conn_id)
             .unwrap_or_else(|| CompactString::new(UNKNOWN_HOST));
-        self.with_host(&host, |row| row.conns = row.conns.saturating_add(1));
+        self.with_host(&host, |row| {
+            row.conns = row.conns.saturating_add(1);
+            if let Some(tag) = outbound {
+                row.outbound = Some(CompactString::new(tag));
+            }
+        });
         self.open.lock().insert(
             conn_id,
             OpenLeg {
@@ -416,9 +434,24 @@ impl Telemetry {
     ///
     /// `dest` is the destination as the client sent it; the port is stripped
     /// like every other host key. Bytes are never touched.
-    pub fn failed(&self, kind: TraceKind, dest: &str, reason: TraceFailReason) {
+    pub fn failed(
+        &self,
+        kind: TraceKind,
+        dest: &str,
+        reason: TraceFailReason,
+        outbound: Option<&str>,
+    ) {
         let host = host_of(dest);
-        self.with_host(host, |row| row.failed = row.failed.saturating_add(1));
+        // A failure that never parsed a destination has no host to attribute:
+        // it counts in the session total only, never as a `(unknown)` row.
+        if host != UNKNOWN_HOST {
+            self.with_host(host, |row| {
+                row.failed = row.failed.saturating_add(1);
+                if let Some(tag) = outbound {
+                    row.outbound = Some(CompactString::new(tag));
+                }
+            });
+        }
         self.failed_total.fetch_add(1, Ordering::Relaxed);
         Self::emit(
             &self.traces,
@@ -495,8 +528,11 @@ impl Telemetry {
     }
 
     /// Record that one UDP association exchanged traffic with `host`.
-    pub fn udp_conn(&self, host: &str) {
-        self.with_host(host, |row| row.conns = row.conns.saturating_add(1));
+    pub fn udp_conn(&self, host: &str, outbound: &str) {
+        self.with_host(host, |row| {
+            row.conns = row.conns.saturating_add(1);
+            row.outbound = Some(CompactString::new(outbound));
+        });
     }
 
     /// Snapshot the session's per-host accounting for the Sniffer pane.
@@ -516,6 +552,7 @@ impl Telemetry {
                 down: row.down,
                 conns: row.conns,
                 failed: row.failed,
+                outbound: row.outbound.clone(),
             })
             .collect();
 
@@ -545,6 +582,7 @@ impl Telemetry {
                     down,
                     conns: 0,
                     failed: 0,
+                    outbound: None,
                 }),
             }
         }
@@ -949,7 +987,7 @@ mod tests {
         );
         let up = Arc::new(AtomicU64::new(0));
         let down = Arc::new(AtomicU64::new(0));
-        let mut guard = telemetry.guard(id, Arc::clone(&up), Arc::clone(&down));
+        let mut guard = telemetry.guard(id, Arc::clone(&up), Arc::clone(&down), Some("proxy"));
 
         up.fetch_add(100, Ordering::Relaxed);
         down.fetch_add(250, Ordering::Relaxed);
@@ -972,6 +1010,11 @@ mod tests {
             "fold must not double count"
         );
         assert_eq!(closed.hosts[0].conns, 1);
+        assert_eq!(
+            closed.hosts[0].outbound.as_deref(),
+            Some("proxy"),
+            "the marker is set at open and survives the close fold"
+        );
     }
 
     #[test]
@@ -984,6 +1027,7 @@ mod tests {
                     id,
                     Arc::new(AtomicU64::new(10)),
                     Arc::new(AtomicU64::new(1)),
+                    None,
                 )
                 .finish(None);
         }
@@ -1018,6 +1062,65 @@ mod tests {
             .expect("row");
         assert_eq!((row.up, row.down), (40, 120));
         assert_eq!((snap.dropped_datagrams, snap.dropped_bytes), (2, 47));
+    }
+
+    /// A failure that never named a destination counts, but creates no row.
+    #[test]
+    fn an_unattributable_failure_counts_without_creating_a_row() {
+        let (telemetry, _events) = Telemetry::new(16);
+        telemetry.failed(
+            TraceKind::Tcp,
+            UNKNOWN_HOST,
+            TraceFailReason::Malformed,
+            None,
+        );
+        let snap = telemetry.snapshot();
+        assert!(snap.hosts.is_empty(), "no (unknown) row: {snap:?}");
+        assert_eq!(snap.failed, 1);
+    }
+
+    /// A blocked destination marks its row with the outbound the route chose.
+    #[test]
+    fn a_blocked_failure_marks_the_host_and_carries_no_bytes() {
+        let (telemetry, _events) = Telemetry::new(16);
+        telemetry.failed(
+            TraceKind::Http,
+            "x.example:443",
+            TraceFailReason::Blocked,
+            Some("block"),
+        );
+        let snap = telemetry.snapshot();
+        let row = snap
+            .hosts
+            .iter()
+            .find(|h| h.host == "x.example")
+            .expect("row");
+        assert_eq!(row.outbound.as_deref(), Some("block"));
+        assert_eq!((row.up, row.down, row.conns, row.failed), (0, 0, 0, 1));
+        assert_eq!(snap.failed, 1);
+    }
+
+    /// A later leg's outbound replaces the marker; the close fold does not.
+    #[test]
+    fn the_marker_is_last_wins_across_legs() {
+        let (telemetry, _events) = Telemetry::new(16);
+        let up = Arc::new(AtomicU64::new(0));
+        let down = Arc::new(AtomicU64::new(0));
+        for tag in ["direct", "proxy"] {
+            let id = telemetry.opened(
+                TraceKind::Tcp,
+                "cdn.example:443",
+                "vless",
+                "tcp",
+                TraceSecurity::Plain,
+            );
+            let mut guard = telemetry.guard(id, Arc::clone(&up), Arc::clone(&down), Some(tag));
+            guard.finish(None);
+        }
+        assert_eq!(
+            telemetry.snapshot().hosts[0].outbound.as_deref(),
+            Some("proxy")
+        );
     }
 
     #[test]
@@ -1133,7 +1236,7 @@ mod tests {
         let conn_id = tel.opened(TraceKind::Http, "h:443", "vless", "tcp", TraceSecurity::Tls);
         let up = Arc::new(AtomicU64::new(7));
         let down = Arc::new(AtomicU64::new(11));
-        drop(tel.guard(conn_id, Arc::clone(&up), Arc::clone(&down)));
+        drop(tel.guard(conn_id, Arc::clone(&up), Arc::clone(&down), None));
 
         assert!(matches!(
             events.recv().await.expect("opened"),
@@ -1149,7 +1252,7 @@ mod tests {
 
         // A finished guard emits its own row and nothing on drop.
         let conn_id = tel.opened(TraceKind::Tcp, "h:80", "vless", "tcp", TraceSecurity::Plain);
-        let mut guard = tel.guard(conn_id, Arc::clone(&up), Arc::clone(&down));
+        let mut guard = tel.guard(conn_id, Arc::clone(&up), Arc::clone(&down), None);
         guard.finish(None);
         drop(guard);
         assert!(matches!(

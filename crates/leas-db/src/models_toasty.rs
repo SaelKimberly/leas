@@ -662,6 +662,9 @@ pub struct RoutingRule {
     pub id: String,
 
     pub group_id: Option<String>,
+    /// Country ruleset the row belongs to (`cn`/`ir`/`ru`); `None` is a
+    /// pre-ruleset row, shown under every country's custom set.
+    pub ruleset: Option<String>,
     pub r#type: i32, // opaque free-form number, no consumer; kept for form
     pub domain_matcher: Option<String>,
     pub domains: Vec<String>,

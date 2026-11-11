@@ -304,6 +304,7 @@ mod tests {
         RoutingRule {
             id: "r1".to_string(),
             group_id: None,
+            ruleset: None,
             r#type: 0,
             domain_matcher: None,
             domains: vec!["example.com".to_string()],
@@ -327,6 +328,7 @@ mod tests {
         RoutingRule {
             id: "full".to_string(),
             group_id: Some("g1".to_string()),
+            ruleset: None,
             r#type: 7,
             domain_matcher: Some("exact".to_string()),
             domains: vec!["a.com".to_string()],
@@ -599,6 +601,7 @@ mod tests {
         let bare = RoutingRule {
             id: "bare".to_string(),
             group_id: None,
+            ruleset: None,
             r#type: 0,
             domain_matcher: None,
             domains: Vec::new(),

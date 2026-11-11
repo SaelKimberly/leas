@@ -276,8 +276,6 @@ pub async fn build_settings_fields(
                     humantime::format_duration(*state.config.speed_test.speed_test_max_duration)
                         .to_string(),
                 ),
-                ("geosite_url".into(), state.config.geo.geosite_url.clone()),
-                ("geoip_url".into(), state.config.geo.geoip_url.clone()),
                 (
                     "geoip_mode".into(),
                     match state.config.geo.geoip_mode {
@@ -489,15 +487,7 @@ fn apply_settings_fields(
             if let Ok(d) = humantime::parse_duration(get_str("speed_test_max_duration")) {
                 *state.config.speed_test.speed_test_max_duration = d;
             }
-            let old_geoip_url = state.config.geo.geoip_url.clone();
-            let old_geosite_url = state.config.geo.geosite_url.clone();
             let old_geoip_mode = state.config.geo.geoip_mode;
-            if !get_str("geoip_url").is_empty() {
-                state.config.geo.geoip_url = get("geoip_url");
-            }
-            if !get_str("geosite_url").is_empty() {
-                state.config.geo.geosite_url = get("geosite_url");
-            }
             state.config.geo.geoip_mode = if get_str("geoip_mode").eq_ignore_ascii_case("mmdb") {
                 leas_config::app_config::GeoIpMode::Mmdb
             } else {
@@ -507,15 +497,13 @@ fn apply_settings_fields(
             if let Ok(v) = get_str("geo_update_interval").parse::<u64>() {
                 state.config.geo.update_interval_hours = v;
             }
-            // A URL/mode change must fetch the new artifact; an unrelated save
-            // only recompiles. A forced refresh keeps the old file on failure.
-            if state.config.geo.geoip_url != old_geoip_url
-                || state.config.geo.geosite_url != old_geosite_url
-                || state.config.geo.geoip_mode != old_geoip_mode
-            {
-                crate::ops::geodata::refresh_geo(state);
-            } else {
+            // A mode change must fetch the new artifact; an unrelated save
+            // only recompiles. The dataset itself is chosen in the Routing
+            // pane's header, which refreshes on its own.
+            if state.config.geo.geoip_mode == old_geoip_mode {
                 state.spawn_routing_engine_rebuild();
+            } else {
+                crate::ops::geodata::refresh_geo(state);
             }
         }
         // Dns, Routing and RouteProbes are handled separately (DB-backed)
@@ -639,9 +627,11 @@ pub async fn save_routing_rule(
     };
     let ports = split_u16(get_str("ports"));
     let source_ports = split_u16(get_str("source_ports"));
+    let active_ruleset = state.config.geo.country.key();
     let rule = RoutingRule {
         id,
         group_id: None,
+        ruleset: Some(active_ruleset.to_string()),
         r#type: get_str("type").parse::<i32>().unwrap_or(0),
         domain_matcher: get_opt("domain_matcher"),
         domains: split(get_str("domains")),
@@ -681,31 +671,7 @@ pub async fn save_routing_rule(
     }
     // The typed model has no dedicated routing-rule write; upsert through the
     // pooled connection (upsert is idempotent for add and edit alike).
-    let result: Result<(), String> = async {
-        let mut conn = state.db.connection().await.map_err(|e| e.to_string())?;
-        leas_db::models::RoutingRule::upsert_by_id(rule.id.clone())
-            .group_id(rule.group_id.clone())
-            .r#type(rule.r#type)
-            .domain_matcher(rule.domain_matcher.clone())
-            .domains(rule.domains.clone())
-            .ips(rule.ips.clone())
-            .inbound_tags(rule.inbound_tags.clone())
-            .ports(rule.ports.clone())
-            .source_ports(rule.source_ports.clone())
-            .network(rule.network.clone())
-            .protocols(rule.protocols.clone())
-            .domain_strategy(rule.domain_strategy.clone())
-            .outbound_tag(rule.outbound_tag.clone())
-            .balancer_tag(rule.balancer_tag.clone())
-            .rule_set_file(rule.rule_set_file.clone())
-            .rule_set_url(rule.rule_set_url.clone())
-            .sort_order(rule.sort_order)
-            .exec(&mut conn)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-    .await;
+    let result = upsert_rule(&state.db, &rule).await;
     match result {
         Ok(()) => state.log_trace("info", "tui::ops::settings", "Routing rule saved"),
         Err(e) => state.log_trace(
@@ -715,6 +681,73 @@ pub async fn save_routing_rule(
         ),
     }
     state.reload_routing_rules().await;
+}
+
+/// Insert or update one routing row. Shared by the form save and the
+/// default-table seed so the two cannot drift on the column set.
+pub(crate) async fn upsert_rule(db: &leas_db::Database, rule: &RoutingRule) -> Result<(), String> {
+    let mut conn = db.connection().await.map_err(|e| e.to_string())?;
+    leas_db::models::RoutingRule::upsert_by_id(rule.id.clone())
+        .group_id(rule.group_id.clone())
+        .ruleset(rule.ruleset.clone())
+        .r#type(rule.r#type)
+        .domain_matcher(rule.domain_matcher.clone())
+        .domains(rule.domains.clone())
+        .ips(rule.ips.clone())
+        .inbound_tags(rule.inbound_tags.clone())
+        .ports(rule.ports.clone())
+        .source_ports(rule.source_ports.clone())
+        .network(rule.network.clone())
+        .protocols(rule.protocols.clone())
+        .domain_strategy(rule.domain_strategy.clone())
+        .outbound_tag(rule.outbound_tag.clone())
+        .balancer_tag(rule.balancer_tag.clone())
+        .rule_set_file(rule.rule_set_file.clone())
+        .rule_set_url(rule.rule_set_url.clone())
+        .sort_order(rule.sort_order)
+        .exec(&mut conn)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Seed the active country's custom set from its shipped table, when the
+/// country has no custom rows yet. Called when the mode flips to `custom`, so
+/// "custom" starts identical to "default".
+pub async fn seed_custom_rules(state: &mut AppState) {
+    let country = state.config.geo.country;
+    let key = country.key();
+    // NULL rows are this country's custom rows too (`active_rules` selects
+    // them), so seeding on top of them would duplicate the user's set.
+    if state
+        .routing_rules
+        .iter()
+        .any(|rule| rule.ruleset.as_deref().is_none_or(|value| value == key))
+    {
+        return;
+    }
+    let start = state
+        .routing_rules
+        .iter()
+        .filter_map(|rule| rule.sort_order)
+        .max()
+        .map_or(0, |order| order.saturating_add(1));
+    for rule in crate::ops::routing_defaults::default_rules(country, start) {
+        if let Err(error) = upsert_rule(&state.db, &rule).await {
+            state.log_trace(
+                "error",
+                "tui::ops::settings",
+                &format!("Failed to seed the default ruleset: {error}"),
+            );
+            return;
+        }
+    }
+    state.reload_routing_rules().await;
+    state.log_trace(
+        "info",
+        "tui::ops::settings",
+        "Custom ruleset seeded from the shipped default",
+    );
 }
 
 /// Persist the probes editor: split the comma-separated field, drop empties,
@@ -824,8 +857,11 @@ mod tests {
     use super::apply_settings_fields;
     use super::build_settings_fields;
     use super::save_route_probes;
+    use super::seed_custom_rules;
+    use super::upsert_rule;
     use crate::AppState;
     use crate::types::SettingsSection;
+    use leas_db::models::RoutingRule;
 
     /// The exit-IP provider crosses three representations on one save: the
     /// Select's option string, the stored field value, and the enum the apply
@@ -868,6 +904,164 @@ mod tests {
                 "{name} did not survive the round trip"
             );
         }
+    }
+
+    /// The active ruleset is exclusive and country-scoped: the shipped table
+    /// in `default` mode, the country's custom rows (plus pre-ruleset NULL
+    /// rows) in `custom` mode, and nothing from another country.
+    #[tokio::test]
+    async fn active_rules_follow_the_mode_and_the_country() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            leas_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, leas_config::AppConfig::default()).await;
+        state.config.geo.country = leas_config::GeoCountry::Ru;
+        state.config.geo.ruleset = Some(leas_config::RulesetMode::Default);
+
+        let shipped = state.active_rules();
+        assert_eq!(
+            shipped.len(),
+            crate::ops::routing_defaults::default_rules(leas_config::GeoCountry::Ru, 0).len()
+        );
+        assert!(shipped.iter().all(|r| r.ruleset.as_deref() == Some("ru")));
+
+        // Custom rows for two countries plus a pre-ruleset NULL row.
+        for (id, ruleset) in [("a", Some("ru")), ("b", Some("cn")), ("legacy", None)] {
+            let mut rule = RoutingRule {
+                id: id.to_string(),
+                group_id: None,
+                ruleset: ruleset.map(str::to_string),
+                r#type: 0,
+                domain_matcher: None,
+                domains: vec!["example.com".to_string()],
+                ips: Vec::new(),
+                inbound_tags: Vec::new(),
+                ports: Vec::new(),
+                source_ports: Vec::new(),
+                network: None,
+                protocols: Vec::new(),
+                domain_strategy: None,
+                outbound_tag: Some("direct".to_string()),
+                balancer_tag: None,
+                rule_set_file: None,
+                rule_set_url: None,
+                sort_order: Some(0),
+            };
+            rule.sort_order = Some(rule.sort_order.unwrap_or(0));
+            upsert_rule(&state.db, &rule).await.unwrap();
+        }
+        state.reload_routing_rules().await;
+        state.config.geo.ruleset = Some(leas_config::RulesetMode::Custom);
+
+        let ids: Vec<String> = state.active_rules().into_iter().map(|r| r.id).collect();
+        assert!(ids.contains(&"a".to_string()));
+        assert!(ids.contains(&"legacy".to_string()));
+        assert!(
+            !ids.contains(&"b".to_string()),
+            "another country's rows stay inactive"
+        );
+    }
+
+    /// A rules read failure keeps the previous snapshot and must NOT flip the
+    /// effective mode to the shipped table: that would reroute traffic on a
+    /// transient DB error.
+    #[tokio::test]
+    async fn a_rules_read_failure_pins_the_custom_ruleset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            leas_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, leas_config::AppConfig::default()).await;
+        assert_eq!(
+            state.ruleset_mode(),
+            leas_config::RulesetMode::Default,
+            "an empty table resolves to the shipped default"
+        );
+        state.routing_rules_load_failed = true;
+        assert_eq!(
+            state.ruleset_mode(),
+            leas_config::RulesetMode::Custom,
+            "a failed read must not substitute the shipped table"
+        );
+        assert!(
+            state.active_rules().is_empty(),
+            "the snapshot is kept as-is"
+        );
+    }
+
+    /// A pre-ruleset NULL row IS the country's custom set: seeding on top of
+    /// it would duplicate the user's rules.
+    #[tokio::test]
+    async fn seeding_skips_a_table_that_already_has_legacy_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            leas_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, leas_config::AppConfig::default()).await;
+        state.config.geo.country = leas_config::GeoCountry::Ru;
+        let mut legacy = RoutingRule {
+            id: "legacy".to_string(),
+            group_id: None,
+            ruleset: None,
+            r#type: 0,
+            domain_matcher: None,
+            domains: vec!["example.com".to_string()],
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: Vec::new(),
+            network: None,
+            protocols: Vec::new(),
+            domain_strategy: None,
+            outbound_tag: Some("direct".to_string()),
+            balancer_tag: None,
+            rule_set_file: None,
+            rule_set_url: None,
+            sort_order: Some(0),
+        };
+        legacy.sort_order = Some(0);
+        upsert_rule(&state.db, &legacy).await.unwrap();
+        state.reload_routing_rules().await;
+
+        seed_custom_rules(&mut state).await;
+        assert_eq!(state.routing_rules.len(), 1, "no shipped rows were added");
+        assert_eq!(state.routing_rules[0].id, "legacy");
+    }
+
+    /// Flipping to custom seeds the shipped table once; a second flip must not
+    /// duplicate it, or every mode toggle would grow the table.
+    #[tokio::test]
+    async fn seed_custom_rules_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            leas_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, leas_config::AppConfig::default()).await;
+        state.config.geo.country = leas_config::GeoCountry::Cn;
+
+        seed_custom_rules(&mut state).await;
+        let first = state.routing_rules.len();
+        assert_eq!(
+            first,
+            crate::ops::routing_defaults::default_rules(leas_config::GeoCountry::Cn, 0).len()
+        );
+        seed_custom_rules(&mut state).await;
+        assert_eq!(state.routing_rules.len(), first, "seed must be idempotent");
+        assert!(
+            state
+                .routing_rules
+                .iter()
+                .all(|r| r.ruleset.as_deref() == Some("cn"))
+        );
     }
 
     #[tokio::test]

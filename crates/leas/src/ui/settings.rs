@@ -1205,8 +1205,6 @@ const fn form_field_defs_for_section(
                 "Speed Test Max Duration",
                 "Duration",
             ),
-            ("geoip_url", "GeoIP URL", "Url"),
-            ("geosite_url", "GeoSite URL", "Url"),
             ("geoip_mode", "GeoIP Mode", "Select:dat,mmdb"),
             ("geo_auto_update", "Geo Auto Update", "Boolean"),
             ("geo_update_interval", "Geo Update Interval Hours", "Number"),
@@ -1613,11 +1611,84 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
         _ => return,
     };
 
-    let rules = &state.routing_rules;
+    let rules = state.active_rules();
     let max = rules.len().saturating_sub(1);
+    let editable = state.ruleset_mode() == leas_config::RulesetMode::Custom;
+    let guard_read_only = |state: &mut AppState| {
+        if !editable {
+            state.log_trace(
+                "info",
+                "tui::ui::settings",
+                "The shipped ruleset is read-only — press M to switch to custom",
+            );
+        }
+    };
 
     match key.code {
+        // ── Ruleset header: dataset, country, mode ────────────────────
+        KeyCode::Char('D') => {
+            state.config.geo.dataset = match state.config.geo.dataset {
+                leas_config::GeoDataset::Loyalsoldier => leas_config::GeoDataset::Roscomvpn,
+                leas_config::GeoDataset::Roscomvpn => leas_config::GeoDataset::Loyalsoldier,
+            };
+            if let Err(e) = state.config.save() {
+                state.log_trace(
+                    "error",
+                    "tui::ui::settings",
+                    &format!("config save failed: {e}"),
+                );
+            }
+            // The two datasets share the artifact file names: force a refetch.
+            crate::ops::geodata::refresh_geo(state);
+        }
+        KeyCode::Char('C') => {
+            state.config.geo.country = match state.config.geo.country {
+                leas_config::GeoCountry::Ru => leas_config::GeoCountry::Cn,
+                leas_config::GeoCountry::Cn => leas_config::GeoCountry::Ir,
+                leas_config::GeoCountry::Ir => leas_config::GeoCountry::Ru,
+            };
+            if let Err(e) = state.config.save() {
+                state.log_trace(
+                    "error",
+                    "tui::ui::settings",
+                    &format!("config save failed: {e}"),
+                );
+            }
+            state.spawn_routing_engine_rebuild();
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right: SplitRightPane::RoutingList { ref mut selected },
+                        ..
+                    },
+            } = state.mode
+            {
+                *selected = 0;
+            }
+        }
+        KeyCode::Char('M') => {
+            let next = match state.ruleset_mode() {
+                leas_config::RulesetMode::Default => leas_config::RulesetMode::Custom,
+                leas_config::RulesetMode::Custom => leas_config::RulesetMode::Default,
+            };
+            state.config.geo.ruleset = Some(next);
+            if let Err(e) = state.config.save() {
+                state.log_trace(
+                    "error",
+                    "tui::ui::settings",
+                    &format!("config save failed: {e}"),
+                );
+            }
+            if next == leas_config::RulesetMode::Custom {
+                crate::ops::settings::seed_custom_rules(state).await;
+            }
+            state.spawn_routing_engine_rebuild();
+        }
         KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !editable {
+                guard_read_only(state);
+                return;
+            }
             if selected > 0 && selected <= rules.len() {
                 let mut ids: Vec<(String, i32)> = rules
                     .iter()
@@ -1653,6 +1724,10 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !editable {
+                guard_read_only(state);
+                return;
+            }
             if selected < max {
                 let mut ids: Vec<(String, i32)> = rules
                     .iter()
@@ -1713,6 +1788,10 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Char('a' | 'A') => {
+            if !editable {
+                guard_read_only(state);
+                return;
+            }
             let fields = routing_rule_fields(None);
             if let AppMode::Settings {
                 mode:
@@ -1733,6 +1812,10 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Char('e' | 'E') => {
+            if !editable {
+                guard_read_only(state);
+                return;
+            }
             if !rules.is_empty() && selected < rules.len() {
                 let fields = routing_rule_fields(Some(&rules[selected]));
                 if let AppMode::Settings {
@@ -1754,7 +1837,11 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
                 }
             }
         }
-        KeyCode::Char('d' | 'D') => {
+        KeyCode::Char('d') => {
+            if !editable {
+                guard_read_only(state);
+                return;
+            }
             let (rule_id, list_len) = if !rules.is_empty() && selected < rules.len() {
                 (Some(rules[selected].id.clone()), rules.len())
             } else {
@@ -1978,6 +2065,9 @@ struct RoutingRuleItem {
     rule_type: String,
     targets: String,
     outbound: String,
+    /// The active datasets cannot serve this row's codes: dimmed, skipped at
+    /// build.
+    disabled: bool,
 }
 
 impl ListItem for RoutingRuleItem {
@@ -1997,6 +2087,10 @@ impl ListItem for RoutingRuleItem {
                 .fg(ctx.palette.primary)
                 .bg(ctx.palette.surface)
                 .add_modifier(Modifier::REVERSED)
+        } else if self.disabled {
+            Style::default()
+                .fg(ctx.palette.foreground)
+                .add_modifier(Modifier::DIM)
         } else {
             Style::default().fg(ctx.palette.foreground)
         };
@@ -2011,10 +2105,31 @@ fn render_routing_list_inner(
     theme: &opaline::Theme,
     selected: usize,
 ) {
-    let rules = &state.routing_rules;
-    let list_area = area;
+    let rules = state.active_rules();
+    let inventory = state.routing_engine.read().inventory.clone();
+    let mode = state.ruleset_mode();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(area);
+    let header = vec![
+        Line::from(format!(
+            " dataset: {}   country: {}   ruleset: {}",
+            state.config.geo.dataset, state.config.geo.country, mode
+        )),
+        Line::from(if mode == leas_config::RulesetMode::Default {
+            " [D] dataset  [C] country  [M] mode   shipped table — switch to custom to edit"
+                .to_string()
+        } else {
+            " [D] dataset  [C] country  [M] mode   [a/e/d] rule  [Ctrl+↑↓] reorder".to_string()
+        })
+        .style(ThemeStyles::hint(theme)),
+    ];
+    frame.render_widget(Paragraph::new(header), rows[0]);
+    let list_area = rows[1];
 
-    // Build list items
+    // Build list items. A rule whose codes the active datasets cannot serve is
+    // shown disabled (the build skips it) instead of failing the engine.
     let items: Vec<RoutingRuleItem> = rules
         .iter()
         .enumerate()
@@ -2028,11 +2143,19 @@ fn render_routing_list_inner(
             } else {
                 ips
             };
+            let disabled = inventory
+                .as_ref()
+                .and_then(|inv| crate::ops::geodata::incompatibility(rule, inv));
             RoutingRuleItem {
                 index: i + 1,
                 rule_type: rule.r#type.to_string(),
                 targets,
-                outbound: rule.outbound_tag.as_deref().unwrap_or("-").to_string(),
+                outbound: if disabled.is_some() {
+                    "off".to_string()
+                } else {
+                    rule.outbound_tag.as_deref().unwrap_or("-").to_string()
+                },
+                disabled: disabled.is_some(),
             }
         })
         .collect();
