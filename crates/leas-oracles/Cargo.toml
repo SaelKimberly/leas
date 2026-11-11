@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 # The client core under test (the e2e suite dials it against real servers).
-leas-native = { path = "../leas-native", features = ["e2e-support"] }
+leas-native = { path = "../leas-native", version = "0.1.0", features = ["e2e-support"] }
 leas-core = { path = "../leas-core", version = "0.1.0" }
 leas-db = { path = "../leas-db", version = "0.1.0" }
 leas-proto.workspace = true
@@ -88,7 +88,7 @@ tokio-tungstenite = "0.30.0"
 futures-core = "0.3.34"
 toasty = { workspace = true, features = ["serde"] }
 # `relay` benches the SOCKS5 inbound through the routing engine.
-leas-route = { path = "../leas-route" }
+leas-route = { path = "../leas-route", version = "0.1.0" }
 
 [[bench]]
 name = "relay"

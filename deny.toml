@@ -25,6 +25,9 @@ allow = [
     "zlib-acknowledgement",
 ]
 confidence-threshold = 0.8
+# The allow list is a policy, not an inventory: an entry no crate happens to use
+# today is not a problem (a dependency update may need it tomorrow).
+unused-allowed-license = "allow"
 
 [licenses.private]
 ignore = true

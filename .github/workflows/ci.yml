@@ -82,11 +82,11 @@ jobs:
     runs-on: ubuntu-24.04
     container: ubuntu:22.04
     steps:
-      - name: Prerequisites (C toolchain for ring / zstd-sys / libsqlite3-sys)
+      - name: Prerequisites (C toolchain for ring, zstd-sys, libsqlite3-sys; cmake for mimalloc-sys)
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl git pkg-config
+            build-essential ca-certificates cmake curl git pkg-config
       - uses: actions/checkout@v7
       - name: Toolchain + task runners (prebuilt, verified)
         uses: taiki-e/install-action@v2

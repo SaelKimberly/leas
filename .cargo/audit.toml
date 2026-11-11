@@ -11,7 +11,17 @@
 # no workspace member enables — this project is SQLite/turso-only. The chain
 # sits in Cargo.lock as an unactivated optional resolution; no fixed rsa
 # release exists. Ignored as unreachable, re-evaluate when toasty/sqlx bump.
-ignore = ["RUSTSEC-2023-0071"]
+ignore = [
+    # rsa: see below.
+    "RUSTSEC-2023-0071",
+    # libsqlite3-sys 0.38.2 (CVE-2026-119375, fixed in 0.39): enters only through
+    # toasty's optional `sqlite` driver (toasty-driver-sqlite → rusqlite →
+    # libsqlite3-sys), and no workspace member enables that driver — the global
+    # database is turso. `cargo tree -i libsqlite3-sys` prints nothing for the
+    # built graph, so no bundled SQLite is ever compiled or called. Re-evaluate
+    # when rusqlite (or toasty) moves to libsqlite3-sys 0.39.
+    "RUSTSEC-2026-0459",
+]
 informational_warnings = ["unmaintained", "unsound", "notice"]
 severity_threshold = "low"
 
