@@ -80,13 +80,31 @@ jobs:
   code-linux:
     name: code (linux, glibc 2.35 floor)
     runs-on: ubuntu-24.04
-    container: ubuntu:22.04
+    container:
+      image: ubuntu:22.04
+      # A container inherits the runner's resolver when it is created; when that
+      # proxy is unhealthy the image cannot even install its own prerequisites
+      # (2026-11-11: every `apt-get update` in the job failed with `Could not
+      # resolve 'archive.ubuntu.com'` while the host-side action downloads
+      # worked). Pin public resolvers so the job does not depend on the host's.
+      options: --dns 1.1.1.1 --dns 8.8.8.8
     steps:
       - name: Prerequisites (C toolchain for ring, zstd-sys, libsqlite3-sys; cmake for mimalloc-sys)
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential ca-certificates cmake curl git pkg-config
+          # Mirror/DNS blips are infrastructure, not this repository: retry the
+          # whole step a few times before letting the job go red.
+          ok=0
+          for attempt in 1 2 3; do
+            if apt-get -o Acquire::Retries=3 update && \
+               apt-get install -y --no-install-recommends \
+                 build-essential ca-certificates cmake curl git pkg-config; then
+              ok=1
+              break
+            fi
+            echo "apt attempt ${attempt} failed; retrying in 10s" >&2
+            sleep 10
+          done
+          [ "$ok" = 1 ]
       - uses: actions/checkout@v7
       - name: Toolchain + task runners (prebuilt, verified)
         uses: taiki-e/install-action@v2
