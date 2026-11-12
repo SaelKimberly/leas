@@ -286,3 +286,21 @@ Screen output (session: routing-rules-audit, mode: buffer):
 ```
 
 [Showing lines 1-172 and 754-866 of 866; 581 middle lines (39.9KB) elided. Read artifact://24 for full output]
+---
+
+## Appendix: run 1 (failed first attempt, verbatim step 15)
+
+The first script expected `a` to open the routing form while the pane was in
+`ruleset: default` (read-only). Step 15 is the evidence the key is a silent
+no-op there; steps 1–14 match the saved run above.
+
+```
+[15] expect(expect_text) — error (5517 ms)
+ToolError: Pattern 'Domain Matcher' not found after 5s.
+Current screen (40 lines):
+┌ 1: [Profiles]  Sniffer  Logs ───... (unchanged routing list,
+    header "dataset: loyalsoldier   country: ru   ruleset: default",
+    rows 1..10 geosite:* with block/proxy/direct, no form)
+------------------------------------------------------------
+steps: 15 · errored: 1 · session closed
+```
