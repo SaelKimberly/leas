@@ -1324,6 +1324,20 @@ fn render_form_with_area(
     }
 }
 
+/// Column split of one form row: `(label_w, value_budget)`. The label column
+/// floored at 12 used to underflow `row.width - prefix - label_w` on rows
+/// narrower than 15 cells (a 20-col terminal's popup), so the label yields
+/// before the value budget goes to zero.
+fn row_columns(width: u16) -> (usize, usize) {
+    let prefix_cells = 3usize; // cursor cell + marker + space
+    let label_w = (width.saturating_sub(14).clamp(12, 24) as usize)
+        .min((width as usize).saturating_sub(prefix_cells));
+    (
+        label_w,
+        (width as usize).saturating_sub(prefix_cells + label_w),
+    )
+}
+
 /// One row of a settings-style form: `›` on the focused row, the provenance
 /// marker, the display-width-padded label, then the value — type-colored
 /// (`value_style_for`), truncated to the remaining width, with the focused
@@ -1354,13 +1368,12 @@ fn render_field_row(
     // A label longer than the column still gets one separating space,
     // or the value collides with it at the narrow minimum
     // (`Sing-Box Path—` at 54 columns).
-    let label_w = row.width.saturating_sub(14).clamp(12, 24) as usize;
+    let (label_w, budget) = row_columns(row.width);
     let label_text = if label.chars().count() >= label_w {
         format!("{label} ")
     } else {
         crate::ui::textfit::pad(label, label_w)
     };
-    let budget = row.width as usize - prefix_cells - label_w;
     let display = value_display(field_type, current);
     let (value_text, value_cells) = if focused {
         // Reserve one cell for the cursor: the `█` is always visible.
@@ -2991,6 +3004,27 @@ mod tests {
         assert_eq!(super::value_display("Select:en,zh", "zh"), "‹ 2/2 · zh ›");
         // A stored value no longer offered lands on position 1.
         assert_eq!(super::value_display("Select:en,zh", "fr"), "‹ 1/2 · fr ›");
+    }
+
+    /// Regression: the label column floored at 12 used to underflow the
+    /// value budget on rows narrower than 15 cells — reachable through the
+    /// popup on a 20-col terminal (`clamp(50,110).min(area.width)`), where
+    /// the old code never panicked.
+    #[test]
+    fn row_columns_never_underflow_on_a_narrow_row() {
+        // Below the 3-cell prefix the row renders nothing; both columns
+        // collapse to zero instead of panicking.
+        assert_eq!(super::row_columns(0), (0, 0));
+        assert_eq!(super::row_columns(2), (0, 0));
+        // The label yields before the budget goes negative; at 15 cells the
+        // label column keeps its floor and the budget is zero.
+        assert_eq!(super::row_columns(15), (12, 0));
+        assert_eq!(super::row_columns(16), (12, 1));
+        assert_eq!(super::row_columns(54), (24, 27));
+        for w in 3..=120u16 {
+            let (label_w, budget) = super::row_columns(w);
+            assert!(label_w + budget + 3 <= usize::from(w), "width {w}");
+        }
     }
 
     /// Regression: pressing Right on the Protocol Core form panicked
