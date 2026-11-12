@@ -70,8 +70,8 @@ unicode-width, leas-config (serde defaults).
   `width` display cells, truncation ends with `…`),
   `pub fn truncate(s: &str, width: usize) -> String` (at most `width` cells,
   one cell reserved for `…` only when truncation happens),
-  `pub fn truncate_keep_tail(s: &str, width: usize, tail_cells: usize) -> String`
-  (keeps the LAST `tail_cells` cells — the cursor cell — truncating the head;
+  `pub fn truncate_head(s: &str, width: usize) -> String`
+   (drops the head, keeps the last width-1 cells — the cursor cell — callers
   used so a focused value's `█` always renders).
 
 - [ ] **Step 1: Write the failing tests**
@@ -100,10 +100,12 @@ mod tests {
 
     #[test]
     fn keep_tail_keeps_the_cursor_visible() {
-        // 6-cell budget, 1 tail cell: the cursor survives at the right edge.
-        assert_eq!(truncate_keep_tail("abcdefg", 6, 1), "…def █");
+        // The cursor is NOT in the string: the caller reserves one cell in
+        // the budget and appends the █ Span itself.
+        // 5-cell budget, 1 tail cell: …(1) + def(3) + g(1) = 5.
+        assert_eq!(truncate_head("abcdefg", 5), "…defg");
         // Short value untouched.
-        assert_eq!(truncate_keep_tail("ab", 6, 1), "ab    ");
+        assert_eq!(truncate_head("ab", 5), "ab");
     }
 }
 ```
@@ -117,7 +119,7 @@ implement; the tests above are the contract — implement to them.)
 - [ ] **Step 3: Implement.** Walk `UnicodeSegmentation::graphemes` (dep exists
   transitively via ratatui; if not importable, walk chars with
   `unicode_width::UnicodeWidthChar`), accumulate display cells; on overflow
-  drop back one cell for `…`. `truncate_keep_tail` renders `…` + as many
+  drop back one cell for `…`. `truncate_head` renders a leading `…` plus the last kept cells
   leading cells as fit, then pads the remainder — callers append the cursor
   span themselves (it is NOT part of the string; the test string above is the
   cell budget the caller then fills with `value + █`).
@@ -175,7 +177,7 @@ fn dirty_value_carries_warning_tint() {
     `format!("{label:<label_w$}")`.
   - Value rendering: budget = `area.width - (marker 2 + label_w + 2)`;
     unfocused → `textfit::truncate(value, budget)`; focused →
-    `textfit::truncate_keep_tail(value, budget, 1)` then append `█`.
+    `textfit::truncate_head(value, budget)` then append `█`.
   - Inline error: only when `2 + label_w + 2 + value_cells + 3 + width(err)`
     ≤ area.width; else skip (status band repeats it — Task 4 keeps that).
   - Group headers in `render_sections`: `▾ {name} · {n}` / `▸ {name} · {n}`
@@ -656,5 +658,5 @@ cargo fmt
   Tasks 3+7; `textfit::*` used by Tasks 2, 4, 5, 7; `AppMode::GroupForm`
   used by Tasks 5+6; `settings_form_defaults` by Task 3 (+4's dirty count
   uses `settings_form_snapshot`, unchanged).
-- Review Focus → tests: (1) Task 1 tests, (2) Task 1 `truncate_keep_tail` +
+- Review Focus → tests: (1) Task 1 tests, (2) Task 1 `truncate_head` +
   Task 2 renderer, (3) Task 3 Step 2, (4) Task 3 Step 1, (5) Task 7 Step 1.

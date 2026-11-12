@@ -9,6 +9,7 @@ pub mod settings;
 pub mod sniffer;
 pub mod status_bar;
 pub mod tasks;
+pub mod textfit;
 pub mod theme;
 pub mod widgets;
 use crate::ops::job_scheduler::{self, TaskKind, TaskSpec};
