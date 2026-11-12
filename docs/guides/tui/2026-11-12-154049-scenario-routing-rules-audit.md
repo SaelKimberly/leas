@@ -66,6 +66,7 @@ expect("dataset:", timeout=5)
 capture()
 region(5, 13, col_start=2, col_end=117)
 send("a", delay=0.4)
+capture()
 assert_text("geosite:win-spy")
 send("M", delay=0.4)
 expect("custom", timeout=5)
@@ -93,7 +94,7 @@ close()
 | E2 | PASS | Step 5: `Sections` found; step 12 capture shows the ` Search ` bar and ` Sections · 2/2 ` |
 | E3 | PASS | Step 9: `Routing Rules` found; ` Sections · 2/2 ` confirms the filter narrowed 20 rows to 2 |
 | E4 | PASS | Steps 11–13: header `dataset: loyalsoldier   country: ru   ruleset: default`, hint `[D] dataset  [C] country  [M] mode   shipped table — switch to custom t│` (clipped, see P3), rows `1  0  geosite:win-spy … block` |
-| E5 | PASS (finding) | Run 1 step 15: `a` in `ruleset: default` timed out — the screen never changed (`Domain Matcher` not found after 5s). The list is read-only and gives no feedback. Run 2 step 15 asserts the no-op |
+| E5 | PASS (finding) | Run 1 step 15: `a` in `ruleset: default` timed out — the screen never changed (`Domain Matcher` not found after 5s). The list is read-only and gives no feedback. Saved-run step 15's capture (after `a`) is identical to the step-12 pre-`a` screen — same header, same rows, no form — so the no-op is evidenced by the unchanged screen, not by an assertion on pre-existing text |
 | E6 | PASS | Run 2 step 17: `ruleset: custom`; step 18 capture shows the same 10 shipped rows and hint `[a/e/d] rule  [Ctrl+↑↓] reorder` |
 | E7 | PASS | Run 2 steps 20–21: form renders `Type` / `Domain Matcher` / `Domains (comma-sep)` … as `> (empty)` Input rows inside a ` Routing Rule ` titled pane; the modal border shows `[Enter] Save  [Ctrl+W] Sections  [Esc] Back` |
 | E8 | PASS (findings) | Run 2 steps 24–28: at 80x24 the popup re-lays, but `ruleset:` truncates to `rules`, the `[a/e/d` hint clips mid-token, and list rows overrun the popup's right border (`…geosite:win-spy                 block` with no border tail); only 2 rules visible |
@@ -107,6 +108,11 @@ close()
   transcript step 15 is preserved in the transcript file.
 - The routing form renders **inside the right pane** (a `Routing Rule ` titled
   pane), not as an overlay — expectation wording adjusted.
+- Two intermediate reruns were invalid and are not cited as evidence: `M`
+  persists `ruleset: custom` in the fixture config, so reusing the fixture
+  home makes the default-mode no-op untestable (`a` legitimately opens the
+  form there). The saved transcript is the fresh-fixture run; the fixture is
+  recreated from `fixtures/config.json` before each clean run.
 
 ## Visual polish remarks
 

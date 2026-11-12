@@ -171,6 +171,15 @@ keys are silently dead, the help band wastes 6 of 8 rows, and the 14-field
 routing form has no scroll (tail fields unreachable while focus can Tab into
 them).
 
+Root cause of the border overrun, verified in code: `RoutingRuleItem::render`
+builds the row as `format!(" {:>2} {} {:<30} {} ", …)` — a fixed 30-column
+target cell plus fixed number/type/outbound columns (~45+ columns minimum)
+— and paints it with `buf.set_string` clamped to nothing. Below ~45 inner
+columns the row paints past the pane and erases its border; `{: <30}` pads
+but never truncates, so a long targets blob overruns at any width. The group
+list's own render (pop-truncate on `unicode_width`) is the in-repo precedent
+for the fix.
+
 - Header becomes a controls row: `D ‹dataset› · C ‹country› · M ‹ruleset›`
   with accent-bold values (same bracket idiom as selectors), plus a summary
   `12 rules · 2 off`.
