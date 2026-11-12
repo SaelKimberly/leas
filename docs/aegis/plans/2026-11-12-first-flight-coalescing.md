@@ -174,3 +174,13 @@ Executed inline. Reviewer findings applied before the commit:
   `Pending`); a `Pending` inner write has its own test; the e2e PQ assertion in
   `leas-oracles` peels the new wrapper, and that is why `first_flight` is `pub` with an
   `e2e-support`-only `inner()`.
+- **Mux was wired too**, after a review pass: `connect_mux_plain` holds the header for
+  the first mux frame and `connect_mux_vision` seeds header + camouflage as one
+  preamble. The UDP connect paths keep writing eagerly and are named as the declared
+  exception in `AGENTS.md` and the spec, not left implied.
+- **Real-core evidence** (cores built by `leas-oracles`' `build.rs`):
+  `cargo nextest run -p leas-oracles --test vless --test trojan --test vmess` →
+  **155 passed, 8 skipped**, and the mux rows alone
+  (`--test vless mux`) → **5 passed** (xray + sing-box, TLS + REALITY, mux and
+  mux-vision). A real server accepting the coalesced header is the interop proof; a
+  wrapper test cannot supply it.
