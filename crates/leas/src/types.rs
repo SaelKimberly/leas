@@ -164,22 +164,25 @@ impl NativeActivityLog {
     }
 }
 
-/// Top pane's tabs (spec D2): the table, the per-host sniffer, the log viewer.
+/// Top pane's tabs (spec D2): the table, the per-host sniffer, the
+/// subscription sources table, the log viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane1Tab {
     Profiles,
     Sniffer,
+    Sources,
     Logs,
 }
 
 impl Pane1Tab {
-    pub const ALL: &'static [Self] = &[Self::Profiles, Self::Sniffer, Self::Logs];
+    pub const ALL: &'static [Self] = &[Self::Profiles, Self::Sniffer, Self::Sources, Self::Logs];
 
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
             Self::Profiles => Self::Sniffer,
-            Self::Sniffer => Self::Logs,
+            Self::Sniffer => Self::Sources,
+            Self::Sources => Self::Logs,
             Self::Logs => Self::Profiles,
         }
     }
@@ -189,7 +192,8 @@ impl Pane1Tab {
         match self {
             Self::Profiles => Self::Logs,
             Self::Sniffer => Self::Profiles,
-            Self::Logs => Self::Sniffer,
+            Self::Sources => Self::Sniffer,
+            Self::Logs => Self::Sources,
         }
     }
 }
@@ -517,6 +521,13 @@ pub enum AppMode {
     ImportUrl {
         input: String,
         error: Option<String>,
+    },
+    /// Add/edit a subscription group (Sources tab). None = adding.
+    GroupForm {
+        group_id: Option<String>,
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     /// Speed test menu overlay
     SpeedTestMenu {
@@ -897,10 +908,12 @@ mod tests {
 
     #[test]
     fn tabs_cycle_through_the_sniffer() {
+        // The Sources tab sits between Sniffer and Logs (spec §1).
         assert_eq!(Pane1Tab::Profiles.next(), Pane1Tab::Sniffer);
-        assert_eq!(Pane1Tab::Sniffer.next(), Pane1Tab::Logs);
+        assert_eq!(Pane1Tab::Sniffer.next(), Pane1Tab::Sources);
+        assert_eq!(Pane1Tab::Sources.next(), Pane1Tab::Logs);
         assert_eq!(Pane1Tab::Logs.next(), Pane1Tab::Profiles);
         assert_eq!(Pane1Tab::Profiles.prev(), Pane1Tab::Logs);
-        assert_eq!(Pane1Tab::ALL.len(), 3);
+        assert_eq!(Pane1Tab::ALL.len(), 4);
     }
 }

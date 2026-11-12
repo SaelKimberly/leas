@@ -7,6 +7,7 @@ pub mod native_activity;
 pub mod profiles;
 pub mod settings;
 pub mod sniffer;
+pub mod sources;
 pub mod status_bar;
 pub mod tasks;
 pub mod textfit;
@@ -482,6 +483,24 @@ fn paste_into_focused_field(state: &mut AppState) -> bool {
         return true;
     }
 
+    // The Sources tab's group form: every field is free text.
+    if let crate::AppMode::GroupForm {
+        fields,
+        focus_index,
+        ..
+    } = &mut state.mode
+    {
+        if *focus_index >= fields.len() {
+            return true;
+        }
+        let Some(payload) = crate::ops::clipboard::get_text().ok() else {
+            return true;
+        };
+        let (_, val) = &mut fields[*focus_index];
+        val.push_str(&payload);
+        return true;
+    }
+
     // Profiles list: paste opens the import screen (the historical door).
     if state.profiles_active() {
         return import_clipboard_payload(state);
@@ -612,6 +631,21 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     // BatchImport: route all keys to batch import handler
     if matches!(&state.mode, crate::AppMode::BatchImport { .. }) {
         add_server::handle_batch_import_key(state, key).await;
+        return;
+    }
+
+    // Group form (Sources tab): route all keys to its own handler.
+    if matches!(&state.mode, crate::AppMode::GroupForm { .. }) {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if state.connected && state.confirmation.is_none() {
+                    state.confirmation = Some(ConfirmAction::Quit);
+                } else {
+                    state.should_quit = true;
+                }
+            }
+            _ => sources::handle_group_form_key(state, key).await,
+        }
         return;
     }
 
@@ -983,6 +1017,25 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         // else: fall through to main handler for quit/tab/help/etc.
     }
 
+    // Sources tab: the group table's own keys (spec §1). Tab-scoped like the
+    // sniffer's, so `a`/`e`/`d`/`u` do not collide with the Profiles tab.
+    if matches!(state.pane1_tab, crate::Pane1Tab::Sources)
+        && matches!(state.focused_pane, crate::FocusedPane::Pane1)
+        && matches!(state.mode, crate::AppMode::List)
+    {
+        let is_sources_key = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Char('a' | 'e' | 'd' | 'u' | 'A' | 'E' | 'D' | 'U' | ' ')
+        ) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_sources_key {
+            crate::ui::sources::handle_key(state, key);
+            return;
+        }
+        // else: fall through to main handler for quit/tab/help/etc.
+    }
+
     // NativeActivity tab: route scroll keys to the screen handler
     if matches!(state.pane2_tab, crate::Pane2Tab::Metrics)
         && matches!(state.focused_pane, crate::FocusedPane::Pane2)
@@ -1002,6 +1055,25 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             && !key.modifiers.contains(KeyModifiers::ALT);
         if is_native_activity_key {
             native_activity::handle_key(state, key);
+            return;
+        }
+        // else: fall through to main handler for quit/tab/help/etc.
+    }
+
+    // Sources tab: the group table's own keys (spec §1). Tab-scoped like the
+    // sniffer's, so `a`/`e`/`d`/`u` do not collide with the Profiles tab.
+    if matches!(state.pane1_tab, crate::Pane1Tab::Sources)
+        && matches!(state.focused_pane, crate::FocusedPane::Pane1)
+        && matches!(state.mode, crate::AppMode::List)
+    {
+        let is_sources_key = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Char('a' | 'e' | 'd' | 'u' | 'A' | 'E' | 'D' | 'U' | ' ')
+        ) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_sources_key {
+            crate::ui::sources::handle_key(state, key);
             return;
         }
         // else: fall through to main handler for quit/tab/help/etc.
@@ -1084,6 +1156,25 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         // else: fall through to main handler for quit/tab/help/etc.
     }
 
+    // Sources tab: the group table's own keys (spec §1). Tab-scoped like the
+    // sniffer's, so `a`/`e`/`d`/`u` do not collide with the Profiles tab.
+    if matches!(state.pane1_tab, crate::Pane1Tab::Sources)
+        && matches!(state.focused_pane, crate::FocusedPane::Pane1)
+        && matches!(state.mode, crate::AppMode::List)
+    {
+        let is_sources_key = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Char('a' | 'e' | 'd' | 'u' | 'A' | 'E' | 'D' | 'U' | ' ')
+        ) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_sources_key {
+            crate::ui::sources::handle_key(state, key);
+            return;
+        }
+        // else: fall through to main handler for quit/tab/help/etc.
+    }
+
     // TargetPicker mode: route to target picker handler
     if matches!(&state.mode, crate::AppMode::TargetPicker { .. }) {
         logs::handle_target_picker_key(state, key);
@@ -1132,11 +1223,17 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.focused_pane = crate::FocusedPane::Pane2;
         }
         KeyCode::Char('[') => match state.focused_pane {
-            crate::FocusedPane::Pane1 => state.pane1_tab = state.pane1_tab.prev(),
+            crate::FocusedPane::Pane1 => {
+                state.pane1_tab = state.pane1_tab.prev();
+                crate::ui::sources::enter_sources_if_selected(state).await;
+            }
             crate::FocusedPane::Pane2 => state.pane2_tab = state.pane2_tab.prev(),
         },
         KeyCode::Char(']') => match state.focused_pane {
-            crate::FocusedPane::Pane1 => state.pane1_tab = state.pane1_tab.next(),
+            crate::FocusedPane::Pane1 => {
+                state.pane1_tab = state.pane1_tab.next();
+                crate::ui::sources::enter_sources_if_selected(state).await;
+            }
             crate::FocusedPane::Pane2 => state.pane2_tab = state.pane2_tab.next(),
         },
         // Pane-2 height resize (spec D3): Alt+↑/↓, clamped 3..term/2.
@@ -1275,21 +1372,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
         }
         KeyCode::Char('g' | 'G') if state.profiles_active() => {
-            // `g` opens Settings already on Subscriptions: the popup opens with
-            // a section loaded (R1), so the selection has to move with the pane.
-            state.enter_settings().await;
-            state.settings_sections.selected =
-                crate::ui::settings::section_leaf_index(crate::SettingsSection::Subscriptions);
-            let pane = state
-                .build_right_pane(crate::SettingsSection::Subscriptions)
-                .await;
-            if let crate::AppMode::Settings {
-                mode: crate::SettingsMode::Split { right, focus },
-            } = &mut state.mode
-            {
-                *right = pane;
-                *focus = crate::SplitFocus::Right;
-            }
+            // `g` jumps to the Sources tab (spec §1): subscription groups are
+            // a pane-1 tab now, not a Settings section.
+            state.pane1_tab = crate::Pane1Tab::Sources;
+            state.focused_pane = crate::FocusedPane::Pane1;
+            crate::ui::sources::enter_sources_if_selected(state).await;
         }
         KeyCode::Char('p' | 'P') if state.profiles_active() => {
             state.cycle_purgatory_view();
@@ -1416,6 +1503,9 @@ fn render_base(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState)
         crate::AppMode::BatchImport { .. } => {
             add_server::render_batch_import(frame, area, state);
         }
+        crate::AppMode::GroupForm { .. } => {
+            sources::render_group_form(frame, area, state);
+        }
         crate::AppMode::Settings { .. } => {
             settings::render(frame, area, state);
         }
@@ -1423,11 +1513,13 @@ fn render_base(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState)
     }
 }
 
-/// Pane 1 content (spec §6): Profiles or Logs.
+/// Pane 1 content (spec §6): Profiles, the per-host sniffer, the
+/// subscription sources table, or the log viewer.
 fn render_pane1(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     match state.pane1_tab {
         crate::Pane1Tab::Profiles => profiles::render(frame, area, state),
         crate::Pane1Tab::Sniffer => sniffer::render(frame, area, state),
+        crate::Pane1Tab::Sources => sources::render(frame, area, state),
         crate::Pane1Tab::Logs => logs::render_inner(frame, area, state),
     }
 }
@@ -1768,6 +1860,10 @@ fn render(frame: &mut Frame, state: &AppState) {
             "Sniffer",
             matches!(state.pane1_tab, crate::Pane1Tab::Sniffer),
         ),
+        (
+            "Sources",
+            matches!(state.pane1_tab, crate::Pane1Tab::Sources),
+        ),
         ("Logs", matches!(state.pane1_tab, crate::Pane1Tab::Logs)),
     ];
     let p1_border = if pane1_focused {
@@ -1888,6 +1984,16 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("Ctrl+D", "Disconnect"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
+                ],
+                crate::Pane1Tab::Sources => vec![
+                    ("↑↓", "Navigate sources"),
+                    ("Space", "Toggle the selected group"),
+                    ("a", "Add a group"),
+                    ("e", "Edit the selected group"),
+                    ("d", "Delete selected group(s)"),
+                    ("u", "Update every group"),
+                    ("g", "Return to Profiles from the shell"),
+                    ("[ / ]", "Cycle the focused pane's tabs"),
                 ],
                 crate::Pane1Tab::Sniffer => vec![
                     ("↑↓", "Scroll hosts"),
@@ -2273,16 +2379,9 @@ mod tests {
         let _clipboard =
             crate::ops::clipboard::set_test_clipboard("https://example.invalid/feed?token=abc");
         let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
-        // `start_add_group` only fills the pane while the Settings split is
-        // already open, which is the state the real `a` key reaches it from;
-        // that key path also puts the focus on the right pane.
-        state.enter_settings().await;
-        if let crate::AppMode::Settings {
-            mode: crate::SettingsMode::Split { focus, .. },
-        } = &mut state.mode
-        {
-            *focus = crate::SplitFocus::Right;
-        }
+        // The group form is a full screen off the Sources tab; `a` is how the
+        // real key path reaches it.
+        state.pane1_tab = crate::Pane1Tab::Sources;
         crate::ops::subscriptions::start_add_group(&mut state);
 
         // The URL field is the second one. `Down` advances the group form's
@@ -2298,19 +2397,13 @@ mod tests {
         )
         .await;
 
-        let crate::AppMode::Settings {
-            mode: crate::SettingsMode::Split { right, .. },
-        } = &state.mode
-        else {
-            panic!("the group form must still be open");
-        };
-        let crate::SplitRightPane::GroupForm {
+        let crate::AppMode::GroupForm {
             fields,
             focus_index,
             ..
-        } = right
+        } = &state.mode
         else {
-            panic!("expected the group form, got {right:?}");
+            panic!("the group form must still be open");
         };
         assert_eq!(*focus_index, 1, "the URL field must be the focused one");
         assert_eq!(

@@ -21,6 +21,7 @@ use leas_proto::proto_spec::common::TransportConfig;
 use leas_proto::proto_spec::{
     EndpointEssentials, HostKind, ParsedProto, ProtoSpec, ProtocolConfig,
 };
+use rapidhash::HashMapExt as _;
 use toasty::{Deferred, Json};
 
 use crate::ops::{
@@ -156,6 +157,12 @@ pub struct AppState {
     pub settings_search: SettingsSearch,
     /// Transient settings message for the popup's status row (spec A7).
     pub settings_notice: Option<String>,
+    /// Sources tab (pane 1): the selected group row and the enabled-mask
+    /// checkboxes. Session-only; reset when the tab is entered.
+    pub sources_selected: usize,
+    pub sources_selected_mask: Vec<bool>,
+    /// Sources tab: members per group, refreshed when the tab is entered.
+    pub sources_counts: rapidhash::RapidHashMap<String, usize>,
     /// The loaded Profiles page: the window the tab renders and indexes.
     /// `selected_index` indexes this vector, never the whole feed.
     pub endpoints: Vec<EndpointRow>,
@@ -803,6 +810,9 @@ impl AppState {
             settings_sections: SectionList::default(),
             settings_search: SettingsSearch::default(),
             settings_notice: None,
+            sources_selected: 0,
+            sources_selected_mask: Vec::new(),
+            sources_counts: rapidhash::RapidHashMap::new(),
             endpoints: Vec::new(),
             filter_cache_valid: Cell::new(true),
             page_total: 0,

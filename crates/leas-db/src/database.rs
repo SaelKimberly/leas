@@ -969,6 +969,20 @@ impl Database {
         Ok(groups)
     }
 
+    /// Members per group, one row per `endpoint_groups` link: the Sources
+    /// tab's `Endpoints` column. The typed model has no COUNT aggregate, so
+    /// the links are loaded and folded in memory — the caller refreshes this
+    /// once per tab entry, not per row.
+    pub async fn get_group_member_counts(&self) -> Result<RapidHashMap<String, usize>> {
+        let mut conn = self.conn().await?;
+        let links: Vec<EndpointGroup> = EndpointGroup::all().exec(&mut conn).await?;
+        let mut counts: RapidHashMap<String, usize> = RapidHashMap::new();
+        for link in links {
+            *counts.entry(link.group_id).or_default() += 1;
+        }
+        Ok(counts)
+    }
+
     /// Groups enabled with a non-empty url whose refresh window has elapsed:
     /// `last_refreshed IS NULL` or `last_refreshed + refresh_interval minutes
     /// < now` (`refresh_interval` defaults to 1440 minutes, matching the old

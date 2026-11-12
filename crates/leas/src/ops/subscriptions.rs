@@ -15,7 +15,7 @@ use crate::AppState;
 use crate::ops::stream_import::ImportOutcome;
 use crate::state::{LiveProxy, ProxyEndpoint};
 
-use crate::types::{CoreEvent, SplitRightPane};
+use crate::types::CoreEvent;
 use crate::{get_field, try_send_or_warn};
 
 pub fn start_add_group(state: &mut AppState) {
@@ -25,17 +25,12 @@ pub fn start_add_group(state: &mut AppState) {
         ("user_agent".into(), String::new()),
         ("update_interval".into(), "1h".into()),
     ];
-    if let crate::AppMode::Settings {
-        mode: crate::SettingsMode::Split { right, .. },
-    } = &mut state.mode
-    {
-        *right = SplitRightPane::GroupForm {
-            group_id: None,
-            fields,
-            focus_index: 0,
-            form_errors: HashMap::new(),
-        };
-    }
+    state.mode = crate::AppMode::GroupForm {
+        group_id: None,
+        fields,
+        focus_index: 0,
+        form_errors: HashMap::new(),
+    };
 }
 
 pub fn start_edit_group(state: &mut AppState, group_id: &str) {
@@ -60,28 +55,17 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
         ("user_agent".into(), group.user_agent.unwrap_or_default()),
         ("update_interval".into(), update_interval_value),
     ];
-    if let crate::AppMode::Settings {
-        mode: crate::SettingsMode::Split { right, .. },
-    } = &mut state.mode
-    {
-        *right = SplitRightPane::GroupForm {
-            group_id: Some(group_id.into()),
-            fields,
-            focus_index: 0,
-            form_errors: HashMap::new(),
-        };
-    }
+    state.mode = crate::AppMode::GroupForm {
+        group_id: Some(group_id.into()),
+        fields,
+        focus_index: 0,
+        form_errors: HashMap::new(),
+    };
 }
 
 pub async fn confirm_add_group(state: &mut AppState) {
     let fields = match &state.mode {
-        crate::AppMode::Settings {
-            mode:
-                crate::SettingsMode::Split {
-                    right: SplitRightPane::GroupForm { fields, .. },
-                    ..
-                },
-        } => fields.clone(),
+        crate::AppMode::GroupForm { fields, .. } => fields.clone(),
         _ => return,
     };
     let interval: i64 = get_field(&fields, "update_interval")
@@ -117,27 +101,12 @@ pub async fn confirm_add_group(state: &mut AppState) {
         ),
     );
     state.reload_groups().await;
-    if let crate::AppMode::Settings {
-        mode: crate::SettingsMode::Split { right, .. },
-    } = &mut state.mode
-    {
-        *right = SplitRightPane::GroupList {
-            selected: 0,
-            selected_mask: vec![false; state.groups.len()],
-        };
-    }
+    state.mode = crate::AppMode::List;
 }
 pub async fn confirm_edit_group(state: &mut AppState) {
     let (group_id_opt, fields) = match &state.mode {
-        crate::AppMode::Settings {
-            mode:
-                crate::SettingsMode::Split {
-                    right:
-                        SplitRightPane::GroupForm {
-                            group_id, fields, ..
-                        },
-                    ..
-                },
+        crate::AppMode::GroupForm {
+            group_id, fields, ..
         } => (group_id.clone(), fields.clone()),
         _ => return,
     };
@@ -165,15 +134,7 @@ pub async fn confirm_edit_group(state: &mut AppState) {
     }
     state.log_trace("info", "tui::ops::subscriptions", "Group updated");
     state.reload_groups().await;
-    if let crate::AppMode::Settings {
-        mode: crate::SettingsMode::Split { right, .. },
-    } = &mut state.mode
-    {
-        *right = SplitRightPane::GroupList {
-            selected: 0,
-            selected_mask: vec![false; state.groups.len()],
-        };
-    }
+    state.mode = crate::AppMode::List;
 }
 
 pub async fn delete_group(state: &mut AppState, group_id: &str) {
@@ -936,6 +897,22 @@ pub fn spawn_auto_update(state: &mut AppState) {
             }
         }
     });
+}
+
+/// Refresh the Sources tab's per-group endpoint counts. One query per tab
+/// entry, not per row: the typed model has no COUNT aggregate, so
+/// `get_group_member_counts` folds the links in memory.
+pub async fn reload_sources_counts(state: &mut AppState) {
+    match state.db.get_group_member_counts().await {
+        Ok(counts) => state.sources_counts = counts,
+        Err(e) => {
+            state.log_trace(
+                "error",
+                "tui::ops::subscriptions",
+                &format!("Failed to count group members: {e}"),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
