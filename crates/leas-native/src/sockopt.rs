@@ -41,6 +41,13 @@ pub struct SockOpts {
     pub nodelay: Option<bool>,
     /// `IP_TOS` / `IPV6_TCLASS` diffserv byte.
     pub tos: Option<u32>,
+    /// `TCP_MAXSEG`: the MSS we advertise before connect. Unix only; ignored
+    /// on Windows. Safe through `socket2`'s `all` feature (no unsafe, no ADR).
+    pub tcp_maxseg: Option<u16>,
+    /// `TCP_QUICKACK`: ACK immediately instead of using delayed ACK. Linux and
+    /// Android only; the kernel resets it after internal protocol events, so it
+    /// is applied once at dial rather than tracked.
+    pub tcp_quickack: Option<bool>,
 }
 
 impl SockOpts {
@@ -54,6 +61,8 @@ impl SockOpts {
             && self.reuse_port.is_none()
             && self.nodelay.is_none()
             && self.tos.is_none()
+            && self.tcp_maxseg.is_none()
+            && self.tcp_quickack.is_none()
     }
 
     /// Apply to an already-connected stream (tokio or std) through
@@ -93,6 +102,17 @@ impl SockOpts {
         if let Some(tos) = self.tos {
             let _ = socket.set_tos_v4(tos);
         }
+        // Set before connect: the MSS is advertised in the SYN, so applying it
+        // to an established socket would only change our own segments, which
+        // is not the direction that black-holes.
+        #[cfg(unix)]
+        if let Some(mss) = self.tcp_maxseg {
+            let _ = socket.set_tcp_mss(u32::from(mss));
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
+        if let Some(quick) = self.tcp_quickack {
+            let _ = socket.set_tcp_quickack(quick);
+        }
     }
 }
 
@@ -114,6 +134,26 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    /// The MSS option is only useful if it is in the SYN, i.e. applied before
+    /// connect. `TCP_MAXSEG` is readable, so the value is asserted against the
+    /// kernel rather than trusting the call site.
+    #[cfg(unix)]
+    #[test]
+    fn maxseg_reaches_the_socket() {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .expect("socket");
+        let opts = SockOpts {
+            tcp_maxseg: Some(1360),
+            ..SockOpts::default()
+        };
+        opts.apply(&socket2::SockRef::from(&socket));
+        assert_eq!(socket.tcp_mss().expect("read back TCP_MAXSEG"), 1360);
     }
 
     #[test]

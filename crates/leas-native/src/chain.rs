@@ -79,7 +79,17 @@ async fn secured_upgraded(ctx: &LinkContext, dialed: BoxStream) -> Result<BoxStr
     if transport::is_self_contained(ctx) {
         return Ok(dialed);
     }
-    let secured = security::wrap(ctx, dialed).await?;
+    let secured = security::wrap(ctx, dialed).await;
+    // The one owner of the MSS policy's evidence: a TLS/REALITY handshake that
+    // timed out after the dial succeeded is the black-holed-MTU symptom, and a
+    // completed one proves the current size works. Two shapes are excluded
+    // because they carry no evidence about a TCP MSS: a plaintext row runs no
+    // handshake at all (`security::wrap` is the identity), and a QUIC link has
+    // no TCP socket even when the probe path routes it through here.
+    if ctx.is_tls() && !crate::protocol::is_quic_link(ctx) {
+        crate::path_mss::note_outcome(&secured);
+    }
+    let secured = secured?;
     transport::upgrade(ctx, secured).await
 }
 

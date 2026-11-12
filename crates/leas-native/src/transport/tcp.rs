@@ -11,21 +11,34 @@ pub async fn connect(
         Ok(stream)
     } else {
         let socket = ctx.server_socket().await?;
+        // Options are applied to the UNCONNECTED socket: `TCP_MAXSEG` changes
+        // the MSS announced in the SYN only when it is set before connection
+        // establishment, and the whole point is that the server never sends a
+        // segment larger than the path can carry. Applying it after connect
+        // would cap only our own segments — cost without benefit.
+        let sock = if socket.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        }
+        .map_err(|e| NativeError::Dial(format!("{socket}: {e}")))?;
+        // The one socket option every dial has always set, now through the
+        // `sockopt` seam so a future config surface has a single owner.
+        let opts = crate::sockopt::SockOpts {
+            nodelay: Some(true),
+            tcp_maxseg: Some(crate::path_mss::current()),
+            tcp_quickack: Some(true),
+            ..crate::sockopt::SockOpts::default()
+        };
+        opts.apply_to_stream(&sock);
         let timeout = timeouts::TRANSPORT;
-        let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(socket))
+        let stream = tokio::time::timeout(timeout, sock.connect(socket))
             .await
             .map_err(|_| NativeError::Timeout {
                 step: "tcp dial",
                 limit: timeout,
             })?
             .map_err(|e| NativeError::Dial(format!("{socket}: {e}")))?;
-        // The one socket option every dial has always set, now through the
-        // `sockopt` seam so a future config surface has a single owner.
-        let opts = crate::sockopt::SockOpts {
-            nodelay: Some(true),
-            ..crate::sockopt::SockOpts::default()
-        };
-        opts.apply_to_stream(&stream);
         Ok(Box::new(stream))
     }
 }

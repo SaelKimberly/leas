@@ -56,6 +56,8 @@ pub mod error;
 pub mod headers;
 pub mod inbound;
 pub mod mux_session;
+/// The MSS policy for proxy dials (see the module docs).
+pub(crate) mod path_mss;
 /// HTTP-over-tunnel primitive (the real-ping probe's transport).
 pub mod probe;
 pub mod protocol;
