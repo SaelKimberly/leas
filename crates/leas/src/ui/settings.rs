@@ -311,10 +311,45 @@ fn value_display(field_type: &str, value: &str) -> String {
     if value.is_empty() {
         return "—".to_string();
     }
-    if select_options(field_type).is_some() {
-        return format!("< {value} >");
+    if let Some(options) = select_options(field_type) {
+        // Position + option count, so a narrow pane still shows which of the
+        // offered values is chosen. A stored value that is no longer offered
+        // lands on position 1 (the same "first going forward" rule as
+        // `cycle_select`).
+        let index = options.iter().position(|o| o == value).unwrap_or(0);
+        return format!("‹ {}/{} · {value} ›", index + 1, options.len());
     }
     value.to_string()
+}
+
+/// The value span's style: type-level colors (bools), a dirty tint, and the
+/// focused select's bold value.
+fn value_style_for(
+    theme: &opaline::Theme,
+    field_type: &str,
+    value: &str,
+    focused: bool,
+    dirty: bool,
+) -> ratatui::style::Style {
+    if dirty {
+        return ThemeStyles::warning(theme);
+    }
+    if field_type == "Boolean" {
+        return if value == "true" {
+            ThemeStyles::success(theme)
+        } else {
+            ThemeStyles::hint(theme)
+        };
+    }
+    if focused {
+        let base = ThemeStyles::footer_value(theme);
+        return if select_options(field_type).is_some() {
+            base.add_modifier(Modifier::BOLD)
+        } else {
+            base
+        };
+    }
+    ThemeStyles::hint(theme)
 }
 
 /// Provenance marker: `*` when the field differs from the values the pane was
@@ -579,7 +614,8 @@ fn render_sections(
                     group, collapsed, ..
                 } => {
                     let chevron = if *collapsed { "▸" } else { "▾" };
-                    format!("{marker}{chevron} {}", SETTINGS_TREE[*group].name)
+                    let count = SETTINGS_TREE[*group].items.len();
+                    format!("{marker}{chevron} {} · {count}", SETTINGS_TREE[*group].name)
                 }
                 SectionRow::Leaf { leaf } => {
                     format!("{marker}   {}", leaf_name(*leaf).unwrap_or_default())
@@ -1265,63 +1301,95 @@ fn render_form_with_area(
         .saturating_sub(height.saturating_sub(1))
         .min(visible.len().saturating_sub(height.max(1)));
 
-    let label_w = area.width.saturating_sub(14).clamp(12, 24);
     for (y, (offset, index)) in
         (area.y..area.bottom()).zip(visible.iter().skip(start).take(height).enumerate())
     {
         let focused = Some(start + offset) == focused_row;
-        let (key, label, field_type) = field_defs[*index];
+        let def = &field_defs[*index];
         let current = fields.get(*index).map_or("", |(_, v)| v.as_str());
         let base = snapshot
             .and_then(|snap| snap.get(*index))
             .map(|(_, v)| v.as_str());
         let marker = provenance_marker(base, current);
-        let marker_style = if marker == '*' {
-            ThemeStyles::warning(theme)
-        } else {
-            ThemeStyles::hint(theme)
-        };
-        let label_style = if focused {
-            ThemeStyles::table_row_selected(theme).add_modifier(Modifier::BOLD)
-        } else {
-            ThemeStyles::table_row_normal(theme)
-        };
-        let value_style = if focused {
-            ThemeStyles::footer_value(theme)
-        } else {
-            ThemeStyles::hint(theme)
-        };
-        let mut spans = vec![
-            Span::styled(if focused { "›" } else { " " }, label_style),
-            Span::styled(format!("{marker} "), marker_style),
-            // A label longer than the column still gets one separating space,
-            // or the value collides with it at the narrow minimum
-            // (`Sing-Box Path—` at 54 columns).
-            Span::styled(
-                if label.chars().count() >= label_w as usize {
-                    format!("{label} ")
-                } else {
-                    format!("{label:<label_w$}", label_w = label_w as usize)
-                },
-                label_style,
-            ),
-        ];
-        let mut value = value_display(field_type, current);
-        if focused {
-            value.push('█');
-        }
-        spans.push(Span::styled(value, value_style));
-        if let Some(error) = form_errors.get(key) {
-            spans.push(Span::styled(
-                format!("  ⚠ {error}"),
-                ThemeStyles::error(theme),
-            ));
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
+        render_field_row(
+            frame,
             Rect::new(area.x, y, area.width, 1),
+            theme,
+            def,
+            current,
+            focused,
+            marker,
+            form_errors.get(def.0).map(String::as_str),
         );
     }
+}
+
+/// One row of a settings-style form: `›` on the focused row, the provenance
+/// marker, the display-width-padded label, then the value — type-colored
+/// (`value_style_for`), truncated to the remaining width, with the focused
+/// cursor `█` always on screen and the inline `⚠` error only when the whole
+/// row fits. The caller draws no outer block.
+fn render_field_row(
+    frame: &mut Frame,
+    row: Rect,
+    theme: &opaline::Theme,
+    def: &(&'static str, &'static str, &'static str),
+    current: &str,
+    focused: bool,
+    marker: char,
+    error: Option<&str>,
+) {
+    let (_, label, field_type) = *def;
+    let label_style = if focused {
+        ThemeStyles::table_row_selected(theme).add_modifier(Modifier::BOLD)
+    } else {
+        ThemeStyles::table_row_normal(theme)
+    };
+    let marker_style = if marker == '*' {
+        ThemeStyles::warning(theme)
+    } else {
+        ThemeStyles::hint(theme)
+    };
+    let prefix_cells = 3usize; // cursor cell + marker + space
+    // A label longer than the column still gets one separating space,
+    // or the value collides with it at the narrow minimum
+    // (`Sing-Box Path—` at 54 columns).
+    let label_w = row.width.saturating_sub(14).clamp(12, 24) as usize;
+    let label_text = if label.chars().count() >= label_w {
+        format!("{label} ")
+    } else {
+        crate::ui::textfit::pad(label, label_w)
+    };
+    let budget = row.width as usize - prefix_cells - label_w;
+    let display = value_display(field_type, current);
+    let (value_text, value_cells) = if focused {
+        // Reserve one cell for the cursor: the `█` is always visible.
+        let text = crate::ui::textfit::truncate_head(&display, budget.saturating_sub(1));
+        let cells = crate::ui::textfit::width(&text);
+        (format!("{text}█"), cells + 1)
+    } else {
+        let text = crate::ui::textfit::truncate(&display, budget);
+        let cells = crate::ui::textfit::width(&text);
+        (text, cells)
+    };
+    let value_style = value_style_for(theme, field_type, current, focused, marker == '*');
+
+    let mut spans = vec![
+        Span::styled(if focused { "›" } else { " " }, label_style),
+        Span::styled(format!("{marker} "), marker_style),
+        Span::styled(label_text, label_style),
+        Span::styled(value_text, value_style),
+    ];
+    if let Some(error) = error
+        && prefix_cells + label_w + value_cells + 3 + crate::ui::textfit::width(error)
+            <= row.width as usize
+    {
+        spans.push(Span::styled(
+            format!("  ⚠ {error}"),
+            ThemeStyles::error(theme),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), row);
 }
 
 async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
@@ -2686,7 +2754,7 @@ mod section_list_tests {
     #[case::bool_true("Boolean", "true", "✓")]
     #[case::bool_false("Boolean", "false", "✗")]
     #[case::empty_text("Text", "", "—")]
-    #[case::select_keeps_angle_brackets("Select:debug,info", "info", "< info >")]
+    #[case::select_shows_position_and_option("Select:debug,info", "info", "‹ 2/2 · info ›")]
     #[case::text_verbatim("Number", "443", "443")]
     fn values_render_per_field_type(
         #[case] field_type: &str,
@@ -2889,11 +2957,41 @@ mod navigation_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::handle_form_key;
+    use super::{handle_form_key, value_style_for};
     use crate::AppState;
     use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
+
+    #[test]
+    fn bool_value_colors_split_by_truth() {
+        let theme = crate::ui::theme::load("dracula").unwrap();
+        assert_eq!(
+            value_style_for(&theme, "Boolean", "true", false, false),
+            crate::ui::theme::ThemeStyles::success(&theme)
+        );
+        assert_eq!(
+            value_style_for(&theme, "Boolean", "false", false, false),
+            crate::ui::theme::ThemeStyles::hint(&theme)
+        );
+    }
+
+    #[test]
+    fn dirty_value_carries_warning_tint() {
+        let theme = crate::ui::theme::load("dracula").unwrap();
+        assert_eq!(
+            value_style_for(&theme, "Text", "x", false, true),
+            crate::ui::theme::ThemeStyles::warning(&theme)
+        );
+    }
+
+    #[test]
+    fn selector_position_renders_as_bracketed_counter() {
+        // Select:en,zh with the second option chosen.
+        assert_eq!(super::value_display("Select:en,zh", "zh"), "‹ 2/2 · zh ›");
+        // A stored value no longer offered lands on position 1.
+        assert_eq!(super::value_display("Select:en,zh", "fr"), "‹ 1/2 · fr ›");
+    }
 
     /// Regression: pressing Right on the Protocol Core form panicked
     /// ("index out of bounds: the len is 0 but the index is 0" at
