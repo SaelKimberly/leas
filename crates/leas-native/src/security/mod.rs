@@ -351,6 +351,19 @@ mod tests {
     /// Spawns a blocking-thread rustls server that completes the handshake
     /// and echoes back the first application-data bytes it reads (the client
     /// sends 4, reads 4 back, then drops the stream).
+    fn echo_buffered(conn: &mut rustls::ServerConnection, sock: &mut std::net::TcpStream) -> bool {
+        let mut buf = [0u8; 8192];
+        match conn.reader().read(&mut buf) {
+            // `WouldBlock` (nothing buffered) or a closed connection.
+            Ok(0) | Err(_) => false,
+            Ok(n) => {
+                conn.writer().write_all(&buf[..n]).expect("write plaintext");
+                conn.write_tls(sock).expect("flush");
+                true
+            }
+        }
+    }
+
     fn spawn_echo_tls_server(cert_pem: &str, key_pem: &str) -> std::net::SocketAddr {
         let cfg = server_config(cert_pem, key_pem);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -365,20 +378,18 @@ mod tests {
             while conn.is_handshaking() {
                 conn.complete_io(&mut sock).expect("handshake");
             }
-            // Drain decrypted application data; echo the first chunk.
-            while let Ok(read) = conn.read_tls(&mut sock) {
-                if read == 0 {
-                    break;
-                }
-                let state = conn.process_new_packets().expect("process packets");
-                if state.plaintext_bytes_to_read() > 0 {
-                    let mut buf = vec![0u8; state.plaintext_bytes_to_read()];
-                    // The buffer is exactly the available plaintext, so a
-                    // blocking read_exact cannot stall.
-                    conn.reader().read_exact(&mut buf).expect("read plaintext");
-                    conn.writer().write_all(&buf).expect("write plaintext");
-                    conn.write_tls(&mut sock).expect("flush");
-                    break;
+            // Echo the first application chunk. The client's record can share
+            // the final handshake flight: `complete_io` consumes it and leaves
+            // the plaintext in the reader, so the buffered data must be checked
+            // BEFORE waiting for another record. Missing that made the server
+            // block on `read_tls` until its 15 s timeout and close, which the
+            // client saw as an early EOF (seen on a Windows runner).
+            while !echo_buffered(&mut conn, &mut sock) {
+                match conn.read_tls(&mut sock) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        conn.process_new_packets().expect("process packets");
+                    }
                 }
             }
         });
