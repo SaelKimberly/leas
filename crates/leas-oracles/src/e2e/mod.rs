@@ -329,7 +329,14 @@ fn outer_tls_negotiated_hybrid(stream: &leas_native::BoxStream) -> bool {
     use leas_tls::record::stream::TlsStream;
 
     fn hybrid(s: &leas_native::BoxStream) -> bool {
+        use leas_native::protocol::first_flight::HeaderFirst;
+
         let any: &dyn std::any::Any = &**s;
+        // The request header is coalesced under this wrapper; the engine
+        // stream is one level further down.
+        if let Some(framed) = any.downcast_ref::<HeaderFirst<leas_native::BoxStream>>() {
+            return hybrid(framed.inner());
+        }
         any.downcast_ref::<TlsStream<leas_native::BoxStream>>()
             .is_some_and(leas_tls::record::stream::TlsStream::negotiated_hybrid)
     }

@@ -15,6 +15,8 @@ use crate::error::NativeError;
 use crate::protocol::vless::PacketMode;
 
 pub mod anytls;
+/// Request-header coalescing: the header leaves with the first payload.
+pub mod first_flight;
 pub mod http;
 pub mod hysteria1;
 pub mod hysteria2;

@@ -8,6 +8,7 @@ use crate::BoxStream;
 use crate::addr::{Host, TargetAddr};
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
+use crate::protocol::first_flight::HeaderFirst;
 use crate::protocol::vless::stream::VlessClientStream;
 use crate::protocol::vless::vision::{
     FLOW_XTLS_RPRX_VISION, FLOW_XTLS_RPRX_VISION_UDP443, VisionStream,
@@ -99,39 +100,28 @@ async fn connect_encrypted(
             });
         }
     }
-    let mut conn = conn;
     let request = header::encode_request(&uuid, &ctx.target, header::CMD_TCP, None)?;
-    let timeout = timeouts::PROTOCOL;
-    tokio::time::timeout(timeout, conn.write_all(&request))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "vless mlkem request write",
-            limit: timeout,
-        })??;
+    // The header waits in the wrapper and leaves with the first payload: one
+    // carrier write instead of a small telltale record, and connect no longer
+    // parks on a write (the relay's idle bound is the outer timeout).
     Ok(Box::new(VlessClientStream::with_ack_slot(
-        Box::new(conn),
+        Box::new(HeaderFirst::new(conn, request)),
         ctx.ack.clone(),
     )))
 }
 
 /// Plain VLESS connect: request header without addons, then the tunnel.
+// Kept async: the dispatch table calls every protocol through one
+// awaitable signature, and this arm no longer needs to await anything.
+#[allow(clippy::unused_async)]
 async fn connect_plain(
     ctx: &LinkContext,
     stream: BoxStream,
     uuid: [u8; 16],
 ) -> Result<BoxStream, NativeError> {
     let request = header::encode_request(&uuid, &ctx.target, header::CMD_TCP, None)?;
-    let timeout = timeouts::PROTOCOL;
-    let mut stream = stream;
-    tokio::time::timeout(timeout, stream.write_all(&request))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "vless request write",
-            limit: timeout,
-        })??;
-
     Ok(Box::new(VlessClientStream::with_ack_slot(
-        stream,
+        Box::new(HeaderFirst::new(stream, request)),
         ctx.ack.clone(),
     )))
 }
@@ -171,6 +161,9 @@ async fn connect_vision(
 /// frame, then the padded codec with the response peel inside it. Called by
 /// the plain path (TLS/REALITY underneath) and by the `mlkem` path (the
 /// encryption conn underneath, which keeps framing after Direct).
+// Kept async: the dispatch table calls every protocol through one
+// awaitable signature, and this arm no longer needs to await anything.
+#[allow(clippy::unused_async)]
 async fn connect_vision_over(
     ctx: &LinkContext,
     stream: BoxStream,
@@ -186,27 +179,14 @@ async fn connect_vision_over(
         header::CMD_TCP,
         header::encode_addons(flow).as_deref(),
     )?;
-    let timeout = timeouts::PROTOCOL;
-    let mut stream = stream;
-    tokio::time::timeout(timeout, stream.write_all(&request))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "vless request write",
-            limit: timeout,
-        })??;
-
-    // Step 3: the camouflage frame — one empty long-padding Continue frame
-    // carrying the UUID, right after the header (xray delays it 500 ms via
-    // a timer; we emit it immediately — same wire bytes, spec §9 deviation
-    // 1). The camouflage consumes the writer's UUID, so the codec's own
-    // frames never carry one.
+    // The camouflage frame — one empty long-padding Continue frame carrying
+    // the UUID — rides in front of the same first write as the header (xray
+    // delays it 500 ms via a timer; we emit it immediately — same wire bytes,
+    // spec §9 deviation 1). The camouflage consumes the writer's UUID, so the
+    // codec's own frames never carry one.
     let camo = VisionStream::<BoxStream>::camouflage_frame(&uuid);
-    tokio::time::timeout(timeout, stream.write_all(&camo))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "vless vision camouflage write",
-            limit: timeout,
-        })??;
+    let mut preamble = request;
+    preamble.extend_from_slice(&camo);
 
     // Wrap the secured stream in the padded codec, with the response-header
     // peel INSIDE it — Go's exact composition (outbound.go getResponse
@@ -216,7 +196,8 @@ async fn connect_vision_over(
     // buffers it via EncodeResponseHeader + SetFlushNext and flushes both
     // together) — is consumed by the peel, so the codec's UUID gate never
     // sees it and the multiplexer/payload never sees it either.
-    let peeled: BoxStream = Box::new(VlessClientStream::with_ack_slot(stream, ctx.ack.clone()));
+    let framed: BoxStream = Box::new(HeaderFirst::new(stream, preamble));
+    let peeled: BoxStream = Box::new(VlessClientStream::with_ack_slot(framed, ctx.ack.clone()));
     let vision = VisionStream::new(peeled, uuid);
     Ok(Box::new(vision))
 }

@@ -26,6 +26,8 @@ use bytes::{Buf, BytesMut};
 use memchr::memmem;
 use smallvec::{SmallVec, smallvec};
 
+use crate::BoxStream;
+use crate::protocol::first_flight::HeaderFirst;
 use crate::protocol::vless::stream::VlessClientStream;
 
 /// The vision flow name (VLESS `addons.flow`).
@@ -140,15 +142,26 @@ fn set_direct(stream: &mut Box<dyn crate::Stream>, write: bool) {
 /// `mlkem` `CommonConn` — the composition whose Direct handoff is a no-op.
 fn wraps_encryption_conn(stream: &mut Box<dyn crate::Stream>) -> bool {
     use crate::protocol::vless::encryption::CommonConn;
-    let any: &mut dyn std::any::Any = &mut **stream;
-    if any.downcast_mut::<CommonConn>().is_some() {
-        return true;
+    fn holds_conn(any: &mut dyn std::any::Any) -> bool {
+        if any.downcast_mut::<CommonConn>().is_some() {
+            return true;
+        }
+        // The first-flight wrapper sits between the peel and the carrier.
+        let Some(framed) = any.downcast_mut::<HeaderFirst<BoxStream>>() else {
+            return false;
+        };
+        let inner: &mut dyn std::any::Any = &mut **framed.inner_mut();
+        inner.downcast_mut::<CommonConn>().is_some()
     }
-    let Some(peeled) = any.downcast_mut::<VlessClientStream>() else {
-        return false;
-    };
-    let wrapped: &mut dyn std::any::Any = &mut **peeled.inner_mut();
-    wrapped.downcast_mut::<CommonConn>().is_some()
+    let any: &mut dyn std::any::Any = &mut **stream;
+    if std::any::Any::type_id(&*any) == std::any::TypeId::of::<VlessClientStream>() {
+        let peeled = any
+            .downcast_mut::<VlessClientStream>()
+            .expect("vision must wrap an engine TlsStream");
+        let wrapped: &mut dyn std::any::Any = &mut **peeled.inner_mut();
+        return holds_conn(wrapped);
+    }
+    holds_conn(any)
 }
 
 /// Recover the concrete engine `TlsStream` behind the boxed seam (upcast
@@ -164,16 +177,29 @@ fn wraps_encryption_conn(stream: &mut Box<dyn crate::Stream>) -> bool {
 fn tls_stream_mut(
     stream: &mut Box<dyn crate::Stream>,
 ) -> Option<&mut leas_tls::record::stream::TlsStream<crate::BoxStream>> {
-    let any: &mut dyn std::any::Any = &mut **stream;
-    let tid = std::any::Any::type_id(&*any);
-    if tid == std::any::TypeId::of::<leas_tls::record::stream::TlsStream<crate::BoxStream>>() {
-        return any.downcast_mut::<leas_tls::record::stream::TlsStream<crate::BoxStream>>();
+    type Tls = leas_tls::record::stream::TlsStream<crate::BoxStream>;
+    /// Peel the first-flight wrapper, which sits between the response peel and
+    /// the carrier, then find the engine stream.
+    fn through_first_flight(any: &mut dyn std::any::Any) -> Option<&mut Tls> {
+        if std::any::Any::type_id(&*any) == std::any::TypeId::of::<Tls>() {
+            return any.downcast_mut::<Tls>();
+        }
+        if std::any::Any::type_id(&*any) != std::any::TypeId::of::<HeaderFirst<BoxStream>>() {
+            return None;
+        }
+        let framed = any.downcast_mut::<HeaderFirst<BoxStream>>()?;
+        let inner: &mut dyn std::any::Any = &mut **framed.inner_mut();
+        inner.downcast_mut::<Tls>()
     }
-    let peeled = any
-        .downcast_mut::<VlessClientStream>()
-        .expect("vision must wrap an engine TlsStream");
-    let wrapped: &mut dyn std::any::Any = &mut **peeled.inner_mut();
-    wrapped.downcast_mut::<leas_tls::record::stream::TlsStream<crate::BoxStream>>()
+    let any: &mut dyn std::any::Any = &mut **stream;
+    if std::any::Any::type_id(&*any) == std::any::TypeId::of::<VlessClientStream>() {
+        let peeled = any
+            .downcast_mut::<VlessClientStream>()
+            .expect("vision must wrap an engine TlsStream");
+        let wrapped: &mut dyn std::any::Any = &mut **peeled.inner_mut();
+        return through_first_flight(wrapped);
+    }
+    through_first_flight(any)
 }
 
 /// Client-side vision stream: pads uplink writes, unpads downlink reads,

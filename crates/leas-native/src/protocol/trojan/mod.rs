@@ -25,9 +25,11 @@ use leas_proto::proto_spec::TrojanConfig;
 use crate::BoxStream;
 use crate::addr::{
     TargetAddr, addr_port_last_tail_len, decode_addr_port_last, encode_addr_port_last,
+    write_addr_port_last,
 };
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
+use crate::protocol::first_flight::HeaderFirst;
 
 /// TCP command byte (`protocol.go` `commandTCP`).
 const COMMAND_TCP: u8 = 1;
@@ -74,28 +76,25 @@ fn encode_request(key: &[u8; 56], target: &TargetAddr) -> Result<Vec<u8>, Native
     out.extend_from_slice(key);
     out.extend_from_slice(&CRLF);
     out.push(COMMAND_TCP);
-    out.extend_from_slice(&encode_addr_port_last(target)?);
+    write_addr_port_last(&mut out, target)?;
     out.extend_from_slice(&CRLF);
     Ok(out)
 }
 
 /// trojan has no response header to peel. UDP rides
 /// [`connect_udp`] (command 3 + per-datagram address framing).
+// Kept async: the dispatch table calls every protocol through one
+// awaitable signature, and this arm no longer needs to await anything.
+#[allow(clippy::unused_async)]
 pub async fn connect(
     ctx: &LinkContext,
     stream: BoxStream,
     cfg: &TrojanConfig,
 ) -> Result<BoxStream, NativeError> {
     let request = encode_request(&auth_key(&cfg.password), &ctx.target)?;
-    let timeout = timeouts::PROTOCOL;
-    let mut stream = stream;
-    tokio::time::timeout(timeout, stream.write_all(&request))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "trojan request write",
-            limit: timeout,
-        })??;
-    Ok(stream)
+    // The header leaves with the first payload instead of as its own small
+    // record; see `first_flight`.
+    Ok(Box::new(HeaderFirst::new(stream, request)))
 }
 
 /// Encode the trojan UDP request header: command 3 + the session target

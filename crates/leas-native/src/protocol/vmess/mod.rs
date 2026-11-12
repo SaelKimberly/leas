@@ -5,13 +5,12 @@
 //! chacha20-poly1305; xray-core 26.x refuses `none`/`zero`/`auto` body
 //! streams server-side.
 
-use tokio::io::AsyncWriteExt;
-
 use leas_proto::proto_spec::VmessConfig;
 
 use crate::BoxStream;
 use crate::context::LinkContext;
-use crate::error::{NativeError, timeouts};
+use crate::error::NativeError;
+use crate::protocol::first_flight::HeaderFirst;
 use crate::protocol::vmess::header::{
     SECURITY_AES128_GCM, SECURITY_CHACHA20_POLY1305, Session, encode_request, encode_request_legacy,
 };
@@ -54,14 +53,15 @@ pub fn security_byte(cfg: &VmessConfig) -> Result<u8, NativeError> {
 
 /// Write the AEAD request header for `command` and wrap the stream in the
 /// record tunnel — the ONE `VMess` handshake, shared by [`connect`]
-/// (command 1) and [`connect_udp`] (command 2). `step` names the write for
-/// the timeout error.
+/// (command 1) and [`connect_udp`] (command 2).
+// Kept async: its two callers are async arms of the same dispatch shape, and
+// the header write no longer needs to await anything.
+#[allow(clippy::unused_async)]
 async fn handshake(
     ctx: &LinkContext,
     stream: BoxStream,
     cfg: &VmessConfig,
     command: u8,
-    step: &'static str,
 ) -> Result<VmessClientStream, NativeError> {
     check_security(cfg)?;
     let uuid = crate::protocol::vless::header::uuid_bytes(&cfg.uuid)?;
@@ -83,32 +83,19 @@ async fn handshake(
         // header, then the response stream is CFB-decrypted as a whole.
         let request =
             encode_request_legacy(&uuid, &ck, &session, &ctx.target, command, ts, &mut entropy)?;
-        let timeout = timeouts::PROTOCOL;
-        let mut stream = stream;
-        tokio::time::timeout(timeout, stream.write_all(&request))
-            .await
-            .map_err(|_| NativeError::Timeout {
-                step,
-                limit: timeout,
-            })??;
+        // Header waits for the first payload (see `first_flight`).
+        let framed = HeaderFirst::new(stream, request);
         let reader = crate::protocol::vmess::legacy::CfbReader::new(
-            stream,
+            framed,
             &session.response_body_key,
             &session.response_body_iv,
         );
         return Ok(VmessClientStream::new_legacy(Box::new(reader), session));
     }
     let request = encode_request(&ck, &session, &ctx.target, command, ts, &mut entropy)?;
-    let timeout = timeouts::PROTOCOL;
-    let mut stream = stream;
-    tokio::time::timeout(timeout, stream.write_all(&request))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step,
-            limit: timeout,
-        })??;
-
-    Ok(VmessClientStream::new(stream, session))
+    // Header waits for the first payload (see `first_flight`).
+    let framed: BoxStream = Box::new(HeaderFirst::new(stream, request));
+    Ok(VmessClientStream::new(framed, session))
 }
 
 /// Connect through a `VMess` outbound over an already-secured stream.
@@ -117,7 +104,7 @@ pub async fn connect(
     stream: BoxStream,
     cfg: &VmessConfig,
 ) -> Result<BoxStream, NativeError> {
-    let tunnel = handshake(ctx, stream, cfg, header::COMMAND_TCP, "vmess request write").await?;
+    let tunnel = handshake(ctx, stream, cfg, header::COMMAND_TCP).await?;
     Ok(Box::new(tunnel))
 }
 
@@ -134,14 +121,7 @@ pub async fn connect_udp(
     stream: BoxStream,
     cfg: &VmessConfig,
 ) -> Result<udp::PacketConn<BoxStream>, NativeError> {
-    let tunnel = handshake(
-        ctx,
-        stream,
-        cfg,
-        header::COMMAND_UDP,
-        "vmess udp request write",
-    )
-    .await?;
+    let tunnel = handshake(ctx, stream, cfg, header::COMMAND_UDP).await?;
     Ok(udp::PacketConn::new(tunnel, &ctx.target))
 }
 
