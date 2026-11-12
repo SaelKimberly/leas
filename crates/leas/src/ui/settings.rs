@@ -352,11 +352,13 @@ fn value_style_for(
     ThemeStyles::hint(theme)
 }
 
-/// Provenance marker: `*` when the field differs from the values the pane was
-/// built with, `·` otherwise (spec D4).
-fn provenance_marker(snapshot: Option<&str>, current: &str) -> char {
+/// Provenance marker (spec D4 + §2): `*` when the field differs from the
+/// values the pane was built with, `○` when the saved value equals what a
+/// fresh install would load, `·` otherwise. Unsaved wins over at-default.
+fn provenance_marker(snapshot: Option<&str>, current: &str, default: Option<&str>) -> char {
     match snapshot {
         Some(base) if base != current => '*',
+        _ if default.is_some_and(|d| d == current) => '○',
         _ => '·',
     }
 }
@@ -460,7 +462,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let (left_area, right_area) = split_rect(rows[1], left_w);
     render_sections(frame, left_area, state, theme, *focus);
     render_right_pane(frame, right_area, state, theme, right, *focus);
-    render_help(frame, rows[2], theme, right);
+    render_help(
+        frame,
+        rows[2],
+        theme,
+        right,
+        state.settings_form_defaults.as_ref(),
+    );
     if status_rows > 0 {
         render_status(frame, rows[3], state, theme);
     }
@@ -628,8 +636,14 @@ fn render_sections(
 }
 
 /// The help band (spec D10): what the focused field is, and the marker legend.
-fn render_help(frame: &mut Frame, area: Rect, theme: &opaline::Theme, right: &SplitRightPane) {
-    let (title, lines) = help_content(theme, right);
+fn render_help(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &opaline::Theme,
+    right: &SplitRightPane,
+    defaults: Option<&Vec<(String, String)>>,
+) {
+    let (title, lines) = help_content(theme, right, defaults);
     let block = Block::default()
         .title(title)
         .title_style(ThemeStyles::container_title(theme))
@@ -640,7 +654,11 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &opaline::Theme, right: &Sp
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn help_content(theme: &opaline::Theme, right: &SplitRightPane) -> (String, Vec<Line<'static>>) {
+fn help_content(
+    theme: &opaline::Theme,
+    right: &SplitRightPane,
+    defaults: Option<&Vec<(String, String)>>,
+) -> (String, Vec<Line<'static>>) {
     let label = ThemeStyles::footer_label(theme).add_modifier(Modifier::BOLD);
     let value = ThemeStyles::footer_value(theme);
     let row = |name: &str, text: String| {
@@ -649,7 +667,7 @@ fn help_content(theme: &opaline::Theme, right: &SplitRightPane) -> (String, Vec<
             Span::styled(text, value),
         ])
     };
-    let legend = "· saved   * unsaved   › selected".to_string();
+    let legend = "· saved   ○ at default   * unsaved   › selected".to_string();
     match right {
         SplitRightPane::Form {
             section,
@@ -658,7 +676,7 @@ fn help_content(theme: &opaline::Theme, right: &SplitRightPane) -> (String, Vec<
             ..
         } => {
             let defs = form_field_defs_for_section(*section);
-            let Some((_, field_label, field_type)) = defs.get(*focus_index).copied() else {
+            let Some((key, field_label, field_type)) = defs.get(*focus_index).copied() else {
                 return (
                     format!(" Help · {} ", section_name(*section)),
                     vec![Line::styled(
@@ -671,12 +689,22 @@ fn help_content(theme: &opaline::Theme, right: &SplitRightPane) -> (String, Vec<
                 .get(*focus_index)
                 .map_or("", |(_, v)| v.as_str())
                 .to_string();
+            let default = defaults
+                .and_then(|d| d.iter().find(|(k, _)| *k == key))
+                .map_or("", |(_, v)| v.as_str())
+                .to_string();
+            let description = crate::ops::settings::field_defs(*section)
+                .iter()
+                .find(|def| def.key == key)
+                .map_or("", |def| def.description);
             (
                 format!(" Help · {} ", section_name(*section)),
                 vec![
                     row("Field", (*field_label).to_string()),
                     row("Type", field_type_label(field_type).to_string()),
+                    row("Does", description.to_string()),
                     row("Accepts", field_accepts(field_type)),
+                    row("Default", value_display(field_type, &default)),
                     row("Current", value_display(field_type, &current)),
                     row("Keys", legend),
                 ],
@@ -832,6 +860,7 @@ fn render_right_pane(
                 *focus_index,
                 form_errors,
                 state.settings_form_snapshot.as_ref(),
+                state.settings_form_defaults.as_ref(),
             );
         }
         SplitRightPane::RoutingList { selected } => {
@@ -872,6 +901,7 @@ fn render_right_pane(
                 fields.as_slice(),
                 *focus_index,
                 form_errors,
+                None,
                 None,
             );
         }
@@ -1131,135 +1161,28 @@ async fn handle_sections_key(state: &mut AppState, key: &KeyEvent) {
     }
 }
 
-const fn form_field_defs(
-    mode: &SettingsMode,
-) -> &'static [(&'static str, &'static str, &'static str)] {
-    // &[(key, label, field_type)]
+fn form_field_defs(mode: &SettingsMode) -> Vec<(&'static str, &'static str, &'static str)> {
+    // (key, label, field_type) — the ui-side projection of the one table in
+    // `ops::settings` (key order, labels and types cannot drift from it).
     // field_type: "Text", "Number", "Url", "Duration", "Boolean", "Select" (comma-separated)
     match mode {
         SettingsMode::Split {
             right: SplitRightPane::Form { section, .. },
             ..
         } => form_field_defs_for_section(*section),
-        SettingsMode::Split { .. } => &[],
+        SettingsMode::Split { .. } => Vec::new(),
     }
 }
 
-const fn form_field_defs_for_section(
+fn form_field_defs_for_section(
     section: SettingsSection,
-) -> &'static [(&'static str, &'static str, &'static str)] {
-    match section {
-        SettingsSection::Gui => &[
-            ("language", "Language", "Select:en,zh"),
-            // A selector over opaline's builtin slugs: as free text it could
-            // name a theme that does not exist, and `AppState::new` panics on
-            // an unknown `theme_name` at the NEXT launch.
-            ("theme", "Theme", "SelectThemes"),
-            ("refresh_interval", "Refresh Interval", "Text"),
-        ],
-        SettingsSection::Inbound => &[
-            ("socks_port", "SOCKS Port", "Number"),
-            ("http_port", "HTTP Port", "Number"),
-            ("mixed_port", "Mixed Port", "Number"),
-            ("listen", "Listen Address", "Text"),
-            ("sniffing", "Sniffing", "Boolean"),
-        ],
-        SettingsSection::Dns => &[
-            ("servers", "Servers (JSON)", "Text"),
-            ("hosts", "Hosts (JSON)", "Text"),
-            (
-                "query_strategy",
-                "Query Strategy",
-                "Select:,,UseIP,UseIPv4,UseIPv6",
-            ),
-            ("disable_cache", "Disable Cache", "Boolean"),
-            ("disable_fallback", "Disable Fallback", "Boolean"),
-            ("client_ip", "Client IP", "Text"),
-            ("cache_ttl_secs", "DNS Cache TTL (secs)", "Number"),
-        ],
-        SettingsSection::SystemProxy => &[
-            ("enabled", "Enabled", "Boolean"),
-            ("http_port", "HTTP Port", "Number"),
-            ("socks_port", "SOCKS Port", "Number"),
-            ("bypass", "Bypass", "Text"),
-        ],
-        SettingsSection::Tun => &[
-            ("enabled", "Enabled", "Boolean"),
-            ("interface_name", "Interface Name", "Text"),
-            ("mtu", "MTU", "Number"),
-        ],
-        SettingsSection::Mux => &[
-            ("enabled", "Enabled", "Boolean"),
-            ("concurrency", "Concurrency", "Number"),
-            ("protocol", "Protocol", "Select:smux,yamux,h2mux"),
-            ("max_connections", "Max Connections", "Number"),
-            ("min_streams", "Min Streams", "Number"),
-            ("max_streams", "Max Streams", "Number"),
-            ("padding", "Padding", "Boolean"),
-            ("fragment_enabled", "Fragment Enabled", "Boolean"),
-            ("fragment_packets", "Fragment Packets", "Text"),
-            ("fragment_length", "Fragment Length", "Text"),
-            ("fragment_interval", "Fragment Interval", "Text"),
-        ],
-        SettingsSection::SpeedTest => &[
-            ("ping_url", "Ping Test URL", "Url"),
-            (
-                "ip_provider",
-                "IP Provider",
-                leas_config::ip_provider::SELECT_CELL,
-            ),
-            ("tcp_timeout_secs", "TCP Timeout", "Duration"),
-            ("real_ping_timeout_secs", "Real Ping Timeout", "Duration"),
-            ("real_ping_retries", "Real Ping Retries", "Number"),
-            ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
-            (
-                "real_ping_test_all_protocols",
-                "Real Ping Test All Protocols",
-                "Boolean",
-            ),
-            (
-                "task_queue_limit",
-                "Task Queue Limit (0=no queue)",
-                "Number",
-            ),
-            (
-                "dns_failure_defer_secs",
-                "DNS Failure Defer (secs)",
-                "Number",
-            ),
-            ("speed_test_url", "Speed Test URL", "Url"),
-            ("speed_test_concurrency", "Speed Test Concurrency", "Number"),
-            ("speed_test_retries", "Speed Test Retries", "Number"),
-            (
-                "speed_test_min_duration",
-                "Speed Test Min Duration",
-                "Duration",
-            ),
-            ("speed_test_min_bytes", "Speed Test Min Bytes", "Number"),
-            (
-                "speed_test_max_duration",
-                "Speed Test Max Duration",
-                "Duration",
-            ),
-            ("geoip_mode", "GeoIP Mode", "Select:dat,mmdb"),
-            ("geo_auto_update", "Geo Auto Update", "Boolean"),
-            ("geo_update_interval", "Geo Update Interval Hours", "Number"),
-        ],
-        SettingsSection::Logging => &[
-            ("log_ttl_secs", "Log Retention", "Duration"),
-            ("log_to_file", "Log to File", "Boolean"),
-            ("log_file_path", "Log File Path", "Text"),
-        ],
-        SettingsSection::Subscriptions => &[
-            ("name", "Name", "Text"),
-            ("subscription_url", "Subscription URL / Channel", "Url"),
-            ("user_agent", "User Agent", "Text"),
-            ("update_interval", "Update Interval", "Duration"),
-        ],
-        SettingsSection::Routing => &[],
-        SettingsSection::RouteProbes => &[("probes", "Probes (comma-sep)", "Text")],
-    }
+) -> Vec<(&'static str, &'static str, &'static str)> {
+    crate::ops::settings::field_defs(section)
+        .iter()
+        .map(|def| (def.key, def.label, def.ftype))
+        .collect()
 }
+
 const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
     match mode {
         SettingsMode::Split {
@@ -1291,6 +1214,7 @@ fn render_form_with_area(
     focus_index: usize,
     form_errors: &HashMap<String, String>,
     snapshot: Option<&Vec<(String, String)>>,
+    defaults: Option<&Vec<(String, String)>>,
 ) {
     let field_defs = form_field_defs_for_section(section);
     let visible = visible_field_rows(section);
@@ -1310,7 +1234,10 @@ fn render_form_with_area(
         let base = snapshot
             .and_then(|snap| snap.get(*index))
             .map(|(_, v)| v.as_str());
-        let marker = provenance_marker(base, current);
+        let default = defaults
+            .and_then(|d| d.get(*index))
+            .map(|(_, v)| v.as_str());
+        let marker = provenance_marker(base, current, default);
         render_field_row(
             frame,
             Rect::new(area.x, y, area.width, 1),
@@ -1491,7 +1418,22 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                 *focus_index += 1;
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Reset the focused field to what a fresh install would load
+            // (spec §2): a form edit, not a save — `*` marks it until Ctrl+S.
+            // Before the typing arm: without the guard there, `r` would land
+            // in the value as text and this arm would be dead.
+            let default = state
+                .settings_form_defaults
+                .as_ref()
+                .and_then(|d| d.get(*focus_index).map(|(_, v)| v.clone()));
+            if let Some(value) = default
+                && let Some((_, val)) = fields.get_mut(*focus_index)
+            {
+                *val = value;
+            }
+        }
+        KeyCode::Char(c) if c != 'r' && !key.modifiers.contains(KeyModifiers::CONTROL) => {
             if *focus_index >= fields.len() {
                 return;
             }
@@ -2778,15 +2720,19 @@ mod section_list_tests {
     }
 
     #[rstest]
-    #[case::no_snapshot(None, "x", '·')]
-    #[case::unchanged(Some("x"), "x", '·')]
-    #[case::changed(Some("x"), "xy", '*')]
-    fn provenance_marks_only_unsaved_edits(
+    #[case::no_snapshot(None, "x", None, '·')]
+    #[case::unchanged(Some("x"), "x", None, '·')]
+    #[case::changed(Some("x"), "xy", None, '*')]
+    #[case::at_default(Some("x"), "x", Some("x"), '○')]
+    #[case::default_differs_from_saved(Some("custom"), "custom", Some("x"), '·')]
+    #[case::unsaved_to_default_wins(Some("x"), "other", Some("other"), '*')]
+    fn provenance_marks_unsaved_then_default_then_saved(
         #[case] snapshot: Option<&str>,
         #[case] current: &str,
+        #[case] default: Option<&str>,
         #[case] expected: char,
     ) {
-        assert_eq!(provenance_marker(snapshot, current), expected);
+        assert_eq!(provenance_marker(snapshot, current, default), expected);
     }
 
     #[test]
@@ -3025,6 +2971,53 @@ mod tests {
             let (label_w, budget) = super::row_columns(w);
             assert!(label_w + budget + 3 <= usize::from(w), "width {w}");
         }
+    }
+
+    /// `r` writes the fresh-install value into the focused field without
+    /// saving: the form goes dirty (`*`) until `Ctrl+S`.
+    #[tokio::test]
+    async fn r_writes_the_default_and_flips_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            leas_db::Database::open(dir.path().join("r.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, leas_config::AppConfig::default()).await;
+        state.settings_form_defaults = Some(vec![("listen".into(), "127.0.0.1".into())]);
+        state.settings_form_snapshot = Some(vec![("listen".into(), "0.0.0.0".into())]);
+        state.mode = AppMode::Settings {
+            mode: SettingsMode::Split {
+                focus: SplitFocus::Right,
+                right: SplitRightPane::Form {
+                    section: SettingsSection::Inbound,
+                    fields: vec![("listen".into(), "10.0.0.1".into())],
+                    focus_index: 0,
+                    form_errors: HashMap::new(),
+                },
+            },
+        };
+        handle_form_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .await;
+        let AppMode::Settings {
+            mode:
+                SettingsMode::Split {
+                    right: SplitRightPane::Form { fields, .. },
+                    ..
+                },
+        } = &state.mode
+        else {
+            unreachable!("form is still open")
+        };
+        assert_eq!(fields[0].1, "127.0.0.1", "r wrote the default");
+        assert_ne!(
+            fields[0].1,
+            state.settings_form_snapshot.as_ref().unwrap()[0].1,
+            "the form is dirty until saved"
+        );
     }
 
     /// Regression: pressing Right on the Protocol Core form panicked

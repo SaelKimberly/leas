@@ -146,6 +146,10 @@ pub struct AppState {
     /// Settings popup dirty-tracking (spec P3): the form values as loaded.
     /// `None` when no form pane is open or the form is clean.
     pub settings_form_snapshot: Option<Vec<(String, String)>>,
+    /// The values a fresh install would load, per open form: `r` (reset)
+    /// writes these and the `○` marker compares against them. `None` when no
+    /// form pane is open. Same length/order as `settings_form_snapshot`.
+    pub settings_form_defaults: Option<Vec<(String, String)>>,
     /// Settings section list: selection and per-group expansion (spec D2/D4).
     pub settings_sections: SectionList,
     /// Settings search bar state (spec D8).
@@ -795,6 +799,7 @@ impl AppState {
             pane2_tab: Pane2Tab::Details,
             pane2_height: 0,
             settings_form_snapshot: None,
+            settings_form_defaults: None,
             settings_sections: SectionList::default(),
             settings_search: SettingsSearch::default(),
             settings_notice: None,

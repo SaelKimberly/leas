@@ -10,6 +10,399 @@ pub fn cancel_form(state: &mut AppState) {
     state.mode = AppMode::List;
 }
 
+/// One settings field: the key the form saves under, its label, the input
+/// type the form dispatches on, and the one-line description the help band
+/// shows. ONE table per section — the form defs, the value builder and the
+/// defaults all walk it, so label/type/order/description cannot drift apart
+/// (the SpeedTest table and builder used to disagree past
+/// `dns_failure_defer_secs`, mislabeling nine rows).
+pub(crate) struct FieldDef {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub ftype: &'static str,
+    pub description: &'static str,
+}
+
+const GUI_DEFS: &[FieldDef] = &[
+    FieldDef {
+        key: "language",
+        label: "Language",
+        ftype: "Select:en,zh",
+        description: "UI language",
+    },
+    FieldDef {
+        key: "theme",
+        label: "Theme",
+        ftype: "SelectThemes",
+        description: "Colour theme, applied live on save",
+    },
+    FieldDef {
+        key: "refresh_interval",
+        label: "Refresh Interval",
+        ftype: "Text",
+        description: "How often the feed re-queries the DB",
+    },
+];
+
+const INBOUND_DEFS: &[FieldDef] = &[
+    FieldDef {
+        key: "socks_port",
+        label: "SOCKS Port",
+        ftype: "Number",
+        description: "Local SOCKS5 listen port",
+    },
+    FieldDef {
+        key: "http_port",
+        label: "HTTP Port",
+        ftype: "Number",
+        description: "Local HTTP listen port, empty = off",
+    },
+    FieldDef {
+        key: "mixed_port",
+        label: "Mixed Port",
+        ftype: "Number",
+        description: "Local mixed (SOCKS+HTTP) port, empty = off",
+    },
+    FieldDef {
+        key: "listen",
+        label: "Listen Address",
+        ftype: "Text",
+        description: "Bind address for the local inbound",
+    },
+    FieldDef {
+        key: "sniffing",
+        label: "Sniffing",
+        ftype: "Boolean",
+        description: "Sniff destination domains for routing",
+    },
+];
+
+const SYSTEM_PROXY_DEFS: &[FieldDef] = &[
+    FieldDef {
+        key: "enabled",
+        label: "Enabled",
+        ftype: "Boolean",
+        description: "Set the OS proxy to leas's inbound",
+    },
+    FieldDef {
+        key: "http_port",
+        label: "HTTP Port",
+        ftype: "Number",
+        description: "OS proxy HTTP port",
+    },
+    FieldDef {
+        key: "socks_port",
+        label: "SOCKS Port",
+        ftype: "Number",
+        description: "OS proxy SOCKS port",
+    },
+    FieldDef {
+        key: "bypass",
+        label: "Bypass",
+        ftype: "Text",
+        description: "Hosts the OS proxy must not capture",
+    },
+];
+
+const TUN_DEFS: &[FieldDef] = &[
+    FieldDef {
+        key: "enabled",
+        label: "Enabled",
+        ftype: "Boolean",
+        description: "TUN device capture (needs privileges)",
+    },
+    FieldDef {
+        key: "interface_name",
+        label: "Interface Name",
+        ftype: "Text",
+        description: "TUN interface name",
+    },
+    FieldDef {
+        key: "mtu",
+        label: "MTU",
+        ftype: "Number",
+        description: "TUN interface MTU, empty = default",
+    },
+];
+
+const MUX_DEFS: &[FieldDef] = &[
+    FieldDef {
+        key: "enabled",
+        label: "Enabled",
+        ftype: "Boolean",
+        description: "Multiplex links over one connection",
+    },
+    FieldDef {
+        key: "concurrency",
+        label: "Concurrency",
+        ftype: "Number",
+        description: "Streams per connection, empty = auto",
+    },
+    FieldDef {
+        key: "protocol",
+        label: "Protocol",
+        ftype: "Select:smux,yamux,h2mux",
+        description: "Mux protocol the core speaks",
+    },
+    FieldDef {
+        key: "max_connections",
+        label: "Max Connections",
+        ftype: "Number",
+        description: "Connection pool cap",
+    },
+    FieldDef {
+        key: "min_streams",
+        label: "Min Streams",
+        ftype: "Number",
+        description: "Min streams before a new connection",
+    },
+    FieldDef {
+        key: "max_streams",
+        label: "Max Streams",
+        ftype: "Number",
+        description: "Max streams per connection",
+    },
+    FieldDef {
+        key: "padding",
+        label: "Padding",
+        ftype: "Boolean",
+        description: "Pad mux frames",
+    },
+    FieldDef {
+        key: "fragment_enabled",
+        label: "Fragment Enabled",
+        ftype: "Boolean",
+        description: "Split TLS ClientHello into fragments",
+    },
+    FieldDef {
+        key: "fragment_packets",
+        label: "Fragment Packets",
+        ftype: "Text",
+        description: "Fragment sizes, e.g. 10-20,30-50",
+    },
+    FieldDef {
+        key: "fragment_length",
+        label: "Fragment Length",
+        ftype: "Text",
+        description: "Fragment byte lengths",
+    },
+    FieldDef {
+        key: "fragment_interval",
+        label: "Fragment Interval",
+        ftype: "Text",
+        description: "Delay between fragments (ms)",
+    },
+];
+
+const SPEED_TEST_DEFS: &[FieldDef] = &[
+    FieldDef {
+        key: "ping_url",
+        label: "Ping Test URL",
+        ftype: "Url",
+        description: "URL the real probe fetches",
+    },
+    FieldDef {
+        key: "ip_provider",
+        label: "IP Provider",
+        ftype: leas_config::ip_provider::SELECT_CELL,
+        description: "Service that reports the exit IP",
+    },
+    FieldDef {
+        key: "tcp_timeout_secs",
+        label: "TCP Timeout",
+        ftype: "Duration",
+        description: "Transport stage timeout",
+    },
+    FieldDef {
+        key: "real_ping_timeout_secs",
+        label: "Real Ping Timeout",
+        ftype: "Duration",
+        description: "Real probe timeout",
+    },
+    FieldDef {
+        key: "real_ping_retries",
+        label: "Real Ping Retries",
+        ftype: "Number",
+        description: "Retries per real probe",
+    },
+    FieldDef {
+        key: "real_ping_concurrency",
+        label: "Real Ping Concurrency",
+        ftype: "Number",
+        description: "Parallel real probes",
+    },
+    FieldDef {
+        key: "real_ping_test_all_protocols",
+        label: "Real Ping Test All Protocols",
+        ftype: "Boolean",
+        description: "Probe every link of an endpoint, not the best",
+    },
+    FieldDef {
+        key: "task_queue_limit",
+        label: "Task Queue Limit (0=no queue)",
+        ftype: "Number",
+        description: "Queued-test cap, 0 = unlimited",
+    },
+    FieldDef {
+        key: "dns_failure_defer_secs",
+        label: "DNS Failure Defer (secs)",
+        ftype: "Number",
+        description: "Window a DNS failure defers a re-test",
+    },
+    // Was missing from the defs while the builder produced it: the rows from
+    // `speed_test_url` on showed wrong label/value pairs.
+    FieldDef {
+        key: "error_ttl_hours",
+        label: "Error TTL Hours",
+        ftype: "Number",
+        description: "Hours a failure marker stays believable, empty = never",
+    },
+    FieldDef {
+        key: "speed_test_url",
+        label: "Speed Test URL",
+        ftype: "Url",
+        description: "File downloaded for the speed test",
+    },
+    FieldDef {
+        key: "speed_test_concurrency",
+        label: "Speed Test Concurrency",
+        ftype: "Number",
+        description: "Parallel speed tests",
+    },
+    FieldDef {
+        key: "speed_test_retries",
+        label: "Speed Test Retries",
+        ftype: "Number",
+        description: "Retries per speed test",
+    },
+    FieldDef {
+        key: "speed_test_min_duration",
+        label: "Speed Test Min Duration",
+        ftype: "Duration",
+        description: "Min run length per download",
+    },
+    FieldDef {
+        key: "speed_test_min_bytes",
+        label: "Speed Test Min Bytes",
+        ftype: "Number",
+        description: "Min bytes per download",
+    },
+    FieldDef {
+        key: "speed_test_max_duration",
+        label: "Speed Test Max Duration",
+        ftype: "Duration",
+        description: "Max run length per download",
+    },
+    FieldDef {
+        key: "geoip_mode",
+        label: "GeoIP Mode",
+        ftype: "Select:dat,mmdb",
+        description: "GeoIP artifact format",
+    },
+    FieldDef {
+        key: "geo_auto_update",
+        label: "Geo Auto Update",
+        ftype: "Boolean",
+        description: "Re-download geo artifacts on a timer",
+    },
+    FieldDef {
+        key: "geo_update_interval",
+        label: "Geo Update Interval Hours",
+        ftype: "Number",
+        description: "Geo artifact re-download interval (hours)",
+    },
+];
+
+const LOGGING_DEFS: &[FieldDef] = &[
+    FieldDef {
+        key: "log_ttl_secs",
+        label: "Log Retention",
+        ftype: "Duration",
+        description: "How long core logs stay stored",
+    },
+    FieldDef {
+        key: "log_to_file",
+        label: "Log to File",
+        ftype: "Boolean",
+        description: "Also write core logs to a file",
+    },
+    FieldDef {
+        key: "log_file_path",
+        label: "Log File Path",
+        ftype: "Text",
+        description: "Log file path",
+    },
+];
+
+const DNS_DEFS: &[FieldDef] = &[
+    FieldDef {
+        key: "servers",
+        label: "Servers (JSON)",
+        ftype: "Text",
+        description: "DNS servers the core queries (comma-sep)",
+    },
+    FieldDef {
+        key: "hosts",
+        label: "Hosts (JSON)",
+        ftype: "Text",
+        description: "Static host mappings (comma-sep)",
+    },
+    FieldDef {
+        key: "query_strategy",
+        label: "Query Strategy",
+        ftype: "Select:,,UseIP,UseIPv4,UseIPv6",
+        description: "A/AAAA preference",
+    },
+    FieldDef {
+        key: "disable_cache",
+        label: "Disable Cache",
+        ftype: "Boolean",
+        description: "Disable the core's DNS cache",
+    },
+    FieldDef {
+        key: "disable_fallback",
+        label: "Disable Fallback",
+        ftype: "Boolean",
+        description: "Disable fallback servers",
+    },
+    FieldDef {
+        key: "client_ip",
+        label: "Client IP",
+        ftype: "Text",
+        description: "Reported client IP for EDNS",
+    },
+    FieldDef {
+        key: "cache_ttl_secs",
+        label: "DNS Cache TTL (secs)",
+        ftype: "Number",
+        description: "TUI DNS cache TTL, empty = 300",
+    },
+];
+
+const ROUTE_PROBES_DEFS: &[FieldDef] = &[FieldDef {
+    key: "probes",
+    label: "Probes (comma-sep)",
+    ftype: "Text",
+    description: "Hostnames that must resolve for the routing probe",
+}];
+
+/// The field table a section's form shows, in row order. `Routing` is a list
+/// pane (no fields); `Subscriptions` rows belong to the group form.
+pub(crate) fn field_defs(section: SettingsSection) -> &'static [FieldDef] {
+    match section {
+        SettingsSection::Gui => GUI_DEFS,
+        SettingsSection::Inbound => INBOUND_DEFS,
+        SettingsSection::SystemProxy => SYSTEM_PROXY_DEFS,
+        SettingsSection::Tun => TUN_DEFS,
+        SettingsSection::Mux => MUX_DEFS,
+        SettingsSection::SpeedTest => SPEED_TEST_DEFS,
+        SettingsSection::Logging => LOGGING_DEFS,
+        SettingsSection::Dns => DNS_DEFS,
+        SettingsSection::RouteProbes => ROUTE_PROBES_DEFS,
+        SettingsSection::Routing | SettingsSection::Subscriptions => &[],
+    }
+}
+
 /// Open the Settings popup with the first section selected and its settings
 /// already on screen (R1).
 ///
@@ -23,6 +416,8 @@ pub async fn enter_settings(state: &mut AppState) {
     state.settings_sections = crate::types::SectionList::default();
     state.settings_search = crate::types::SettingsSearch::default();
     state.settings_notice = None;
+    state.settings_form_snapshot = None;
+    state.settings_form_defaults = None;
     let section = crate::SettingsSection::Gui;
     let right = state.build_right_pane(section).await;
     state.mode = AppMode::Settings {
@@ -37,321 +432,191 @@ pub async fn build_settings_fields(
     state: &AppState,
     section: SettingsSection,
 ) -> Vec<(String, String)> {
-    use crate::SettingsSection::{
-        Dns, Gui, Inbound, Logging, Mux, Routing, SpeedTest, Subscriptions, SystemProxy, Tun,
-    };
     match section {
-        Gui => {
-            vec![
-                ("language".into(), state.config.gui.language.clone()),
-                // `theme_name` is the key the app actually reads (it loads the
-                // theme from it at startup). The GUI form used to read and write
-                // `gui.theme`, which nothing consumes — so this field showed a
-                // value that had no effect.
-                ("theme".into(), state.config.theme_name.clone()),
+        SettingsSection::Dns => match state.db.get_dns_settings().await {
+            Ok(Some(dns)) => vec![
+                // Vec fields render comma-joined in the form; split back
+                // on save (join/split at the form boundary).
+                ("servers".into(), dns.servers.join(",")),
+                ("hosts".into(), dns.hosts.join(",")),
                 (
-                    "refresh_interval".into(),
-                    humantime::format_duration(*state.config.gui.refresh_interval_secs).to_string(),
+                    "query_strategy".into(),
+                    match dns.query_strategy {
+                        Some(leas_db::models::QueryStrategy::UseIp) => "UseIP".into(),
+                        Some(leas_db::models::QueryStrategy::UseIpv4) => "UseIPv4".into(),
+                        Some(leas_db::models::QueryStrategy::UseIpv6) => "UseIPv6".into(),
+                        None => String::new(),
+                    },
                 ),
-            ]
-        }
-        Inbound => {
-            vec![
+                ("disable_cache".into(), dns.disable_cache.to_string()),
+                ("disable_fallback".into(), dns.disable_fallback.to_string()),
+                ("client_ip".into(), dns.client_ip.unwrap_or_default()),
                 (
-                    "socks_port".into(),
-                    state.config.inbound.socks_port.to_string(),
+                    "cache_ttl_secs".into(),
+                    dns.cache_ttl_secs
+                        .map_or_else(String::new, |t| t.to_string()),
                 ),
-                (
-                    "http_port".into(),
-                    state
-                        .config
-                        .inbound
-                        .http_port
-                        .map(|p| p.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "mixed_port".into(),
-                    state
-                        .config
-                        .inbound
-                        .mixed_port
-                        .map(|p| p.to_string())
-                        .unwrap_or_default(),
-                ),
-                ("listen".into(), state.config.inbound.listen.clone()),
-                ("sniffing".into(), state.config.inbound.sniffing.to_string()),
-            ]
-        }
-        SystemProxy => {
-            vec![
-                (
-                    "enabled".into(),
-                    state.config.system_proxy.enabled.to_string(),
-                ),
-                (
-                    "http_port".into(),
-                    state
-                        .config
-                        .system_proxy
-                        .http_port
-                        .map(|p| p.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "socks_port".into(),
-                    state
-                        .config
-                        .system_proxy
-                        .socks_port
-                        .map(|p| p.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "bypass".into(),
-                    state.config.system_proxy.bypass.clone().unwrap_or_default(),
-                ),
-            ]
-        }
-        Tun => {
-            vec![
-                ("enabled".into(), state.config.tun.enabled.to_string()),
-                (
-                    "interface_name".into(),
-                    state.config.tun.interface_name.clone().unwrap_or_default(),
-                ),
-                (
-                    "mtu".into(),
-                    state
-                        .config
-                        .tun
-                        .mtu
-                        .map(|m| m.to_string())
-                        .unwrap_or_default(),
-                ),
-            ]
-        }
-        Mux => {
-            vec![
-                ("enabled".into(), state.config.mux.enabled.to_string()),
-                (
-                    "concurrency".into(),
-                    state
-                        .config
-                        .mux
-                        .concurrency
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                ("protocol".into(), state.config.mux.protocol.clone()),
-                (
-                    "max_connections".into(),
-                    state
-                        .config
-                        .mux
-                        .max_connections
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "min_streams".into(),
-                    state
-                        .config
-                        .mux
-                        .min_streams
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "max_streams".into(),
-                    state
-                        .config
-                        .mux
-                        .max_streams
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                ("padding".into(), state.config.mux.padding.to_string()),
-                (
-                    "fragment_enabled".into(),
-                    state.config.mux.fragment_enabled.to_string(),
-                ),
-                (
-                    "fragment_packets".into(),
-                    state
-                        .config
-                        .mux
-                        .fragment_packets
-                        .clone()
-                        .unwrap_or_default(),
-                ),
-                (
-                    "fragment_length".into(),
-                    state.config.mux.fragment_length.clone().unwrap_or_default(),
-                ),
-                (
-                    "fragment_interval".into(),
-                    state
-                        .config
-                        .mux
-                        .fragment_interval
-                        .clone()
-                        .unwrap_or_default(),
-                ),
-            ]
-        }
-
-        SpeedTest => {
-            vec![
-                ("ping_url".into(), state.config.speed_test.ping_url.clone()),
-                (
-                    "ip_provider".into(),
-                    state.config.speed_test.ip_provider.to_string(),
-                ),
-                (
-                    "tcp_timeout_secs".into(),
-                    humantime::format_duration(*state.config.speed_test.tcp_timeout_secs)
-                        .to_string(),
-                ),
-                (
-                    "real_ping_timeout_secs".into(),
-                    humantime::format_duration(*state.config.speed_test.real_ping_timeout_secs)
-                        .to_string(),
-                ),
-                (
-                    "real_ping_retries".into(),
-                    state.config.speed_test.real_ping_retries.to_string(),
-                ),
-                (
-                    "real_ping_concurrency".into(),
-                    state.config.speed_test.real_ping_concurrency.to_string(),
-                ),
-                (
-                    "real_ping_test_all_protocols".into(),
-                    state
-                        .config
-                        .speed_test
-                        .real_ping_test_all_protocols
-                        .to_string(),
-                ),
-                (
-                    "task_queue_limit".into(),
-                    state.config.speed_test.task_queue_limit.to_string(),
-                ),
-                (
-                    "dns_failure_defer_secs".into(),
-                    state.config.speed_test.dns_failure_defer_secs.to_string(),
-                ),
-                (
-                    "error_ttl_hours".into(),
-                    state
-                        .config
-                        .speed_test
-                        .error_ttl_hours
-                        .map_or_else(String::new, |h| h.to_string()),
-                ),
-                (
-                    "speed_test_url".into(),
-                    state.config.speed_test.speed_test_url.clone(),
-                ),
-                (
-                    "speed_test_concurrency".into(),
-                    state.config.speed_test.speed_test_concurrency.to_string(),
-                ),
-                (
-                    "speed_test_retries".into(),
-                    state.config.speed_test.speed_test_retries.to_string(),
-                ),
-                (
-                    "speed_test_min_duration".into(),
-                    humantime::format_duration(*state.config.speed_test.speed_test_min_duration)
-                        .to_string(),
-                ),
-                (
-                    "speed_test_min_bytes".into(),
-                    state.config.speed_test.speed_test_min_bytes.to_string(),
-                ),
-                (
-                    "speed_test_max_duration".into(),
-                    humantime::format_duration(*state.config.speed_test.speed_test_max_duration)
-                        .to_string(),
-                ),
-                (
-                    "geoip_mode".into(),
-                    match state.config.geo.geoip_mode {
-                        leas_config::app_config::GeoIpMode::Dat => "dat",
-                        leas_config::app_config::GeoIpMode::Mmdb => "mmdb",
-                    }
-                    .to_string(),
-                ),
-                (
-                    "geo_auto_update".into(),
-                    state.config.geo.auto_update.to_string(),
-                ),
-                (
-                    "geo_update_interval".into(),
-                    state.config.geo.update_interval_hours.to_string(),
-                ),
-            ]
-        }
-
-        Dns => {
-            if let Ok(Some(dns)) = state.db.get_dns_settings().await {
-                vec![
-                    // Vec fields render comma-joined in the form; split back
-                    // on save (join/split at the form boundary).
-                    ("servers".into(), dns.servers.join(",")),
-                    ("hosts".into(), dns.hosts.join(",")),
-                    (
-                        "query_strategy".into(),
-                        match dns.query_strategy {
-                            Some(leas_db::models::QueryStrategy::UseIp) => "UseIP".into(),
-                            Some(leas_db::models::QueryStrategy::UseIpv4) => "UseIPv4".into(),
-                            Some(leas_db::models::QueryStrategy::UseIpv6) => "UseIPv6".into(),
-                            None => String::new(),
-                        },
-                    ),
-                    ("disable_cache".into(), dns.disable_cache.to_string()),
-                    ("disable_fallback".into(), dns.disable_fallback.to_string()),
-                    ("client_ip".into(), dns.client_ip.unwrap_or_default()),
-                    (
-                        "cache_ttl_secs".into(),
-                        dns.cache_ttl_secs
-                            .map_or_else(String::new, |t| t.to_string()),
-                    ),
-                ]
-            } else {
-                vec![
-                    ("servers".into(), String::new()),
-                    ("hosts".into(), String::new()),
-                    ("query_strategy".into(), String::new()),
-                    ("disable_cache".into(), String::new()),
-                    ("disable_fallback".into(), String::new()),
-                    ("client_ip".into(), String::new()),
-                    ("cache_ttl_secs".into(), String::new()),
-                ]
-            }
-        }
-
+            ],
+            _ => dns_fresh_fields(),
+        },
         // Routing/Subscriptions list panes build their own state; RouteProbes
         // loads in build_right_pane (async db read can't live here).
-        Routing | Subscriptions | crate::SettingsSection::RouteProbes => vec![],
-        Logging => {
-            vec![
-                (
-                    "log_ttl_secs".into(),
-                    humantime::format_duration(*state.config.logging.ttl_secs).to_string(),
-                ),
-                (
-                    "log_to_file".into(),
-                    state.config.logging.log_to_file.to_string(),
-                ),
-                (
-                    "log_file_path".into(),
-                    state.config.logging.log_file_path.clone(),
-                ),
-            ]
+        _ => build_config_fields(&state.config, section),
+    }
+}
+
+/// The fresh-install Dns form: no DB row means nothing is configured; the
+/// empty fields ARE the defaults (the cache TTL's 300 lives in the app, not
+/// the row).
+fn dns_fresh_fields() -> Vec<(String, String)> {
+    field_defs(SettingsSection::Dns)
+        .iter()
+        .map(|def| (def.key.to_owned(), String::new()))
+        .collect()
+}
+
+/// The values a section's form shows, straight from `config`. Key order is
+/// the `field_defs` table's — the two cannot drift.
+fn build_config_fields(
+    config: &leas_config::AppConfig,
+    section: SettingsSection,
+) -> Vec<(String, String)> {
+    match section {
+        SettingsSection::Dns | SettingsSection::RouteProbes => {
+            // DB-backed; `build_settings_fields` owns them.
+            Vec::new()
         }
+        SettingsSection::Routing | SettingsSection::Subscriptions => Vec::new(),
+        _ => field_defs(section)
+            .iter()
+            .map(|def| (def.key.to_owned(), config_value(config, section, def.key)))
+            .collect(),
+    }
+}
+
+/// One field's value off a config, formatted exactly as the form always
+/// showed it (humantime durations, empty string for `None`).
+fn config_value(config: &leas_config::AppConfig, section: SettingsSection, key: &str) -> String {
+    use crate::SettingsSection::{Gui, Inbound, Logging, Mux, SpeedTest, SystemProxy, Tun};
+    match (section, key) {
+        (Gui, "language") => config.gui.language.clone(),
+        (Gui, "theme") => config.theme_name.clone(),
+        (Gui, "refresh_interval") => {
+            humantime::format_duration(*config.gui.refresh_interval_secs).to_string()
+        }
+        (Inbound, "socks_port") => config.inbound.socks_port.to_string(),
+        (Inbound, "http_port") => config
+            .inbound
+            .http_port
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+        (Inbound, "mixed_port") => config
+            .inbound
+            .mixed_port
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+        (Inbound, "listen") => config.inbound.listen.clone(),
+        (Inbound, "sniffing") => config.inbound.sniffing.to_string(),
+        (SystemProxy, "enabled") => config.system_proxy.enabled.to_string(),
+        (SystemProxy, "http_port") => config
+            .system_proxy
+            .http_port
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+        (SystemProxy, "socks_port") => config
+            .system_proxy
+            .socks_port
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+        (SystemProxy, "bypass") => config.system_proxy.bypass.clone().unwrap_or_default(),
+        (Tun, "enabled") => config.tun.enabled.to_string(),
+        (Tun, "interface_name") => config.tun.interface_name.clone().unwrap_or_default(),
+        (Tun, "mtu") => config.tun.mtu.map(|m| m.to_string()).unwrap_or_default(),
+        (Mux, "enabled") => config.mux.enabled.to_string(),
+        (Mux, "concurrency") => config
+            .mux
+            .concurrency
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        (Mux, "protocol") => config.mux.protocol.clone(),
+        (Mux, "max_connections") => config
+            .mux
+            .max_connections
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        (Mux, "min_streams") => config
+            .mux
+            .min_streams
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        (Mux, "max_streams") => config
+            .mux
+            .max_streams
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        (Mux, "padding") => config.mux.padding.to_string(),
+        (Mux, "fragment_enabled") => config.mux.fragment_enabled.to_string(),
+        (Mux, "fragment_packets") => config.mux.fragment_packets.clone().unwrap_or_default(),
+        (Mux, "fragment_length") => config.mux.fragment_length.clone().unwrap_or_default(),
+        (Mux, "fragment_interval") => config.mux.fragment_interval.clone().unwrap_or_default(),
+        (SpeedTest, "ping_url") => config.speed_test.ping_url.clone(),
+        (SpeedTest, "ip_provider") => config.speed_test.ip_provider.to_string(),
+        (SpeedTest, "tcp_timeout_secs") => {
+            humantime::format_duration(*config.speed_test.tcp_timeout_secs).to_string()
+        }
+        (SpeedTest, "real_ping_timeout_secs") => {
+            humantime::format_duration(*config.speed_test.real_ping_timeout_secs).to_string()
+        }
+        (SpeedTest, "real_ping_retries") => config.speed_test.real_ping_retries.to_string(),
+        (SpeedTest, "real_ping_concurrency") => config.speed_test.real_ping_concurrency.to_string(),
+        (SpeedTest, "real_ping_test_all_protocols") => {
+            config.speed_test.real_ping_test_all_protocols.to_string()
+        }
+        (SpeedTest, "task_queue_limit") => config.speed_test.task_queue_limit.to_string(),
+        (SpeedTest, "dns_failure_defer_secs") => {
+            config.speed_test.dns_failure_defer_secs.to_string()
+        }
+        (SpeedTest, "error_ttl_hours") => config
+            .speed_test
+            .error_ttl_hours
+            .map_or_else(String::new, |h| h.to_string()),
+        (SpeedTest, "speed_test_url") => config.speed_test.speed_test_url.clone(),
+        (SpeedTest, "speed_test_concurrency") => {
+            config.speed_test.speed_test_concurrency.to_string()
+        }
+        (SpeedTest, "speed_test_retries") => config.speed_test.speed_test_retries.to_string(),
+        (SpeedTest, "speed_test_min_duration") => {
+            humantime::format_duration(*config.speed_test.speed_test_min_duration).to_string()
+        }
+        (SpeedTest, "speed_test_min_bytes") => config.speed_test.speed_test_min_bytes.to_string(),
+        (SpeedTest, "speed_test_max_duration") => {
+            humantime::format_duration(*config.speed_test.speed_test_max_duration).to_string()
+        }
+        (SpeedTest, "geoip_mode") => match config.geo.geoip_mode {
+            leas_config::app_config::GeoIpMode::Dat => "dat",
+            leas_config::app_config::GeoIpMode::Mmdb => "mmdb",
+        }
+        .to_string(),
+        (SpeedTest, "geo_auto_update") => config.geo.auto_update.to_string(),
+        (SpeedTest, "geo_update_interval") => config.geo.update_interval_hours.to_string(),
+        (Logging, "log_ttl_secs") => {
+            humantime::format_duration(*config.logging.ttl_secs).to_string()
+        }
+        (Logging, "log_to_file") => config.logging.log_to_file.to_string(),
+        (Logging, "log_file_path") => config.logging.log_file_path.clone(),
+        _ => String::new(),
+    }
+}
+
+/// What a fresh install would load into `section`'s form: the value of `r`
+/// (reset) and the `○`-at-default comparison. Config-backed sections read
+/// `AppConfig::default()` through the SAME formatter as the live builder, so
+/// reset and load cannot disagree.
+pub fn default_fields(section: SettingsSection) -> Vec<(String, String)> {
+    match section {
+        SettingsSection::Dns => dns_fresh_fields(),
+        SettingsSection::RouteProbes => vec![("probes".into(), String::new())],
+        _ => build_config_fields(&leas_config::AppConfig::default(), section),
     }
 }
 
@@ -523,8 +788,10 @@ fn apply_settings_fields(
 pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) -> SplitRightPane {
     let fields = build_settings_fields(state, section).await;
     // Dirty-tracking snapshot (spec P3): Esc on a form compares live fields
-    // against what was loaded.
+    // against what was loaded. The defaults snapshot (fresh-install values)
+    // is what `r` writes and `○` compares against; a list pane has neither.
     state.settings_form_snapshot = None;
+    state.settings_form_defaults = None;
     match section {
         SettingsSection::Routing => {
             state.reload_routing_rules().await;
@@ -537,6 +804,8 @@ pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) ->
         },
         SettingsSection::RouteProbes => {
             let hosts = state.db.get_route_probes().await.unwrap_or_default();
+            state.settings_form_snapshot = Some(vec![("probes".into(), hosts.join(", "))]);
+            state.settings_form_defaults = Some(default_fields(section));
             SplitRightPane::Form {
                 section,
                 fields: vec![("probes".into(), hosts.join(", "))],
@@ -546,6 +815,7 @@ pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) ->
         }
         _ => {
             state.settings_form_snapshot = Some(fields.clone());
+            state.settings_form_defaults = Some(default_fields(section));
             SplitRightPane::Form {
                 section,
                 fields,
@@ -849,6 +1119,75 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
             "tui::ops::settings",
             &format!("Failed to save DNS settings: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::SettingsSection;
+
+    /// Reset ground truth: what `r` writes and what a fresh install loads
+    /// must be the same vector, section by section.
+    #[tokio::test]
+    async fn default_fields_equal_build_over_a_fresh_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            leas_db::Database::open(dir.path().join("defaults.db"))
+                .await
+                .unwrap(),
+        );
+        let state = AppState::new(db, leas_config::AppConfig::default()).await;
+        for section in [
+            SettingsSection::Gui,
+            SettingsSection::Inbound,
+            SettingsSection::SystemProxy,
+            SettingsSection::Tun,
+            SettingsSection::Mux,
+            SettingsSection::SpeedTest,
+            SettingsSection::Logging,
+        ] {
+            let built = build_settings_fields(&state, section).await;
+            let defaults = default_fields(section);
+            assert_eq!(
+                built, defaults,
+                "{section}: reset must write what a fresh config loads"
+            );
+        }
+    }
+
+    /// The defs table and the builder share one key order; when this test
+    /// was written, SpeedTest's builder emitted `error_ttl_hours` while the
+    /// defs did not, so every row from `speed_test_url` on showed the wrong
+    /// label/value pair. DB-backed sections are checked against their own
+    /// builder branch (`build_config_fields` deliberately skips them).
+    #[test]
+    fn every_section_def_matches_the_builder_key_order() {
+        // Config-backed: the table IS the builder's key source.
+        for section in [
+            SettingsSection::Gui,
+            SettingsSection::Inbound,
+            SettingsSection::SystemProxy,
+            SettingsSection::Tun,
+            SettingsSection::Mux,
+            SettingsSection::SpeedTest,
+            SettingsSection::Logging,
+        ] {
+            let def_keys: Vec<_> = field_defs(section).iter().map(|def| def.key).collect();
+            let built = build_config_fields(&leas_config::AppConfig::default(), section);
+            let built_keys: Vec<_> = built.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(def_keys, built_keys, "{section}: defs and builder drifted");
+        }
+        // DB-backed Dns: the table must match the builder's fresh-DB branch.
+        let dns_fresh: Vec<String> = dns_fresh_fields().into_iter().map(|(k, _)| k).collect();
+        let dns_keys = field_defs(SettingsSection::Dns)
+            .iter()
+            .map(|def| def.key.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dns_keys, dns_fresh,
+            "Dns: defs and the fresh-DB branch drifted"
+        );
     }
 }
 

@@ -262,7 +262,7 @@ pub(crate) fn settings_hints(state: &AppState) -> String {
             // `Space/Enter` advance a selector, so the save key is named
             // explicitly and `Enter` keeps saving only on non-selector fields.
             crate::SplitRightPane::Form { .. } | crate::SplitRightPane::GroupForm { .. } => {
-                " [Tab/Shift+Tab] Field  [Space] Advance  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back "
+                " [Tab/Shift+Tab] Field  [Space] Advance  [r] Default  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back "
                     .to_string()
             }
             crate::SplitRightPane::RoutingList { .. } => {
