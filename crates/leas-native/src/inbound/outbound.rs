@@ -164,8 +164,50 @@ async fn dial_direct(target: &TargetAddr) -> Result<TcpStream, NativeError> {
     Ok(stream)
 }
 
-/// One 16 KiB buffer per relay direction, reused for every chunk.
-const RELAY_BUF: usize = 16 * 1024;
+/// Every direction starts on a small buffer and is promoted to a large one only
+/// once a read fills the small one completely, i.e. once the flow has shown it
+/// is a bulk transfer. Interactive and idle tunnels — most of a desktop client's
+/// tunnels — then cost 32 KiB, while bulk transfers run on 64 KiB chunks: eight
+/// times Xray's 8 KiB, so a gigabit flow is a few thousand read/write rounds a
+/// second rather than tens of thousands. 128 KiB bought no measurable throughput
+/// in the reference measurement this rule follows and doubled the cost of every
+/// busy connection, so [`RELAY_LARGE`] is the ceiling.
+const RELAY_SMALL: usize = 16 * 1024;
+const RELAY_LARGE: usize = 64 * 1024;
+
+/// One direction's buffer plus its promotion state.
+///
+/// The rule lives in a type so its transition is testable without a socket: a
+/// read that fills the buffer proves the flow is bulk, and is the only thing
+/// that promotes. There is no demotion — a tunnel that once moved bulk bytes
+/// keeps the larger chunk size until it closes, which the idle timeout bounds.
+struct RelayBuf {
+    buf: Vec<u8>,
+}
+
+impl RelayBuf {
+    fn new() -> Self {
+        Self {
+            buf: vec![0u8; RELAY_SMALL],
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    /// Record a read of `read` bytes into the current buffer.
+    fn filled(&mut self, read: usize) {
+        if read == self.buf.len() && self.buf.len() == RELAY_SMALL {
+            self.buf = vec![0u8; RELAY_LARGE];
+        }
+    }
+
+    #[cfg(test)]
+    const fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+}
 
 /// The tunnel's shared idle deadline.
 ///
@@ -215,9 +257,13 @@ pub(crate) async fn relay(client: TcpStream, upstream: BoxStream) -> Result<(), 
     // One future per direction instead of one `select!` over both: an error
     // still tears the peer direction down, but a write in flight is never
     // cancelled by the *other* direction completing.
+    // One buffer per direction, owned here so promotion survives the whole
+    // connection rather than being rebuilt per call.
+    let mut client_to_upstream = RelayBuf::new();
+    let mut upstream_to_client = RelayBuf::new();
     tokio::try_join!(
-        copy_half(client_r, up_w, &idle),
-        copy_half(up_r, client_w, &idle)
+        copy_half(client_r, up_w, &mut client_to_upstream, &idle),
+        copy_half(up_r, client_w, &mut upstream_to_client, &idle)
     )?;
     Ok(())
 }
@@ -227,12 +273,16 @@ pub(crate) async fn relay(client: TcpStream, upstream: BoxStream) -> Result<(), 
 /// One buffer and one timer per direction, both reused across chunks: the
 /// previous shape allocated a fresh 16 KiB stack buffer and built a fresh
 /// `tokio::time::timeout` future per chunk.
-async fn copy_half<R, W>(mut r: R, mut w: W, idle: &Idle) -> Result<(), std::io::Error>
+async fn copy_half<R, W>(
+    mut r: R,
+    mut w: W,
+    buf: &mut RelayBuf,
+    idle: &Idle,
+) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; RELAY_BUF];
     let sleep = tokio::time::sleep_until(idle.deadline());
     tokio::pin!(sleep);
     loop {
@@ -241,7 +291,7 @@ where
         let n = tokio::select! {
             // `AsyncReadExt::read` is cancel-safe, so the timeout branch can
             // only ever discard a read that produced no bytes.
-            res = r.read(&mut buf) => res?,
+            res = r.read(buf.as_mut_slice()) => res?,
             () = sleep.as_mut() => {
                 // The peer direction moved bytes inside the window: the
                 // tunnel is alive, re-arm from the shared stamp.
@@ -261,7 +311,10 @@ where
         // the other direction must not read the tunnel as idle.
         idle.touch();
         // Outside the `select!`: bytes that were read are always written.
-        w.write_all(&buf[..n]).await?;
+        w.write_all(&buf.as_mut_slice()[..n]).await?;
+        // Promote only after the write: the read filled this buffer, and
+        // replacing it earlier would discard the bytes just read.
+        buf.filled(n);
     }
     // EOF: send FIN and let the peer direction keep draining.
     let _ = w.shutdown().await;
@@ -361,7 +414,12 @@ mod tests {
             resolved_ip: None,
         }));
         let target = TargetAddr::new(Host::Domain("example.com".into()), 80);
-        let _ = super::dial(&kind, &target).await;
+        let mut tunnel = super::dial(&kind, &target).await.expect("dial");
+        // The request header now leaves with the first payload (`first_flight`),
+        // so the application's first byte is what makes the command byte
+        // observable at all. This test still asserts the branch through the
+        // real wire, it just has to speak to get there.
+        tunnel.write_all(b"x").await.expect("first payload");
         seen.await.expect("join")
     }
 
@@ -707,6 +765,63 @@ mod tests {
         assert!(
             !relayed.is_finished(),
             "relay ended while the tunnel was live"
+        );
+    }
+
+    /// The promotion trigger is the whole memory contract: an interactive
+    /// tunnel must not pay for 64 KiB, a bulk one must, and a full read at the
+    /// ceiling must not allocate again (a fresh 64 KiB `Vec` per chunk is
+    /// exactly the per-chunk cost the type exists to remove).
+    #[test]
+    fn relay_buffer_promotes_only_after_a_full_read() {
+        let mut buf = RelayBuf::new();
+        assert_eq!(buf.capacity(), RELAY_SMALL);
+        buf.filled(RELAY_SMALL - 1);
+        assert_eq!(buf.capacity(), RELAY_SMALL, "a short read must not promote");
+        buf.filled(RELAY_SMALL);
+        assert_eq!(buf.capacity(), RELAY_LARGE, "a full read must promote");
+        let base = buf.as_mut_slice().as_ptr();
+        buf.filled(RELAY_LARGE);
+        assert_eq!(buf.capacity(), RELAY_LARGE, "the ceiling holds");
+        assert_eq!(
+            buf.as_mut_slice().as_ptr(),
+            base,
+            "a full read at the ceiling must not reallocate"
+        );
+        buf.filled(1);
+        assert_eq!(buf.capacity(), RELAY_LARGE, "there is no demotion");
+    }
+
+    /// The promotion has to be observable through the function that owns the
+    /// read/write loop, not only through `RelayBuf` directly: a regression that
+    /// stops calling `filled` must fail something.
+    #[tokio::test]
+    async fn copy_half_promotes_on_a_bulk_read_and_not_on_a_short_one() {
+        async fn run(payload: &[u8]) -> usize {
+            let (client, mut server) = tokio::io::duplex(payload.len().max(64));
+            let payload = payload.to_vec();
+            let feeder = tokio::spawn(async move {
+                let _ = server.write_all(&payload).await;
+            });
+            let mut buf = RelayBuf::new();
+            copy_half(client, tokio::io::sink(), &mut buf, &Idle::new())
+                .await
+                .expect("copy half");
+            feeder.await.expect("feeder");
+            buf.capacity()
+        }
+
+        let bulk = vec![0x11_u8; RELAY_SMALL * 2];
+        assert_eq!(
+            run(&bulk).await,
+            RELAY_LARGE,
+            "a burst that fills the small buffer must promote"
+        );
+        let interactive = vec![0x11_u8; 100];
+        assert_eq!(
+            run(&interactive).await,
+            RELAY_SMALL,
+            "an interactive-sized burst must not promote"
         );
     }
 }
