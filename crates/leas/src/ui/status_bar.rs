@@ -268,8 +268,15 @@ pub(crate) fn settings_hints(state: &AppState) -> String {
                     .to_string()
             }
             crate::SplitRightPane::RoutingList { .. } => {
-                " [↑/↓] Nav  [a] Add  [e] Edit  [d] Delete  [D]ataset  [C]ountry  [M]ode  [Ctrl+W] Sections  [Esc] Back "
-                    .to_string()
+                // Read-only in the shipped table: the edit keys are dead, so
+                // the hint must not advertise them (spec §3).
+                if state.ruleset_mode() == leas_config::RulesetMode::Custom {
+                    " [↑/↓] Nav  [a] Add  [e] Edit  [d] Delete  [Ctrl+↑↓] Reorder  [D]ataset  [C]ountry  [M]ode  [Ctrl+W] Sections  [Esc] Back "
+                        .to_string()
+                } else {
+                    " [↑/↓] Nav  [D]ataset  [C]ountry  [M]ode  [Ctrl+W] Sections  [Esc] Back "
+                        .to_string()
+                }
             }
             crate::SplitRightPane::RoutingForm { .. } => {
                 " [Enter] Save  [Ctrl+W] Sections  [Esc] Back ".to_string()

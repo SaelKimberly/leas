@@ -1,13 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui_cheese::field::ValidationKind;
-use ratatui_cheese::input::{Input, InputState};
-use ratatui_cheese::list::{List, ListItem, ListItemContext, ListState};
 use std::collections::{HashMap, HashSet};
 
 use crate::ui::theme::ThemeStyles;
@@ -1742,6 +1738,10 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
     let editable = state.ruleset_mode() == leas_config::RulesetMode::Custom;
     let guard_read_only = |state: &mut AppState| {
         if !editable {
+            // The status band carries the message; a log line alone was
+            // invisible to a user pressing `a` in the shipped table (the
+            // footer hint advertised the very key that did nothing).
+            state.settings_notice = Some("default is read-only — [M] switch to custom".to_string());
             state.log_trace(
                 "info",
                 "tui::ui::settings",
@@ -2186,42 +2186,48 @@ async fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
 }
 // ── Render: Routing List ────────────────────────────────────────────────
 
-struct RoutingRuleItem {
-    index: usize,
-    rule_type: String,
-    targets: String,
-    outbound: String,
-    /// The active datasets cannot serve this row's codes: dimmed, skipped at
-    /// build.
-    disabled: bool,
+/// One routing rule's list row, pre-styled: the caller has the theme, the
+/// draw loop only sets strings.
+/// The first entries of `targets` that fit `budget` cells, then `+k more`
+/// (k = the entries that did not fit).
+fn fit_targets(entries: &[String], budget: usize) -> String {
+    let mut used = 0usize;
+    let mut shown: Vec<&str> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let cost = crate::ui::textfit::width(entry) + usize::from(i > 0) * 2; // ", " separator
+        if used + cost > budget {
+            return format!("{} +{} more", shown.join(", "), entries.len() - shown.len());
+        }
+        used += cost;
+        shown.push(entry);
+    }
+    shown.join(", ")
 }
 
-impl ListItem for RoutingRuleItem {
-    fn height(&self) -> u16 {
-        1
+/// One rule's matcher summary: the domain matcher, else the ports, else the
+/// network, else `—`.
+fn matcher_of(rule: &leas_db::models::RoutingRule) -> String {
+    if let Some(m) = &rule.domain_matcher
+        && !m.is_empty()
+    {
+        return m.clone();
     }
-
-    fn render(&self, area: Rect, buf: &mut Buffer, ctx: &ListItemContext) {
-        let is_selected = ctx.selected;
-        let nums = format!(" {:>2} ", self.index);
-        let type_str = format!(" {} ", self.rule_type);
-        let target_str = format!(" {:<30} ", self.targets);
-        let out_str = format!(" {} ", self.outbound);
-        let line = format!("{nums}{type_str}{target_str}{out_str}");
-        let style = if is_selected {
-            Style::default()
-                .fg(ctx.palette.primary)
-                .bg(ctx.palette.surface)
-                .add_modifier(Modifier::REVERSED)
-        } else if self.disabled {
-            Style::default()
-                .fg(ctx.palette.foreground)
-                .add_modifier(Modifier::DIM)
-        } else {
-            Style::default().fg(ctx.palette.foreground)
-        };
-        buf.set_string(area.x + 1, area.y, &line, style);
+    if !rule.ports.is_empty() {
+        return format!(
+            ":{}",
+            rule.ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
+    if let Some(n) = &rule.network
+        && !n.is_empty()
+    {
+        return n.clone();
+    }
+    "—".to_string()
 }
 
 fn render_routing_list_inner(
@@ -2234,73 +2240,125 @@ fn render_routing_list_inner(
     let rules = state.active_rules();
     let inventory = state.routing_engine.read().inventory.clone();
     let mode = state.ruleset_mode();
+    let editable = mode == leas_config::RulesetMode::Custom;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(0)])
         .split(area);
-    let header = vec![
-        Line::from(format!(
-            " dataset: {}   country: {}   ruleset: {}",
-            state.config.geo.dataset, state.config.geo.country, mode
-        )),
-        Line::from(if mode == leas_config::RulesetMode::Default {
-            " [D] dataset  [C] country  [M] mode   shipped table — switch to custom to edit"
-                .to_string()
-        } else {
-            " [D] dataset  [C] country  [M] mode   [a/e/d] rule  [Ctrl+↑↓] reorder".to_string()
+
+    // Controls row (spec §3): the three switchable knobs, values in accent
+    // brackets like the selectors elsewhere, then the rule summary.
+    let off = rules
+        .iter()
+        .filter(|r| {
+            inventory
+                .as_ref()
+                .and_then(|inv| crate::ops::geodata::incompatibility(r, inv))
+                .is_some()
         })
-        .style(ThemeStyles::hint(theme)),
+        .count();
+    let knobs = format!(
+        "D ‹{}› · C ‹{}› · M ‹{}›",
+        state.config.geo.dataset,
+        state.config.geo.country,
+        if editable { "custom" } else { "default" }
+    );
+    let summary = format!("{} rules · {} off", rules.len(), off);
+    let summary_fits = crate::ui::textfit::width(&knobs) + 2 + crate::ui::textfit::width(&summary)
+        <= usize::from(area.width.saturating_sub(4));
+    let hint2 = if editable {
+        " [D] dataset  [C] country  [M] mode   [a/e/d] rule  [Ctrl+↑↓] reorder"
+    } else {
+        " [D] dataset  [C] country  [M] mode   shipped table — [M] to edit"
+    };
+    let mut line1 = vec![
+        Span::styled(" D ", ThemeStyles::hint(theme)),
+        Span::styled(knobs, ThemeStyles::container_title(theme)),
+    ];
+    if summary_fits {
+        line1.push(Span::styled(
+            format!("  {summary}"),
+            ThemeStyles::hint(theme),
+        ));
+    }
+    let header = vec![
+        Line::from(line1),
+        Line::from(Span::styled(
+            crate::ui::textfit::truncate(hint2, area.width as usize),
+            ThemeStyles::hint(theme),
+        )),
     ];
     frame.render_widget(Paragraph::new(header), rows[0]);
+
+    // One row per rule — no blank gap rows (the `List` widget used to spend
+    // every second row on nothing, halving the visible rules).
     let list_area = rows[1];
-
-    // Build list items. A rule whose codes the active datasets cannot serve is
-    // shown disabled (the build skips it) instead of failing the engine.
-    let items: Vec<RoutingRuleItem> = rules
-        .iter()
-        .enumerate()
-        .map(|(i, rule)| {
-            let domains = rule.domains.join(",");
-            let ips = rule.ips.join(",");
-            let targets = if !domains.is_empty() && !ips.is_empty() {
-                format!("{domains}, {ips}")
-            } else if !domains.is_empty() {
-                domains
-            } else {
-                ips
-            };
-            let disabled = inventory
-                .as_ref()
-                .and_then(|inv| crate::ops::geodata::incompatibility(rule, inv));
-            RoutingRuleItem {
-                index: i + 1,
-                rule_type: rule.r#type.to_string(),
-                targets,
-                outbound: if disabled.is_some() {
-                    "off".to_string()
-                } else {
-                    rule.outbound_tag.as_deref().unwrap_or("-").to_string()
-                },
-                disabled: disabled.is_some(),
+    let height = list_area.height as usize;
+    let start = selected.saturating_sub(height.saturating_sub(1));
+    let accent = ThemeStyles::container_title(theme);
+    let dim = ThemeStyles::hint(theme).add_modifier(Modifier::DIM);
+    for (offset, i) in (0..rules.len()).skip(start).take(height).enumerate() {
+        let y = list_area.y + offset as u16;
+        let rule = &rules[i];
+        let disabled = inventory
+            .as_ref()
+            .and_then(|inv| crate::ops::geodata::incompatibility(rule, inv));
+        let number = format!(" {:>2} ", i + 1);
+        let outbound = disabled.as_ref().map_or_else(
+            || rule.outbound_tag.as_deref().unwrap_or("-").to_string(),
+            |_| "off".to_string(),
+        );
+        let outbound_style = if disabled.is_some() {
+            dim
+        } else {
+            match outbound.as_str() {
+                "block" => ThemeStyles::error(theme),
+                "proxy" => accent,
+                _ => ThemeStyles::footer_value(theme),
             }
-        })
-        .collect();
-
-    // Render list widget
-    let list = List::new(&items)
-        .palette(crate::ui::theme::widget_palette(theme))
-        // The widget's default `│` gutter drew a second bar right after the
-        // pane's own border (`││  Default`); the selected row is marked by
-        // `sel_mark` inside the item instead.
-        .selection_indicator(" ")
-        .show_paginator(false);
-    let mut list_state = ListState::new(items.len());
-    list_state.select(selected, items.len());
-    frame.render_stateful_widget(list, list_area, &mut list_state);
-
-    // No hint line of its own: the modal's bottom border already carries this
-    // pane's keys (`status_bar::settings_hints`), and printing them twice also
-    // overflowed the pane — the routing footer overwrote its right border.
+        };
+        let row_style = if disabled.is_some() || !editable {
+            dim
+        } else if i == selected {
+            ThemeStyles::table_row_selected(theme).add_modifier(Modifier::BOLD)
+        } else {
+            ThemeStyles::table_row_normal(theme)
+        };
+        let targets: Vec<String> = rule
+            .domains
+            .iter()
+            .chain(rule.ips.iter())
+            .cloned()
+            .collect();
+        let number_cells = crate::ui::textfit::width(&number);
+        let out_cells = crate::ui::textfit::width(&outbound).max(6) + 2;
+        let match_text = matcher_of(rule);
+        let match_cells = crate::ui::textfit::width(&match_text).clamp(1, 14);
+        let targets_budget =
+            (area.width as usize).saturating_sub(number_cells + out_cells + match_cells + 4);
+        let targets_text = fit_targets(&targets, targets_budget.max(8));
+        let out_w = out_cells;
+        // Draw per-column so the outbound keeps its color; the rest of the
+        // row is one string clamped to the pane.
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(number, row_style),
+                Span::styled(format!("{outbound:<out_w$}"), outbound_style),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        crate::ui::textfit::truncate(&targets_text, targets_budget)
+                    ),
+                    row_style,
+                ),
+                Span::styled(
+                    format!("  {}", crate::ui::textfit::truncate(&match_text, 14)),
+                    row_style,
+                ),
+            ])),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
 }
 
 // ── Render: Routing Form ────────────────────────────────────────────────
@@ -2313,51 +2371,34 @@ fn render_routing_form_inner(
     focus_index: usize,
     form_errors: &HashMap<String, String>,
 ) {
-    // Render each field as an Input widget with y-coordinate tracking
-    let mut y = area.y;
-    let max_y = area.bottom();
+    // The shared field-row renderer (spec §3): one row per field with the
+    // same label column, value styling, cursor and inline-error rules as the
+    // settings forms. No bottom help line — the modal border owns the keys.
+    let focused_row = focus_index.min(ROUTING_FIELD_DEFS.len().saturating_sub(1));
+    let height = area.height as usize;
+    let start = focused_row
+        .saturating_sub(height.saturating_sub(1))
+        .min(ROUTING_FIELD_DEFS.len().saturating_sub(height.max(1)));
 
-    for (i, (key, label, _field_type)) in ROUTING_FIELD_DEFS.iter().enumerate() {
-        if y >= max_y {
-            break;
-        }
-
-        let is_focused = i == focus_index;
-        let val = fields.get(i).map_or("", |(_, v)| v.as_str());
-
-        // Compute display value
-        let display_val = if val.is_empty() {
-            "(empty)".into()
-        } else {
-            val.to_string()
-        };
-
-        let input = Input::new(label).palette(&crate::ui::theme::widget_palette(theme));
-        let mut input_state = InputState::new();
-        input_state.set_value(display_val);
-        input_state.set_focused(is_focused);
-
-        // Show validation error if present
-        if let Some(error) = form_errors.get(*key) {
-            input_state.set_validation(Some((ValidationKind::Error, error.clone())));
-        }
-
-        let has_error = u16::from(input_state.validation().is_some());
-        let field_height = 2 + has_error;
-        let field_area = Rect::new(area.x, y, area.width, field_height.min(max_y - y));
-        frame.render_stateful_widget(&input, field_area, &mut input_state);
-        y += field_height;
-    }
-
-    // Help text at the bottom
-    if y < max_y {
-        let help = " [Tab] Next  [Shift+Tab] Prev  [Enter] Save  [Esc] Cancel ";
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(help, ThemeStyles::hint(theme)))),
+    for (y, (offset, index)) in
+        (area.y..area.bottom()).zip((start..ROUTING_FIELD_DEFS.len()).take(height).enumerate())
+    {
+        let focused = start + offset == focused_row;
+        let def = ROUTING_FIELD_DEFS[index];
+        let current = fields.get(index).map_or("", |(_, v)| v.as_str());
+        render_field_row(
+            frame,
             Rect::new(area.x, y, area.width, 1),
+            theme,
+            &def,
+            current,
+            focused,
+            ' ',
+            form_errors.get(def.0).map(String::as_str),
         );
     }
 }
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2593,7 +2634,7 @@ mod navigation_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_form_key, value_style_for};
+    use super::{handle_form_key, handle_key, value_style_for};
     use crate::AppState;
     use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2753,6 +2794,122 @@ mod tests {
         assert!(
             text.contains("Values · 1/3 · 2 unsaved"),
             "title must carry the dirty count:\n{text}"
+        );
+        drop(dir);
+    }
+
+    async fn routing_state(pane_w: u16) -> (tempfile::TempDir, AppState) {
+        let (dir, mut state) = popup_state().await;
+        state.mode = AppMode::Settings {
+            mode: SettingsMode::Split {
+                focus: SplitFocus::Right,
+                right: SplitRightPane::RoutingList { selected: 0 },
+            },
+        };
+        let _ = pane_w;
+        (dir, state)
+    }
+
+    fn flatten(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// At a narrow popup the rule rows must not paint over the popup's right
+    /// border — the fixed-width target cell used to overrun it, and a long
+    /// targets blob overran at ANY width (the list rows now clamp).
+    #[tokio::test]
+    async fn routing_rows_never_overrun_the_border() {
+        let (dir, state) = routing_state(0).await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|frame| super::render(frame, frame.area(), &state))
+            .unwrap();
+        let rows = flatten(&terminal);
+        let rule_rows: Vec<&String> = rows
+            .iter()
+            .filter(|l| l.contains("geosite:") || l.contains("geoip:"))
+            .collect();
+        assert!(
+            !rule_rows.is_empty(),
+            "rules must render:\n{}",
+            rows.join("\n")
+        );
+        for row in rule_rows {
+            assert!(row.trim_end().ends_with('│'), "row lost its border:\n{row}");
+        }
+        // One row per rule — no blank gap rows between consecutive rules.
+        let rule_idx: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("geosite:"))
+            .map(|(i, _)| i)
+            .collect();
+        if rule_idx.len() >= 2 {
+            assert!(
+                rule_idx[1] == rule_idx[0] + 1,
+                "rules must be consecutive rows"
+            );
+        }
+        drop(dir);
+    }
+
+    /// `a` in the shipped table is a read-only guard: the status band says
+    /// so (the footer hint no longer advertises the dead keys).
+    #[tokio::test]
+    async fn ignored_edit_key_in_default_mode_sets_the_notice() {
+        let (dir, mut state) = routing_state(0).await;
+        handle_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .await;
+        assert!(
+            matches!(
+                state.settings_notice.as_deref(),
+                Some("default is read-only — [M] switch to custom")
+            ),
+            "the guard must set the status notice, got {:?}",
+            state.settings_notice
+        );
+        drop(dir);
+    }
+
+    /// The 14-field routing form scrolls with the focused field: on a short
+    /// pane the tail fields (Rule Set File/URL) stay reachable.
+    #[tokio::test]
+    async fn routing_form_scrolls_to_the_focused_field() {
+        let (dir, mut state) = popup_state().await;
+        let fields = crate::ui::settings::routing_rule_fields(None);
+        state.mode = AppMode::Settings {
+            mode: SettingsMode::Split {
+                focus: SplitFocus::Right,
+                right: SplitRightPane::RoutingForm {
+                    rule_id: None,
+                    fields,
+                    focus_index: 13,
+                    form_errors: HashMap::new(),
+                },
+            },
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| super::render(frame, frame.area(), &state))
+            .unwrap();
+        let rows = flatten(&terminal);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("Rule Set (URL)"),
+            "the last field must be on screen when focused:\n{text}"
         );
         drop(dir);
     }
