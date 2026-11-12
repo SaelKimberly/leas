@@ -77,7 +77,9 @@ pending write, so the first carrier write is `header | camo | first padded frame
   wrapper sits **below** it, on the carrier, so the peel still sees the response
   first.
 - Interaction to respect: mux writes its `New` frame as the first post-header write,
-  so coalescing is a straight win there and needs no special case.
+  so coalescing is a straight win there. Both mux connects are wired (`plain` and
+  `Vision`, the latter with `header || camo` as the preamble); the UDP connect paths
+  are the declared exception.
 
 ## 5. Verification
 

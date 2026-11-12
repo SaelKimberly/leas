@@ -380,24 +380,22 @@ pub async fn connect_mux(
 
 /// Plain mux connect: request header without addons (`cmd = CMD_MUX`),
 /// then the multiplexer over the peeled tunnel.
+// Kept async: the dispatch table calls every protocol through one
+// awaitable signature, and this arm no longer needs to await anything.
+#[allow(clippy::unused_async)]
 async fn connect_mux_plain(
     ctx: &LinkContext,
     stream: BoxStream,
     uuid: [u8; 16],
 ) -> Result<MuxClient<BoxStream>, NativeError> {
     let request = header::encode_request(&uuid, &mux_header_target(), header::CMD_MUX, None)?;
-    let timeout = timeouts::PROTOCOL;
-    let mut stream = stream;
-    tokio::time::timeout(timeout, stream.write_all(&request))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "vless mux request write",
-            limit: timeout,
-        })??;
+    // The header waits for the first mux frame, so the connection opens with
+    // one write instead of a small recognisable record (see `first_flight`).
+    let framed: BoxStream = Box::new(HeaderFirst::new(stream, request));
 
     // The mux frame stream rides the peeled tunnel: the server's `[0,0]`
     // response header is consumed on the first read, then frames flow.
-    let peeled: BoxStream = Box::new(VlessClientStream::with_ack_slot(stream, ctx.ack.clone()));
+    let peeled: BoxStream = Box::new(VlessClientStream::with_ack_slot(framed, ctx.ack.clone()));
     Ok(MuxClient::new(peeled))
 }
 
@@ -416,6 +414,9 @@ async fn connect_mux_plain(
 /// accept vision+mux (`inbound.go` splices `RequestCommandMux` under flow
 /// XRV with `CanSpliceCopy = 3`). The udp443 variant is the XUDP carrier
 /// under vision — the addon truncates to `xtls-rprx-vision` (spec §4.3).
+// Kept async: the dispatch table calls every protocol through one
+// awaitable signature, and this arm no longer needs to await anything.
+#[allow(clippy::unused_async)]
 async fn connect_mux_vision(
     ctx: &LinkContext,
     stream: BoxStream,
@@ -442,32 +443,21 @@ async fn connect_mux_vision(
         header::CMD_MUX,
         header::encode_addons(flow).as_deref(),
     )?;
-    let timeout = timeouts::PROTOCOL;
-    let mut stream = stream;
-    tokio::time::timeout(timeout, stream.write_all(&request))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "vless mux request write",
-            limit: timeout,
-        })??;
-
     // Step 3: the camouflage frame — one empty long-padding Continue frame
     // carrying the UUID, right after the header (same wire bytes as the
-    // TCP vision path, spec §4.6 step 3 deviation 1).
+    // TCP vision path, spec §4.6 step 3 deviation 1). Both wait for the first
+    // padded frame (`first_flight`).
     let camo = VisionStream::<BoxStream>::camouflage_frame(&uuid);
-    tokio::time::timeout(timeout, stream.write_all(&camo))
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "vless mux vision camouflage write",
-            limit: timeout,
-        })??;
+    let mut preamble = request;
+    preamble.extend_from_slice(&camo);
 
     // The response-header peel, THEN the vision codec, then the
     // multiplexer — Go's client peels the header from the raw conn before
     // wrapping the VisionReader (outbound.go getResponse), so neither the
     // VisionReader nor the mux dispatcher ever sees the `[0,0]` (the same
     // composition as the TCP vision path `connect_vision`).
-    let peeled: BoxStream = Box::new(VlessClientStream::with_ack_slot(stream, ctx.ack.clone()));
+    let framed: BoxStream = Box::new(HeaderFirst::new(stream, preamble));
+    let peeled: BoxStream = Box::new(VlessClientStream::with_ack_slot(framed, ctx.ack.clone()));
     let vision = VisionStream::new(peeled, uuid);
     Ok(MuxClient::new(Box::new(vision)))
 }
