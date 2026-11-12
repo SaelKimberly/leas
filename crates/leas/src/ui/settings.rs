@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -431,10 +431,29 @@ pub fn form_is_dirty(state: &AppState) -> bool {
     }
 }
 
+/// True when the Values pane owns a form cursor: the input bar names the
+/// edited field, so it is not idle.
+const fn form_editing(state: &AppState) -> bool {
+    matches!(
+        &state.mode,
+        AppMode::Settings {
+            mode: SettingsMode::Split {
+                focus: SplitFocus::Right,
+                right: SplitRightPane::Form { .. },
+                ..
+            },
+        }
+    )
+}
+
 /// Four bands, as in the reference (spec §4): bar / split / help / status.
 ///
 /// The footer hints live in the popup's bottom border (spec D9), so
 /// `ui::status_bar` drops its own settings hints while this popup is open.
+///
+/// Narrow mode (inner width < 90, spec §3): the idle bar collapses to a
+/// borderless hint row, the help band to two rows, and the split gives the
+/// values pane everything past a fixed 18-column section list.
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let AppMode::Settings {
         mode: SettingsMode::Split { focus, right },
@@ -443,22 +462,61 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     };
     let theme = state.theme();
+    // Too-small guard (spec §3): below ~40x12 the four bands fight each
+    // other for rows; a centered error line beats a garbage layout.
+    if area.width < 40 || area.height < 12 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "Settings needs 40x12".to_string(),
+                ThemeStyles::error(theme),
+            ))
+            .alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+    let narrow = area.width < 90;
+    let idle_bar = narrow && !state.settings_search.active && !form_editing(state);
+    let bar_rows = if idle_bar { 1 } else { 3 };
     let status_rows = u16::from(settings_status(state).is_some());
     // The help band yields before the sections/values split does, so a short
     // terminal loses help rows rather than the list itself (spec §4).
-    let help_rows = 10u16.min(area.height.saturating_sub(3 + 7 + status_rows));
+    let help_rows = if narrow {
+        2
+    } else {
+        10u16.min(area.height.saturating_sub(bar_rows + 7 + status_rows))
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(bar_rows),
             Constraint::Min(7),
             Constraint::Length(help_rows),
             Constraint::Length(status_rows),
         ])
         .split(area);
-    render_input_bar(frame, rows[0], state, theme);
-    let left_pct = if rows[1].width < 80 { 0.35 } else { 0.30 };
-    let left_w = (f64::from(rows[1].width) * left_pct) as u16;
+    if idle_bar {
+        // The idle bar is a hint, not a control: a full bordered box spent
+        // two rows a narrow terminal cannot spare.
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "Press / to filter settings",
+                ThemeStyles::hint(theme),
+            )),
+            rows[0],
+        );
+    } else {
+        render_input_bar(frame, rows[0], state, theme);
+    }
+    // 18 is the safe floor: longest leaf "Routing Rules" (13) + marker (2)
+    // + indent (3). Below the narrow threshold the values pane keeps the
+    // rest — proportional splits starved it (30% of 76 = 23 columns).
+    let left_w = if narrow {
+        18
+    } else {
+        let left_pct = if rows[1].width < 80 { 0.35 } else { 0.30 };
+        (f64::from(rows[1].width) * left_pct) as u16
+    };
     let (left_area, right_area) = split_rect(rows[1], left_w);
     render_sections(frame, left_area, state, theme, *focus);
     render_right_pane(frame, right_area, state, theme, right, *focus);
@@ -468,6 +526,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         theme,
         right,
         state.settings_form_defaults.as_ref(),
+        narrow,
     );
     if status_rows > 0 {
         render_status(frame, rows[3], state, theme);
@@ -565,6 +624,7 @@ fn render_sections(
     theme: &opaline::Theme,
     focus: SplitFocus,
 ) {
+    let left_w = area.width;
     let query = state.settings_search.query.as_str();
     let (rows, selected_row) = section_rows(query, &state.settings_sections);
     // A counter that does not fit is clipped mid-number ("2/" at 50 cols),
@@ -623,10 +683,19 @@ fn render_sections(
                 } => {
                     let chevron = if *collapsed { "▸" } else { "▾" };
                     let count = SETTINGS_TREE[*group].items.len();
-                    format!("{marker}{chevron} {} · {count}", SETTINGS_TREE[*group].name)
+                    let name = &SETTINGS_TREE[*group].name;
+                    // 18 = marker(2) + chevron/space(2) + count suffix room;
+                    // never clip mid-name at the fixed floor.
+                    let budget = left_w.saturating_sub(7).max(4) as usize;
+                    format!(
+                        "{marker}{chevron} {} · {count}",
+                        crate::ui::textfit::truncate(name, budget)
+                    )
                 }
                 SectionRow::Leaf { leaf } => {
-                    format!("{marker}   {}", leaf_name(*leaf).unwrap_or_default())
+                    let name = leaf_name(*leaf).unwrap_or_default();
+                    let budget = left_w.saturating_sub(5).max(4) as usize;
+                    format!("{marker}   {}", crate::ui::textfit::truncate(name, budget))
                 }
             };
             Line::styled(text, style)
@@ -642,8 +711,9 @@ fn render_help(
     theme: &opaline::Theme,
     right: &SplitRightPane,
     defaults: Option<&Vec<(String, String)>>,
+    narrow: bool,
 ) {
-    let (title, lines) = help_content(theme, right, defaults);
+    let (title, lines) = help_content(theme, right, defaults, narrow);
     let block = Block::default()
         .title(title)
         .title_style(ThemeStyles::container_title(theme))
@@ -658,6 +728,7 @@ fn help_content(
     theme: &opaline::Theme,
     right: &SplitRightPane,
     defaults: Option<&Vec<(String, String)>>,
+    narrow: bool,
 ) -> (String, Vec<Line<'static>>) {
     let label = ThemeStyles::footer_label(theme).add_modifier(Modifier::BOLD);
     let value = ThemeStyles::footer_value(theme);
@@ -668,6 +739,63 @@ fn help_content(
         ])
     };
     let legend = "· saved   ○ at default   * unsaved   › selected".to_string();
+    // Narrow mode (spec §3): two rows — the field facts on one line, the
+    // value wrapped onto the second when it does not fit. The wide layout
+    // keeps the named rows (the band has the height to spend).
+    if narrow {
+        let one_line = |label: &str, text: String| format!("{label} {text}");
+        let (keys, field_line, value_line) = match right {
+            SplitRightPane::Form {
+                section,
+                fields,
+                focus_index,
+                ..
+            } => {
+                let defs = form_field_defs_for_section(*section);
+                let (key, field_label, field_type) =
+                    defs.get(*focus_index).copied().unwrap_or(("", "—", "Text"));
+                let current = fields
+                    .get(*focus_index)
+                    .map_or("", |(_, v)| v.as_str())
+                    .to_string();
+                let default = defaults
+                    .and_then(|d| d.iter().find(|(k, _)| *k == key))
+                    .map_or("", |(_, v)| v.as_str())
+                    .to_string();
+                let description = crate::ops::settings::field_defs(*section)
+                    .iter()
+                    .find(|def| def.key == key)
+                    .map_or("", |def| def.description);
+                let facts = one_line(
+                    "·",
+                    format!("{field_label} · {field_type} · {description} · default {default}"),
+                );
+                let current_line = one_line("›", value_display(field_type, &current));
+                (
+                    format!("[/] filter  [Tab] focus  [Esc] back  {legend}"),
+                    facts,
+                    current_line,
+                )
+            }
+            _ => (
+                format!("[/] filter  [Tab] focus  [Esc] back  {legend}"),
+                String::new(),
+                String::new(),
+            ),
+        };
+        let lines = if value_line.is_empty() {
+            vec![Line::styled(keys, ThemeStyles::hint(theme))]
+        } else {
+            vec![
+                Line::from(vec![Span::styled(keys, ThemeStyles::hint(theme))]),
+                Line::from(vec![
+                    Span::styled(field_line, ThemeStyles::footer_label(theme)),
+                    Span::styled(value_line, ThemeStyles::footer_value(theme)),
+                ]),
+            ]
+        };
+        return (" Help ".to_string(), lines);
+    }
     match right {
         SplitRightPane::Form {
             section,
@@ -771,13 +899,24 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &opalin
     frame.render_widget(Paragraph::new(Line::styled(text, style)), area);
 }
 
-/// The popup's footer hints (spec D9), owned by `ui::status_bar` so the modal
-/// border and the app status bar can never drift apart.
+/// The popup's footer hints (spec D9), owned by `ui::status_bar`.
+///
+/// The modal border and the app status bar can never drift apart. Below 80
+/// popup cells the modifier names collapse to short spellings (`^S`, `⇤`)
+/// before `fit_hints` drops segments from the left.
 pub fn footer_hints(state: &AppState, popup_width: u16) -> String {
-    crate::ui::status_bar::fit_hints(
-        crate::ui::status_bar::settings_hints(state),
-        popup_width.saturating_sub(2).max(20) as usize,
-    )
+    let hints = crate::ui::status_bar::settings_hints(state);
+    let hints = if popup_width < 80 {
+        hints
+            .replace("[Ctrl+S]", "[^S]")
+            .replace("[Ctrl+W]", "[^W]")
+            .replace("[Ctrl+U]", "[^U]")
+            .replace("[Ctrl+↑↓]", "[^↑↓]")
+            .replace("Shift+Tab", "⇤")
+    } else {
+        hints
+    };
+    crate::ui::status_bar::fit_hints(hints, popup_width.saturating_sub(2).max(20) as usize)
 }
 pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     handle_split_key(state, key).await;
@@ -812,13 +951,26 @@ fn render_right_pane(
     let title = match right {
         SplitRightPane::Form {
             section,
+            fields,
             focus_index,
             ..
         } => {
             let rows = visible_field_rows(*section);
             let position = (*focus_index).min(rows.len().saturating_sub(1));
             if area.width >= 18 {
-                format!(" Values · {} ", counter_label(position, rows.len()))
+                let unsaved = state.settings_form_snapshot.as_ref().map_or(0, |snap| {
+                    fields
+                        .iter()
+                        .zip(snap)
+                        .filter(|((_, c), (_, b))| c != b)
+                        .count()
+                });
+                let suffix = if unsaved > 0 {
+                    format!(" · {unsaved} unsaved")
+                } else {
+                    String::new()
+                };
+                format!(" Values · {}{suffix} ", counter_label(position, rows.len()))
             } else {
                 " Values ".to_string()
             }
@@ -2971,6 +3123,113 @@ mod tests {
             let (label_w, budget) = super::row_columns(w);
             assert!(label_w + budget + 3 <= usize::from(w), "width {w}");
         }
+    }
+
+    /// Render the popup inner at `w x h` and flatten the screen.
+    fn render_at(state: &AppState, w: u16, h: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test backend");
+        terminal
+            .draw(|frame| super::render(frame, frame.area(), state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn popup_state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            leas_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, leas_config::AppConfig::default()).await;
+        state.mode = AppMode::Settings {
+            mode: SettingsMode::Split {
+                focus: SplitFocus::Tree,
+                right: SplitRightPane::Form {
+                    section: SettingsSection::Gui,
+                    fields: Vec::new(),
+                    focus_index: 0,
+                    form_errors: HashMap::new(),
+                },
+            },
+        };
+        (dir, state)
+    }
+
+    /// Narrow mode (spec §3): the idle bar is a borderless hint row, the
+    /// help band collapses to two rows (no named `Does` row), and the
+    /// section list keeps a fixed 18 columns.
+    #[tokio::test]
+    async fn narrow_mode_collapses_idle_bar_and_help() {
+        let (dir, state) = popup_state().await;
+        let text = render_at(&state, 70, 30);
+        let hint_rows: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("Press / to filter settings"))
+            .collect();
+        assert_eq!(hint_rows.len(), 1, "one hint row:\n{text}");
+        assert!(
+            !hint_rows[0].contains('┌') && !hint_rows[0].contains('└'),
+            "idle bar must be borderless:\n{}",
+            hint_rows[0]
+        );
+        assert!(
+            !text.contains("Does"),
+            "narrow help must drop the named rows:\n{text}"
+        );
+        drop(dir);
+    }
+
+    /// Below ~40x12 the popup renders only the guard line (spec §3).
+    #[tokio::test]
+    async fn tiny_area_renders_only_the_guard_line() {
+        let (dir, state) = popup_state().await;
+        let text = render_at(&state, 30, 10);
+        assert!(text.contains("Settings needs 40x12"), "\n{text}");
+        assert!(!text.contains("Sections"), "\n{text}");
+        drop(dir);
+    }
+
+    /// The Values title counts unsaved fields (spec §3).
+    #[tokio::test]
+    async fn values_title_counts_unsaved_fields() {
+        let (dir, mut state) = popup_state().await;
+        // Three fields, two of them edited after load.
+        state.settings_form_snapshot = Some(vec![
+            ("language".into(), "en".into()),
+            ("theme".into(), "dracula".into()),
+            ("refresh_interval".into(), "5s".into()),
+        ]);
+        if let AppMode::Settings {
+            mode:
+                SettingsMode::Split {
+                    right: SplitRightPane::Form { fields, .. },
+                    ..
+                },
+        } = &mut state.mode
+        {
+            *fields = vec![
+                ("language".into(), "en".into()),
+                ("theme".into(), "opaline".into()),
+                ("refresh_interval".into(), "9s".into()),
+            ];
+        }
+        let text = render_at(&state, 120, 40);
+        assert!(
+            text.contains("Values · 1/3 · 2 unsaved"),
+            "title must carry the dirty count:\n{text}"
+        );
+        drop(dir);
     }
 
     /// `r` writes the fresh-install value into the focused field without

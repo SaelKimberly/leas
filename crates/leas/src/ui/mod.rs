@@ -1519,6 +1519,73 @@ mod overlay_tests {
         s
     }
 
+    /// Text of every cell, row by row (`TestBackend` has no text accessor).
+    fn screen_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn settings_mode() -> crate::AppMode {
+        crate::AppMode::Settings {
+            mode: crate::SettingsMode::Split {
+                focus: crate::SplitFocus::Tree,
+                right: crate::SplitRightPane::Form {
+                    section: crate::SettingsSection::Gui,
+                    fields: Vec::new(),
+                    focus_index: 0,
+                    form_errors: std::collections::HashMap::new(),
+                },
+            },
+        }
+    }
+
+    /// The popup uses the full useful width on a 120-col terminal: 140 wide
+    /// gives 118 (140-4), not the old 110 cap.
+    #[tokio::test]
+    async fn settings_popup_caps_at_118() {
+        let state = state_with(settings_mode()).await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 44)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_overlay(OverlayKind::Settings, frame, frame.area(), &state);
+            })
+            .unwrap();
+        // Popup left edge: (140 - 118) / 2 = 11; the top border row sits just
+        // under the pane-1 frame.
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(11, 2)].symbol(), "┌", "popup starts at col 11");
+        assert_eq!(buffer[(128, 2)].symbol(), "┐", "popup ends at col 128");
+    }
+
+    /// Below ~40x12 the four bands fight for rows; the popup says so instead
+    /// of drawing a garbage layout.
+    #[tokio::test]
+    async fn tiny_area_renders_only_the_guard_line() {
+        let state = state_with(settings_mode()).await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_overlay(OverlayKind::Settings, frame, frame.area(), &state);
+            })
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(
+            text.contains("Settings needs 40x12"),
+            "guard line missing:\n{text}"
+        );
+        assert!(!text.contains("Sections"), "bands must not render:\n{text}");
+    }
+
     #[tokio::test]
     async fn confirmation_outranks_every_popup() {
         let mut s = state_with(crate::AppMode::Help).await;
@@ -1588,8 +1655,9 @@ fn render_overlay(
     match kind {
         OverlayKind::Settings => {
             // Centered popup over the pane shell (spec D5 dims): width
-            // clamp(w-4, 50, 110), height clamp(h-2, 20, 40).
-            let w = area.width.saturating_sub(4).clamp(50, 110).min(area.width);
+            // clamp(w-4, 50, 118), height clamp(h-2, 20, 40). 118 uses the
+            // full useful width on a 120-col terminal.
+            let w = area.width.saturating_sub(4).clamp(50, 118).min(area.width);
             // Clamp to the live area: on a screen shorter than the minimum the
             // frame used to be clipped, losing its own border (spec D1).
             let h = area.height.saturating_sub(2).clamp(20, 40).min(area.height);

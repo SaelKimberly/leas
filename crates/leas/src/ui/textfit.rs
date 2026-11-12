@@ -49,11 +49,12 @@ pub fn truncate(s: &str, width: usize) -> String {
     out
 }
 
-/// At most `width` cells, dropping the HEAD: a leading `…` followed by the
-/// last `width - 1` cells of `s`. For a value being edited the freshest part
-/// is at the end (typing appends), so the tail survives and the ellipsis
-/// marks what was cut. Callers reserve the cursor cell in `width` and append
-/// `█` themselves.
+/// At most `width` cells, dropping the HEAD.
+///
+/// A leading `…` is followed by the last `width - 1` cells of `s`. For a
+/// value being edited the freshest part is at the end (typing appends), so
+/// the tail survives and the ellipsis marks what was cut. Callers reserve
+/// the cursor cell in `width` and append `█` themselves.
 ///
 /// A string that already fits is returned unchanged.
 #[must_use]
@@ -62,7 +63,11 @@ pub fn truncate_head(s: &str, width: usize) -> String {
         return s.to_owned();
     }
     if width <= 1 {
-        return (width == 1).then(|| "…".to_owned()).unwrap_or_default();
+        return if width == 1 {
+            "…".to_owned()
+        } else {
+            String::new()
+        };
     }
     let keep = width - 1; // one cell for the ellipsis
     let kept: String = s

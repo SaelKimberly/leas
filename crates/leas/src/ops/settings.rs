@@ -14,7 +14,7 @@ pub fn cancel_form(state: &mut AppState) {
 /// type the form dispatches on, and the one-line description the help band
 /// shows. ONE table per section — the form defs, the value builder and the
 /// defaults all walk it, so label/type/order/description cannot drift apart
-/// (the SpeedTest table and builder used to disagree past
+/// (the `SpeedTest` table and builder used to disagree past
 /// `dns_failure_defer_secs`, mislabeling nine rows).
 pub(crate) struct FieldDef {
     pub key: &'static str,
@@ -388,7 +388,7 @@ const ROUTE_PROBES_DEFS: &[FieldDef] = &[FieldDef {
 
 /// The field table a section's form shows, in row order. `Routing` is a list
 /// pane (no fields); `Subscriptions` rows belong to the group form.
-pub(crate) fn field_defs(section: SettingsSection) -> &'static [FieldDef] {
+pub(crate) const fn field_defs(section: SettingsSection) -> &'static [FieldDef] {
     match section {
         SettingsSection::Gui => GUI_DEFS,
         SettingsSection::Inbound => INBOUND_DEFS,
@@ -608,10 +608,12 @@ fn config_value(config: &leas_config::AppConfig, section: SettingsSection, key: 
     }
 }
 
-/// What a fresh install would load into `section`'s form: the value of `r`
-/// (reset) and the `○`-at-default comparison. Config-backed sections read
-/// `AppConfig::default()` through the SAME formatter as the live builder, so
-/// reset and load cannot disagree.
+/// What a fresh install would load into `section`'s form.
+///
+/// This is the value of `r` (reset) and the `○`-at-default comparison.
+/// Config-backed sections read `AppConfig::default()` through the SAME
+/// formatter as the live builder, so reset and load cannot disagree.
+#[must_use]
 pub fn default_fields(section: SettingsSection) -> Vec<(String, String)> {
     match section {
         SettingsSection::Dns => dns_fresh_fields(),
@@ -1157,7 +1159,7 @@ mod metadata_tests {
     }
 
     /// The defs table and the builder share one key order; when this test
-    /// was written, SpeedTest's builder emitted `error_ttl_hours` while the
+    /// was written, `SpeedTest`'s builder emitted `error_ttl_hours` while the
     /// defs did not, so every row from `speed_test_url` on showed the wrong
     /// label/value pair. DB-backed sections are checked against their own
     /// builder branch (`build_config_fields` deliberately skips them).
