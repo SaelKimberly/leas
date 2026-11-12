@@ -399,7 +399,7 @@ pub(crate) const fn field_defs(section: SettingsSection) -> &'static [FieldDef] 
         SettingsSection::Logging => LOGGING_DEFS,
         SettingsSection::Dns => DNS_DEFS,
         SettingsSection::RouteProbes => ROUTE_PROBES_DEFS,
-        SettingsSection::Routing | SettingsSection::Subscriptions => &[],
+        SettingsSection::Routing => &[],
     }
 }
 
@@ -486,7 +486,7 @@ fn build_config_fields(
             // DB-backed; `build_settings_fields` owns them.
             Vec::new()
         }
-        SettingsSection::Routing | SettingsSection::Subscriptions => Vec::new(),
+        SettingsSection::Routing => Vec::new(),
         _ => field_defs(section)
             .iter()
             .map(|def| (def.key.to_owned(), config_value(config, section, def.key)))
@@ -628,7 +628,7 @@ fn apply_settings_fields(
     fields: &[(String, String)],
 ) {
     use crate::SettingsSection::{
-        Dns, Gui, Inbound, Logging, Mux, Routing, SpeedTest, Subscriptions, SystemProxy, Tun,
+        Dns, Gui, Inbound, Logging, Mux, Routing, SpeedTest, SystemProxy, Tun,
     };
     let get_str = |key: &str| -> &str {
         fields
@@ -774,7 +774,7 @@ fn apply_settings_fields(
             }
         }
         // Dns, Routing and RouteProbes are handled separately (DB-backed)
-        Dns | Routing | Subscriptions | crate::SettingsSection::RouteProbes => {}
+        Dns | Routing | crate::SettingsSection::RouteProbes => {}
         Logging => {
             if let Ok(d) = humantime::parse_duration(get_str("log_ttl_secs")) {
                 *state.config.logging.ttl_secs = d;
@@ -800,10 +800,6 @@ pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) ->
             SplitRightPane::RoutingList { selected: 0 }
         }
 
-        SettingsSection::Subscriptions => SplitRightPane::GroupList {
-            selected: 0,
-            selected_mask: vec![false; state.groups.len()],
-        },
         SettingsSection::RouteProbes => {
             let hosts = state.db.get_route_probes().await.unwrap_or_default();
             state.settings_form_snapshot = Some(vec![("probes".into(), hosts.join(", "))]);

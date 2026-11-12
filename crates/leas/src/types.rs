@@ -363,19 +363,6 @@ pub enum SplitRightPane {
         focus_index: usize,
         form_errors: HashMap<String, String>,
     },
-    /// Group/subscription list shown in the settings Subscriptions section.
-    GroupList {
-        selected: usize,
-        selected_mask: Vec<bool>,
-    },
-    /// Add/edit group form shown in the settings Subscriptions section.
-    GroupForm {
-        /// None = adding a new group; Some(gid) = editing an existing group.
-        group_id: Option<String>,
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
 }
 
 /// Which pane has focus in the Settings split view.
@@ -443,7 +430,6 @@ pub enum SettingsSection {
     Mux,
     SpeedTest,
     Logging,
-    Subscriptions,
     RouteProbes,
 }
 
@@ -459,7 +445,6 @@ impl std::fmt::Display for SettingsSection {
             Self::Mux => write!(f, "Mux"),
             Self::SpeedTest => write!(f, "Speed Test"),
             Self::Logging => write!(f, "Logging"),
-            Self::Subscriptions => write!(f, "Subscriptions"),
             Self::RouteProbes => write!(f, "Route Probes"),
         }
     }

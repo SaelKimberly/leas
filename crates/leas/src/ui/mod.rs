@@ -464,13 +464,8 @@ fn paste_into_focused_field(state: &mut AppState) -> bool {
                 fields,
                 focus_index,
                 ..
-            }
-            | crate::SplitRightPane::GroupForm {
-                fields,
-                focus_index,
-                ..
             } => (fields, *focus_index),
-            _ => return false,
+            crate::SplitRightPane::RoutingList { .. } => return false,
         };
         if focus_index >= fields.len() {
             return true;

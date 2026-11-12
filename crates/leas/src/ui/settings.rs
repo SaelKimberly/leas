@@ -84,10 +84,6 @@ const SETTINGS_TREE: &[SettingsTreeGroup] = &[
                 name: "Logging",
                 section: Some(SettingsSection::Logging),
             },
-            SettingsTreeNode {
-                name: "Subscriptions",
-                section: Some(SettingsSection::Subscriptions),
-            },
         ],
     },
 ];
@@ -127,7 +123,7 @@ fn leaf_section(leaf: usize) -> Option<SettingsSection> {
 }
 
 /// The leaf index a section sits at, so an entry point that jumps to a
-/// section (`g` -> Subscriptions) can move the selection with it.
+/// section (`g` -> the Sources tab) can move the selection with it.
 #[must_use]
 pub fn section_leaf_index(section: SettingsSection) -> usize {
     (0..leaf_count())
@@ -403,7 +399,6 @@ const fn section_name(section: SettingsSection) -> &'static str {
         SettingsSection::SystemProxy => "System Proxy",
         SettingsSection::Tun => "TUN",
         SettingsSection::Mux => "Mux",
-        SettingsSection::Subscriptions => "Subscriptions",
         SettingsSection::SpeedTest => "Speed Test",
         SettingsSection::Logging => "Logging",
         SettingsSection::RouteProbes => "Probe Hosts",
@@ -975,18 +970,8 @@ fn render_right_pane(
                 " Values ".to_string()
             }
         }
-        SplitRightPane::GroupForm { focus_index, .. } => {
-            let rows = visible_field_rows(SettingsSection::Subscriptions);
-            let position = (*focus_index).min(rows.len().saturating_sub(1));
-            if area.width >= 18 {
-                format!(" Values · {} ", counter_label(position, rows.len()))
-            } else {
-                " Values ".to_string()
-            }
-        }
         SplitRightPane::RoutingList { .. } => " Routing Rules ".to_string(),
         SplitRightPane::RoutingForm { .. } => " Routing Rule ".to_string(),
-        SplitRightPane::GroupList { .. } => " Subscriptions ".to_string(),
     };
     let block = Block::default()
         .title(title)
@@ -1031,30 +1016,6 @@ fn render_right_pane(
                 fields.as_slice(),
                 *focus_index,
                 form_errors,
-            );
-        }
-        SplitRightPane::GroupList {
-            selected,
-            selected_mask,
-        } => {
-            render_group_list_inner(frame, inner, state, theme, *selected, selected_mask);
-        }
-        SplitRightPane::GroupForm {
-            fields,
-            focus_index,
-            form_errors,
-            ..
-        } => {
-            render_form_with_area(
-                frame,
-                inner,
-                theme,
-                SettingsSection::Subscriptions,
-                fields.as_slice(),
-                *focus_index,
-                form_errors,
-                None,
-                None,
             );
         }
     }
@@ -1111,8 +1072,6 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
                     SplitRightPane::Form { .. } => 1,
                     SplitRightPane::RoutingList { .. } => 2,
                     SplitRightPane::RoutingForm { .. } => 3,
-                    SplitRightPane::GroupList { .. } => 5,
-                    SplitRightPane::GroupForm { .. } => 6,
                 },
                 _ => return,
             };
@@ -1120,8 +1079,6 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
                 1 => handle_form_key(state, key).await,
                 2 => handle_routing_list_key(state, key).await,
                 3 => handle_routing_form_key(state, key).await,
-                5 => handle_group_list_key(state, key).await,
-                6 => handle_group_form_key(state, key).await,
                 _ => {}
             }
         }
@@ -1134,13 +1091,7 @@ fn search_available(state: &AppState) -> bool {
     match &state.mode {
         AppMode::Settings {
             mode: SettingsMode::Split { focus, right },
-        } => {
-            *focus == SplitFocus::Tree
-                || matches!(
-                    right,
-                    SplitRightPane::RoutingList { .. } | SplitRightPane::GroupList { .. }
-                )
-        }
+        } => *focus == SplitFocus::Tree || matches!(right, SplitRightPane::RoutingList { .. }),
         _ => false,
     }
 }
@@ -2407,432 +2358,6 @@ fn render_routing_form_inner(
         );
     }
 }
-// ── Group List (Subscriptions) ───────────────────────────────────────────
-
-struct GroupListItem {
-    name: String,
-    url: String,
-    status: String,
-    selected: bool,
-}
-
-impl ListItem for GroupListItem {
-    fn height(&self) -> u16 {
-        1
-    }
-
-    fn render(&self, area: Rect, buf: &mut Buffer, ctx: &ListItemContext) {
-        let is_focused = ctx.selected;
-        let sel_mark = if self.selected { " \u{2713} " } else { "   " };
-        // Columns sized from the pane, not from a wide-terminal guess: a fixed
-        // 20/40/10 split elided the status (`nev…`) in a normal popup while
-        // overrunning the pane in a narrow one.
-        let status_w = 10usize;
-        let name_w = ((area.width as usize) * 2 / 10).clamp(8, 20);
-        let url_w = (area.width as usize)
-            .saturating_sub(3 + name_w + status_w)
-            .max(8);
-        let name_str = format!(" {:<name_w$}", self.name, name_w = name_w);
-        let url_str = format!(" {:<url_w$}", self.url, url_w = url_w);
-        let status_str = format!(" {:<status_w$}", self.status, status_w = status_w);
-        let line = format!("{sel_mark}{name_str}{url_str}{status_str}");
-        // The columns are padded for a wide pane; without a clamp the tail runs
-        // past the pane and paints over its right border.
-        let line = if unicode_width::UnicodeWidthStr::width(line.as_str()) > usize::from(area.width)
-        {
-            let keep = (area.width as usize).saturating_sub(1);
-            let mut trimmed = line;
-            while unicode_width::UnicodeWidthStr::width(trimmed.as_str()) > keep {
-                trimmed.pop();
-            }
-            format!("{trimmed}…")
-        } else {
-            line
-        };
-        let style = if is_focused {
-            Style::default()
-                .fg(ctx.palette.primary)
-                .bg(ctx.palette.surface)
-                .add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default().fg(ctx.palette.foreground)
-        };
-        buf.set_string(area.x + 1, area.y, &line, style);
-    }
-}
-
-fn render_group_list_inner(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    theme: &opaline::Theme,
-    selected: usize,
-    selected_mask: &[bool],
-) {
-    let groups = &state.groups;
-    let list_area = area;
-
-    // Build list items
-    let items: Vec<GroupListItem> = groups
-        .iter()
-        .enumerate()
-        .map(|(i, g)| {
-            use leas_db::models::GroupStatus;
-            let status = match g.status {
-                Some(GroupStatus::Ok) => "ok",
-                Some(GroupStatus::Error) => "error",
-                Some(GroupStatus::Never) | None => "never",
-            };
-            let url = g.url.as_deref().unwrap_or("");
-            // Truncate long URLs for display
-            let url_display = if url.len() > 38 {
-                format!("{}…", &url[..37])
-            } else {
-                url.to_string()
-            };
-            GroupListItem {
-                name: g.name.clone().unwrap_or_else(|| "Unnamed".to_string()),
-                url: url_display,
-                // On an error, show WHY. The bare word "error" is what left the
-                // 2026-10-01 truncated import undiagnosable — the reason was in
-                // the activity log, which the user has to know to look in.
-                // `specs/2026-10-02-import-budget-design.md` §5.
-                status: match (&g.status, g.error_message.as_deref()) {
-                    (Some(GroupStatus::Error), Some(reason)) if !reason.is_empty() => {
-                        let reason = reason.trim();
-                        let tail: String = reason.chars().take(60).collect();
-                        format!("error: {tail}")
-                    }
-                    _ => status.to_string(),
-                },
-                selected: selected_mask.get(i).copied().unwrap_or(false),
-            }
-        })
-        .collect();
-
-    // Render list widget
-    let list = List::new(&items)
-        .palette(crate::ui::theme::widget_palette(theme))
-        // The widget's default `│` gutter drew a second bar right after the
-        // pane's own border (`││  Default`); the selected row is marked by
-        // `sel_mark` inside the item instead.
-        .selection_indicator(" ")
-        .show_paginator(false);
-    let mut list_state = ListState::new(items.len());
-    list_state.select(selected, items.len());
-    frame.render_stateful_widget(list, list_area, &mut list_state);
-
-    // Footer with action hints
-    // Keys live in the modal's bottom border (see the routing list).
-}
-
-async fn handle_group_list_key(state: &mut AppState, key: &KeyEvent) {
-    // Extract current selection state (read-only, copies usize)
-    let (selected, max) = match &state.mode {
-        AppMode::Settings {
-            mode:
-                SettingsMode::Split {
-                    right: SplitRightPane::GroupList { selected, .. },
-                    ..
-                },
-        } => (*selected, state.groups.len().saturating_sub(1)),
-        _ => return,
-    };
-
-    match key.code {
-        KeyCode::Up => {
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupList {
-                                ref mut selected, ..
-                            },
-                        ..
-                    },
-            } = state.mode
-            {
-                *selected = selected.saturating_sub(1);
-            }
-        }
-        KeyCode::Down => {
-            if selected < max
-                && let AppMode::Settings {
-                    mode:
-                        SettingsMode::Split {
-                            right:
-                                SplitRightPane::GroupList {
-                                    ref mut selected, ..
-                                },
-                            ..
-                        },
-                } = state.mode
-            {
-                *selected += 1;
-            }
-        }
-        KeyCode::Char(' ') => {
-            // Toggle selection for the current row
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupList {
-                                ref mut selected,
-                                ref mut selected_mask,
-                                ..
-                            },
-                        ..
-                    },
-            } = state.mode
-                && *selected < selected_mask.len()
-            {
-                selected_mask[*selected] = !selected_mask[*selected];
-            }
-        }
-        KeyCode::Char('a' | 'A') => {
-            crate::ops::subscriptions::start_add_group(state);
-        }
-        KeyCode::Char('e' | 'E') => {
-            if !state.groups.is_empty() && selected < state.groups.len() {
-                let group_id = state.groups[selected].id.clone();
-                crate::ops::subscriptions::start_edit_group(state, &group_id);
-            }
-        }
-        KeyCode::Char('d' | 'D') => {
-            // Read selection state without borrow conflict
-            let ids_from_mask: Vec<String> = match &state.mode {
-                AppMode::Settings {
-                    mode:
-                        SettingsMode::Split {
-                            right:
-                                SplitRightPane::GroupList {
-                                    selected,
-                                    selected_mask,
-                                },
-                            ..
-                        },
-                } => {
-                    let ids: Vec<String> = selected_mask
-                        .iter()
-                        .enumerate()
-                        .filter(|&(_, m)| *m)
-                        .filter_map(|(i, _)| state.groups.get(i).map(|g| g.id.clone()))
-                        .collect();
-                    let sel = *selected;
-                    if ids.is_empty() {
-                        // Fall back to current selection
-                        state
-                            .groups
-                            .get(sel)
-                            .map(|g| vec![g.id.clone()])
-                            .unwrap_or_default()
-                    } else {
-                        ids
-                    }
-                }
-                _ => return,
-            };
-            for group_id in ids_from_mask {
-                crate::ops::subscriptions::delete_group(state, &group_id).await;
-            }
-            // Clamp selected after deletion
-            let new_max = state.groups.len().saturating_sub(1);
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupList {
-                                ref mut selected, ..
-                            },
-                        ..
-                    },
-            } = state.mode
-            {
-                if *selected > new_max && new_max > 0 {
-                    *selected = new_max;
-                } else if new_max == 0 {
-                    *selected = 0;
-                }
-            }
-        }
-        KeyCode::Char('u' | 'U') => {
-            crate::ops::subscriptions::update_all_subscriptions(state);
-        }
-        KeyCode::Esc => {
-            if let AppMode::Settings {
-                mode: SettingsMode::Split { ref mut focus, .. },
-            } = state.mode
-            {
-                *focus = SplitFocus::Tree;
-            }
-        }
-        _ => {}
-    }
-}
-
-async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
-    let (group_id, _focus_index, max_index) = match &state.mode {
-        AppMode::Settings {
-            mode:
-                SettingsMode::Split {
-                    right:
-                        SplitRightPane::GroupForm {
-                            group_id,
-                            focus_index,
-                            fields,
-                            ..
-                        },
-                    ..
-                },
-        } => (
-            group_id.clone(),
-            *focus_index,
-            fields.len().saturating_sub(1),
-        ),
-        _ => return,
-    };
-
-    match key.code {
-        KeyCode::Tab => {
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupForm {
-                                ref mut focus_index,
-                                ..
-                            },
-                        ..
-                    },
-            } = state.mode
-                && *focus_index < max_index
-            {
-                *focus_index += 1;
-            }
-        }
-        KeyCode::BackTab => {
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupForm {
-                                ref mut focus_index,
-                                ..
-                            },
-                        ..
-                    },
-            } = state.mode
-                && *focus_index > 0
-            {
-                *focus_index -= 1;
-            }
-        }
-        KeyCode::Enter => {
-            // Save the form
-            if group_id.is_some() {
-                crate::ops::subscriptions::confirm_edit_group(state).await;
-            } else {
-                crate::ops::subscriptions::confirm_add_group(state).await;
-            }
-        }
-        KeyCode::Esc => {
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        ref mut right,
-                        ref mut focus,
-                        ..
-                    },
-            } = state.mode
-            {
-                *right = SplitRightPane::GroupList {
-                    selected: 0,
-                    selected_mask: vec![false; state.groups.len()],
-                };
-                *focus = SplitFocus::Right;
-            }
-        }
-        KeyCode::Up => {
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupForm {
-                                ref mut focus_index,
-                                ..
-                            },
-                        ..
-                    },
-            } = state.mode
-                && *focus_index > 0
-            {
-                *focus_index -= 1;
-            }
-        }
-        KeyCode::Down => {
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupForm {
-                                ref mut focus_index,
-                                ..
-                            },
-                        ..
-                    },
-            } = state.mode
-                && *focus_index < max_index
-            {
-                *focus_index += 1;
-            }
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupForm {
-                                ref mut fields,
-                                ref mut focus_index,
-                                ..
-                            },
-                        ..
-                    },
-            } = state.mode
-            {
-                if *focus_index >= fields.len() {
-                    return;
-                }
-                let (_, ref mut val) = fields[*focus_index];
-                val.push(c);
-            }
-        }
-        KeyCode::Backspace => {
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupForm {
-                                ref mut fields,
-                                ref mut focus_index,
-                                ..
-                            },
-                        ..
-                    },
-            } = state.mode
-                && *focus_index < fields.len()
-            {
-                let (_, ref mut val) = fields[*focus_index];
-                val.pop();
-            }
-        }
-        // Right/Left are deliberately inert here (the form's own key path owns
-        // caret movement), so they fall through with everything else.
-        _ => {}
-    }
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2900,12 +2425,12 @@ mod section_list_tests {
 
     #[test]
     fn collapsed_group_hides_its_leaves_but_a_filter_reveals_them() {
-        // 11 leaves, all visible with no filter.
+        // 10 leaves, all visible with no filter.
         let list = SectionList::default();
-        assert_eq!(visible_leaves("", &list).len(), 11);
+        assert_eq!(visible_leaves("", &list).len(), 10);
         let mut collapsed = SectionList::default();
         collapsed.toggle_expanded(0);
-        assert_eq!(visible_leaves("", &collapsed).len(), 7);
+        assert_eq!(visible_leaves("", &collapsed).len(), 6);
         // A filter always shows what it matched, collapse or not.
         assert_eq!(visible_leaves("dns", &collapsed).len(), 1);
     }
@@ -3045,7 +2570,7 @@ mod navigation_tests {
         for _ in 0..40 {
             step_selection(&mut app, true);
         }
-        assert_eq!(app.settings_sections.selected, 10, "clamps at the last row");
+        assert_eq!(app.settings_sections.selected, 9, "clamps at the last row");
     }
 
     #[tokio::test]

@@ -104,8 +104,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 crate::SplitRightPane::Form { section, .. } => status_bar_section_label(*section),
                 crate::SplitRightPane::RoutingList { .. }
                 | crate::SplitRightPane::RoutingForm { .. } => " Settings > Routing",
-                crate::SplitRightPane::GroupList { .. }
-                | crate::SplitRightPane::GroupForm { .. } => " Settings > Subscriptions",
             },
         },
         crate::AppMode::AddServer { .. } => " Add Server",
@@ -265,7 +263,7 @@ pub(crate) fn settings_hints(state: &AppState) -> String {
         crate::SplitFocus::Right => match right {
             // `Space/Enter` advance a selector, so the save key is named
             // explicitly and `Enter` keeps saving only on non-selector fields.
-            crate::SplitRightPane::Form { .. } | crate::SplitRightPane::GroupForm { .. } => {
+            crate::SplitRightPane::Form { .. } => {
                 " [Tab/Shift+Tab] Field  [Space] Advance  [r] Default  [Ctrl+S] Save  [Ctrl+W] Sections  [Esc] Back "
                     .to_string()
             }
@@ -275,10 +273,6 @@ pub(crate) fn settings_hints(state: &AppState) -> String {
             }
             crate::SplitRightPane::RoutingForm { .. } => {
                 " [Enter] Save  [Ctrl+W] Sections  [Esc] Back ".to_string()
-            }
-            crate::SplitRightPane::GroupList { .. } => {
-                " [↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Sections  [Esc] Back "
-                    .to_string()
             }
         },
     }
@@ -336,7 +330,6 @@ const fn status_bar_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::SpeedTest => " Settings > Speed Test",
         SettingsSection::Logging => " Settings > Logging",
         SettingsSection::Routing => " Settings > Routing",
-        SettingsSection::Subscriptions => " Settings > Subscriptions",
         SettingsSection::RouteProbes => " Settings > Route Probes",
     }
 }
