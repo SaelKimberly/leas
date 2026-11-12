@@ -4,9 +4,9 @@ How the workspace is put together: which crates exist, what each one owns, where
 
 ## Workspace layout
 
-`Cargo.toml` declares `members = ["crates/*"]`, resolver 3, edition 2024, rust-version `1.99.1`, workspace version `0.1.0`. Thirteen crates exist:
+`Cargo.toml` declares `members = ["crates/*"]`, resolver 3, edition 2024, rust-version `1.99.1`, workspace version `0.1.0`. Fourteen crates exist:
 
-`leas`, `leas-config`, `leas-core`, `leas-db`, `leas-dns`, `leas-geoip`, `leas-hakari`, `leas-host-features`, `leas-native`, `leas-oracles`, `leas-proto`, `leas-route`, `leas-tls`. (`leas-oracles` is dev-only and excluded from `default-members`.)
+`leas`, `leas-config`, `leas-core`, `leas-db`, `leas-dns`, `leas-geoip`, `leas-hakari`, `leas-host-features`, `leas-hotpath`, `leas-native`, `leas-oracles`, `leas-proto`, `leas-route`, `leas-tls`. (`leas-oracles` is dev-only and excluded from `default-members`; `leas-hotpath` is a dev benchmark binary, also absent from `default-members`.)
 
 ## Crate dependency graph
 

@@ -11,7 +11,7 @@
 //! 0x02 UDP, 0x03 MUX, 0x04 Rvs.
 //! Response header: `version(1B, echoed 0) | addon_len(1B) | addons`.
 
-use crate::addr::{TargetAddr, encode_addr};
+use crate::addr::{TargetAddr, write_addr};
 use crate::error::NativeError;
 use crate::protocol::vless::vision::{FLOW_XTLS_RPRX_VISION, FLOW_XTLS_RPRX_VISION_UDP443};
 
@@ -58,7 +58,9 @@ pub fn encode_request(
     command: u8,
     addons: Option<&[u8]>,
 ) -> Result<Vec<u8>, NativeError> {
-    let mut out = Vec::with_capacity(32);
+    // Room for the fixed fields *and* the flow addons, so a Vision connect
+    // does not realloc the header it is about to write.
+    let mut out = Vec::with_capacity(32 + addons.map_or(0, <[u8]>::len));
     out.push(VERSION);
     out.extend_from_slice(uuid);
     // addon_len is one byte; the only addon source is `encode_addons`
@@ -72,7 +74,7 @@ pub fn encode_request(
     out.push(command);
     match command {
         CMD_TCP | CMD_UDP => {
-            out.extend_from_slice(&encode_addr(target)?);
+            write_addr(&mut out, target)?;
         }
         // CMD_MUX (0x03) carries NO destination on the wire: xray's
         // `EncodeRequestHeader` skips the address for the Mux/Rvs commands

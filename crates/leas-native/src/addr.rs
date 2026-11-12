@@ -80,6 +80,14 @@ pub const ADDR_TYPE_IPV6: u8 = 3;
 /// (`PortThenAddress`), address = type byte + payload.
 pub fn encode_addr(target: &TargetAddr) -> Result<Vec<u8>, NativeError> {
     let mut out = Vec::with_capacity(8);
+    write_addr(&mut out, target)?;
+    Ok(out)
+}
+
+/// [`encode_addr`] into a caller-owned buffer: the request encoders frame the
+/// whole header in one allocation, and a second `Vec` for the address was one
+/// wasted allocation per connect (`leas-hotpath` gates that).
+pub(crate) fn write_addr(out: &mut Vec<u8>, target: &TargetAddr) -> Result<(), NativeError> {
     out.extend_from_slice(&target.port.to_be_bytes());
     match &target.host {
         Host::Ip(IpAddr::V4(ip)) => {
@@ -99,7 +107,7 @@ pub fn encode_addr(target: &TargetAddr) -> Result<Vec<u8>, NativeError> {
             out.extend_from_slice(domain.as_bytes());
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 // Trojan / SOCKS5-ATYP family bytes. Distinct from the VLESS/VMess wire

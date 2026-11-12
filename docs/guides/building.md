@@ -62,6 +62,14 @@ was captured at; the harness default is 64), and `all` refuses to start when
 `$LEAS_CORE_BIN_DIR` has no `xray`/`sing-box`, because the throughput rows would
 otherwise skip silently and exit 0.
 
+`just hotpath` is a different kind of measurement and is **not** a timing bench:
+`crates/leas-hotpath` installs a counting global allocator and asserts the exact
+allocation count each named hot path may cost (the VLESS request header, the VLESS
+response-header peel, TLS 1.3 record seal and open). An allocation count is
+deterministic, so a breach is a fact rather than a distribution on a shared runner —
+which is why this one is CI-safe where `just bench` is not. It refuses a debug build
+and needs no cores, no sockets and no network.
+
 ## Host state can fake a green build
 
 Three host-level sources override the repository, and none is visible in a

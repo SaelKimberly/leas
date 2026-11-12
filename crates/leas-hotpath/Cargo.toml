@@ -1,0 +1,19 @@
+[package]
+name = "leas-hotpath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Exact allocation-count gate for leas hot paths (a benchmark binary, not a library)"
+publish = false
+
+[dependencies]
+leas-native = { path = "../leas-native", version = "0.1.0" }
+leas-tls = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "sync"] }
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[lints]
+workspace = true

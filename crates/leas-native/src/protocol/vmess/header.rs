@@ -5,7 +5,7 @@ use aes::cipher::KeyInit;
 use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, Payload};
 
-use crate::addr::{TargetAddr, encode_addr};
+use crate::addr::{TargetAddr, write_addr};
 use crate::error::NativeError;
 use crate::protocol::vmess::keys;
 
@@ -85,7 +85,7 @@ fn rand_bytes(out: &mut [u8]) {
 /// NOTE on address order: `VMess` uses the same `PortThenAddress()` parser as
 /// VLESS in both Xray-core and v2ray-core (proxy/vmess/encoding/encoding.go),
 /// mihomo, and sing-vmess — the port comes FIRST, then the address type byte
-/// and bytes. The crate's [`encode_addr`] already emits exactly that order.
+/// and bytes. [`crate::addr::encode_addr`] already emits exactly that order.
 pub fn encode_request(
     cmd_key: &[u8; 16],
     session: &Session,
@@ -226,10 +226,9 @@ fn build_body(
 /// Append the `VMess` target address to `body`: port BE2 first, then the
 /// address (type byte + payload). `VMess` uses the same port-first
 /// `PortThenAddress()` order as VLESS — Go `encoding.go` address parser —
-/// which is exactly what [`encode_addr`] emits.
+/// which is exactly what [`crate::addr::encode_addr`] emits.
 fn encode_address_port(body: &mut Vec<u8>, target: &TargetAddr) -> Result<(), NativeError> {
-    body.extend_from_slice(&encode_addr(target)?);
-    Ok(())
+    write_addr(body, target)
 }
 
 #[cfg(test)]

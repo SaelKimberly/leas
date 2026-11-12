@@ -208,6 +208,16 @@ bench target='all':
         just fast cargo criterion -p leas-oracles --bench throughput
     fi
 
+# ─── Hot-path allocation gates ────────────────────────────────────
+#
+# `crates/leas-hotpath` installs a counting global allocator and asserts the
+# allocation count each named hot path is allowed to cost. Counts are exact
+# and deterministic, so a breach is a fact, not a distribution — unlike a
+# criterion row on a shared runner. Release only; the binary refuses a debug
+# build itself.
+hotpath:
+    cargo run --release -p leas-hotpath
+
 # ─── Oracle pin table ──────────────────────────────────────────────
 #
 # Print the four pinned assets (name + sha256) for each version, ready to paste
