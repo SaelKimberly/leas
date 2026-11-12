@@ -11,3 +11,4 @@
 - [details-panel](2026-10-23-scenario-details-panel.md) — leas pane-2 Details tab, the selected server's static fact sheet plus the DB aggregate status, two columns that stack below 100 cols, and the facts column's own scroll offset
 - [tasks-pane](2026-10-23-scenario-tasks-pane.md) — leas pane-2 Tasks tab, the running task's progress bar on top, the queued tasks below, and the d/s/r keys scoped to the tab
 - [routing-rules-audit](2026-11-12-154049-scenario-routing-rules-audit.md) — The Settings Routing Rules pane at 120x40 and 80x24 — header controls, rule list columns, the add-rule form, and what narrow width clips
+- [routing-sources-verify](2026-11-12-162000-scenario-routing-sources-verify.md) — Post-implementation verification of the Routing Rules rework and the new Sources pane-1 tab (header controls, clamped rows, read-only notice, tab entry)

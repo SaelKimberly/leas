@@ -31,7 +31,7 @@ The window is two framed panes, a shell-level log row, and a status bar.
 
 | Part | Tabs / behaviour |
 | --- | --- |
-| Pane 1 | `Profiles` (endpoint table), `Sniffer` (per-host traffic for the native session), `Logs` (core log viewer) |
+| Pane 1 | `Profiles` (endpoint table), `Sniffer` (per-host traffic for the native session), `Sources` (subscription groups), `Logs` (core log viewer) |
 | Pane 2 | `Details` (selected server's static facts plus DB aggregates), `Metrics` (connection status, traffic, native connection ring, core stats), `Tasks` (job queue) |
 | Log row | Newest log line, between pane 2's bottom border and the status bar. It is outside pane 2's frame, so the pane stays a complete rectangle; it is dropped when pane 2 collapses to one row |
 | Status bar | Connection state and mode on the left, contextual keys on the right (`## Status bar`) |
@@ -301,10 +301,66 @@ hints for the current mode.
   `d` dumps the last 20 database-monitor lines plus a `mem:` line (process RSS
   and the size of every session-lifetime cache) into the log.
 
+### Sources (pane 1)
+
+The subscription groups as a table, a pane-1 tab between Sniffer and Logs;
+`g` on the Profiles tab jumps straight here. Columns, widest set first:
+`Name · Enabled · Status · Updated · Endpoints · URL`; narrow panes shed whole
+columns from the right (URL first), so nothing renders half-drawn. An error
+row shows WHY in the Status column (error color); a group being updated gets a
+`⟳` beside its `✓`.
+
+| Key | Action |
+| --- | --- |
+| `a` | Add a group |
+| `e` | Edit the selected group |
+| `d` | Delete the selected group(s) (`y` confirms; the Space mask selects) |
+| `u` | Update every group's subscription |
+| `Space` | Toggle the selected group's mask |
+| `[` / `]` | Cycle pane tabs |
+
+**Group form** (full screen): fields `name`, `subscription_url`,
+`user_agent`, `update_interval`. `Tab`/`Shift+Tab` or `↑`/`↓` moves, `Enter`
+saves, `Esc` cancels. `Ctrl+V` pastes the clipboard into the focused text
+field (crossterm's Windows backend has no bracketed paste, so `Ctrl+V` is the
+only paste door there).
+
+
+
+`subscription_url` (in the group form) also takes a **Telegram public channel**: `@name`,
+`t.me/name`, `t.me/s/name` or `telegram.me/name`. The channel's public web
+preview (`t.me/s/<name>`) is crawled newest-first, one page per request, and
+each message's share URLs enter the same parse-and-persist pipeline as a
+subscription — feed ceilings, dedup and per-group membership included.
+
+- The crawl stops at the group's watermark (`app_meta`,
+  `tg_watermark:<group>:<channel>`), the lowest message id already imported; a
+  refresh walks back from the newest post only until it reaches that id. The
+  FIRST import reads up to five pages (about 100 messages) and records the
+  lowest id it read, so the next refresh continues backwards from there and a
+  re-read overlaps rather than skips. Editing the URL to a different channel
+  starts that channel's own crawl (the key carries the channel name).
+- A post `t.me` truncates with `…` loses its tail URL: the cut config is
+  unrecoverable and is dropped, not stored malformed.
+- A channel with no public preview (private or unknown) fails the group row with
+  that reason, and a failed crawl never advances the watermark.
+- A channel fetch obeys the same route gate as a subscription: with a live
+  tunnel it is dialed through that tunnel (SOCKS5h, remote DNS), so the routing
+  rules match the source hostname exactly as they do for an HTTP feed. A
+  `block`/`reject` rule on `t.me` refuses the update instead of fetching it,
+  and `direct` fetches outside the tunnel. The shipped rulesets already cover
+  the host through `geosite:telegram`; a hand-written domain entry is a SUFFIX
+  rule, so matching the bare `t.me` needs the rule's exact matcher.
+- `user_agent` is used for the channel request too; leave it empty for
+  `leas/0.1`.
+
+
 ### Settings (popup)
 
-`,` opens a centered modal (width `clamp(term-4, 50, 110)`, height
+`,` opens a centered modal (width `clamp(term-4, 50, 118)`, height
 `clamp(term-2, 20, 40)`) over both panes. The shell keeps rendering behind it.
+Below ~40x12 the popup renders only `Settings needs 40x12` instead of a garbage
+layout; under 90 columns it switches to its narrow mode (bands below).
 `Esc` closes; leaving a dirty form asks `Discard unsaved settings? (y/N)` first.
 The popup carries its key hints in its bottom border; the app status bar shows
 only the mode.
@@ -334,22 +390,33 @@ moves the cursor into the fields.
 1. **Filter / edit bar.** Idle it reads `Search` with `Press / to filter settings`;
    while filtering the title is `Filter` and the body is the query behind a `█`
    cursor; with a field focused it names what you are editing (`Edit Servers (JSON) · Text`).
-   Its border is accented while active.
-2. **Sections** (left, 30%) and **Values** (right). The titles count position:
-   `Sections · n/N` counts display rows (group headers included), `Values · i/n`
-   counts the open section's field rows. A group header carries `▾` when expanded
-   and `▸` when collapsed; `←`/`→` toggles the group that owns the selection, and
-   a collapsed group's header carries the highlight.
-3. **Help** names the field under the cursor: `Field`, `Type`, `Accepts`,
-   `Current`, plus the marker legend. It yields rows first on a short terminal so
-   the lists keep their viewport.
+   Its border is accented while active. In narrow mode the idle bar collapses to a
+   borderless one-line hint.
+2. **Sections** (left, 30%; a fixed 18 columns in narrow mode) and **Values**
+   (right). The titles count position: `Sections · n/N` counts display rows
+   (group headers included, each carrying its leaf count: `▾ Routing · 3`),
+   `Values · i/n` counts the open section's field rows and appends the dirty
+   count when edits exist (`Values · 1/2 · 2 unsaved`). A group header carries
+   `▾` when expanded and `▸` when collapsed; `←`/`→` toggles the group that owns
+   the selection, and a collapsed group's header carries the highlight.
+3. **Help** names the field under the cursor: `Field`, `Type`, `Does` (what the
+   setting does), `Accepts`, `Default`, `Current`, plus the marker legend. It
+   yields rows first on a short terminal so the lists keep their viewport. In
+   narrow mode it collapses to two rows: the field facts on one line, the
+   current value on the next.
 4. **Status** appears only when it has something to say: the first validation
-   error, a filter that matched nothing, or the last save.
+   error, a filter that matched nothing, the read-only notice, or the last save.
 
 **Value rows** are `›` (focused) + a provenance marker + the label + the value:
-`·` when the value matches what the section was loaded with, `*` for an edit not
-yet saved. Bools render `✓`/`✗`, an empty text field renders `—`, selects render
-`< option >`, and a focused row ends with a `█` cursor.
+`·` saved and different from the default, `○` saved at the field's default
+(dimmed), `*` an edit not yet saved (the value carries a warning tint until
+saved). Bools render `✓`/`✗`, an empty text field renders `—`, selects render
+`‹ i/n · option ›`, and a focused row ends with a `█` cursor. The cursor never
+scrolls off: a value longer than its column is cut from the head so the last
+characters (and the `█`) stay visible.
+
+**`r`** on a focused field resets it to what a fresh install would load (shown
+as `Default` in the help band); the edit stays unsaved until `Ctrl+S`.
 
 **Selectors** (Log Level, **Theme**) advance on `Space` or
 `Enter` and wrap past the last option; `←`/`→` step one option. Because `Enter`
@@ -357,14 +424,14 @@ belongs to the selector on those fields, `Ctrl+S` saves the section (`Enter`
 still saves every other field type). Theme lists every builtin opaline slug, is
 bound to the theme the app actually loads, and applies on save.
 
-**Section tree (11 leaves in 4 groups):**
+**Section tree (10 leaves in 4 groups):**
 
 | Group | Leaves |
 | --- | --- |
 | Connection | Inbound, System Proxy, TUN, Mux |
 | Routing | Routing Rules, Probe Hosts, DNS |
 | GUI | GUI Settings |
-| Advanced | Speed Test, Logging, Subscriptions |
+| Advanced | Speed Test, Logging |
 
 **Filter.** `/` starts a case-insensitive substring filter over the section list
 (a leaf name or its group name). It never filters the Values pane. `Enter`
@@ -372,14 +439,15 @@ applies and leaves the query in place; `Esc` cancels and clears it; `Ctrl+U`
 clears it while typing. A query that matches nothing says so in the status band.
 A filtered list ignores collapsed groups, so a search reveals its own matches,
 and a filter that moves the selection moves the Values pane with it. `/` is
-claimed only where it cannot be text: the sections list, or the routing and
-subscription list panes.
+claimed only where it cannot be text: the sections list or the routing list pane.
 
 #### Routing Rules (Settings → Routing)
 
 Three levels:
 
-- **Ruleset header** (top two lines): `D` cycles the geo dataset
+- **Controls header** (top two lines): the switchable knobs rendered like the
+  selectors elsewhere (`D ‹loyalsoldier› · C ‹ru› · M ‹default›`, values
+  accent-bold) plus a summary (`10 rules · 2 off`). `D` cycles the geo dataset
   (`loyalsoldier` / `roscomvpn`, refetched on change), `C` cycles the country
   ruleset (`ru` / `cn` / `ir`), `M` toggles `default` / `custom`. Exactly one
   ruleset is active; other countries' custom rows stay stored. Switching to
@@ -387,59 +455,20 @@ Three levels:
   custom starts identical to default. A rule whose `geosite:`/`geoip:` codes
   the active dataset cannot serve renders dimmed with `off` and is skipped at
   compile instead of failing the engine.
-- **Routing list**: `↑`/`↓` navigate, `a` adds, `e` edits, `d` deletes (no
-  confirmation), `Ctrl+↑`/`Ctrl+↓` move the selected rule one place and persist
-  the whole order immediately. In `default` mode the list is read-only
-  (`M` switches to custom first).
-- **Routing rule form**: `Tab`/`Shift+Tab` and `↑`/`↓` move between fields,
-  `Enter` saves, `Esc` returns to the list.
-
-#### Subscriptions (Settings → Advanced)
-
-`g` on the Profiles tab jumps straight here. The list shows Name, URL
-(truncated), Enabled, Status, and Last Updated.
-
-| Key | Action |
-| --- | --- |
-| `a` | Add a group |
-| `e` | Edit the selected group |
-| `d` | Delete the selected group (`y` confirms) |
-| `u` | Update every group's subscription |
-| `Space` | Toggle the selected group's enabled mask |
-| `Esc` | Return to the section list |
-
-**Group form** fields: `name`, `subscription_url`, `user_agent`,
-`update_interval`, `core_type`. `Tab`/`Shift+Tab` moves, `Enter` saves, `Esc`
-cancels. `Ctrl+V` pastes the clipboard into the focused text field (crossterm's
-Windows backend has no bracketed paste, so `Ctrl+V` is the only paste door there).
-
-`subscription_url` also takes a **Telegram public channel**: `@name`,
-`t.me/name`, `t.me/s/name` or `telegram.me/name`. The channel's public web
-preview (`t.me/s/<name>`) is crawled newest-first, one page per request, and
-each message's share URLs enter the same parse-and-persist pipeline as a
-subscription — feed ceilings, dedup and per-group membership included.
-
-- The crawl stops at the group's watermark (`app_meta`,
-  `tg_watermark:<group>:<channel>`), the lowest message id already imported; a
-  refresh walks back from the newest post only until it reaches that id. The
-  FIRST import reads up to five pages (about 100 messages) and records the
-  lowest id it read, so the next refresh continues backwards from there and a
-  re-read overlaps rather than skips. Editing the URL to a different channel
-  starts that channel's own crawl (the key carries the channel name).
-- A post `t.me` truncates with `…` loses its tail URL: the cut config is
-  unrecoverable and is dropped, not stored malformed.
-- A channel with no public preview (private or unknown) fails the group row with
-  that reason, and a failed crawl never advances the watermark.
-- A channel fetch obeys the same route gate as a subscription: with a live
-  tunnel it is dialed through that tunnel (SOCKS5h, remote DNS), so the routing
-  rules match the source hostname exactly as they do for an HTTP feed. A
-  `block`/`reject` rule on `t.me` refuses the update instead of fetching it,
-  and `direct` fetches outside the tunnel. The shipped rulesets already cover
-  the host through `geosite:telegram`; a hand-written domain entry is a SUFFIX
-  rule, so matching the bare `t.me` needs the rule's exact matcher.
-- `user_agent` is used for the channel request too; leave it empty for
-  `leas/0.1`.
-
+- **Routing list**: one row per rule — `#`, the outbound (colored: `block`
+  red, `proxy` accent, `direct` neutral, `off` dimmed), the targets (first
+  entries, then `+k more`), and the matcher (domain matcher, ports, network,
+  else `—`). Rows clamp to the pane; nothing paints over the border. `↑`/`↓`
+  navigate, `a` adds, `e` edits, `d` deletes (no confirmation),
+  `Ctrl+↑`/`Ctrl+↓` move the selected rule one place and persist the whole
+  order immediately. In `default` mode every row is dimmed — the read-only
+  state is visible — the edit keys set a status notice
+  (`default is read-only — [M] switch to custom`), and the footer hint drops
+  the dead edit keys.
+- **Routing rule form**: the same field rows as the settings forms, scrolling
+  with the focused field (all 14 fields stay reachable on a short pane).
+  `Tab`/`Shift+Tab` and `↑`/`↓` move between fields, `Enter` saves, `Esc`
+  returns to the list.
 
 ### Add and edit server
 

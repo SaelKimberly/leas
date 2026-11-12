@@ -2271,10 +2271,7 @@ fn render_routing_list_inner(
     } else {
         " [D] dataset  [C] country  [M] mode   shipped table — [M] to edit"
     };
-    let mut line1 = vec![
-        Span::styled(" D ", ThemeStyles::hint(theme)),
-        Span::styled(knobs, ThemeStyles::container_title(theme)),
-    ];
+    let mut line1 = vec![Span::styled(knobs, ThemeStyles::container_title(theme))];
     if summary_fits {
         line1.push(Span::styled(
             format!("  {summary}"),
