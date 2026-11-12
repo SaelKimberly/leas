@@ -270,6 +270,7 @@ ignored = [
     "data-encoding",
     "digest",
     "either",
+    "fastrand",
     "flate2",
     "form_urlencoded",
     "futures-channel",
