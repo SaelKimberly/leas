@@ -71,7 +71,8 @@ Module layout beyond the UI: `state.rs` (`AppState`), `types.rs` (`CoreEvent`, `
 | `job_scheduler.rs` | the user-visible task queue, `TaskKind`, terminal events |
 | `enrich.rs` | background DNS, mmdb, whitelist and exit-IP enrichment |
 | `profiles.rs`, `subscriptions.rs`, `settings.rs`, `settings` writes | profile mutations, subscription updates, settings persistence |
-| `compact.rs`, `purge.rs`, `updates.rs`, `export.rs`, `stream_import.rs`, `db_monitor.rs`, `speed_test.rs` | maintenance commands, retention, binary updates, export, import streaming, DB monitoring, single-link speed tests |
+| `stream_import.rs`, `telegram.rs` | the one import pipeline (decoder, batches, write-behind) and its two sources: HTTP subscriptions and Telegram public channels |
+| `compact.rs`, `purge.rs`, `updates.rs`, `export.rs`, `db_monitor.rs`, `speed_test.rs` | maintenance commands, retention, binary updates, export, DB monitoring, single-link speed tests |
 | `clipboard.rs` | one process-lifetime `arboard::Clipboard` handle behind `LazyLock<Mutex<Option<Clipboard>>>` for every copy and paste site |
 
 Export splits across three owners: `leas-db/src/export.rs` opens a dedicated Turso read connection and drains ordered rows, `ops/export.rs` owns scope policy and the clipboard/file sinks, `ui/export.rs` owns the popup. The single clipboard handle matters because `arboard::Clipboard` is the X11 selection owner on Linux; a per-call handle drops the serving window and the payload is lost without a clipboard manager.

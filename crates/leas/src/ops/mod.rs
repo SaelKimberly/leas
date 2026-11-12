@@ -18,3 +18,4 @@ pub mod settings;
 pub mod speed_test;
 pub mod stream_import;
 pub mod subscriptions;
+pub mod telegram;

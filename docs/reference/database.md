@@ -57,7 +57,7 @@ for the tables, and `schema/ddl.rs` owns everything toasty cannot express.
 | `routing_rules` | model | routing table |
 | `dns_settings` | model | DNS configuration |
 | `route_probes` | model | must-resolve hostnames |
-| `app_meta` | model | key/value stamp (`psl_version`, `stability_seeded_v2`) |
+| `app_meta` | model | key/value stamp (`psl_version`, `stability_seeded_v2`, `tg_watermark:<group>:<channel>`) |
 | `endpoint_rank` | model + raw columns | derived ordering keys |
 | `rank_weight_meta` | raw DDL | one row: the key-input version stamp |
 | `__toasty_migrations` | driver | the driver's own migration bookkeeping |
@@ -289,9 +289,13 @@ arrays; `cache_ttl_secs` is the TUI-side resolution cache TTL, `NULL` = 300).
 **`route_probes`**: a single row (`id = 'global'`) holding the hostnames the
 routing engine must resolve.
 
-**`app_meta`**: the typed key/value stamp table. Two keys are live:
+**`app_meta`**: the typed key/value stamp table. Three keys are live:
 `psl_version` (the `psl2` Public Suffix List version, whose change can re-key
-endpoints) and `stability_seeded_v2` (the day-one stability seed has run).
+endpoints), `stability_seeded_v2` (the day-one stability seed has run), and one
+`tg_watermark:<group id>:<channel>` row per Telegram-channel group — the lowest message id
+that group has imported, which bounds the next crawl
+(`crates/leas/src/ops/telegram.rs`). `identity_version` is the re-key marker,
+documented under the identity steps below.
 
 ### Derived state
 

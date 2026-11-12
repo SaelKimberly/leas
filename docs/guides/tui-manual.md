@@ -413,6 +413,33 @@ Three levels:
 cancels. `Ctrl+V` pastes the clipboard into the focused text field (crossterm's
 Windows backend has no bracketed paste, so `Ctrl+V` is the only paste door there).
 
+`subscription_url` also takes a **Telegram public channel**: `@name`,
+`t.me/name`, `t.me/s/name` or `telegram.me/name`. The channel's public web
+preview (`t.me/s/<name>`) is crawled newest-first, one page per request, and
+each message's share URLs enter the same parse-and-persist pipeline as a
+subscription — feed ceilings, dedup and per-group membership included.
+
+- The crawl stops at the group's watermark (`app_meta`,
+  `tg_watermark:<group>:<channel>`), the lowest message id already imported; a
+  refresh walks back from the newest post only until it reaches that id. The
+  FIRST import reads up to five pages (about 100 messages) and records the
+  lowest id it read, so the next refresh continues backwards from there and a
+  re-read overlaps rather than skips. Editing the URL to a different channel
+  starts that channel's own crawl (the key carries the channel name).
+- A post `t.me` truncates with `…` loses its tail URL: the cut config is
+  unrecoverable and is dropped, not stored malformed.
+- A channel with no public preview (private or unknown) fails the group row with
+  that reason, and a failed crawl never advances the watermark.
+- A channel fetch obeys the same route gate as a subscription: with a live
+  tunnel it is dialed through that tunnel (SOCKS5h, remote DNS), so the routing
+  rules match the source hostname exactly as they do for an HTTP feed. A
+  `block`/`reject` rule on `t.me` refuses the update instead of fetching it,
+  and `direct` fetches outside the tunnel. The shipped rulesets already cover
+  the host through `geosite:telegram`; a hand-written domain entry is a SUFFIX
+  rule, so matching the bare `t.me` needs the rule's exact matcher.
+- `user_agent` is used for the channel request too; leave it empty for
+  `leas/0.1`.
+
 
 ### Add and edit server
 

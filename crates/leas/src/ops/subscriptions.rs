@@ -506,20 +506,27 @@ async fn do_update_subscription(
             "Subscription URL uses HTTP, traffic is not encrypted"
         );
     }
+    // A Telegram channel and a subscription are ONE row type: the URL decides
+    // the fetch, and a channel is route-planned as its canonical `https` page.
+    let (source_url, telegram) = match crate::ops::telegram::detect(&url) {
+        crate::ops::telegram::SourceKind::Telegram(channel) => (channel, true),
+        crate::ops::telegram::SourceKind::Http => (url.clone(), false),
+    };
     // The caller passes the ACTIVE ruleset (`AppState::active_rules`); a
     // read failure there already kept the previous snapshot.
     let rules = if live.is_some() { rules } else { Vec::new() };
-    let outcome = match plan_http_route(&url, live, &rules, engine) {
+    let outcome = match plan_http_route(&source_url, live, &rules, engine) {
         FetchRoute::Direct => {
             tracing::info!(
                 target: "tui::ops::subscriptions",
-                "subscription fetch routed direct"
+                "source fetch routed direct"
             );
-            crate::ops::stream_import::import_http_subscription(
-                &url,
+            import_source(
+                &source_url,
+                telegram,
                 &user_agent,
                 &db,
-                Some(&group_id),
+                &group_id,
                 &validation,
                 budget,
                 None,
@@ -529,15 +536,16 @@ async fn do_update_subscription(
         FetchRoute::Tunnel(proxy) => {
             tracing::info!(
                 target: "tui::ops::subscriptions",
-                "subscription fetch routed through live tunnel {}:{}",
+                "source fetch routed through live tunnel {}:{}",
                 proxy.host,
                 proxy.port
             );
-            crate::ops::stream_import::import_http_subscription(
-                &url,
+            import_source(
+                &source_url,
+                telegram,
                 &user_agent,
                 &db,
-                Some(&group_id),
+                &group_id,
                 &validation,
                 budget,
                 Some(&proxy),
@@ -547,7 +555,7 @@ async fn do_update_subscription(
         FetchRoute::Refused(reason) => {
             tracing::warn!(
                 target: "tui::ops::subscriptions",
-                "subscription fetch refused: {reason}"
+                "source fetch refused: {reason}"
             );
             ImportOutcome {
                 ended_early: Some(reason),
@@ -581,6 +589,47 @@ async fn do_update_subscription(
 
     let error = partial_import_message(&outcome);
     (group_id, outcome.links, outcome.summary, error)
+}
+
+/// One source fetch: the group's URL decides which stream feeds the SHARED
+/// pipeline (decoder, feed ceilings, write-behind persist, dedup).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "both source wrappers take the same parameters; a struct would only rename them"
+)]
+async fn import_source(
+    url: &str,
+    telegram: bool,
+    user_agent: &str,
+    db: &Arc<Database>,
+    group_id: &str,
+    validation: &ValidationSettings,
+    budget: leas_config::app_config::ImportConfig,
+    proxy: Option<&ProxyEndpoint>,
+) -> ImportOutcome {
+    if telegram {
+        crate::ops::telegram::import_telegram_channel(
+            url,
+            user_agent,
+            db,
+            Some(group_id),
+            validation,
+            budget,
+            proxy,
+        )
+        .await
+    } else {
+        crate::ops::stream_import::import_http_subscription(
+            url,
+            user_agent,
+            db,
+            Some(group_id),
+            validation,
+            budget,
+            proxy,
+        )
+        .await
+    }
 }
 
 /// The user-facing statement of a truncated import: that it was cut short and
@@ -924,6 +973,16 @@ mod tests {
         }
     }
 
+    /// A rule matching the host ITSELF: plain `domains` entries compile to
+    /// dot-prefixed suffixes (`.t.me` matches `x.t.me`, not `t.me`), so an apex
+    /// host needs `domain_matcher: exact`. `geosite:` rows carry the apex
+    /// themselves; a hand-written domain list does not.
+    fn exact_rule(domains: &[&str], outbound: &str) -> RoutingRule {
+        let mut rule = route_rule(domains, outbound);
+        rule.domain_matcher = Some("exact".to_owned());
+        rule
+    }
+
     fn protocol_rule(outbound: &str, protocol: &str) -> RoutingRule {
         let mut rule = route_rule(&[], outbound);
         rule.protocols = vec![protocol.to_owned()];
@@ -1007,6 +1066,14 @@ mod tests {
     #[case::live_custom_tag(true, vec![route_rule(&["example.com"], "custom")], "https://example.com/feed", RouteKind::Tunnel)]
     #[case::live_tls_protocol_https(true, vec![protocol_rule("direct", "tls")], "https://example.com/feed", RouteKind::Direct)]
     #[case::live_tls_protocol_http(true, vec![protocol_rule("direct", "tls")], "http://example.com/feed", RouteKind::Tunnel)]
+    // A Telegram channel is route-planned as its canonical preview page, so a
+    // `t.me` rule decides its fetch exactly as it decides a subscription's.
+    #[case::live_channel_apex_direct(true, vec![exact_rule(&["t.me"], "direct")], "https://t.me/s/chan", RouteKind::Direct)]
+    #[case::live_channel_apex_block(true, vec![exact_rule(&["t.me"], "block")], "https://t.me/s/chan", RouteKind::Refused)]
+    #[case::live_channel_no_rules(true, vec![], "https://t.me/s/chan", RouteKind::Tunnel)]
+    // Pins the trap the two cases above avoid: a SUFFIX `t.me` rule covers
+    // `x.t.me` only, so it neither blocks nor bypasses the apex host.
+    #[case::live_channel_apex_suffix_tunnels(true, vec![route_rule(&["t.me"], "block")], "https://t.me/s/chan", RouteKind::Tunnel)]
     fn plan_http_route_cases(
         #[case] live: bool,
         #[case] rules: Vec<RoutingRule>,

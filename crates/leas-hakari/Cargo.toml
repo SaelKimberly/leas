@@ -38,6 +38,7 @@ crypto-common = { version = "0.2", default-features = false, features = ["getran
 data-encoding = { version = "2" }
 digest = { version = "0.11", features = ["alloc", "mac", "oid", "zeroize"] }
 either = { version = "1", features = ["use_std"] }
+fastrand = { version = "2" }
 flate2 = { version = "1", features = ["zlib-rs"] }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -90,7 +91,7 @@ simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 siphasher = { version = "1" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
-stable_deref_trait = { version = "1", default-features = false, features = ["alloc"] }
+stable_deref_trait = { version = "1" }
 strum = { version = "0.28", default-features = false, features = ["derive", "std"] }
 subtle = { version = "2", default-features = false, features = ["const-generics"] }
 time = { version = "0.3", default-features = false, features = ["local-offset"] }
@@ -134,6 +135,7 @@ crc32fast = { version = "1" }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 digest = { version = "0.11", features = ["alloc", "mac", "oid", "zeroize"] }
 either = { version = "1", features = ["use_std"] }
+fastrand = { version = "2" }
 flate2 = { version = "1", features = ["zlib-rs"] }
 form_urlencoded = { version = "1" }
 futures-core = { version = "0.3" }

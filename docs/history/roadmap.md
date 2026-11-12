@@ -49,6 +49,7 @@
 -
 - ✅ Add/edit/delete subscription groups
 - ✅ Update all/group subscriptions (HTTP download + parse)
+- ✅ Telegram public channels as a source — a group URL may be `@name`/`t.me/<name>`; the `t.me/s/<channel>` preview is crawled newest-first behind a per-group message-id watermark, entering the same import pipeline and route gate as an HTTP subscription
 - ☐ Update via proxy
 - ✅ Subscription format detection (base64, plain, v2rayN, sing-box) — streaming decoder with auto-encoding detection
 - ✅ Scheduled auto-update

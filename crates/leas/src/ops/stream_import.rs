@@ -3,7 +3,9 @@
 //! Fetch bytes in bounded chunks, gather complete share-URLs into batches,
 //! parse + persist each batch immediately (partial-load semantics — a source
 //! dying mid-update keeps everything already stored). One shared pipeline
-//! serves HTTP today and streaming sources (e.g. Telegram) later.
+//! serves both sources: an HTTP subscription ([`HttpSource`]) and a Telegram
+//! public channel (`crate::ops::telegram`, which supplies the same byte
+//! chunks from its preview pages).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,9 +62,10 @@ pub struct ImportOutcome {
 
 /// Streaming byte source — the seam every source kind normalizes to.
 ///
-/// HTTP subscriptions wrap `Response::chunk()`; a Telegram-channel source
-/// later wraps its update poller. Each `next_chunk` returns an arbitrarily
-/// sized piece of the logical stream; the decoder accepts any size.
+/// An HTTP subscription wraps `Response::chunk()`; a Telegram channel
+/// (`crate::ops::telegram::TelegramSource`) yields one preview page per call.
+/// Each `next_chunk` returns an arbitrarily sized piece of the logical stream;
+/// the decoder accepts any size, and `None` ends the source.
 pub trait UrlSource: Send {
     fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<SourceBatch>> + Send + '_>>;
 }
@@ -628,22 +631,21 @@ async fn flush_import(
     }
 }
 
-/// HTTP convenience: fetch a subscription URL and stream it through
-/// [`run_streaming_import`]. Equivalent to the old buffered path but never
-/// holds the whole body in memory.
+/// The HTTP client every source fetch uses: user agent, both deadlines, the
+/// safe redirect policy and, when one exists, the live tunnel.
 ///
 /// `proxy` is the live tunnel's `SOCKS5h` endpoint. When present, DNS is
 /// delegated to the running core so domain routing rules match the source
 /// hostname.
-pub async fn import_http_subscription(
-    url: &str,
+///
+/// # Errors
+///
+/// The failure text, already logged, when the proxy or the client cannot be
+/// built.
+pub(crate) fn http_client(
     user_agent: &str,
-    db: &Arc<Database>,
-    group_id: Option<&str>,
-    validation: &ValidationSettings,
-    budget: leas_config::app_config::ImportConfig,
     proxy: Option<&ProxyEndpoint>,
-) -> ImportOutcome {
+) -> Result<reqwest::Client, String> {
     // Two budgets, never one total deadline: the total deadline used to cover
     // the whole body AND the consumer's persist work between reads, so a
     // large feed was killed mid-stream and looked like a clean run.
@@ -654,22 +656,33 @@ pub async fn import_http_subscription(
         .redirect(leas_core::http::safe_redirect_policy(false));
     if let Some(proxy) = proxy {
         let proxy_url = proxy.socks5h_url();
-        match reqwest::Proxy::all(&proxy_url) {
-            Ok(configured) => builder = builder.proxy(configured),
-            Err(e) => {
-                return ImportOutcome {
-                    ended_early: Some(format!("SOCKS5 proxy setup failed for {proxy_url}: {e}")),
-                    ..ImportOutcome::default()
-                };
-            }
-        }
+        let configured = reqwest::Proxy::all(&proxy_url)
+            .map_err(|e| format!("SOCKS5 proxy setup failed for {proxy_url}: {e}"))?;
+        builder = builder.proxy(configured);
     }
-    let client = match builder.build() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(target: "tui::ops::subscriptions", "HTTP client build failed: {e}");
+    builder.build().map_err(|e| {
+        tracing::error!(target: "tui::ops::subscriptions", "HTTP client build failed: {e}");
+        format!("HTTP client build failed: {e}")
+    })
+}
+
+/// HTTP convenience: fetch a subscription URL and stream it through
+/// [`run_streaming_import`]. Equivalent to the old buffered path but never
+/// holds the whole body in memory.
+pub async fn import_http_subscription(
+    url: &str,
+    user_agent: &str,
+    db: &Arc<Database>,
+    group_id: Option<&str>,
+    validation: &ValidationSettings,
+    budget: leas_config::app_config::ImportConfig,
+    proxy: Option<&ProxyEndpoint>,
+) -> ImportOutcome {
+    let client = match http_client(user_agent, proxy) {
+        Ok(client) => client,
+        Err(reason) => {
             return ImportOutcome {
-                ended_early: Some(format!("HTTP client build failed: {e}")),
+                ended_early: Some(reason),
                 ..ImportOutcome::default()
             };
         }

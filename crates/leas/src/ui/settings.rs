@@ -1216,7 +1216,7 @@ const fn form_field_defs_for_section(
         ],
         SettingsSection::Subscriptions => &[
             ("name", "Name", "Text"),
-            ("subscription_url", "Subscription URL", "Url"),
+            ("subscription_url", "Subscription URL / Channel", "Url"),
             ("user_agent", "User Agent", "Text"),
             ("update_interval", "Update Interval", "Duration"),
         ],
