@@ -13,7 +13,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::table::{
-    CACHE_HITS, CACHE_RESOLVES, Cached, LIVE_BYTES, NO_TAG, OVERFLOWED, State, UNTRACED,
+    ATTRIBUTED, CACHE_HITS, CACHE_RESOLVES, Cached, FRAMES_WALKED, LIVE_BYTES, NO_TAG, OVERFLOWED,
+    State, UNTRACED,
 };
 
 /// Bounded capture: enough to cross the `std` allocation shims and the tracer's
@@ -58,8 +59,26 @@ pub fn enter() -> Option<Reentry> {
 ///
 /// `roots` are crate-name prefixes whose modules are attributed; `min_bytes`
 /// sends smaller allocations to the `<untraced>` row (0 traces everything).
+#[must_use]
 pub fn start(roots: &'static [&'static str], min_bytes: usize) -> bool {
-    STATE.set(State::new(roots, min_bytes)).is_ok()
+    start_with(roots, min_bytes, &[])
+}
+
+/// Like [`start`], with metadata the artifacts echo: feature set, binary name,
+/// dataset — whatever makes two runs distinguishable without a transcript.
+#[must_use]
+pub fn start_with(
+    roots: &'static [&'static str],
+    min_bytes: usize,
+    metadata: &'static [(&'static str, &'static str)],
+) -> bool {
+    STATE.set(State::new(roots, min_bytes, metadata)).is_ok()
+}
+
+/// The metadata the running window was started with (empty when not started).
+#[must_use]
+pub fn metadata() -> &'static [(&'static str, &'static str)] {
+    STATE.get().map_or(&[], |state| state.metadata)
 }
 
 /// Whether a trace window is running.
@@ -87,13 +106,27 @@ pub fn attribute(size: usize) -> u32 {
     if size < state.min_bytes {
         return UNTRACED;
     }
+    ATTRIBUTED.fetch_add(1, Relaxed);
+    // Probe while capturing: the walk stops at the first frame that already
+    // resolves, so a repeated allocation pays the depth to its row instead of
+    // `MAX_FRAMES`. A row's *first* sight still needs the callers, because the
+    // folded path is the one output that depends on stack depth — that cold
+    // path walks again below, once per instruction pointer (~5 700 per run).
     let mut frames = [0_usize; MAX_FRAMES];
-    let captured = capture(&mut frames);
-    for &ip in &frames[..captured] {
+    let mut walked = 0_usize;
+    let mut resolved: Option<u32> = None;
+    let mut fresh: Option<(usize, String)> = None;
+    backtrace::trace(|frame| {
+        let ip = frame.ip() as usize;
+        if walked < MAX_FRAMES {
+            frames[walked] = ip;
+        }
+        walked += 1;
         match state.cache_get(ip) {
             Some(Cached::Row(id)) => {
                 CACHE_HITS.fetch_add(1, Relaxed);
-                return id;
+                resolved = Some(id);
+                return false;
             }
             Some(Cached::Foreign) => {
                 CACHE_HITS.fetch_add(1, Relaxed);
@@ -102,16 +135,38 @@ pub fn attribute(size: usize) -> u32 {
                 CACHE_RESOLVES.fetch_add(1, Relaxed);
                 match module_of(ip, state.roots) {
                     Some(module) => {
-                        let id = row_for(state, &module, &frames[..captured]);
-                        state.cache_put(ip, Cached::Row(id));
-                        return id;
+                        fresh = Some((ip, module));
+                        return false;
                     }
                     None => state.cache_put(ip, Cached::Foreign),
                 }
             }
         }
+        walked < MAX_FRAMES
+    });
+    if let Some(id) = resolved {
+        FRAMES_WALKED.fetch_add(walked, Relaxed);
+        return id;
     }
-    UNTRACED
+    let Some((ip, module)) = fresh else {
+        FRAMES_WALKED.fetch_add(walked, Relaxed);
+        return UNTRACED;
+    };
+    let mut full = [0_usize; MAX_FRAMES];
+    let captured = capture(&mut full);
+    FRAMES_WALKED.fetch_add(walked + captured, Relaxed);
+    // The folded path must describe the stack that produced the row. Both walks
+    // sample the same call site on the same thread, but if the second did not
+    // contain the frame the first resolved on (a signal handler interrupting the
+    // stack between passes), fall back to the frames the first pass captured.
+    let path_frames = if full[..captured].contains(&ip) {
+        &full[..captured]
+    } else {
+        &frames[..walked.min(MAX_FRAMES)]
+    };
+    let id = row_for(state, &module, path_frames);
+    state.cache_put(ip, Cached::Row(id));
+    id
 }
 
 /// Frame pointers only: no symbolization, no allocation for the common case.
@@ -138,7 +193,7 @@ fn row_for(state: &State, module: &str, frames: &[usize]) -> u32 {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(id) = registry.row(module) else {
-        OVERFLOWED.store(true, Relaxed);
+        OVERFLOWED.fetch_add(1, Relaxed);
         return UNTRACED;
     };
     if !registry.folded().contains_key(&id) {
@@ -297,6 +352,27 @@ fn is_hash(segment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repeated site must stop the walk at its row: the fusion is the point
+    /// of the change, and a regression that restores the full capture fails
+    /// here (the artifact diff alone cannot see a walk that is merely slow).
+    #[test]
+    fn a_repeated_site_walks_one_frame_after_the_first() {
+        assert!(
+            start(&["leas_memtrace"], 0),
+            "the tracer starts once per process"
+        );
+        let _warm = attribute(64);
+        let before = FRAMES_WALKED.load(Relaxed);
+        let _hit = attribute(64);
+        let walked = FRAMES_WALKED.load(Relaxed) - before;
+        // The first frames are `backtrace`/`std` shims, cached as foreign; the
+        // hit follows within a few. Far below `MAX_FRAMES` is the point.
+        assert!(
+            walked <= 4,
+            "a cache hit must stop the walk at the resolving frame, walked {walked}"
+        );
+    }
 
     const ROOTS: &[&str] = &["leas", "leas_native"];
 

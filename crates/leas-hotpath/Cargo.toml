@@ -19,6 +19,8 @@ leas-geoip = { path = "../leas-geoip", version = "0.1.0" }
 leas-tls = { workspace = true }
 # The tracer the `memtrace` bin installs as this binary's process allocator.
 leas-memtrace = { path = "../leas-memtrace", version = "0.1.0" }
+# `memtrace compare` reads the artifacts the tracer writes.
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "io-util", "sync"] }
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 

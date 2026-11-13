@@ -53,8 +53,11 @@ mod attrib;
 mod table;
 
 pub use alloc::TracingAllocator;
-pub use artifact::{Artifacts, CacheCounters, Row, Snapshot, Totals, snapshot, write};
-pub use attrib::{is_started, live_bytes, start};
+pub use artifact::{
+    ALLOCATOR, Artifacts, CacheCounters, REV, Row, Snapshot, Totals, snapshot,
+    spawn_interval_writer, write,
+};
+pub use attrib::{is_started, live_bytes, metadata, start, start_with};
 
 /// The row that collects allocations with no workspace frame, and those below
 /// the configured minimum size.

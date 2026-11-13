@@ -41,7 +41,7 @@ Notes that the manifests enforce:
 - `leas-native` does not depend on `leas-core`; it takes typed configs straight from `leas-proto` and returns `leas-native` types.
 - `leas-core` carries only native-shared glue: ping adapters, speed tests, the heed log store, `SysStats`/formatters and `ensure_tls_provider`. The oracle adapters (config builders, subprocess lifecycle, updater, gRPC stats client, `CoreType`, `core_mapping`) live in the dev-only `leas-oracles::oracle_adapters`; the client graph has no tonic/prost edge.
 - `leas` depends on `leas-proto` and `leas-route` directly, in addition to the crates listed above.
-- `leas-memtrace` is an optional dependency of `leas` (feature `mem-trace`, which implies `std-alloc` and swaps the default mimalloc allocator out) and a plain dependency of the dev-only `leas-hotpath`, whose `memtrace` bin drives real code paths under it.
+- `leas-memtrace` is an optional dependency of `leas` (feature `mem-trace`, which implies `std-alloc` and swaps the default mimalloc allocator out) and a plain dependency of the dev-only `leas-hotpath`, whose `memtrace` bin drives real code paths under it (workloads `header`, `connect`, `geosite`, `record`), diffs two artifacts (`compare`), and therefore also reads `leas-geoip` and `serde_json`.
 
 `leas-hakari` is a cargo-hakari generated feature-unification crate. Every member depends on it; its own dependencies are never referenced from code and exist only to unify feature flags. Regenerate after a `Cargo.lock` change with `cargo hakari generate`; the `hakari-check` gate runs `cargo hakari generate --diff`, `cargo hakari manage-deps --dry-run` and `cargo hakari verify`, and `--dry-run` is what catches a member missing the dependency.
 

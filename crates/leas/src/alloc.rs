@@ -99,7 +99,29 @@ pub fn start_tracing() {
             .ok()
             .and_then(|value| value.trim().parse().ok())
             .unwrap_or(0);
-        leas_memtrace::start(ROOTS, min_bytes);
+        if !leas_memtrace::start_with(ROOTS, min_bytes, &[("bin", "leas")]) {
+            tracing::warn!(
+                target: "tui::alloc",
+                "a trace window is already running; keeping it"
+            );
+        }
+        // Interval artifacts exist for the run that never reaches its exit
+        // boundary (a SIGTERM, a crash); `0`/unset keeps the old behaviour.
+        let interval = std::env::var("LEAS_MEM_TRACE_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        if interval > 0 {
+            let max = std::env::var("LEAS_MEM_TRACE_INTERVAL_MAX")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(8);
+            let dir = std::env::var("LEAS_MEM_TRACE_DIR")
+                .unwrap_or_else(|_| "target/mem-trace".to_owned());
+            if let Err(error) = leas_memtrace::spawn_interval_writer(dir.into(), interval, max) {
+                tracing::warn!(target: "tui::alloc", "interval artifacts unavailable: {error}");
+            }
+        }
     }
 }
 

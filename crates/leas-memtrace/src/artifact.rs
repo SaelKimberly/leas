@@ -15,9 +15,21 @@ use std::time::Duration;
 use crate::UNTRACED_ROW;
 use crate::attrib;
 use crate::table::{
-    ALLOCS, CACHE_EVICTIONS, CACHE_HITS, CACHE_RESOLVES, DEALLOCS, LIVE_BYTES, OVERFLOWED,
-    PEAK_LIVE_BYTES,
+    ALLOCS, ATTRIBUTED, CACHE_EVICTIONS, CACHE_HITS, CACHE_RESOLVES, DEALLOCS, FRAMES_WALKED,
+    LIVE_BYTES, OVERFLOWED, PEAK_LIVE_BYTES,
 };
+
+/// Short git revision of the build, stamped by `build.rs`; `unknown` outside a
+/// checkout (a published crate, a packaged source tree).
+pub const REV: &str = match option_env!("LEAS_GIT_REV") {
+    Some(rev) => rev,
+    None => "unknown",
+};
+
+/// The allocator a traced build runs on: the tracer wraps `System`, so counts
+/// are allocator-independent while live/peak bytes are not comparable with a
+/// mimalloc release.
+pub const ALLOCATOR: &str = "system";
 
 /// One symbol row of the table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +54,12 @@ pub struct Totals {
     pub peak_live_bytes: usize,
     pub allocs: usize,
     pub deallocs: usize,
+    /// Frames the capture walked over the window. The mean is a cost metric of
+    /// the walk, and it divides by `attributed`, not by `allocs`: allocations
+    /// under `min_bytes` and the tracer's own never enter the walk.
+    pub frames_walked: usize,
+    /// Allocations that entered the walk.
+    pub attributed: usize,
 }
 
 /// How well the instruction-pointer cache performed. A `resolves` count that
@@ -64,7 +82,14 @@ pub struct Snapshot {
     pub folded: Vec<(String, usize)>,
     pub totals: Totals,
     pub cache: CacheCounters,
-    pub overflowed: bool,
+    /// Instruction-pointer resolutions refused by a full symbol slab. Charged
+    /// to `<untraced>`; a count, because one refusal is noise and thousands are
+    /// a collapsed attribution.
+    pub overflowed: u64,
+    /// Unit identity echoed from [`crate::start_with`].
+    pub metadata: &'static [(&'static str, &'static str)],
+    /// Which weight the folded stacks carry: `live` or `allocs`.
+    pub fold: &'static str,
 }
 
 /// Where [`write`] put the three files.
@@ -141,7 +166,7 @@ pub fn snapshot() -> Option<Snapshot> {
         // `LEAS_MEM_TRACE_FOLD=allocs` ranks the folded stacks by allocation
         // count instead of live bytes: per-frame temporaries hold nothing at the
         // snapshot, so only their count can place them.
-        let weight_allocs = std::env::var("LEAS_MEM_TRACE_FOLD").is_ok_and(|mode| mode == "allocs");
+        let weight_allocs = fold_allocs();
         let mut folded: Vec<(String, usize)> = registry
             .folded()
             .iter()
@@ -176,6 +201,8 @@ pub fn snapshot() -> Option<Snapshot> {
             peak_live_bytes: PEAK_LIVE_BYTES.load(Relaxed),
             allocs: ALLOCS.load(Relaxed),
             deallocs: DEALLOCS.load(Relaxed),
+            frames_walked: FRAMES_WALKED.load(Relaxed),
+            attributed: ATTRIBUTED.load(Relaxed),
         },
         cache: CacheCounters {
             hits: CACHE_HITS.load(Relaxed),
@@ -183,6 +210,8 @@ pub fn snapshot() -> Option<Snapshot> {
             evictions: CACHE_EVICTIONS.load(Relaxed),
         },
         overflowed: OVERFLOWED.load(Relaxed),
+        metadata: state.metadata,
+        fold: if fold_allocs() { "allocs" } else { "live" },
     })
 }
 
@@ -230,8 +259,19 @@ fn render_json(snapshot: &Snapshot) -> String {
         .map(|(stack, live)| serde_json::json!({ "stack": stack, "live_bytes": live }))
         .collect();
     let document = serde_json::json!({
+        // 2: `totals.frames_walked` and the identity fields T2 adds; readers
+        // that do not know the version must not guess at a mismatch.
+        "schema": 2,
         "scope": format!("process {}", snapshot.pid),
         "note": "current process only; child processes are not traced",
+        "rev": REV,
+        "allocator": ALLOCATOR,
+        "fold": snapshot.fold,
+        "metadata": snapshot
+            .metadata
+            .iter()
+            .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+            .collect::<Vec<_>>(),
         "duration_ms": snapshot.duration.as_millis(),
         "roots": snapshot.roots,
         "min_bytes": snapshot.min_bytes,
@@ -240,6 +280,8 @@ fn render_json(snapshot: &Snapshot) -> String {
             "peak_live_bytes": snapshot.totals.peak_live_bytes,
             "allocs": snapshot.totals.allocs,
             "deallocs": snapshot.totals.deallocs,
+            "frames_walked": snapshot.totals.frames_walked,
+            "attributed": snapshot.totals.attributed,
         },
         "cache": {
             "hits": snapshot.cache.hits,
@@ -264,12 +306,35 @@ fn render_text(snapshot: &Snapshot) -> String {
         snapshot.pid
     );
     let _ = writeln!(out, "duration: {:.3}s", snapshot.duration.as_secs_f64());
+    let _ = writeln!(out, "rev: {REV}");
+    let _ = writeln!(
+        out,
+        "allocator: {ALLOCATOR} (counts are allocator-independent)"
+    );
+    let _ = writeln!(out, "fold: {}", snapshot.fold);
+    for (key, value) in snapshot.metadata {
+        let _ = writeln!(out, "{key}: {value}");
+    }
     let _ = writeln!(out, "roots: {}", snapshot.roots.join(", "));
     let _ = writeln!(out, "min_bytes: {}", snapshot.min_bytes);
     let _ = writeln!(
         out,
         "cache: hits {} resolves {} evictions {}",
         snapshot.cache.hits, snapshot.cache.resolves, snapshot.cache.evictions
+    );
+    // A diagnostic mean over the allocations that actually walked: the ones
+    // under `min_bytes` and the tracer's own never enter `frame`. The precision
+    // loss of a usize->f64 mean is irrelevant here.
+    #[allow(clippy::cast_precision_loss)]
+    let per_attributed = if snapshot.totals.attributed == 0 {
+        0.0
+    } else {
+        snapshot.totals.frames_walked as f64 / snapshot.totals.attributed as f64
+    };
+    let _ = writeln!(
+        out,
+        "capture: frames walked {} over {} attributed allocation(s) ({per_attributed:.2} each)",
+        snapshot.totals.frames_walked, snapshot.totals.attributed
     );
     let _ = writeln!(
         out,
@@ -279,10 +344,11 @@ fn render_text(snapshot: &Snapshot) -> String {
         snapshot.totals.allocs,
         snapshot.totals.deallocs
     );
-    if snapshot.overflowed {
+    if snapshot.overflowed > 0 {
         let _ = writeln!(
             out,
-            "warning: the symbol slab filled up; overflow was charged to {UNTRACED_ROW}"
+            "warning: the symbol slab filled up; {} instruction-pointer resolution(s) were charged to {UNTRACED_ROW}",
+            snapshot.overflowed
         );
     }
     let _ = writeln!(
@@ -302,7 +368,58 @@ fn render_text(snapshot: &Snapshot) -> String {
             row.total_count
         );
     }
+
+    // The live sort hides churn: a row that allocates and frees fast holds
+    // nothing at the snapshot and would fall off the page. Rank by count too.
+    let mut by_count: Vec<&Row> = snapshot.rows.iter().collect();
+    by_count.sort_by(|a, b| {
+        b.total_count
+            .cmp(&a.total_count)
+            .then_with(|| b.total_bytes.cmp(&a.total_bytes))
+    });
+    let _ = writeln!(out, "\nby allocations (top 10)");
+    let _ = writeln!(out, "{:<46} {:>12} {:>12}", "module", "total #", "total B");
+    for row in by_count.iter().take(10) {
+        let _ = writeln!(
+            out,
+            "{:<46} {:>12} {:>12}",
+            row.name, row.total_count, row.total_bytes
+        );
+    }
+
+    // Crate rollup: the row names are module paths, so the first segment is the
+    // crate. It answers "which crate is expensive" without reading 20 rows.
+    let mut crates: Vec<(String, usize, usize, usize)> = Vec::new();
+    for row in &snapshot.rows {
+        if row.name == UNTRACED_ROW {
+            continue;
+        }
+        let krate = row.name.split("::").next().unwrap_or(&row.name).to_owned();
+        match crates.iter_mut().find(|(name, ..)| *name == krate) {
+            Some(slot) => {
+                slot.1 += row.live_bytes;
+                slot.2 += row.total_bytes;
+                slot.3 += row.total_count;
+            }
+            None => crates.push((krate, row.live_bytes, row.total_bytes, row.total_count)),
+        }
+    }
+    crates.sort_by_key(|slot| std::cmp::Reverse(slot.3));
+    let _ = writeln!(out, "\nby crate");
+    let _ = writeln!(
+        out,
+        "{:<26} {:>12} {:>12} {:>12}",
+        "crate", "live B", "total B", "total #"
+    );
+    for (name, live, total, count) in &crates {
+        let _ = writeln!(out, "{name:<26} {live:>12} {total:>12} {count:>12}");
+    }
     out
+}
+
+/// Whether `LEAS_MEM_TRACE_FOLD=allocs` asks for allocation-weighted stacks.
+fn fold_allocs() -> bool {
+    std::env::var("LEAS_MEM_TRACE_FOLD").is_ok_and(|mode| mode == "allocs")
 }
 
 /// The number a folded stack is ranked by: live bytes, peak when the workload
@@ -325,6 +442,70 @@ fn render_folded(snapshot: &Snapshot) -> String {
     out
 }
 
+/// Write `tick-<n>` artifacts every `secs` seconds from a background thread.
+///
+/// A run that is killed never reaches its exit boundary, and this session lost
+/// exactly that way: the interval copy is the evidence a SIGTERM leaves behind.
+/// `max` caps the directory (oldest first); `0` keeps every tick. A tick is
+/// three file writes plus a directory scan, so a 1 s interval is a debugging
+/// tool, not a profiler.
+///
+/// # Errors
+/// `dir` must be usable by the first write.
+pub fn spawn_interval_writer(dir: PathBuf, secs: u64, max: usize) -> io::Result<()> {
+    if secs == 0 {
+        return Ok(());
+    }
+    fs::create_dir_all(&dir)?;
+    std::thread::Builder::new()
+        .name("memtrace-interval".to_owned())
+        .spawn(move || {
+            let mut tick = 0_u64;
+            loop {
+                std::thread::sleep(Duration::from_secs(secs));
+                tick += 1;
+                let label = format!("tick-{tick:04}");
+                let _ = write(&dir, &label);
+                if max > 0 {
+                    prune_ticks(&dir, max);
+                }
+            }
+        })?;
+    Ok(())
+}
+
+/// Keep only the newest `max` interval artifacts, by *stem*: each tick writes
+/// three files, and counting files instead of stems deleted two thirds of every
+/// tick it meant to keep.
+fn prune_ticks(dir: &Path, max: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut ticks: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("tick-") && name.ends_with(".json")
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    if ticks.len() <= max {
+        return;
+    }
+    ticks.sort_by_key(|(modified, _)| *modified);
+    let excess = ticks.len() - max;
+    for (_, path) in ticks.into_iter().take(excess) {
+        let _ = fs::remove_file(&path);
+        let stem = path.with_extension("");
+        let _ = fs::remove_file(stem.with_extension("txt"));
+        let _ = fs::remove_file(stem.with_extension("folded"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +522,68 @@ mod tests {
         );
     }
 
+    /// Pruning counts *stems*, not files: each tick writes three files, and a
+    /// file-counting prune deletes every tick it meant to keep. This pins the
+    /// deterministic half; the writer's loop itself is exercised by the
+    /// existence check below.
+    #[test]
+    fn prune_keeps_the_newest_ticks_by_stem() {
+        let dir = std::env::temp_dir().join(format!("memtrace-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for tick in 1..=5 {
+            for ext in ["json", "txt", "folded"] {
+                let path = dir.join(format!("tick-{tick:04}-1.{ext}"));
+                std::fs::write(&path, b"x").unwrap();
+                // Stagger the mtimes so "newest" is deterministic.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        super::prune_ticks(&dir, 2);
+        let mut stems: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.strip_suffix(".json").map(str::to_owned)
+            })
+            .collect();
+        stems.sort();
+        assert_eq!(stems, vec!["tick-0004-1", "tick-0005-1"]);
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(files, 6, "each kept stem keeps all three files");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The writer must actually write: one bounded existence check, because a
+    /// zero-second interval returns early and would prove nothing.
+    #[test]
+    fn interval_writer_writes_a_tick() {
+        let dir = std::env::temp_dir().join(format!("memtrace-ticks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        if !crate::attrib::is_started() {
+            assert!(crate::attrib::start(&["leas_memtrace"], 0));
+        }
+        super::spawn_interval_writer(dir.clone(), 1, 3).expect("interval writer");
+        let mut tick = None;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(200));
+            tick = std::fs::read_dir(&dir)
+                .unwrap_or_else(|_| std::fs::read_dir(".").unwrap())
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "json"));
+            if tick.is_some() {
+                break;
+            }
+        }
+        assert!(
+            tick.is_some(),
+            "the interval writer produced no tick in 10 s"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn snapshot_with(rows: Vec<Row>, folded: Vec<(String, usize)>) -> Snapshot {
         Snapshot {
             pid: 4242,
@@ -354,13 +597,17 @@ mod tests {
                 peak_live_bytes: 4096,
                 allocs: 10,
                 deallocs: 2,
+                frames_walked: 40,
+                attributed: 8,
             },
             cache: CacheCounters {
                 hits: 900,
                 resolves: 12,
                 evictions: 3,
             },
-            overflowed: false,
+            overflowed: 0,
+            metadata: &[("features", "mem-trace")],
+            fold: "live",
         }
     }
 

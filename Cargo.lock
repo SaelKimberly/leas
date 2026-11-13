@@ -3542,6 +3542,7 @@ dependencies = [
  "leas-memtrace",
  "leas-native",
  "leas-tls",
+ "serde_json",
  "tokio",
 ]
 

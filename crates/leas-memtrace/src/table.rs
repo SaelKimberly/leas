@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Row 0 collects allocations no row attributes; real symbols start at 1.
@@ -79,9 +79,19 @@ pub static DEALLOCS: AtomicUsize = AtomicUsize::new(0);
 pub static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 pub static CACHE_RESOLVES: AtomicUsize = AtomicUsize::new(0);
 pub static CACHE_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
-/// Set when a distinct module was found after the slab filled up: its bytes are
-/// charged to `<untraced>` and the artifact says so.
-pub static OVERFLOWED: AtomicBool = AtomicBool::new(false);
+/// Frames the capture walked, summed over allocations. The mean is the
+/// mechanism metric for the cache: a hit stops the walk at the first resolved
+/// frame, so this should sit far below `MAX_FRAMES` per allocation.
+pub static FRAMES_WALKED: AtomicUsize = AtomicUsize::new(0);
+/// How many instruction-pointer resolutions found a module after the slab
+/// filled up: their bytes are charged to `<untraced>` and the artifact reports
+/// the count, because a sticky flag cannot tell one stray row from a run whose
+/// attribution collapsed.
+pub static OVERFLOWED: AtomicU64 = AtomicU64::new(0);
+
+/// Allocations that entered the walk (i.e. were not filtered by `min_bytes`).
+/// The frame-walk mean divides by this, never by the raw allocation count.
+pub static ATTRIBUTED: AtomicUsize = AtomicUsize::new(0);
 
 /// Per-symbol counters. All five are plain `Relaxed` atomics: the artifact only
 /// needs a consistent-enough snapshot, never a transaction.
@@ -205,17 +215,24 @@ pub struct State {
     cache: Box<[Slot]>,
     pub roots: &'static [&'static str],
     pub min_bytes: usize,
+    /// Unit identity the artifacts echo (`rev`, features, dataset).
+    pub metadata: &'static [(&'static str, &'static str)],
     pub started: Instant,
 }
 
 impl State {
-    pub fn new(roots: &'static [&'static str], min_bytes: usize) -> Self {
+    pub fn new(
+        roots: &'static [&'static str],
+        min_bytes: usize,
+        metadata: &'static [(&'static str, &'static str)],
+    ) -> Self {
         Self {
             stats: (0..=MAX_SYMBOLS).map(|_| Stats::new()).collect(),
             registry: Mutex::new(Registry::default()),
             cache: (0..SLOTS).map(|_| Slot::empty()).collect(),
             roots,
             min_bytes,
+            metadata,
             started: Instant::now(),
         }
     }
@@ -323,7 +340,7 @@ mod tests {
 
     #[test]
     fn cache_remembers_rows_and_foreign_frames() {
-        let state = State::new(&["leas"], 0);
+        let state = State::new(&["leas"], 0, &[]);
         let ip = 0x7f00_0000_1000_usize;
         assert_eq!(state.cache_get(ip), None);
         state.cache_put(ip, Cached::Row(7));

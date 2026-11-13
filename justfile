@@ -228,6 +228,20 @@ hotpath:
 memtrace workload='all' iterations='1000':
     cargo run --release -p leas-hotpath --bin memtrace -- {{workload}} {{iterations}}
 
+# Drive a traced `leas` through a PTY on a copied sandbox and report its CPU
+# time; `scripts/trace_app.py` documents the environment it stages (the app
+# reads `$HOME/.config/leas`, so the sandbox sets HOME, not XDG_CONFIG_HOME).
+# Build first: `cargo build --release -p leas --features mem-trace`.
+#   just memtrace-app [delay_secs]
+memtrace-app delay='12':
+    cargo build --release -p leas --features mem-trace
+    DELAY={{delay}} python3 scripts/trace_app.py
+
+# Diff two memtrace artifacts: per-module Δallocations/Δbytes, biggest first.
+#   just memtrace-compare target/mem-trace/a.json target/mem-trace/b.json [--force]
+memtrace-compare a b='' force='':
+    cargo run --release -p leas-hotpath --bin memtrace -- compare {{a}} {{b}} {{force}}
+
 # ─── Oracle pin table ──────────────────────────────────────────────
 #
 # Print the four pinned assets (name + sha256) for each version, ready to paste

@@ -11,6 +11,11 @@
 //! it refuses to run without them, because a workload that silently measured
 //! nothing would be worse than none.
 //!
+//! `memtrace compare <a.json> <b.json> [--force]` diffs two artifacts instead of
+//! running a workload: per-module Δallocations/Δbytes, biggest change first. It
+//! refuses runs whose `schema`, `rev` or roots differ unless forced, because a
+//! delta across builds is not a delta of the change under review.
+//!
 //! Unlike the allocation-count gate in `main.rs` this accepts a debug build: it
 //! asserts nothing, it reports. Counts stay exact in either profile; the
 //! artifact's header carries the duration so a slow run explains itself.
@@ -46,15 +51,20 @@ const RECORD_PLAINTEXT: usize = 16 * 1024;
 
 #[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let workload = args.next().unwrap_or_else(|| "all".to_owned());
-    let iterations: usize = args
-        .next()
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("compare") {
+        return compare(&argv);
+    }
+    let workload = argv.first().cloned().unwrap_or_else(|| "all".to_owned());
+    let iterations: usize = argv
+        .get(1)
         .and_then(|value| value.parse().ok())
         .unwrap_or(1000);
     let dir = std::env::var("LEAS_MEM_TRACE_DIR").unwrap_or_else(|_| "target/mem-trace".to_owned());
 
-    leas_memtrace::start(ROOTS, 0);
+    if !leas_memtrace::start_with(ROOTS, 0, &[("bin", "memtrace")]) {
+        eprintln!("memtrace: a trace window is already running; reusing it");
+    }
     match workload.as_str() {
         "header" => header_workload(iterations),
         "connect" => connect_workload(iterations),
@@ -119,6 +129,95 @@ fn connect_workload(iterations: usize) {
         .expect("encode header");
         black_box(header.len());
     }
+}
+
+/// `memtrace compare a.json b.json [--force]`: per-module deltas between two
+/// artifacts, sorted by absolute allocation change.
+///
+/// Refuses to diff runs whose `rev`, `schema` or roots differ, because a delta
+/// across builds is not a delta of the change under review (`--force` overrides).
+fn compare(args: &[String]) -> ExitCode {
+    let paths: Vec<&String> = args.iter().skip(1).filter(|a| *a != "--force").collect();
+    let force = args.iter().any(|a| a == "--force");
+    let [left, right] = paths.as_slice() else {
+        eprintln!("usage: memtrace compare <a.json> <b.json> [--force]");
+        return ExitCode::FAILURE;
+    };
+    let load = |path: &str| -> Result<serde_json::Value, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))
+    };
+    let (Ok(a), Ok(b)) = (load(left), load(right)) else {
+        return ExitCode::FAILURE;
+    };
+    for key in ["schema", "rev"] {
+        if a.get(key) != b.get(key) && !force {
+            eprintln!(
+                "compare: {key} differs ({:?} vs {:?}); pass --force to diff anyway",
+                a.get(key),
+                b.get(key)
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    if a.get("roots") != b.get("roots") && !force {
+        eprintln!("compare: roots differ; pass --force to diff anyway");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "compare: {} vs {}",
+        a["scope"].as_str().unwrap_or("a"),
+        b["scope"].as_str().unwrap_or("b")
+    );
+    println!(
+        "rev: {} | {}   allocs: {} -> {}",
+        a["rev"].as_str().unwrap_or("?"),
+        b["rev"].as_str().unwrap_or("?"),
+        a["totals"]["allocs"],
+        b["totals"]["allocs"]
+    );
+    let rows = |doc: &serde_json::Value| -> std::collections::HashMap<String, (i64, i64)> {
+        doc["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                Some((
+                    row["name"].as_str()?.to_owned(),
+                    (row["total_count"].as_i64()?, row["total_bytes"].as_i64()?),
+                ))
+            })
+            .collect()
+    };
+    let deltas = compare_deltas(&rows(&a), &rows(&b));
+    println!("\n{:<46} {:>12} {:>12}", "module", "Δ allocs", "Δ bytes");
+    for (name, count, bytes) in deltas.iter().take(25) {
+        println!("{name:<46} {count:>12} {bytes:>12}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Per-module `(name, Δallocs, Δbytes)` between two row maps, biggest
+/// allocation change first. A module that appears in only one artifact is a
+/// delta from zero, which is the interesting case after a refactor.
+fn compare_deltas(
+    a: &std::collections::HashMap<String, (i64, i64)>,
+    b: &std::collections::HashMap<String, (i64, i64)>,
+) -> Vec<(String, i64, i64)> {
+    let mut names: Vec<&String> = a.keys().chain(b.keys()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut deltas: Vec<(String, i64, i64)> = names
+        .into_iter()
+        .map(|name| {
+            let (ca, ba) = a.get(name).copied().unwrap_or((0, 0));
+            let (cb, bb) = b.get(name).copied().unwrap_or((0, 0));
+            (name.clone(), cb - ca, bb - ba)
+        })
+        .filter(|(_, ca, ba)| *ca != 0 || *ba != 0)
+        .collect();
+    deltas.sort_by(|x, y| y.1.abs().cmp(&x.1.abs()).then_with(|| x.0.cmp(&y.0)));
+    deltas
 }
 
 /// The geosite loader in isolation: one `load_geosite` call per iteration for the
@@ -194,4 +293,42 @@ fn report(workload: &str, iterations: usize, artifacts: &leas_memtrace::Artifact
         "cache: hits {} resolves {} evictions {}",
         snapshot.cache.hits, snapshot.cache.resolves, snapshot.cache.evictions
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compare_deltas;
+    use std::collections::HashMap;
+
+    fn rows(entries: &[(&str, i64, i64)]) -> HashMap<String, (i64, i64)> {
+        entries
+            .iter()
+            .map(|(name, allocs, bytes)| ((*name).to_owned(), (*allocs, *bytes)))
+            .collect()
+    }
+
+    /// A module that disappears is a delta to zero, and the biggest allocation
+    /// change sorts first — the table exists to answer "what changed".
+    #[test]
+    fn deltas_cover_added_removed_and_changed_modules() {
+        let a = rows(&[("leas::a", 100, 1000), ("leas::gone", 40, 400)]);
+        let b = rows(&[("leas::a", 130, 1300), ("leas::new", 7, 70)]);
+        let deltas = compare_deltas(&a, &b);
+        assert_eq!(
+            deltas,
+            vec![
+                ("leas::gone".to_owned(), -40, -400),
+                ("leas::a".to_owned(), 30, 300),
+                ("leas::new".to_owned(), 7, 70),
+            ]
+        );
+    }
+
+    /// An unchanged run is an empty table, not a list of zeros.
+    #[test]
+    fn identical_runs_produce_no_rows() {
+        let rows = rows(&[("leas::a", 10, 100)]);
+        let deltas: Vec<(String, i64, i64)> = compare_deltas(&rows, &rows);
+        assert_eq!(deltas.len(), 0, "an unchanged run must not list rows");
+    }
 }

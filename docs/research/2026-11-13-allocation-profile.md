@@ -376,6 +376,23 @@ render loop plus the DB monitor. The display-row cache (`ui/profiles.rs`, keyed
 on `endpoints_gen` + selection + dirty bits) is doing its job; per-frame row
 rebuilds are not a cost.
 
+## Tracer cost (measured while improving the tracer itself)
+
+CPU time of the same 11 s boot, `getrusage(RUSAGE_CHILDREN)`:
+
+| build | CPU |
+| --- | ---: |
+| untraced release (mimalloc) | 0.55 s |
+| traced, `MIN_BYTES` filters everything out of the walk | 0.72 s |
+| traced, full 32-frame capture (the first version) | 9.7 s |
+| traced, probe-as-you-capture (shipped) | **6.8 s** |
+
+The walk is the cost: ~0.27 µs of setup plus ~0.09 µs per captured frame per
+allocation. Probing the cache inside the walk stops at the first workspace frame
+(16.9 frames per attributed allocation on this app, not the ~3 assumed), hence
+the 2× rather than the projected 4–6×. Details and the remaining levers (opt-in
+sampling, a frame-pointer unwinder): `docs/aegis/plans/2026-11-13-memtrace-improvements.md`.
+
 ## Next measurements
 
 Not covered here, in the order they matter: the import pipeline (subscription
