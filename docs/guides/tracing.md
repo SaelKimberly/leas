@@ -35,6 +35,9 @@ not** — never compare a traced RSS with a release one.
 | `KEYS` (driver) | scripted input for `scripts/trace_app.py`: `j:1,TAB:2,COMMA:2,ESC:1` — a chunk, then a pause; tokens `ESC`, `TAB`, `BTAB`, `ENTER`, `UP`/`DOWN`/`LEFT`/`RIGHT`, `COMMA`, `+` joins |
 | `HOME_SRC` (driver) | source config directory to stage; point it at an empty directory for the no-profiles control run |
 | `SOAK` (driver) | repeat `KEYS` until the delay expires and write an RSS CSV under `TRACE_DIR` (long-session curves) |
+| `LOG` (driver) | keep the app's PTY output in `TRACE_DIR/app.log` (the only way to see app-level diagnostics under the driver) |
+| `TRIM` (driver) | endpoints kept in the sandbox copy (default 3 000) — the knob behind the scaling runs |
+| `LEAS_IDLE_PURGE` / `_LOG` | `0` disables the event loop's idle allocator collect; `_LOG=1` prints each one |
 | `LEAS_MEM_TRACE_FOLD=allocs` | rank folded stacks by allocation count instead of live bytes (per-frame temporaries hold nothing at snapshot time) |
 | `LEAS_MEM_TRACE_INTERVAL_SECS` | write `tick-N` artifacts every N seconds — the evidence a killed run leaves behind |
 | `LEAS_MEM_TRACE_INTERVAL_MAX` | cap on retained ticks (default 32, oldest pruned first) |

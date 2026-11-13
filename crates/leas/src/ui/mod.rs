@@ -224,6 +224,11 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     let mut resize_seen = false;
     // Set when any other event was handled; renders input changes promptly.
     let mut events_seen = false;
+    // Set only when the *user* did something. The idle reclaim keys on this,
+    // not on `events_seen`: a boot's ping/enrich events are exactly the work
+    // that grew the heap, and waiting for them to stop would delay the reclaim
+    // for as long as the feed is lively.
+    let mut input_seen = false;
 
     // (channels already created in AppState::new)
 
@@ -238,6 +243,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         for i in 0..MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(ev) => {
+                    input_seen = true;
                     if matches!(&ev, Event::Resize(_, _)) {
                         // Process resize immediately — keep draining for more
                         resize_seen = true;
@@ -328,22 +334,35 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             crate::ops::ping::log_startup_envelope(state);
             envelope_logged = true;
         }
+        // Sampled before the draw block clears them: the purge below must not
+        // read a flag the draw just reset, or input would never count as
+        // activity and an idle collect could fire mid-keystroke.
+        let had_input = input_seen;
         if resize_seen || events_seen || last_tick.elapsed() >= refresh_interval {
             last_tick = std::time::Instant::now();
             resize_seen = false;
             events_seen = false;
+            input_seen = false;
             terminal.draw(|f| render(f, &*state))?;
         }
-        if events_seen || resize_seen {
+        if had_input {
             last_activity = std::time::Instant::now();
         } else if idle_purge_enabled
             && last_activity.elapsed() >= IDLE_PURGE_AFTER
             && last_purge.is_none_or(|at| at.elapsed() >= IDLE_PURGE_EVERY)
             && state.connected_protocol_id.is_none()
-            && !crate::ops::job_scheduler::is_busy(state)
         {
+            // Deliberately not gated on the job queue: the queue is busy for as
+            // long as a feed is flowing, which is exactly when the heap grew,
+            // and `mi_collect(false)` is a cheap non-forced collect.
             crate::alloc::purge_idle_heap();
             last_purge = Some(std::time::Instant::now());
+            if std::env::var("LEAS_IDLE_PURGE_LOG").is_ok() {
+                eprintln!(
+                    "idle-purge: collected after {}s quiet",
+                    last_activity.elapsed().as_secs()
+                );
+            }
         }
         // Keep the cheap 16ms wakeup so events are serviced promptly.
         tokio::time::sleep(Duration::from_millis(16)).await;

@@ -223,6 +223,12 @@ no regression against the 0.67 s untraced CPU baseline. **Falsifier:** RSS that
 does not follow `.text` means the pages are faulted for reasons other than code
 size, and the item closes as "no lever".
 
+**Result — closed, no lever.** `lto = "thin"` gives `.text` **40.9 MiB against
+40.3 MiB** (larger, not smaller) and a settled RSS of **96 MiB against 93–96**
+for the default profile, both with the idle reclaim on. The falsifier fired: the
+image's residency is not a function of its size, so no profile change is
+adopted.
+
 ## 9. Rejected, with numbers
 
 Carried from `mem-audit/report.md` §5: `SmallVec`/`ArrayVec` for cells (redundant
@@ -267,13 +273,18 @@ bisect with the artifact's `rev` and `rows` printed to prove the binary under
 test. Until then no code change in `run` is justified.
 
 **P1 landed.** `alloc::purge_idle_heap()` (the existing `mi_collect(false)`) is
-called from the event loop after 5 s without input, with no live connection and
-no queued/running job, at most every 30 s (`LEAS_IDLE_PURGE=0` disables it for an
-A/B). Measured on the shipped mimalloc build, same 45 s `SOAK` script: settled
-RSS **126 MiB with the reclaim off, 93–96 MiB with it on** (three runs; peaks
-unchanged). That is a 24–26 % cut, short of the 50 % target — the remaining
-anonymous memory is the allocator's per-thread heaps, which a process-wide
-collect does not return.
+called from the event loop after 5 s without **user** input (a key or a resize),
+with no live connection, at most every 30 s (`LEAS_IDLE_PURGE=0` disables it for
+an A/B, `LEAS_IDLE_PURGE_LOG=1` prints each collect). Two gating mistakes were
+found by measuring, not by reading: keying the idle timer on `events_seen` (which
+the draw block resets) froze it at startup, and gating on
+`job_scheduler::is_busy` meant a feed that is still flowing — exactly the state
+that grew the heap — never qualified. Measured on the shipped mimalloc build with
+the same `SOAK` script: settled RSS **126 MiB with the reclaim off, 93–100 MiB
+with it on** across four runs; peaks unchanged. The spread is *when* the first
+collect lands (the app keeps redrawing while the boot's events stream), not
+whether it reclaims. The remaining anonymous memory is the allocator's per-thread
+heaps, which a process-wide collect does not return.
 
 Audit-run facts worth keeping (2026-11-13, `rev 1eac71656619-dirty`, toolchain
 1.99.1): `SOAK=1` curves reached 110 MiB (traced) and 108 MiB (mimalloc) at t=5 s

@@ -21,6 +21,7 @@ Options (env):
              `BTAB`, `ENTER`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `COMMA`), other text
              is sent literally, and `+` joins tokens into one chunk. Empty
              (default) sends nothing.
+  LOG        non-empty keeps the app's PTY output in `TRACE_DIR/app.log`
   SOAK       non-empty repeats the `KEYS` schedule until the delay expires and
              writes `rss-<pid>.csv` (`seconds,rss_kib,hwm_kib`, one row per second).
 
@@ -184,6 +185,8 @@ def main() -> int:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", TTY_LINES, TTY_COLS, 0, 0))
     started = time.time()
     schedule = key_schedule()
+    transcript = os.path.join(TRACE_DIR, "app.log")
+    log = open(transcript, "wb") if os.environ.get("LOG") else None
     rss_peak, next_smaps, next_csv = 0, 0.0, 0.0
     curve = open(os.path.join(TRACE_DIR, f"rss-{pid}.csv"), "w") if SOAK else None
     if curve:
@@ -208,11 +211,15 @@ def main() -> int:
         readable, _, _ = select.select([fd], [], [], 0.2)
         if readable:
             try:
-                os.read(fd, 65536)
+                chunk = os.read(fd, 65536)
             except OSError:
                 break
+            if log:
+                log.write(chunk)
     if curve:
         curve.close()
+    if log:
+        log.close()
     for _ in range(3):
         try:
             os.write(fd, b"q")
