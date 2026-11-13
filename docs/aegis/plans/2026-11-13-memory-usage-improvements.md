@@ -63,6 +63,18 @@ written into this plan with the run's `rev`.
 **Rollback.** None needed (artifact addition; schema stays 2 unless a field is
 dropped — additive fields are fine).
 
+## 2a. Re-ranked after P0 (decisions, with numbers)
+
+The P0 runs moved three items. Nothing below is a promise; each carries the
+measurement that decided it.
+
+| item | measured | decision |
+|---|---|---|
+| P2 (per-frame `Vec`s) | 5 allocations, ~12 KiB per frame; the boot mass is 2.5 M | **closed as rejected** — below the noise floor (R11). Re-open only if a frame-rate change makes it visible. |
+| P3 (`DisplayRowData` cells) | `build_display_rows` 18 617 allocations at n = 1 000 (2.0 % of boot), 41 614 in a 50 s interactive run (1.4 %); the rebuild is already cache-gated | **deferred**: the `CompactString` swap is the mechanism if the rebuild frequency rises; it cannot move a 2.5 M boot today. |
+| P4 (patch rows by id) | `load_profiles_rows` 21 460 at boot, **428 834** when a search keystroke invalidates the page — interaction-bound, not boot-bound | **deferred with a measurement**: count reloads per keystroke first; the patch path touches the ordering law and is not justified by a number yet. |
+| P5 (duplicate crates) | `compact_str` 0.9.1 via `ratatui-core`, `parking_lot` 0.12.5 via arboard/crossterm/hickory | **closed**: our copies are the direct ones; the bumps belong to upstreams; no memory effect. |
+
 ## 3. P1 — reclaim retained arena pages when the app goes idle (RSS)
 
 **Finding:** F2. mimalloc holds 63.5 MiB anonymous for a 4–10 MiB live heap after
@@ -231,6 +243,37 @@ tracer run recorded with its `rev` (the artifacts are comparable because
 
 (to be filled as stages land: the run `rev`, the numbers, and any deviation from
 this plan — the same shape as `2026-11-13-memtrace-improvements.md`.)
+
+**P0 landed (`af42893`).** `LEAS_MEM_TRACE_ROWS=symbol` keys rows by
+`module::function` on the existing walk (no second capture), and the grain is in
+the artifact header. Results: a fresh sandbox allocates 58 013 times; a 3 000-row
+DB 2.56 M — the cost is **linear in endpoints at ~810 allocations each**, one-time
+(6/12/25 s windows agree to ±30), terminal-size independent, 95.4 % under 64 B.
+`build_display_rows` is 18 617 of it, `load_profiles_rows` 21 460; the rest
+collapses into `leas::ui::run` — an **open question**, not a finding. What the
+runs do establish: the mass is **not rendering** (a 24×80 and a 50×200 terminal
+give the same count, and a search that filters the grid to zero rows still shows
+1.96 M in `run`), and it is not the visible-row draw (`DataTable::render` loops
+`while y < bottom`). An `#[inline(never)]` bisect was attempted and its result is
+**void** — the patch briefly broke `ops/events.rs`, and the build that followed
+was never verified to be a traced build, so the unchanged row count proves
+nothing. `perf record` is unavailable here (0-byte capture: no permission).
+
+**Next instrument, in order:** (1) emit the top site instruction pointers in the
+artifact (`LEAS_MEM_TRACE_IPS=1`) and resolve them offline with
+`addr2line -f -i -e target/release/leas …`, which *does* expand inline frames —
+the tracer's `backtrace::resolve` does not; (2) re-run the `#[inline(never)]`
+bisect with the artifact's `rev` and `rows` printed to prove the binary under
+test. Until then no code change in `run` is justified.
+
+**P1 landed.** `alloc::purge_idle_heap()` (the existing `mi_collect(false)`) is
+called from the event loop after 5 s without input, with no live connection and
+no queued/running job, at most every 30 s (`LEAS_IDLE_PURGE=0` disables it for an
+A/B). Measured on the shipped mimalloc build, same 45 s `SOAK` script: settled
+RSS **126 MiB with the reclaim off, 93–96 MiB with it on** (three runs; peaks
+unchanged). That is a 24–26 % cut, short of the 50 % target — the remaining
+anonymous memory is the allocator's per-thread heaps, which a process-wide
+collect does not return.
 
 Audit-run facts worth keeping (2026-11-13, `rev 1eac71656619-dirty`, toolchain
 1.99.1): `SOAK=1` curves reached 110 MiB (traced) and 108 MiB (mimalloc) at t=5 s

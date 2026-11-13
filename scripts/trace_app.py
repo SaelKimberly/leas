@@ -48,6 +48,7 @@ TRACE_DIR = os.environ.get("TRACE_DIR", os.path.join(ROOT, "target", "mem-trace"
 DELAY = float(os.environ.get("DELAY", "12"))
 KEYS = os.environ.get("KEYS", "")
 SOAK = os.environ.get("SOAK", "")
+TRIM = int(os.environ.get("TRIM", "3000"))
 TTY_LINES = int(os.environ.get("TTY_LINES", "50"))
 TTY_COLS = int(os.environ.get("TTY_COLS", "200"))
 NAMED_KEYS = {"ESC": b"\x1b", "TAB": b"\t", "ENTER": b"\r",
@@ -128,7 +129,7 @@ def stage() -> str:
         # A 64k-row profile database keeps the UI busy enough that a scripted
         # `q` is not reliably read; a 3 000-row copy boots and quits. Only the
         # sandbox copy is trimmed.
-        kept = "select id from endpoints limit 3000"
+        kept = f"select id from endpoints limit {TRIM}"
         rows = db.execute("select count(*) from endpoints").fetchone()[0]
         db.commit()
         if rows > 5000:

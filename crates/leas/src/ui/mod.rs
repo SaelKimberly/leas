@@ -132,6 +132,13 @@ pub fn confirmation_text(state: &AppState) -> Option<String> {
 }
 // ── Entry point ───────────────────────────────────────────────────────
 
+/// A session that quiets down after a peak never reaches a job boundary, and
+/// mimalloc keeps an arena it grew until something collects (upstream #1422).
+/// Five quiet seconds is "the user is reading, not working"; the collect is
+/// process-wide, so the interval between them is a rate limit, not a schedule.
+const IDLE_PURGE_AFTER: Duration = Duration::from_secs(5);
+const IDLE_PURGE_EVERY: Duration = Duration::from_secs(30);
+
 pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -206,6 +213,13 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     let mut envelope_logged = false;
     let refresh_interval = *state.config.gui.refresh_interval_secs;
     let mut last_tick = std::time::Instant::now();
+    let mut last_activity = std::time::Instant::now();
+    // `None` is eligible immediately: the first collect belongs five idle
+    // seconds after the startup burst settles, not thirty after the loop opens.
+    let mut last_purge: Option<std::time::Instant> = None;
+    // `LEAS_IDLE_PURGE=0` keeps the reclaim off: the A/B for the RSS curve, and
+    // the escape hatch if a collect ever shows up as a hitch.
+    let idle_purge_enabled = !std::env::var("LEAS_IDLE_PURGE").is_ok_and(|v| v == "0");
     // Set when a Resize event is drained; forces the next loop iteration to redraw.
     let mut resize_seen = false;
     // Set when any other event was handled; renders input changes promptly.
@@ -319,6 +333,17 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             resize_seen = false;
             events_seen = false;
             terminal.draw(|f| render(f, &*state))?;
+        }
+        if events_seen || resize_seen {
+            last_activity = std::time::Instant::now();
+        } else if idle_purge_enabled
+            && last_activity.elapsed() >= IDLE_PURGE_AFTER
+            && last_purge.is_none_or(|at| at.elapsed() >= IDLE_PURGE_EVERY)
+            && state.connected_protocol_id.is_none()
+            && !crate::ops::job_scheduler::is_busy(state)
+        {
+            crate::alloc::purge_idle_heap();
+            last_purge = Some(std::time::Instant::now());
         }
         // Keep the cheap 16ms wakeup so events are serviced promptly.
         tokio::time::sleep(Duration::from_millis(16)).await;
