@@ -15,6 +15,7 @@ default-members = [
     "crates/leas-geoip",
     "crates/leas-hakari",
     "crates/leas-host-features",
+    "crates/leas-memtrace",
     "crates/leas-native",
     "crates/leas-proto",
     "crates/leas-route",

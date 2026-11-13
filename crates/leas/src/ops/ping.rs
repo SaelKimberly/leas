@@ -1704,7 +1704,8 @@ async fn finish_batch(shared: &BatchShared) {
     // The batch's peak (in-flight probes plus the plan's per-link maps) is far
     // above the idle set; the allocator would keep those pages committed
     // because nothing allocates enough afterwards to fire its purge timer.
-    crate::alloc::release_freed_heap();
+    // Under `mem-trace` this also writes the `ping-batch` snapshot.
+    crate::alloc::job_boundary("ping-batch");
 }
 
 /// The plan's own record: the pages and links the walk produced and how long it

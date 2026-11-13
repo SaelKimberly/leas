@@ -1,0 +1,24 @@
+[package]
+name = "leas-memtrace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Per-module memory tracing allocator for leas: live/peak bytes and folded stacks, as artifacts"
+readme.workspace = true
+keywords = ["memory", "allocator", "profiling", "trace"]
+categories = ["development-tools::debugging", "memory-management"]
+
+[dependencies]
+# Capture only, no symbolization in the hot path: frames are walked with
+# `backtrace::trace` and a frame's module is resolved once, on a cache miss.
+backtrace = "0.3"
+serde_json.workspace = true
+
+# The workspace feature-unification hack (hakari).
+leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[lints]
+workspace = true

@@ -31,7 +31,10 @@ dashmap.workspace = true
 # Process-wide allocator — owned here, not by a dependency (see `src/alloc.rs`).
 # `mimalloc-safe` + `v3` vendors mimalloc 3.6.1; the older `mimalloc` crate's
 # 3.3.2 is slower on the batch shape and cannot reclaim abandoned thread heaps.
-mimalloc = { package = "mimalloc-safe", version = "0.1.70", default-features = false, features = ["v3"] }
+mimalloc = { package = "mimalloc-safe", version = "0.1.70", default-features = false, features = ["v3"], optional = true }
+
+# Per-module memory tracing allocator (optional, `mem-trace`).
+leas-memtrace = { path = "../leas-memtrace", version = "0.1.0", optional = true }
 
 # ============ Serialization ============
 serde_json.workspace = true
@@ -91,11 +94,20 @@ leas-hakari = { version = "0.1", path = "../leas-hakari" }
 opaline = { version = "0.4.2", default-features = false, features = ["builtin-themes", "ratatui", "gradients", "discovery", "widgets"] }
 
 [features]
+# mimalloc, the shipped allocator (see `src/alloc.rs`).
+default = ["mimalloc"]
 # Cost-lab probes (`ops::ping::flow_cost`): measurement harnesses that print
 # tables and assert nothing, so they are not tests. Off by default to keep them
 # out of the test list; run with
 # `cargo test -p leas --release --lib --features perf-lab -- --ignored --nocapture`.
 perf-lab = []
+# `System` instead of mimalloc: external profilers (heaptrack, valgrind, dhat)
+# only see per-allocation events through the system allocator.
+std-alloc = []
+# The workspace tracer becomes the process allocator: per-module live/peak
+# bytes, written to `target/mem-trace` at each job boundary. Implies
+# `std-alloc` — two `#[global_allocator]`s do not compile.
+mem-trace = ["std-alloc", "dep:leas-memtrace"]
 
 [lints]
 workspace = true

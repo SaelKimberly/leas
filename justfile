@@ -218,6 +218,14 @@ bench target='all':
 hotpath:
     cargo run --release -p leas-hotpath
 
+# `crates/leas-hotpath`'s `memtrace` bin runs the same real code paths under the
+# tracing allocator (`leas-memtrace`) and writes per-module live/peak bytes plus
+# an inferno/flamegraph folded stack to `target/mem-trace/`. It asserts nothing:
+# the allocation gate above is the pass/fail row, this is the explanation.
+#   just memtrace [header|record|all] [iterations]
+memtrace workload='all' iterations='1000':
+    cargo run --release -p leas-hotpath --bin memtrace -- {{workload}} {{iterations}}
+
 # ─── Oracle pin table ──────────────────────────────────────────────
 #
 # Print the four pinned assets (name + sha256) for each version, ready to paste

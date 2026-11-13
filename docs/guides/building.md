@@ -70,6 +70,17 @@ deterministic, so a breach is a fact rather than a distribution on a shared runn
 which is why this one is CI-safe where `just bench` is not. It refuses a debug build
 and needs no cores, no sockets and no network.
 
+The same crate's second bin explains rather than asserts: `just memtrace` runs
+those code paths under `leas-memtrace` (bounded stack capture, per-module live
+and peak bytes) and writes `target/mem-trace/<label>-<pid>.{json,txt,folded}`
+— the `.folded` file feeds `inferno`/`flamegraph.pl`. It accepts a debug build.
+The real application traces itself with `cargo run --features mem-trace`
+(implies `std-alloc`): a snapshot is written at each `alloc::job_boundary`, in
+`target/mem-trace/` or `$LEAS_MEM_TRACE_DIR`. `--features std-alloc` alone swaps
+mimalloc for `System` so heaptrack/valgrind/dhat can see individual allocations.
+Every artifact covers the traced **process only** — the core child processes are
+invisible to it.
+
 ## Host state can fake a green build
 
 Three host-level sources override the repository, and none is visible in a

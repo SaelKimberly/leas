@@ -8,12 +8,21 @@ repository.workspace = true
 authors.workspace = true
 description = "Exact allocation-count gate for leas hot paths (a benchmark binary, not a library)"
 publish = false
+# Two bins: the gate (this name, so `cargo run -p leas-hotpath` keeps working)
+# and `memtrace`, the artifact writer.
+default-run = "leas-hotpath"
 
 [dependencies]
 leas-native = { path = "../leas-native", version = "0.1.0" }
 leas-tls = { workspace = true }
+# The tracer the `memtrace` bin installs as this binary's process allocator.
+leas-memtrace = { path = "../leas-memtrace", version = "0.1.0" }
 tokio = { workspace = true, features = ["rt", "macros", "io-util", "sync"] }
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
+
+[[bin]]
+name = "memtrace"
+path = "src/bin/memtrace.rs"
 
 [lints]
 workspace = true

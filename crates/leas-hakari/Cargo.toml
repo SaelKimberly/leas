@@ -189,6 +189,7 @@ http-body-util = { version = "0.1", features = ["channel"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
+miniz_oxide = { version = "0.9", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["io_uring", "pipe", "process", "stdio", "system", "termios", "time"] }
 simd-adler32 = { version = "0.3" }
@@ -200,6 +201,7 @@ tower-http = { version = "0.6", default-features = false, features = ["decompres
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
+miniz_oxide = { version = "0.9", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["io_uring", "pipe", "process", "stdio", "system", "termios", "time"] }
 simd-adler32 = { version = "0.3" }
@@ -229,6 +231,7 @@ bytemuck = { version = "1", default-features = false, features = ["extern_crate_
 http-body-util = { version = "0.1", features = ["channel"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
+miniz_oxide = { version = "0.9", features = ["simd"] }
 simd-adler32 = { version = "0.3" }
 time = { version = "0.3", default-features = false, features = ["formatting", "parsing"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -239,6 +242,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 
 [target.x86_64-pc-windows-gnu.build-dependencies]
 chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
+miniz_oxide = { version = "0.9", features = ["simd"] }
 simd-adler32 = { version = "0.3" }
 time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "parsing"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
@@ -297,6 +301,7 @@ ignored = [
     "log",
     "md-5",
     "memchr",
+    "miniz_oxide",
     "mio",
     "num-traits",
     "once_cell",

@@ -16,7 +16,7 @@ local-only hack.
 ## Order (topological: dependencies first)
 
 ```text
-leas-proto → leas-tls → leas-dns → leas-geoip → leas-host-features
+leas-proto → leas-tls → leas-dns → leas-geoip → leas-host-features → leas-memtrace
           → leas-route → leas-db → leas-core → leas-config → leas-native → leas
 ```
 
@@ -29,12 +29,13 @@ The edges this order satisfies, from the manifests:
 | `leas-dns` | none |
 | `leas-geoip` | none |
 | `leas-host-features` | none |
+| `leas-memtrace` | none |
 | `leas-route` | `leas-tls`, `leas-dns` (feature `dns`), `leas-geoip` (feature `geoip`) |
 | `leas-db` | `leas-proto` |
 | `leas-core` | `leas-db`, `leas-proto` |
 | `leas-config` | `leas-proto` |
 | `leas-native` | `leas-proto`, `leas-tls`, `leas-route` |
-| `leas` | `leas-core`, `leas-db`, `leas-config`, `leas-proto`, `leas-route`, `leas-geoip`, `leas-dns`, `leas-host-features`, `leas-native` |
+| `leas` | `leas-core`, `leas-db`, `leas-config`, `leas-proto`, `leas-route`, `leas-geoip`, `leas-dns`, `leas-host-features`, `leas-native`, `leas-memtrace` (optional, feature `mem-trace`) |
 
 ## Offline proof (leaf crates only)
 

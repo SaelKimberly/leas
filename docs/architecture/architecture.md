@@ -4,9 +4,9 @@ How the workspace is put together: which crates exist, what each one owns, where
 
 ## Workspace layout
 
-`Cargo.toml` declares `members = ["crates/*"]`, resolver 3, edition 2024, rust-version `1.99.1`, workspace version `0.1.0`. Fourteen crates exist:
+`Cargo.toml` declares `members = ["crates/*"]`, resolver 3, edition 2024, rust-version `1.99.1`, workspace version `0.1.0`. Fifteen crates exist:
 
-`leas`, `leas-config`, `leas-core`, `leas-db`, `leas-dns`, `leas-geoip`, `leas-hakari`, `leas-host-features`, `leas-hotpath`, `leas-native`, `leas-oracles`, `leas-proto`, `leas-route`, `leas-tls`. (`leas-oracles` is dev-only and excluded from `default-members`; `leas-hotpath` is a dev benchmark binary, also absent from `default-members`.)
+`leas`, `leas-config`, `leas-core`, `leas-db`, `leas-dns`, `leas-geoip`, `leas-hakari`, `leas-host-features`, `leas-hotpath`, `leas-memtrace`, `leas-native`, `leas-oracles`, `leas-proto`, `leas-route`, `leas-tls`. (`leas-oracles` is dev-only and excluded from `default-members`; `leas-hotpath` is a dev benchmark pair of binaries, also absent from `default-members`. `leas-memtrace` is a library and a default member, so its unit tests run in the normal suite; it is also the optional `mem-trace` allocator of the `leas` binary — see [`decisions.md`](decisions.md) §30.)
 
 ## Crate dependency graph
 
@@ -30,7 +30,9 @@ leas (binary)
   │     └── leas-geoip     optional, feature `geoip`
   ├── leas-dns              DNSCrypt-stamp resolver
   ├── leas-geoip            geo data: GeoLite2, .dat, .srs
-  └── leas-host-features    SNI / exact-IP / CIDR whitelist membership
+  ├── leas-host-features    SNI / exact-IP / CIDR whitelist membership
+  └── leas-memtrace         optional, feature `mem-trace`: the process allocator +
+                            per-module memory artifacts (also used by `leas-hotpath`)
 ```
 
 Notes that the manifests enforce:
@@ -39,6 +41,7 @@ Notes that the manifests enforce:
 - `leas-native` does not depend on `leas-core`; it takes typed configs straight from `leas-proto` and returns `leas-native` types.
 - `leas-core` carries only native-shared glue: ping adapters, speed tests, the heed log store, `SysStats`/formatters and `ensure_tls_provider`. The oracle adapters (config builders, subprocess lifecycle, updater, gRPC stats client, `CoreType`, `core_mapping`) live in the dev-only `leas-oracles::oracle_adapters`; the client graph has no tonic/prost edge.
 - `leas` depends on `leas-proto` and `leas-route` directly, in addition to the crates listed above.
+- `leas-memtrace` is an optional dependency of `leas` (feature `mem-trace`, which implies `std-alloc` and swaps the default mimalloc allocator out) and a plain dependency of the dev-only `leas-hotpath`, whose `memtrace` bin drives real code paths under it.
 
 `leas-hakari` is a cargo-hakari generated feature-unification crate. Every member depends on it; its own dependencies are never referenced from code and exist only to unify feature flags. Regenerate after a `Cargo.lock` change with `cargo hakari generate`; the `hakari-check` gate runs `cargo hakari generate --diff`, `cargo hakari manage-deps --dry-run` and `cargo hakari verify`, and `--dry-run` is what catches a member missing the dependency.
 

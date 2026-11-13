@@ -248,11 +248,18 @@ const BLOCKING_THREADS: usize = 64;
 fn main() -> Result<()> {
     // Allocator policy before any real work (see `alloc.rs`).
     leas::alloc::configure();
+    // Starts the memory tracer when `mem-trace` built it in.
+    leas::alloc::start_tracing();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(BLOCKING_THREADS)
         .build()?;
-    runtime.block_on(run_app())
+    let outcome = runtime.block_on(run_app());
+    // The last artifact of a traced session: what the run still holds after its
+    // own teardown. Job boundaries write the interesting snapshots; this one
+    // makes a session that ran no batch leave evidence too.
+    leas::alloc::job_boundary("exit");
+    outcome
 }
 
 async fn run_app() -> Result<()> {
