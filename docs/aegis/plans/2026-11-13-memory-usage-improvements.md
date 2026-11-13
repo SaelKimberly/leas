@@ -87,9 +87,11 @@ called at job boundaries (`release_freed_heap`).
 
 **Steps.**
 1. `crates/leas/src/alloc.rs`: add `pub fn purge_idle_heap()` — under
-   `#[cfg(all(feature = "mimalloc", not(feature = "std-alloc")))]` call
-   `mi_collect(false)`; otherwise a no-op with the same doc note as
-   `release_freed_heap`.
+   `#[cfg(all(feature = "mimalloc", not(feature = "std-alloc")))]` call a new
+   `mimalloc_alloc::purge_idle()` binding of `mi_collect(false)`; otherwise a
+   no-op with the same doc note as `release_freed_heap`. The only binding that
+   existed was `mi_collect(true)` (the forced collect at job boundaries), which
+   is *not* what an idle tick should run.
 2. Call site: the UI event loop (`crates/leas/src/ui/mod.rs`), where idle time is
    known — only when **all** hold: no input for ≥ 5 s, no active job
    (`job_scheduler` idle), no live connection, and ≥ 30 s since the last call.
@@ -272,19 +274,19 @@ the tracer's `backtrace::resolve` does not; (2) re-run the `#[inline(never)]`
 bisect with the artifact's `rev` and `rows` printed to prove the binary under
 test. Until then no code change in `run` is justified.
 
-**P1 landed.** `alloc::purge_idle_heap()` (the existing `mi_collect(false)`) is
-called from the event loop after 5 s without **user** input (a key or a resize),
-with no live connection, at most every 30 s (`LEAS_IDLE_PURGE=0` disables it for
-an A/B, `LEAS_IDLE_PURGE_LOG=1` prints each collect). Two gating mistakes were
-found by measuring, not by reading: keying the idle timer on `events_seen` (which
-the draw block resets) froze it at startup, and gating on
-`job_scheduler::is_busy` meant a feed that is still flowing — exactly the state
-that grew the heap — never qualified. Measured on the shipped mimalloc build with
-the same `SOAK` script: settled RSS **126 MiB with the reclaim off, 93–100 MiB
-with it on** across four runs; peaks unchanged. The spread is *when* the first
-collect lands (the app keeps redrawing while the boot's events stream), not
-whether it reclaims. The remaining anonymous memory is the allocator's per-thread
-heaps, which a process-wide collect does not return.
+**P1 closed — no measured effect, reverted.** The first implementation called
+the forced collect (`mi_collect(true)`, the only binding that existed) and looked
+like a 24–26 % cut (126 → 93–96 MiB settled), but that gate was firing during the
+boot's own event burst — i.e. while the heap was still growing. Binding the
+non-forced `mi_collect(false)` and gating on real idle (no input, no connection,
+no running job) gave, over six A/B runs of the same 45 s script on the same
+binary (`LEAS_IDLE_PURGE=0|1`): **off 100 / 103 / 117 MiB settled, on 99 / 101 /
+99 MiB**. The workload's own spread (±17 MiB between identical off runs, because
+mimalloc's own delayed purge already reclaims part of the boot peak) is larger
+than the effect. The runtime path, its predicate and its knob were removed rather
+than shipped unproven; what remains is the finding, and the note that a workload
+shaped like the original complaint (a *burst* far above steady state, e.g. a
+feed import) is the one that could justify a retry.
 
 Audit-run facts worth keeping (2026-11-13, `rev 1eac71656619-dirty`, toolchain
 1.99.1): `SOAK=1` curves reached 110 MiB (traced) and 108 MiB (mimalloc) at t=5 s

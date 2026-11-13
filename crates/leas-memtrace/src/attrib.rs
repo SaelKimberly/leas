@@ -273,8 +273,17 @@ fn path_parts(name: &str, roots: &'static [&'static str]) -> Option<(String, Str
         .then_some((module, function))
 }
 
-/// The row key for a frame: the module, or `module::function` when the window
-/// asked for symbol rows (`LEAS_MEM_TRACE_ROWS=symbol`).
+/// The row key for a demangled symbol: the module, or `module::function` when
+/// the window asked for symbol rows (`LEAS_MEM_TRACE_ROWS=symbol`).
+fn row_key(name: &str, roots: &'static [&'static str], by_symbol: bool) -> Option<String> {
+    if by_symbol {
+        path_parts(name, roots).map(|(module, function)| format!("{module}::{function}"))
+    } else {
+        module_path(name, roots)
+    }
+}
+
+/// The row key for a frame, resolved once per instruction pointer.
 fn key_of(ip: usize, roots: &'static [&'static str], by_symbol: bool) -> Option<String> {
     let probe = ip.wrapping_sub(1) as *mut c_void;
     let mut found = None;
@@ -285,12 +294,7 @@ fn key_of(ip: usize, roots: &'static [&'static str], by_symbol: bool) -> Option<
         let Some(name) = symbol.name() else {
             return;
         };
-        let name = name.to_string();
-        found = if by_symbol {
-            path_parts(&name, roots).map(|(module, function)| format!("{module}::{function}"))
-        } else {
-            module_path(&name, roots)
-        };
+        found = row_key(&name.to_string(), roots, by_symbol);
     });
     found
 }
@@ -404,21 +408,22 @@ mod tests {
 
     const ROOTS: &[&str] = &["leas", "leas_native"];
 
-    /// Symbol rows are the same resolution with the function kept: a run that
-    /// asks for them must distinguish two sites inside one module, which is the
-    /// only way to name the loop responsible for a module's churn.
+    /// The grain switch itself: module rows collapse two functions of one module
+    /// into one row, symbol rows keep them apart. A regression that inverted the
+    /// flag or compared it against the wrong string fails here.
     #[test]
-    fn symbol_rows_keep_the_function() {
-        let name = "leas::ui::render::h1f2e3d4c5b6a7988";
+    fn row_grain_separates_functions_of_one_module() {
+        let render = "leas::ui::render::h1f2e3d4c5b6a7988";
+        let run = "leas::ui::run::{{closure}}";
+        assert_eq!(row_key(render, ROOTS, false).as_deref(), Some("leas::ui"));
+        assert_eq!(row_key(run, ROOTS, false).as_deref(), Some("leas::ui"));
         assert_eq!(
-            path_parts(name, ROOTS).map(|(module, function)| format!("{module}::{function}")),
-            Some("leas::ui::render".to_owned())
+            row_key(render, ROOTS, true).as_deref(),
+            Some("leas::ui::render")
         );
-        assert_eq!(
-            path_parts("leas::ui::run::{{closure}}", ROOTS)
-                .map(|(module, function)| format!("{module}::{function}")),
-            Some("leas::ui::run".to_owned())
-        );
+        assert_eq!(row_key(run, ROOTS, true).as_deref(), Some("leas::ui::run"));
+        // A crate outside the roots stays unattributed under either grain.
+        assert_eq!(row_key("core::mem::drop::h1234", ROOTS, true), None);
     }
 
     #[test]

@@ -19,9 +19,10 @@ pub const NO_TAG: u32 = u32::MAX;
 /// One row per distinct module — or per distinct function when
 /// `LEAS_MEM_TRACE_ROWS=symbol` asks for it, which is what separates two
 /// allocation sites inside one module. The slab is a fixed size so a counter
-/// update is an index, never a grow or a lock; 16 384 rows cost 640 KiB of
-/// virtual memory and a symbol-keyed run of a 40 MiB binary fits inside it.
-const MAX_SYMBOLS: usize = 16_384;
+/// update is an index, never a grow or a lock. 4 096 rows held every module-keyed
+/// run measured so far; a symbol-keyed run keeps the same ceiling (a 16-bit cache
+/// tag caps it at 65 534 anyway), and an overflow is counted, not silent.
+const MAX_SYMBOLS: usize = 4096;
 
 /// 2^16 slots: sixteen times the plausible number of distinct allocating call
 /// sites, so eviction is a non-event. (`SLOT_BITS` < 32 keeps the shift sane.)

@@ -151,8 +151,23 @@ fn compare(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     // `row_grain` belongs with them: a module row and a symbol row never share
-    // a name, so a diff across grain reads as every row removed and added.
-    for key in ["schema", "rev", "row_grain"] {
+    // a name, so a diff across grain reads as every row removed and added. A
+    // missing field is a pre-grain artifact, which was always module-keyed.
+    let grain = |doc: &serde_json::Value| {
+        doc.get("row_grain")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("module")
+            .to_owned()
+    };
+    if grain(&a) != grain(&b) && !force {
+        eprintln!(
+            "compare: row_grain differs ({} vs {}); pass --force to diff anyway",
+            grain(&a),
+            grain(&b)
+        );
+        return ExitCode::FAILURE;
+    }
+    for key in ["schema", "rev"] {
         if a.get(key) != b.get(key) && !force {
             eprintln!(
                 "compare: {key} differs ({:?} vs {:?}); pass --force to diff anyway",
@@ -175,8 +190,8 @@ fn compare(args: &[String]) -> ExitCode {
         "rev: {} | {}   rows: {} | {}   allocs: {} -> {}",
         a["rev"].as_str().unwrap_or("?"),
         b["rev"].as_str().unwrap_or("?"),
-        a["row_grain"].as_str().unwrap_or("?"),
-        b["row_grain"].as_str().unwrap_or("?"),
+        grain(&a),
+        grain(&b),
         a["totals"]["allocs"],
         b["totals"]["allocs"]
     );

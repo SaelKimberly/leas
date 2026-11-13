@@ -105,6 +105,11 @@ def stage() -> str:
     if not real_dst.startswith(os.path.realpath(os.path.join(ROOT, "target")) + os.sep):
         print(f"trace-app: note: sandbox {real_dst} is outside target/; "
               "the trim still only touches that copy", file=sys.stderr)
+    # Wipe the previous run's copy: staging copies only the entries that exist
+    # in the source, so a leftover database from an earlier run would silently
+    # become this run's dataset (that is exactly how the audit's "empty DB"
+    # control measured 3 000 endpoints). The guard above ran first.
+    shutil.rmtree(dst, ignore_errors=True)
     os.makedirs(dst, exist_ok=True)
     for entry in ("data.db", "data.db-wal", "config.json", "geoip.dat", "geosite.dat",
                   "GeoLite2-City.mmdb"):
@@ -207,7 +212,8 @@ def main() -> int:
                 schedule.clear()
         if not schedule and SOAK:
             schedule = [(now + at, payload) for at, payload in key_schedule()]
-        rss_peak = max(rss_peak, sample_rss(pid)[0])
+        rss, hwm = sample_rss(pid)
+        rss_peak = max(rss_peak, rss, hwm)
         readable, _, _ = select.select([fd], [], [], 0.2)
         if readable:
             try:
@@ -244,9 +250,8 @@ def main() -> int:
     except ChildProcessError:
         status = 0
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-    rss_peak = max(rss_peak, sample_rss(pid)[0])
-    if curve:
-        curve.close()
+    rss, hwm = sample_rss(pid)
+    rss_peak = max(rss_peak, rss, hwm)
     print(f"trace-app: elapsed {time.time() - started:.1f}s "
           f"cpu {usage.ru_utime + usage.ru_stime:.2f}s "
           f"rss peak {rss_peak / 1024:.0f}MiB status {status}")

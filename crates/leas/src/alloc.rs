@@ -74,19 +74,6 @@ pub fn release_freed_heap() {
     mimalloc_alloc::release_freed_heap();
 }
 
-/// [`release_freed_heap`] for an **idle** session.
-///
-/// The job-boundary call only fires when work finishes; a session that goes
-/// quiet after a peak never reaches one, and mimalloc purges a freed arena
-/// range only when a later collect runs (upstream #1422 — an idle process
-/// never collects, so the peak stays in RSS). Callers must rate-limit it: it is
-/// a process-wide non-forced collect, cheap only when little is pending.
-///
-/// A no-op when mimalloc is not the allocator.
-pub fn purge_idle_heap() {
-    release_freed_heap();
-}
-
 /// Start the memory tracer, when `mem-trace` built it in.
 ///
 /// Roots are crate-name prefixes; only frames inside them are attributed, and
