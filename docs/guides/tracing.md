@@ -32,6 +32,9 @@ not** — never compare a traced RSS with a release one.
 | --- | --- |
 | `LEAS_MEM_TRACE_DIR` | artifact directory (default `target/mem-trace`) |
 | `LEAS_MEM_TRACE_MIN_BYTES` | charge allocations below this to `<untraced>`; `0` traces everything, `64` is a sane default for long sessions |
+| `KEYS` (driver) | scripted input for `scripts/trace_app.py`: `j:1,TAB:2,COMMA:2,ESC:1` — a chunk, then a pause; tokens `ESC`, `TAB`, `BTAB`, `ENTER`, `UP`/`DOWN`/`LEFT`/`RIGHT`, `COMMA`, `+` joins |
+| `HOME_SRC` (driver) | source config directory to stage; point it at an empty directory for the no-profiles control run |
+| `SOAK` (driver) | repeat `KEYS` until the delay expires and write an RSS CSV under `TRACE_DIR` (long-session curves) |
 | `LEAS_MEM_TRACE_FOLD=allocs` | rank folded stacks by allocation count instead of live bytes (per-frame temporaries hold nothing at snapshot time) |
 | `LEAS_MEM_TRACE_INTERVAL_SECS` | write `tick-N` artifacts every N seconds — the evidence a killed run leaves behind |
 | `LEAS_MEM_TRACE_INTERVAL_MAX` | cap on retained ticks (default 32, oldest pruned first) |
@@ -58,6 +61,11 @@ hours:
 5. **Give the exit a long drain.** The exit artifact is written after the event
    loop returns and the runtime shuts down; a 10 s drain killed runs before the
    write and produced nothing. `trace_app.py` waits up to 90 s.
+
+The driver also samples `VmRSS`/`VmHWM` and keeps the last `/proc/<pid>/smaps` as
+`rss-<pid>.smaps`: an artifact's `peak_live_bytes` is the heap the tracer saw, not what
+the OOM killer sees, and the two differ by the resident binary image and allocator
+retention (see `mem-audit/report.md`).
 
 ## Reading an artifact
 

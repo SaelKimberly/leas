@@ -14,7 +14,18 @@ Options (env):
   TRACE_DIR  artifact output                (default target/mem-trace)
   DELAY      seconds before the app is asked to quit (default 12; the exit
              artifact is written after shutdown, so the drain must be generous)
-  MIN_BYTES, INTERVAL, FOLD  passed through to the tracer
+  MIN_BYTES, INTERVAL, FOLD, ROWS  passed through to the tracer (`ROWS=symbol`
+             keys rows by function instead of module)
+  KEYS       comma-separated `chunk:seconds` pairs sent while the app runs,
+             e.g. `jjj:3,TAB:2,COMMA:2,ESC:1`. A token names a key (`ESC`, `TAB`,
+             `BTAB`, `ENTER`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `COMMA`), other text
+             is sent literally, and `+` joins tokens into one chunk. Empty
+             (default) sends nothing.
+  SOAK       non-empty repeats the `KEYS` schedule until the delay expires and
+             writes `rss-<pid>.csv` (`seconds,rss_kib,hwm_kib`, one row per second).
+
+Every run samples VmRSS/VmHWM from `/proc/<pid>/status`, because an artifact's
+`peak_live_bytes` is the heap the tracer saw, not what the OOM killer sees.
 """
 
 import fcntl
@@ -35,6 +46,47 @@ BIN = os.path.join(ROOT, "target", "release", "leas")
 SANDBOX = os.environ.get("SANDBOX", os.path.join(ROOT, "target", "mem-trace", "sandbox"))
 TRACE_DIR = os.environ.get("TRACE_DIR", os.path.join(ROOT, "target", "mem-trace"))
 DELAY = float(os.environ.get("DELAY", "12"))
+KEYS = os.environ.get("KEYS", "")
+SOAK = os.environ.get("SOAK", "")
+TTY_LINES = int(os.environ.get("TTY_LINES", "50"))
+TTY_COLS = int(os.environ.get("TTY_COLS", "200"))
+NAMED_KEYS = {"ESC": b"\x1b", "TAB": b"\t", "ENTER": b"\r",
+              "UP": b"\x1b[A", "DOWN": b"\x1b[B", "LEFT": b"\x1b[D",
+              "RIGHT": b"\x1b[C", "BTAB": b"\x1b[Z", "COMMA": b","}
+
+
+def dump_smaps(pid: int, path: str) -> None:
+    """Write `/proc/<pid>/smaps` — the only way to say what RSS is made of."""
+    try:
+        with open(f"/proc/{pid}/smaps") as src, open(path, "w") as dst:
+            dst.write(src.read())
+    except OSError:
+        pass
+
+
+def key_schedule() -> list[tuple[float, bytes]]:
+    """`KEYS` as (send_at, bytes) pairs measured from the app's start."""
+    schedule, at = [], 1.5
+    for step in filter(None, (part.strip() for part in KEYS.split(","))):
+        chunk, _, seconds = step.rpartition(":")
+        if not chunk:
+            chunk, seconds = seconds, ""
+        payload = b"".join(NAMED_KEYS.get(token, token.encode())
+                           for token in chunk.replace("\\t", "TAB").split("+")
+                           if token)
+        schedule.append((at, payload))
+        at += float(seconds) if seconds else 2.0
+    return schedule
+
+
+def sample_rss(pid: int) -> tuple[int, int]:
+    """(VmRSS, VmHWM) in KiB for `pid`; (0, 0) once it is gone."""
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            fields = dict(line.split(":", 1) for line in fh if ":" in line)
+        return (int(fields["VmRSS"].split()[0]), int(fields["VmHWM"].split()[0]))
+    except (OSError, KeyError, ValueError):
+        return (0, 0)
 
 
 def stage() -> str:
@@ -61,6 +113,14 @@ def stage() -> str:
     if os.path.isdir(whitelist):
         shutil.copytree(whitelist, os.path.join(dst, "whitelist"), dirs_exist_ok=True)
     db_path = os.path.join(dst, "data.db")
+    copied_db = os.path.exists(os.path.join(src, "data.db"))
+    if not copied_db:
+        # Nothing to pin or trim: the app creates its own schema on first start,
+        # and opening the path here would create an empty file that it then
+        # treats as a corrupt database.
+        print("trace-app: no database copied; this run profiles a fresh install",
+              file=sys.stderr)
+        return dst
     try:
         db = sqlite3.connect(db_path)
         # Due subscriptions turn a boot measurement into an import benchmark.
@@ -90,9 +150,6 @@ def stage() -> str:
         # quit. Fail the recipe instead of tracing it anyway.
         print(f"trace-app: could not prepare the sandbox database: {error}", file=sys.stderr)
         return None
-    if not os.path.exists(db_path):
-        print("trace-app: no database copied; this run profiles a fresh install",
-              file=sys.stderr)
     return dst
 
 
@@ -107,25 +164,54 @@ def main() -> int:
     env = dict(os.environ)
     env.pop("XDG_CONFIG_HOME", None)
     env.update({"HOME": SANDBOX, "LEAS_MEM_TRACE_DIR": TRACE_DIR})
-    for key in ("MIN_BYTES", "INTERVAL", "FOLD"):
+    # `INTERVAL`/`INTERVAL_MAX` map to the `_SECS`/`_MAX` names the binary reads.
+    knobs = {"MIN_BYTES": "MIN_BYTES", "FOLD": "FOLD", "ROWS": "ROWS",
+             "INTERVAL": "INTERVAL_SECS", "INTERVAL_MAX": "INTERVAL_MAX"}
+    for key, name in knobs.items():
         value = os.environ.get(key)
         if value:
-            env[f"LEAS_MEM_TRACE_{key}"] = value
+            env[f"LEAS_MEM_TRACE_{name}"] = value
+    if os.environ.get("TRACE_DEBUG"):
+        print("trace-app: env " + " ".join(sorted(k for k in env if k.startswith("LEAS_"))),
+              file=sys.stderr)
     os.makedirs(TRACE_DIR, exist_ok=True)
     print(f"trace-app: sandbox {config}", file=sys.stderr)
 
     pid, fd = pty.fork()
     if pid == 0:
         os.execvpe(BIN, [BIN], env)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", TTY_LINES, TTY_COLS, 0, 0))
     started = time.time()
+    schedule = key_schedule()
+    rss_peak, next_smaps, next_csv = 0, 0.0, 0.0
+    curve = open(os.path.join(TRACE_DIR, f"rss-{pid}.csv"), "w") if SOAK else None
+    if curve:
+        curve.write("seconds,rss_kib,hwm_kib\n")
     while time.time() - started < DELAY:
+        now = time.time() - started
+        if curve and now >= next_csv:
+            rss, hwm = sample_rss(pid)
+            curve.write(f"{now:.0f},{rss},{hwm}\n")
+            next_csv = now + 1.0
+        if now >= next_smaps:
+            dump_smaps(pid, os.path.join(TRACE_DIR, f"rss-{pid}.smaps"))
+            next_smaps = now + 5.0
+        while schedule and schedule[0][0] <= now:
+            try:
+                os.write(fd, schedule.pop(0)[1])
+            except OSError:
+                schedule.clear()
+        if not schedule and SOAK:
+            schedule = [(now + at, payload) for at, payload in key_schedule()]
+        rss_peak = max(rss_peak, sample_rss(pid)[0])
         readable, _, _ = select.select([fd], [], [], 0.2)
         if readable:
             try:
                 os.read(fd, 65536)
             except OSError:
                 break
+    if curve:
+        curve.close()
     for _ in range(3):
         try:
             os.write(fd, b"q")
@@ -150,8 +236,12 @@ def main() -> int:
     except ChildProcessError:
         status = 0
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    rss_peak = max(rss_peak, sample_rss(pid)[0])
+    if curve:
+        curve.close()
     print(f"trace-app: elapsed {time.time() - started:.1f}s "
-          f"cpu {usage.ru_utime + usage.ru_stime:.2f}s status {status}")
+          f"cpu {usage.ru_utime + usage.ru_stime:.2f}s "
+          f"rss peak {rss_peak / 1024:.0f}MiB status {status}")
     print(f"trace-app: artifacts in {TRACE_DIR}")
     return 0 if status == 0 else 1
 

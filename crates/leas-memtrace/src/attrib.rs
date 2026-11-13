@@ -133,7 +133,7 @@ pub fn attribute(size: usize) -> u32 {
             }
             None => {
                 CACHE_RESOLVES.fetch_add(1, Relaxed);
-                match module_of(ip, state.roots) {
+                match key_of(ip, state.roots, state.rows == "symbol") {
                     Some(module) => {
                         fresh = Some((ip, module));
                         return false;
@@ -248,6 +248,12 @@ fn module_of(ip: usize, roots: &'static [&'static str]) -> Option<String> {
 /// then closure shims. Peel those, then drop the function itself — what remains
 /// is the module that owns it.
 pub fn module_path(name: &str, roots: &'static [&'static str]) -> Option<String> {
+    path_parts(name, roots).map(|(module, _)| module)
+}
+
+/// `(module, function)` for a demangled workspace symbol, or `None` when the
+/// symbol belongs to no root.
+fn path_parts(name: &str, roots: &'static [&'static str]) -> Option<(String, String)> {
     let cleaned = without_disambiguators(name);
     let mut segments = top_level_segments(&cleaned);
     while segments.last().is_some_and(|segment| is_noise(segment)) {
@@ -259,12 +265,34 @@ pub fn module_path(name: &str, roots: &'static [&'static str]) -> Option<String>
         return None;
     }
     // The function: `encode_request`, `batch`, `{{closure}}` already peeled.
-    segments.pop()?;
+    let function = segments.pop()?.to_owned();
     let module = segments.join("::");
     roots
         .iter()
         .any(|root| under_root(&module, root))
-        .then_some(module)
+        .then_some((module, function))
+}
+
+/// The row key for a frame: the module, or `module::function` when the window
+/// asked for symbol rows (`LEAS_MEM_TRACE_ROWS=symbol`).
+fn key_of(ip: usize, roots: &'static [&'static str], by_symbol: bool) -> Option<String> {
+    let probe = ip.wrapping_sub(1) as *mut c_void;
+    let mut found = None;
+    backtrace::resolve(probe, |symbol| {
+        if found.is_some() {
+            return;
+        }
+        let Some(name) = symbol.name() else {
+            return;
+        };
+        let name = name.to_string();
+        found = if by_symbol {
+            path_parts(&name, roots).map(|(module, function)| format!("{module}::{function}"))
+        } else {
+            module_path(&name, roots)
+        };
+    });
+    found
 }
 
 /// Demangled names carry the crate's disambiguator, `leas_memtrace[23d599d2ee…]`.
@@ -375,6 +403,23 @@ mod tests {
     }
 
     const ROOTS: &[&str] = &["leas", "leas_native"];
+
+    /// Symbol rows are the same resolution with the function kept: a run that
+    /// asks for them must distinguish two sites inside one module, which is the
+    /// only way to name the loop responsible for a module's churn.
+    #[test]
+    fn symbol_rows_keep_the_function() {
+        let name = "leas::ui::render::h1f2e3d4c5b6a7988";
+        assert_eq!(
+            path_parts(name, ROOTS).map(|(module, function)| format!("{module}::{function}")),
+            Some("leas::ui::render".to_owned())
+        );
+        assert_eq!(
+            path_parts("leas::ui::run::{{closure}}", ROOTS)
+                .map(|(module, function)| format!("{module}::{function}")),
+            Some("leas::ui::run".to_owned())
+        );
+    }
 
     #[test]
     fn module_is_the_path_above_the_function() {

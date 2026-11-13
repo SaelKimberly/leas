@@ -90,6 +90,10 @@ pub struct Snapshot {
     pub metadata: &'static [(&'static str, &'static str)],
     /// Which weight the folded stacks carry: `live` or `allocs`.
     pub fold: &'static str,
+    /// What a row's name is: `module` (default) or `symbol`
+    /// (`LEAS_MEM_TRACE_ROWS=symbol`). Two runs with different grain are not
+    /// comparable row-for-row, so the mode travels with the artifact.
+    pub row_grain: &'static str,
 }
 
 /// Where [`write`] put the three files.
@@ -212,6 +216,7 @@ pub fn snapshot() -> Option<Snapshot> {
         overflowed: OVERFLOWED.load(Relaxed),
         metadata: state.metadata,
         fold: if fold_allocs() { "allocs" } else { "live" },
+        row_grain: state.rows,
     })
 }
 
@@ -267,6 +272,7 @@ fn render_json(snapshot: &Snapshot) -> String {
         "rev": REV,
         "allocator": ALLOCATOR,
         "fold": snapshot.fold,
+        "row_grain": snapshot.row_grain,
         "metadata": snapshot
             .metadata
             .iter()
@@ -311,7 +317,7 @@ fn render_text(snapshot: &Snapshot) -> String {
         out,
         "allocator: {ALLOCATOR} (counts are allocator-independent)"
     );
-    let _ = writeln!(out, "fold: {}", snapshot.fold);
+    let _ = writeln!(out, "fold: {}  rows: {}", snapshot.fold, snapshot.row_grain);
     for (key, value) in snapshot.metadata {
         let _ = writeln!(out, "{key}: {value}");
     }
@@ -608,6 +614,7 @@ mod tests {
             overflowed: 0,
             metadata: &[("features", "mem-trace")],
             fold: "live",
+            row_grain: "module",
         }
     }
 

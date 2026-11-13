@@ -16,9 +16,12 @@ pub const UNTRACED: u32 = 0;
 /// tracing was off, or from inside the tracer itself.
 pub const NO_TAG: u32 = u32::MAX;
 
-/// One row per distinct module. A workspace has dozens; the slab is a fixed
-/// size so a counter update is an index, never a grow or a lock.
-const MAX_SYMBOLS: usize = 4096;
+/// One row per distinct module — or per distinct function when
+/// `LEAS_MEM_TRACE_ROWS=symbol` asks for it, which is what separates two
+/// allocation sites inside one module. The slab is a fixed size so a counter
+/// update is an index, never a grow or a lock; 16 384 rows cost 640 KiB of
+/// virtual memory and a symbol-keyed run of a 40 MiB binary fits inside it.
+const MAX_SYMBOLS: usize = 16_384;
 
 /// 2^16 slots: sixteen times the plausible number of distinct allocating call
 /// sites, so eviction is a non-event. (`SLOT_BITS` < 32 keeps the shift sane.)
@@ -217,6 +220,9 @@ pub struct State {
     pub min_bytes: usize,
     /// Unit identity the artifacts echo (`rev`, features, dataset).
     pub metadata: &'static [(&'static str, &'static str)],
+    /// `module` (default) or `symbol`: what a row's key is. Symbol rows are the
+    /// finer grain — the same hot path, a different resolution key.
+    pub rows: &'static str,
     pub started: Instant,
 }
 
@@ -233,6 +239,11 @@ impl State {
             roots,
             min_bytes,
             metadata,
+            rows: if std::env::var("LEAS_MEM_TRACE_ROWS").is_ok_and(|v| v == "symbol") {
+                "symbol"
+            } else {
+                "module"
+            },
             started: Instant::now(),
         }
     }
