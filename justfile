@@ -222,7 +222,9 @@ hotpath:
 # tracing allocator (`leas-memtrace`) and writes per-module live/peak bytes plus
 # an inferno/flamegraph folded stack to `target/mem-trace/`. It asserts nothing:
 # the allocation gate above is the pass/fail row, this is the explanation.
-#   just memtrace [header|record|all] [iterations]
+#   just memtrace [header|connect|geosite|record|all] [iterations]
+# `geosite` needs LEAS_GEOSITE_PATH=<geosite.dat> and LEAS_GEOSITE_CODES=<code,...>
+# (comma-separated tokens) to measure the geo loader in isolation.
 memtrace workload='all' iterations='1000':
     cargo run --release -p leas-hotpath --bin memtrace -- {{workload}} {{iterations}}
 

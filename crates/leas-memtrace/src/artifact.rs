@@ -138,6 +138,10 @@ pub fn snapshot() -> Option<Snapshot> {
                 .then_with(|| a.name.cmp(&b.name))
         });
 
+        // `LEAS_MEM_TRACE_FOLD=allocs` ranks the folded stacks by allocation
+        // count instead of live bytes: per-frame temporaries hold nothing at the
+        // snapshot, so only their count can place them.
+        let weight_allocs = std::env::var("LEAS_MEM_TRACE_FOLD").is_ok_and(|mode| mode == "allocs");
         let mut folded: Vec<(String, usize)> = registry
             .folded()
             .iter()
@@ -145,17 +149,15 @@ pub fn snapshot() -> Option<Snapshot> {
                 if path.is_empty() {
                     return None;
                 }
-                let (live, _, peak, _, _) = state.stats.get(usize::try_from(id).ok()?)?.row();
-                // A workload that released everything still has a story: its stack
-                // held `peak` bytes. Live wins when it is non-zero.
-                let bytes = if live > 0 { live } else { peak };
-                if bytes == 0 {
+                let (live, _, peak, _, allocs) = state.stats.get(usize::try_from(id).ok()?)?.row();
+                let weight = folded_weight(live, peak, allocs, weight_allocs);
+                if weight == 0 {
                     return None;
                 }
                 // Recorded innermost-first; a folded stack is root-first.
                 let mut names: Vec<&str> = path.iter().map(String::as_str).collect();
                 names.reverse();
-                Some((names.join(";"), bytes))
+                Some((names.join(";"), weight))
             })
             .collect();
         folded.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -303,6 +305,18 @@ fn render_text(snapshot: &Snapshot) -> String {
     out
 }
 
+/// The number a folded stack is ranked by: live bytes, peak when the workload
+/// released everything, or the symbol's allocation count in `allocs` mode.
+const fn folded_weight(live: usize, peak: usize, allocs: usize, allocs_mode: bool) -> usize {
+    if allocs_mode {
+        allocs
+    } else if live > 0 {
+        live
+    } else {
+        peak
+    }
+}
+
 fn render_folded(snapshot: &Snapshot) -> String {
     let mut out = String::new();
     for (stack, live) in &snapshot.folded {
@@ -314,6 +328,18 @@ fn render_folded(snapshot: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folded_weight_prefers_live_then_peak_unless_allocs_mode() {
+        assert_eq!(folded_weight(120, 500, 40, false), 120, "live wins");
+        assert_eq!(folded_weight(0, 500, 40, false), 500, "peak stands in");
+        assert_eq!(folded_weight(120, 500, 40, true), 40, "allocs mode");
+        assert_eq!(
+            folded_weight(120, 500, 0, true),
+            0,
+            "a symbol with no allocation has no row"
+        );
+    }
 
     fn snapshot_with(rows: Vec<Row>, folded: Vec<(String, usize)>) -> Snapshot {
         Snapshot {

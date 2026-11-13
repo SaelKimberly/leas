@@ -12,6 +12,7 @@ categories = ["network-programming"]
 rust-version.workspace = true
 
 [dependencies]
+compact_str.workspace = true
 # ============ Geo ============
 # 0.32 REMOVED the `simdutf8` feature outright (upstream measured no win on
 # production GeoIP2 databases), so the whole feature list is deleted rather

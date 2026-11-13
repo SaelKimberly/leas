@@ -100,7 +100,10 @@ async fn connect_encrypted(
             });
         }
     }
-    let request = header::encode_request(&uuid, &ctx.target, header::CMD_TCP, None)?;
+    // Built straight into the buffer the wrapper will own: one allocation for
+    // the header, grown in place by the first payload.
+    let mut request = Vec::with_capacity(header::HEADER_RESERVE);
+    header::encode_request_into(&mut request, &uuid, &ctx.target, header::CMD_TCP, None)?;
     // The header waits in the wrapper and leaves with the first payload: one
     // carrier write instead of a small telltale record, and connect no longer
     // parks on a write (the relay's idle bound is the outer timeout).
@@ -119,7 +122,8 @@ async fn connect_plain(
     stream: BoxStream,
     uuid: [u8; 16],
 ) -> Result<BoxStream, NativeError> {
-    let request = header::encode_request(&uuid, &ctx.target, header::CMD_TCP, None)?;
+    let mut request = Vec::with_capacity(header::HEADER_RESERVE);
+    header::encode_request_into(&mut request, &uuid, &ctx.target, header::CMD_TCP, None)?;
     Ok(Box::new(VlessClientStream::with_ack_slot(
         Box::new(HeaderFirst::new(stream, request)),
         ctx.ack.clone(),
@@ -173,11 +177,13 @@ async fn connect_vision_over(
     // Step 2: request header with the flow addon (addon_len = 18; the
     // udp443 variant's addon is truncated to `xtls-rprx-vision` — spec
     // §4.3).
-    let request = header::encode_request(
+    let mut preamble = Vec::with_capacity(header::HEADER_RESERVE);
+    header::encode_request_into(
+        &mut preamble,
         &uuid,
         &ctx.target,
         header::CMD_TCP,
-        header::encode_addons(flow).as_deref(),
+        header::encode_addons(flow),
     )?;
     // The camouflage frame — one empty long-padding Continue frame carrying
     // the UUID — rides in front of the same first write as the header (xray
@@ -185,7 +191,6 @@ async fn connect_vision_over(
     // spec §9 deviation 1). The camouflage consumes the writer's UUID, so the
     // codec's own frames never carry one.
     let camo = VisionStream::<BoxStream>::camouflage_frame(&uuid);
-    let mut preamble = request;
     preamble.extend_from_slice(&camo);
 
     // Wrap the secured stream in the padded codec, with the response-header
@@ -437,18 +442,19 @@ async fn connect_mux_vision(
     // Step 2: request header with the flow addon (addon_len = 18; the
     // udp443 variant's addon is truncated to `xtls-rprx-vision` — spec
     // §4.3).
-    let request = header::encode_request(
+    let mut preamble = Vec::with_capacity(header::HEADER_RESERVE);
+    header::encode_request_into(
+        &mut preamble,
         &uuid,
         &mux_header_target(),
         header::CMD_MUX,
-        header::encode_addons(flow).as_deref(),
+        header::encode_addons(flow),
     )?;
     // Step 3: the camouflage frame — one empty long-padding Continue frame
     // carrying the UUID, right after the header (same wire bytes as the
     // TCP vision path, spec §4.6 step 3 deviation 1). Both wait for the first
     // padded frame (`first_flight`).
     let camo = VisionStream::<BoxStream>::camouflage_frame(&uuid);
-    let mut preamble = request;
     preamble.extend_from_slice(&camo);
 
     // The response-header peel, THEN the vision codec, then the
@@ -830,7 +836,7 @@ mod tests {
         let mut expected = vec![0x00];
         expected.extend_from_slice(&uuid);
         expected.push(18); // addon_len
-        expected.extend_from_slice(&addons);
+        expected.extend_from_slice(addons);
         expected.push(header::CMD_MUX);
         let mut got = vec![0u8; 1 + 16 + 1 + 18 + 1];
         peer.read_exact(&mut got).await.unwrap();
@@ -977,7 +983,7 @@ mod tests {
         let mut expected = vec![0x00];
         expected.extend_from_slice(&uuid);
         expected.push(18); // addon_len
-        expected.extend_from_slice(&addons);
+        expected.extend_from_slice(addons);
         expected.push(0x03); // cmd MUX
         let mut got = vec![0u8; 1 + 16 + 1 + 18 + 1];
         peer.read_exact(&mut got).await.unwrap();

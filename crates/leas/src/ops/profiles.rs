@@ -394,8 +394,21 @@ pub async fn reload_groups(state: &mut AppState) {
 pub async fn reload_routing_rules(state: &mut AppState) {
     match state.db.get_all_routing_rules().await {
         Ok(rules) => {
+            // Recompiling the engine is a full geo parse; showing a pane or
+            // re-reading unchanged rows must not pay it.
+            let changed = rules != state.routing_rules;
             state.routing_rules = rules;
             state.routing_rules_load_failed = false;
+            // Skip the compile only when the rows are unchanged AND the slot
+            // already holds a result: an empty slot must still be filled,
+            // because the route gate refuses a fetch while nothing is compiled.
+            let installed = {
+                let slot = state.routing_engine.read();
+                slot.engine.is_some() || slot.error.is_some()
+            };
+            if changed || !installed {
+                state.spawn_routing_engine_rebuild();
+            }
         }
         Err(error) => {
             // A transient read error must not wipe routing (fail closed), and
@@ -405,10 +418,8 @@ pub async fn reload_routing_rules(state: &mut AppState) {
                 target: "tui::ops::profiles",
                 "routing rules unavailable; keeping the previous snapshot: {error}"
             );
-            return;
         }
     }
-    state.spawn_routing_engine_rebuild();
 }
 
 /// The loaded page, in display order. The page IS the filtered list: the query

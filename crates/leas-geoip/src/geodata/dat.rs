@@ -17,7 +17,8 @@
 //! and only requested categories are decoded. Nothing is vendored; the files
 //! come from the configured release URLs.
 
-use std::collections::{HashMap, HashSet};
+use compact_str::CompactString;
+use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -31,13 +32,13 @@ const MAX_ENTRY: u64 = 256 << 20;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GeoDomains {
     /// `Full` entries: exact host match.
-    pub exact: Vec<String>,
+    pub exact: Vec<CompactString>,
     /// `Domain` entries: the bare host and every subdomain.
-    pub suffix: Vec<String>,
+    pub suffix: Vec<CompactString>,
     /// `Substr` entries.
-    pub keywords: Vec<String>,
+    pub keywords: Vec<CompactString>,
     /// `Regex` entries, verbatim (the engine compiles them).
-    pub regexes: Vec<String>,
+    pub regexes: Vec<CompactString>,
 }
 
 impl GeoDomains {
@@ -130,41 +131,69 @@ fn parse_ip_token(raw: &str) -> anyhow::Result<IpToken> {
 /// # Errors
 /// I/O, malformed-protobuf, empty token, and unknown-code errors.
 pub fn load_geosite(path: &Path, tokens: &[String]) -> anyhow::Result<Vec<(String, GeoDomains)>> {
-    let parsed = tokens
+    let mut parsed = tokens
         .iter()
         .map(|t| parse_site_token(t))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let wanted: HashSet<&str> = parsed.iter().map(|t| t.code.as_str()).collect();
-    let mut raw: HashMap<String, Vec<RawDomain>> = HashMap::new();
+    // code -> the tokens that want it (several may, with different attrs).
+    let mut wanted: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, token) in parsed.iter().enumerate() {
+        wanted.entry(token.code.as_str()).or_default().push(index);
+    }
+    let mut domains: Vec<GeoDomains> = vec![GeoDomains::default(); parsed.len()];
+    let mut seen = vec![false; parsed.len()];
+    let mut scratch: Vec<RawDomain> = Vec::new();
     scan_entries(path, |code, entry| {
-        if !wanted.contains(code) {
+        let Some(indices) = wanted.get(code) else {
             return Ok(());
+        };
+        for &index in indices {
+            // Decoded once per requesting token; the common case is one.
+            scratch.clear();
+            decode_site_entry_into(&mut scratch, entry)
+                .with_context(|| format!("{}: category {code:?}", path.display()))?;
+            let attrs = &parsed[index].attrs;
+            let target = &mut domains[index];
+            for domain in &mut scratch {
+                if !attrs.iter().all(|want| domain.attrs.contains(want)) {
+                    continue;
+                }
+                let mut value = std::mem::take(&mut domain.value);
+                match domain.kind {
+                    0 => {
+                        value.make_ascii_lowercase();
+                        target.keywords.push(value);
+                    }
+                    1 => target.regexes.push(value),
+                    2 => {
+                        value.make_ascii_lowercase();
+                        target.suffix.push(value);
+                    }
+                    3 => {
+                        value.make_ascii_lowercase();
+                        target.exact.push(value);
+                    }
+                    _ => {}
+                }
+            }
+            seen[index] = true;
         }
-        let domains = decode_site_entry(entry)
-            .with_context(|| format!("{}: category {code:?}", path.display()))?;
-        raw.entry(code.to_owned()).or_default().extend(domains);
+        // Keep the outer capacity: a scan touches thousands of entries.
+        scratch.clear();
         Ok(())
     })?;
-    if let Some(missing) = parsed.iter().find(|t| !raw.contains_key(&t.code)) {
-        bail!("{}: no geosite category {:?}", path.display(), missing.code);
+    if let Some(missing) = parsed
+        .iter()
+        .zip(&seen)
+        .find_map(|(token, seen)| (!seen).then_some(&token.code))
+    {
+        bail!("{}: no geosite category {:?}", path.display(), missing);
     }
     let mut out = Vec::with_capacity(parsed.len());
-    for token in parsed {
-        let mut domains = GeoDomains::default();
-        for domain in &raw[&token.code] {
-            if !token.attrs.iter().all(|want| domain.attrs.contains(want)) {
-                continue;
-            }
-            match domain.kind {
-                0 => domains.keywords.push(domain.value.to_ascii_lowercase()),
-                1 => domains.regexes.push(domain.value.clone()),
-                2 => domains.suffix.push(domain.value.to_ascii_lowercase()),
-                3 => domains.exact.push(domain.value.to_ascii_lowercase()),
-                _ => {}
-            }
-        }
+    for (index, token) in parsed.iter_mut().enumerate() {
+        let mut domains = std::mem::take(&mut domains[index]);
         normalize(&mut domains);
-        out.push((token.raw, domains));
+        out.push((std::mem::take(&mut token.raw), domains));
     }
     Ok(out)
 }
@@ -194,27 +223,38 @@ pub fn load_geoip_lenient(path: &Path, tokens: &[String]) -> anyhow::Result<GeoI
         .iter()
         .map(|t| parse_ip_token(t))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let wanted: HashSet<&str> = parsed.iter().map(|t| t.code.as_str()).collect();
-    let mut raw: HashMap<String, (Vec<(IpAddr, u8)>, bool)> = HashMap::new();
+    let mut slots: Vec<IpSlot> = Vec::new();
+    let mut by_code: HashMap<String, usize> = HashMap::new();
+    for token in &parsed {
+        by_code.entry(token.code.clone()).or_insert_with(|| {
+            slots.push(IpSlot {
+                cidrs: Vec::new(),
+                reverse: false,
+                seen: false,
+            });
+            slots.len() - 1
+        });
+    }
     scan_entries(path, |code, entry| {
-        if !wanted.contains(code) {
+        let Some(&slot) = by_code.get(code) else {
             return Ok(());
-        }
-        let (cidrs, reverse) = decode_ip_entry(entry)
+        };
+        let reverse = decode_ip_entry_into(&mut slots[slot].cidrs, entry)
             .with_context(|| format!("{}: category {code:?}", path.display()))?;
-        let slot = raw.entry(code.to_owned()).or_default();
-        slot.0.extend(cidrs);
-        slot.1 |= reverse;
+        slots[slot].reverse |= reverse;
+        slots[slot].seen = true;
         Ok(())
     })?;
     let mut out = GeoIpLoad::default();
     for token in parsed {
-        let Some((cidrs, record_reverse)) = raw.get(&token.code) else {
+        let slot = &slots[by_code[token.code.as_str()]];
+        if !slot.seen {
             out.missing.push(token.code);
             continue;
-        };
-        let reverse = token.reverse ^ record_reverse;
-        let nets = cidrs
+        }
+        let reverse = token.reverse ^ slot.reverse;
+        let nets = slot
+            .cidrs
             .iter()
             .map(|&(addr, prefix)| GeoNet {
                 addr,
@@ -255,14 +295,26 @@ pub fn validate(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(codes)
 }
 
+/// One `geoip:` category while the scan runs: its ranges, the record-level
+/// reverse flag OR-ed across split entries, and whether the file carried it.
+struct IpSlot {
+    cidrs: Vec<(IpAddr, u8)>,
+    reverse: bool,
+    seen: bool,
+}
+
 #[derive(Debug)]
 struct RawDomain {
     kind: u64,
-    value: String,
+    value: CompactString,
     attrs: Vec<String>,
 }
 
 /// Calls `f(code, entry_payload)` for every top-level entry.
+///
+/// The entry buffer and the code string are reused across entries: a scan
+/// touches thousands of entries and allocating both per entry was most of its
+/// allocation count.
 fn scan_entries<F>(path: &Path, mut f: F) -> anyhow::Result<()>
 where
     F: FnMut(&str, &[u8]) -> anyhow::Result<()>,
@@ -270,21 +322,26 @@ where
     let file =
         std::fs::File::open(path).with_context(|| format!("geodata: open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut entry = Vec::new();
+    let mut code = String::new();
     let mut entries = 0usize;
     while let Some((num, wire)) =
         read_key(&mut reader).with_context(|| format!("geodata: {}", path.display()))?
     {
         if num == 1 && wire == 2 {
-            let entry = read_len_delimited(&mut reader, MAX_ENTRY)
+            read_len_delimited_into(&mut entry, &mut reader, MAX_ENTRY)
                 .with_context(|| format!("geodata: {}", path.display()))?;
-            let mut code = None;
+            code.clear();
+            let mut has_code = false;
             for field in Fields::new(&entry) {
                 if let (1, Field::Bytes(bytes)) = field? {
-                    code = Some(String::from_utf8_lossy(bytes).to_ascii_lowercase());
+                    code.push_str(&String::from_utf8_lossy(bytes));
+                    code.make_ascii_lowercase();
+                    has_code = true;
                     break;
                 }
             }
-            if let Some(code) = code {
+            if has_code {
                 entries += 1;
                 f(&code, &entry)?;
             }
@@ -298,8 +355,7 @@ where
     Ok(())
 }
 
-fn decode_site_entry(entry: &[u8]) -> anyhow::Result<Vec<RawDomain>> {
-    let mut out = Vec::new();
+fn decode_site_entry_into(out: &mut Vec<RawDomain>, entry: &[u8]) -> anyhow::Result<()> {
     for field in Fields::new(entry) {
         let (num, value) = field?;
         let Field::Bytes(bytes) = value else { continue };
@@ -312,7 +368,11 @@ fn decode_site_entry(entry: &[u8]) -> anyhow::Result<Vec<RawDomain>> {
         for field in Fields::new(bytes) {
             match field? {
                 (1, Field::Varint(v)) => kind = v,
-                (2, Field::Bytes(b)) => text = Some(String::from_utf8_lossy(b).into_owned()),
+                // Inline for the <=24-byte hosts that dominate a geosite
+                // category; only a longer value reaches the allocator.
+                (2, Field::Bytes(b)) => {
+                    text = Some(CompactString::from(&*String::from_utf8_lossy(b)));
+                }
                 (3, Field::Bytes(attribute)) => {
                     for field in Fields::new(attribute) {
                         if let (1, Field::Bytes(key)) = field? {
@@ -327,11 +387,13 @@ fn decode_site_entry(entry: &[u8]) -> anyhow::Result<Vec<RawDomain>> {
             out.push(RawDomain { kind, value, attrs });
         }
     }
-    Ok(out)
+    Ok(())
 }
 
-fn decode_ip_entry(entry: &[u8]) -> anyhow::Result<(Vec<(IpAddr, u8)>, bool)> {
-    let mut cidrs = Vec::new();
+/// Decodes one geoip entry into `cidrs` (cleared first); returns the record's
+/// reverse flag.
+fn decode_ip_entry_into(cidrs: &mut Vec<(IpAddr, u8)>, entry: &[u8]) -> anyhow::Result<bool> {
+    cidrs.clear();
     let mut reverse = false;
     for field in Fields::new(entry) {
         match field? {
@@ -369,7 +431,7 @@ fn decode_ip_entry(entry: &[u8]) -> anyhow::Result<(Vec<(IpAddr, u8)>, bool)> {
             _ => {}
         }
     }
-    Ok((cidrs, reverse))
+    Ok(reverse)
 }
 
 fn normalize(domains: &mut GeoDomains) {
@@ -513,14 +575,19 @@ fn read_uvarint<R: Read>(reader: &mut R) -> anyhow::Result<u64> {
     }
 }
 
-fn read_len_delimited<R: Read>(reader: &mut R, cap: u64) -> anyhow::Result<Vec<u8>> {
+fn read_len_delimited_into<R: Read>(
+    bytes: &mut Vec<u8>,
+    reader: &mut R,
+    cap: u64,
+) -> anyhow::Result<()> {
     let len = read_uvarint(reader)?;
     if len > cap {
         bail!("geodata: entry of {len} bytes exceeds the {cap}-byte cap");
     }
-    let mut bytes = vec![0u8; usize::try_from(len)?];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes)
+    bytes.clear();
+    bytes.resize(usize::try_from(len)?, 0);
+    reader.read_exact(bytes)?;
+    Ok(())
 }
 
 fn skip<R: Read>(reader: &mut R, wire: u8) -> anyhow::Result<()> {

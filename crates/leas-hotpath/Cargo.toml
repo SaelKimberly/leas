@@ -14,6 +14,8 @@ default-run = "leas-hotpath"
 
 [dependencies]
 leas-native = { path = "../leas-native", version = "0.1.0" }
+# `memtrace`'s `geosite` workload measures the geo loader in isolation.
+leas-geoip = { path = "../leas-geoip", version = "0.1.0" }
 leas-tls = { workspace = true }
 # The tracer the `memtrace` bin installs as this binary's process allocator.
 leas-memtrace = { path = "../leas-memtrace", version = "0.1.0" }

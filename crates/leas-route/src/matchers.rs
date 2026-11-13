@@ -2,6 +2,7 @@
 
 use crate::addr::Cidr;
 use crate::error::RouteError;
+use compact_str::CompactString;
 use daachorse::DoubleArrayAhoCorasick;
 use memchr::memchr;
 use rapidhash::RapidHashSet;
@@ -13,13 +14,13 @@ use std::net::{IpAddr, Ipv6Addr};
 #[derive(Debug, Clone, Default)]
 pub struct DomainRulesSpec {
     /// Exact hostnames.
-    pub exact: Vec<String>,
+    pub exact: Vec<CompactString>,
     /// Matched as parent domains (`sub.example.com` matches suffix `example.com`).
-    pub suffix: Vec<String>,
+    pub suffix: Vec<CompactString>,
     /// Substring keywords.
-    pub keywords: Vec<String>,
+    pub keywords: Vec<CompactString>,
     /// Regular expressions over the hostname.
-    pub regexes: Vec<String>,
+    pub regexes: Vec<CompactString>,
 }
 
 /// A [`DomainRulesSpec`] with no rules.
@@ -35,8 +36,8 @@ pub struct CompiledDomain {
     // attacker can only choose the probed host, never the stored set, so the
     // per-process random seed is the accepted trade — same boundary as the
     // telemetry maps.
-    exact: RapidHashSet<String>,
-    suffix: RapidHashSet<String>,
+    exact: RapidHashSet<CompactString>,
+    suffix: RapidHashSet<CompactString>,
     // Boxed: daachorse's automaton is 168 bytes inline (vs aho-corasick's
     // 24-byte internal box), which alone pushed `ItemMatcher::Domain` over the
     // `large_size_differences_between_variants` gate.
@@ -57,14 +58,24 @@ impl CompiledDomain {
     /// Returns [`RouteError::Parse`] when any regex fails to compile or a
     /// suffix entry is empty.
     pub fn build(spec: &DomainRulesSpec) -> Result<Self, RouteError> {
-        let lower_all = |xs: &[String]| xs.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>();
-        let exact = lower_all(&spec.exact).into_iter().collect();
+        // `matches_domain` compares against lowered entries (full-Unicode, the
+        // same mapping `str::to_lowercase` gives). Most stored values are
+        // already lowercase, so the fast path moves the inline value as-is and
+        // only a folded one pays a copy.
+        let lower_one = |s: &CompactString| {
+            if s.chars().any(char::is_uppercase) {
+                s.to_lowercase()
+            } else {
+                s.clone()
+            }
+        };
+        let exact: RapidHashSet<CompactString> = spec.exact.iter().map(lower_one).collect();
         // Suffix entries are stored dot-prefixed: a small set scans them with
         // `ends_with` (the boundary check is the leading dot itself), and a
         // large set looks each dot-prefixed host tail up directly. Leading
         // dots on the input are trimmed; empty entries are rejected.
         let mut suffix = RapidHashSet::default();
-        for s in lower_all(&spec.suffix) {
+        for s in spec.suffix.iter().map(lower_one) {
             let s = s.trim_start_matches('.');
             if s.is_empty() {
                 return Err(RouteError::Parse {
@@ -73,17 +84,21 @@ impl CompiledDomain {
                     message: "empty suffix".to_owned(),
                 });
             }
-            suffix.insert(format!(".{s}"));
+            let mut entry = CompactString::with_capacity(s.len() + 1);
+            entry.push('.');
+            entry.push_str(s);
+            suffix.insert(entry);
         }
-        let keyword_pats = lower_all(&spec.keywords);
-        let keywords = Box::new(DoubleArrayAhoCorasick::<u32>::new(&keyword_pats).map_err(
+        let keyword_pats: Vec<CompactString> = spec.keywords.iter().map(lower_one).collect();
+        let keyword_bytes: Vec<&[u8]> = keyword_pats.iter().map(CompactString::as_bytes).collect();
+        let keywords = Box::new(DoubleArrayAhoCorasick::<u32>::new(&keyword_bytes).map_err(
             |e| RouteError::Parse {
                 rule_index: 0,
                 field: "keyword",
                 message: e.to_string(),
             },
         )?);
-        let regex_pats = lower_all(&spec.regexes);
+        let regex_pats: Vec<CompactString> = spec.regexes.iter().map(lower_one).collect();
         let regexes = RegexSet::new(&regex_pats).map_err(|e| RouteError::Parse {
             rule_index: 0,
             field: "regex",
@@ -158,7 +173,7 @@ impl CompiledDomain {
 /// No allocation, O(dots) probes. The full host is never a candidate, so a
 /// suffix never matches the bare host. A trailing dot leaves the last slice
 /// as `.`-terminated (`.foo.com.`), which cannot equal `.foo.com`.
-fn suffix_hit(suffix: &RapidHashSet<String>, host: &str) -> bool {
+fn suffix_hit(suffix: &RapidHashSet<CompactString>, host: &str) -> bool {
     let bytes = host.as_bytes();
     let mut from = 0;
     while let Some(pos) = memchr(b'.', &bytes[from..]) {
@@ -404,7 +419,9 @@ mod tests {
 
     #[test]
     fn suffix_walk_over_a_large_set_keeps_label_boundaries() {
-        let mut suffix: Vec<String> = (0..16).map(|i| format!("cdn{i}.example.net")).collect();
+        let mut suffix: Vec<CompactString> = (0..16)
+            .map(|i| CompactString::from(format!("cdn{i}.example.net")))
+            .collect();
         suffix.push("foo.com".into());
         let m = CompiledDomain::build(&DomainRulesSpec {
             suffix,
@@ -422,7 +439,9 @@ mod tests {
 
     #[test]
     fn suffix_walk_handles_non_ascii_labels() {
-        let mut suffix: Vec<String> = (0..16).map(|i| format!("cdn{i}.example.net")).collect();
+        let mut suffix: Vec<CompactString> = (0..16)
+            .map(|i| CompactString::from(format!("cdn{i}.example.net")))
+            .collect();
         suffix.push("例え.テスト".into());
         let m = CompiledDomain::build(&DomainRulesSpec {
             suffix,

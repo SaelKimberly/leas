@@ -152,6 +152,21 @@ impl RouteInputs {
 /// instead of routing with a stale or empty rule set.
 pub async fn rebuild(inputs: &RouteInputs, force_refresh: bool) {
     let _guard = inputs.lock.lock().await;
+    // Single flight: several consumers that found an empty slot queue on this
+    // lock, and without a re-check each one recompiles the same generation in
+    // turn (one full geo parse per caller). A waiter for a generation that is
+    // already installed has nothing to do.
+    //
+    // A recorded error counts as installed too: the slot is fail-closed until
+    // the rows or the config change (a new generation) or an operator forces a
+    // refresh, so a transient failure does not turn every consumer into a
+    // retry loop against a broken dataset.
+    if !force_refresh {
+        let slot = inputs.cell.read();
+        if slot.generation >= inputs.generation && (slot.engine.is_some() || slot.error.is_some()) {
+            return;
+        }
+    }
     match compile_routing_engine(inputs, force_refresh).await {
         Ok((engine, inventory)) => {
             // An out-of-order older rebuild must not resurrect old rules.
@@ -637,6 +652,39 @@ mod tests {
         };
         assert!(error.is_none(), "{error:?}");
         assert!(engine.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_waiter_for_an_installed_generation_does_not_recompile() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = RouteInputs {
+            cell: new_cell(),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            cfg: AppConfig::default(),
+            rules: Vec::new(),
+            geo_ip: None,
+            dns: None,
+            dir: dir.path().to_path_buf(),
+            generation: 7,
+        };
+        rebuild(&inputs, false).await;
+        let first = inputs.cell.read().engine.clone().expect("first build");
+        // Several consumers queue on the lock when a rebuild clears the slot;
+        // the waiters for the generation that just landed must not each run
+        // another full compile.
+        rebuild(&inputs, false).await;
+        let second = inputs.cell.read().engine.clone().expect("kept engine");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a rebuild for an already-installed generation must be a no-op"
+        );
+        // `force_refresh` (the geo auto-update) always compiles.
+        rebuild(&inputs, true).await;
+        let forced = inputs.cell.read().engine.clone().expect("forced build");
+        assert!(
+            !Arc::ptr_eq(&second, &forced),
+            "a forced refresh must recompile"
+        );
     }
 
     #[tokio::test]

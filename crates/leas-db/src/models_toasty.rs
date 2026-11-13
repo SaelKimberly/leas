@@ -655,7 +655,7 @@ pub struct Group {
     pub refresh_interval: Option<i64>, // minutes; None = default 1440 (24h)
 }
 
-#[derive(Debug, Clone, toasty::Model)]
+#[derive(Debug, Clone, PartialEq, Eq, toasty::Model)]
 #[table = "routing_rules"]
 pub struct RoutingRule {
     #[key]

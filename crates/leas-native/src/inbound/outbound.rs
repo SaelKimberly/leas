@@ -7,8 +7,8 @@
 //! SOCKS5 listener wired to a remote proxy.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use leas_proto::proto_spec::ProtocolConfig;
@@ -175,6 +175,62 @@ async fn dial_direct(target: &TargetAddr) -> Result<TcpStream, NativeError> {
 const RELAY_SMALL: usize = 16 * 1024;
 const RELAY_LARGE: usize = 64 * 1024;
 
+/// Buffers kept per size class. Two per tunnel means a hundred idle buffers
+/// cover fifty concurrent tunnels at 2 MiB — the pool never becomes a cache.
+const POOL_CAP: usize = 64;
+
+/// Free lists for the two relay buffer sizes.
+///
+/// Every tunnel takes two 16 KiB buffers and a bulk flow promotes one to
+/// 64 KiB; under connection churn those are the allocator's most frequent
+/// large requests, and the contents never matter — a read fills a buffer
+/// before anything is written from it. Buffers come back on drop, so a
+/// steady-state process stops calling the allocator for relay traffic.
+struct BufferPool {
+    small: Mutex<Vec<Vec<u8>>>,
+    large: Mutex<Vec<Vec<u8>>>,
+}
+
+impl BufferPool {
+    /// The free lists are reserved to [`POOL_CAP`] up front: a return then
+    /// never grows them, which matters because `Drop` calls [`Self::put`] and
+    /// allocating while unwinding aborts.
+    fn new() -> Self {
+        Self {
+            small: Mutex::new(Vec::with_capacity(POOL_CAP)),
+            large: Mutex::new(Vec::with_capacity(POOL_CAP)),
+        }
+    }
+
+    fn take(&self, size: usize) -> Vec<u8> {
+        let slot = if size == RELAY_SMALL {
+            &self.small
+        } else {
+            &self.large
+        };
+        let mut free = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        free.pop().unwrap_or_else(|| vec![0u8; size])
+    }
+
+    fn put(&self, buf: Vec<u8>) {
+        let slot = match buf.len() {
+            RELAY_SMALL => &self.small,
+            RELAY_LARGE => &self.large,
+            _ => return,
+        };
+        let mut free = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if free.len() < POOL_CAP {
+            free.push(buf);
+        }
+    }
+}
+
+static RELAY_POOL: LazyLock<BufferPool> = LazyLock::new(BufferPool::new);
+
 /// One direction's buffer plus its promotion state.
 ///
 /// The rule lives in a type so its transition is testable without a socket: a
@@ -188,7 +244,7 @@ struct RelayBuf {
 impl RelayBuf {
     fn new() -> Self {
         Self {
-            buf: vec![0u8; RELAY_SMALL],
+            buf: RELAY_POOL.take(RELAY_SMALL),
         }
     }
 
@@ -199,13 +255,22 @@ impl RelayBuf {
     /// Record a read of `read` bytes into the current buffer.
     fn filled(&mut self, read: usize) {
         if read == self.buf.len() && self.buf.len() == RELAY_SMALL {
-            self.buf = vec![0u8; RELAY_LARGE];
+            let small = std::mem::replace(&mut self.buf, RELAY_POOL.take(RELAY_LARGE));
+            RELAY_POOL.put(small);
         }
     }
 
     #[cfg(test)]
     const fn capacity(&self) -> usize {
         self.buf.len()
+    }
+}
+
+/// A closed tunnel returns both buffers; the pool is what makes the next one
+/// free.
+impl Drop for RelayBuf {
+    fn drop(&mut self) {
+        RELAY_POOL.put(std::mem::take(&mut self.buf));
     }
 }
 
@@ -790,6 +855,46 @@ mod tests {
         );
         buf.filled(1);
         assert_eq!(buf.capacity(), RELAY_LARGE, "there is no demotion");
+    }
+
+    /// The pool is what makes a closed tunnel's buffers free for the next
+    /// one: the same allocation comes back, unmodified.
+    #[test]
+    fn pool_hands_back_the_same_allocation() {
+        let pool = BufferPool::new();
+        let buf = pool.take(RELAY_SMALL);
+        let addr = buf.as_ptr();
+        pool.put(buf);
+        let again = pool.take(RELAY_SMALL);
+        assert_eq!(
+            again.as_ptr(),
+            addr,
+            "a returned buffer must be handed out again, not reallocated"
+        );
+    }
+
+    /// The pool stays bounded and never mixes size classes or foreign vectors.
+    #[test]
+    fn pool_is_bounded_and_classified() {
+        let pool = BufferPool::new();
+        for _ in 0..POOL_CAP + 8 {
+            pool.put(vec![0u8; RELAY_SMALL]);
+        }
+        assert_eq!(
+            pool.small.lock().unwrap().len(),
+            POOL_CAP,
+            "the pool must not grow past its cap"
+        );
+        pool.put(vec![0u8; 1234]);
+        assert!(
+            pool.large.lock().unwrap().is_empty(),
+            "an unknown size is dropped, not pooled"
+        );
+        assert_eq!(
+            pool.take(RELAY_LARGE).len(),
+            RELAY_LARGE,
+            "a miss allocates"
+        );
     }
 
     /// The promotion has to be observable through the function that owns the

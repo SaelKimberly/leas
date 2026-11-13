@@ -27,28 +27,35 @@ pub fn uuid_bytes(uuid_str: &str) -> Result<[u8; 16], NativeError> {
         .map_err(|e| NativeError::Config(format!("invalid uuid {uuid_str:?}: {e}")))
 }
 
-/// Protobuf addons bytes for the flow (spec §4.1): field 1 (string Flow),
-/// tag `0x0A`, length `0x10`, 16 bytes `"xtls-rprx-vision"` → 18 bytes
-/// total. Returns `None` for empty/unknown flows (`addon_len` stays 0).
-/// The client sends no `Seed` (field 2 unset) — `addons.proto` declares
-/// `Flow = 1`.
+/// Protobuf addons bytes for the flow (spec §4.1), as a borrowed constant.
+///
+/// Field 1 (string `Flow`) is tag `0x0A`, length `0x10`, then 16 bytes of
+/// `"xtls-rprx-vision"` — 18 bytes total. `None` for empty/unknown flows
+/// (`addon_len` stays 0). The client sends no `Seed` (field 2 unset) —
+/// `addons.proto` declares `Flow = 1`.
 ///
 /// The udp443 variant is truncated to the first 16 bytes on the wire —
 /// xray `outbound.go`: `requestAddons.Flow = requestAddons.Flow[:16]`
 /// (spec §4.3) — so both vision flows encode the identical addon.
-pub(crate) fn encode_addons(flow: Option<&str>) -> Option<Vec<u8>> {
+#[must_use]
+pub fn encode_addons(flow: Option<&str>) -> Option<&'static [u8]> {
     flow.and_then(|f| {
-        let vision = match f {
-            FLOW_XTLS_RPRX_VISION | FLOW_XTLS_RPRX_VISION_UDP443 => FLOW_XTLS_RPRX_VISION,
+        match f {
+            FLOW_XTLS_RPRX_VISION | FLOW_XTLS_RPRX_VISION_UDP443 => {}
             _ => return None,
-        };
-        let mut b = Vec::with_capacity(18);
-        b.push(0x0A);
-        b.push(16);
-        b.extend_from_slice(vision.as_bytes());
-        Some(b)
+        }
+        // A wire constant: every vision connect sends these exact bytes, so
+        // the encoder hands out a slice instead of allocating a `Vec`.
+        Some(&ADDONS_VISION[..])
     })
 }
+
+/// `{ field 1 (string): "xtls-rprx-vision" }` as protobuf wire bytes:
+/// tag `0x0A`, length 16, then the 16-byte flow name.
+const ADDONS_VISION: [u8; 18] = [
+    0x0A, 16, b'x', b't', b'l', b's', b'-', b'r', b'p', b'r', b'x', b'-', b'v', b'i', b's', b'i',
+    b'o', b'n',
+];
 
 /// Encode a VLESS request header (version 0). `addons` are the flow addons
 /// from [`encode_addons`] (`None` → `addon_len` 0, the no-flow wire form).
@@ -61,6 +68,34 @@ pub fn encode_request(
     // Room for the fixed fields *and* the flow addons, so a Vision connect
     // does not realloc the header it is about to write.
     let mut out = Vec::with_capacity(32 + addons.map_or(0, <[u8]>::len));
+    encode_request_into(&mut out, uuid, target, command, addons)?;
+    Ok(out)
+}
+
+/// Room a [`HeaderFirst`] carrier reserves for its header and the frame that
+/// joins it.
+///
+/// The longest VLESS header is ~56 bytes (version + uuid + addon length +
+/// 18-byte addon + command + a 16-byte IPv6 destination) and the Vision
+/// camouflage frame is 21, so the connect path builds both here in one
+/// allocation that the join never reallocs.
+pub const HEADER_RESERVE: usize = 96;
+
+/// Append a VLESS request header to `out`.
+///
+/// The connect path appends into the buffer [`HeaderFirst`] will own: the
+/// header and the Vision camouflage frame fit the reservation, so building
+/// them costs no reallocation. The first payload (up to 16 KiB) still grows
+/// that buffer, exactly as it did when the header arrived as its own `Vec`.
+///
+/// [`HeaderFirst`]: crate::protocol::first_flight::HeaderFirst
+pub fn encode_request_into(
+    out: &mut Vec<u8>,
+    uuid: &[u8; 16],
+    target: &TargetAddr,
+    command: u8,
+    addons: Option<&[u8]>,
+) -> Result<(), NativeError> {
     out.push(VERSION);
     out.extend_from_slice(uuid);
     // addon_len is one byte; the only addon source is `encode_addons`
@@ -74,7 +109,7 @@ pub fn encode_request(
     out.push(command);
     match command {
         CMD_TCP | CMD_UDP => {
-            write_addr(&mut out, target)?;
+            write_addr(out, target)?;
         }
         // CMD_MUX (0x03) carries NO destination on the wire: xray's
         // `EncodeRequestHeader` skips the address for the Mux/Rvs commands
@@ -85,7 +120,7 @@ pub fn encode_request(
         // (`v1.mux.cool:9527`, spec §4.1) and is not encoded.
         _ => {}
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -100,6 +135,46 @@ mod tests {
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f,
         ]
+    }
+
+    #[test]
+    fn vision_addons_are_the_wire_constant() {
+        let addons = encode_addons(Some(FLOW_XTLS_RPRX_VISION)).expect("vision addons");
+        assert_eq!(
+            addons,
+            [
+                0x0A, 0x10, b'x', b't', b'l', b's', b'-', b'r', b'p', b'r', b'x', b'-', b'v', b'i',
+                b's', b'i', b'o', b'n'
+            ]
+        );
+        assert_eq!(
+            encode_addons(Some(FLOW_XTLS_RPRX_VISION_UDP443)),
+            Some(addons),
+            "both vision flows encode the identical addon"
+        );
+        assert_eq!(encode_addons(None), None);
+        assert_eq!(encode_addons(Some("xtls-rprx-direct")), None);
+    }
+
+    #[test]
+    fn encode_into_reuses_a_reserved_buffer() {
+        let target = TargetAddr::new(Host::new("127.0.0.1"), 8080);
+        let standalone = encode_request(&uuid(), &target, CMD_TCP, None).unwrap();
+        let mut out = Vec::with_capacity(HEADER_RESERVE);
+        encode_request_into(&mut out, &uuid(), &target, CMD_TCP, None).unwrap();
+        let capacity = out.capacity();
+        encode_request_into(&mut out, &uuid(), &target, CMD_TCP, None).unwrap();
+        assert_eq!(
+            out.capacity(),
+            capacity,
+            "a reserved buffer must not reallocate for a header"
+        );
+        assert_eq!(&out[..standalone.len()], &standalone[..]);
+        assert_eq!(
+            &out[standalone.len()..],
+            &standalone[..],
+            "a second header must append, not overwrite"
+        );
     }
 
     #[test]
@@ -166,12 +241,12 @@ mod tests {
     fn request_header_with_flow_addons_bytes_exact() {
         let target = TargetAddr::new(Host::new("127.0.0.1"), 8080);
         let addons = encode_addons(Some("xtls-rprx-vision")).unwrap();
-        let got = encode_request(&uuid(), &target, CMD_TCP, Some(&addons)).unwrap();
+        let got = encode_request(&uuid(), &target, CMD_TCP, Some(addons)).unwrap();
         // version, uuid, addon_len=18, addons, cmd=1, port 0x1f90, type=1, 127.0.0.1
         let mut expected = vec![0x00];
         expected.extend_from_slice(&uuid());
         expected.push(18);
-        expected.extend_from_slice(&addons);
+        expected.extend_from_slice(addons);
         expected.push(0x01);
         expected.extend_from_slice(&[0x1f, 0x90, 0x01, 127, 0, 0, 1]);
         assert_eq!(got, expected);

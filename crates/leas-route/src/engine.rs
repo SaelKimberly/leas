@@ -2,7 +2,7 @@
 //! (`All`/`Any`/`Invert`) and synchronous pure first-match evaluation.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -393,6 +393,8 @@ impl Engine {
         geo_source: &GeoSource,
     ) -> Result<Self, RouteError> {
         let mut geo = GeoCompiler::new(geo_source);
+        #[cfg(feature = "geoip")]
+        geo.preload(&rs.rules)?;
         let mut rules = Vec::with_capacity(rs.rules.len());
         for (idx, rule) in rs.rules.into_iter().enumerate() {
             // Built once, here: at runtime a match only clones it. The tag is
@@ -650,6 +652,11 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
     decision
 }
 
+/// IR domain strings arrive as `String`; the matcher stores `CompactString`.
+fn compact_domains(values: Vec<String>) -> Vec<compact_str::CompactString> {
+    values.into_iter().map(Into::into).collect()
+}
+
 /// Compiles one [`crate::ir::MatchItem`] with rule-index attribution on errors.
 fn compile_item(
     item: crate::ir::MatchItem,
@@ -665,7 +672,13 @@ fn compile_item(
             regexes,
             geosite,
         } => ItemMatcher::Domain(compile_domain_item(
-            exact, suffix, keywords, regexes, &geosite, idx, geo,
+            compact_domains(exact),
+            compact_domains(suffix),
+            compact_domains(keywords),
+            compact_domains(regexes),
+            &geosite,
+            idx,
+            geo,
         )?),
         M::IpCidr {
             cidrs,
@@ -704,6 +717,15 @@ struct GeoCompiler<'a> {
     source: &'a GeoSource,
     #[cfg(feature = "geoip")]
     srs: HashMap<PathBuf, Arc<leas_geoip::geodata::srs::RuleSet>>,
+    /// `geosite:` category by raw token, parsed once per build.
+    #[cfg(feature = "geoip")]
+    site: HashMap<String, Arc<leas_geoip::geodata::GeoDomains>>,
+    /// `geoip:` ranges by raw token, parsed once per build.
+    #[cfg(feature = "geoip")]
+    ip: HashMap<String, Arc<Vec<leas_geoip::geodata::GeoNet>>>,
+    /// Category codes the `geoip.dat` does not carry (the mmdb's job).
+    #[cfg(feature = "geoip")]
+    ip_missing: HashSet<String>,
 }
 
 impl<'a> GeoCompiler<'a> {
@@ -712,7 +734,120 @@ impl<'a> GeoCompiler<'a> {
             source,
             #[cfg(feature = "geoip")]
             srs: HashMap::new(),
+            #[cfg(feature = "geoip")]
+            site: HashMap::new(),
+            #[cfg(feature = "geoip")]
+            ip: HashMap::new(),
+            #[cfg(feature = "geoip")]
+            ip_missing: HashSet::new(),
         }
+    }
+
+    /// Loads every geo token the rule set references, one scan per dataset.
+    ///
+    /// Without this the compiler scanned the whole file once per rule that
+    /// named a category (14 scans for the shipped rulesets); the parse is a
+    /// pure function of the token, so one pass serves them all.
+    #[cfg(feature = "geoip")]
+    fn preload(&mut self, rules: &[crate::ir::Rule]) -> Result<(), RouteError> {
+        let (site, ip) = collect_geo_tokens(rules);
+        if let Some(path) = self.source.geosite.clone()
+            && !site.is_empty()
+        {
+            let wanted: Vec<String> = site.iter().map(|(token, _)| token.clone()).collect();
+            match leas_geoip::geodata::load_geosite(&path, &wanted) {
+                Ok(loaded) => {
+                    for (raw, domains) in loaded {
+                        self.site.insert(raw, Arc::new(domains));
+                    }
+                }
+                // Cold path (a missing category): name the rule that asked for
+                // it instead of the first rule in the set.
+                Err(error) => {
+                    for (token, index) in &site {
+                        if let Err(token_error) =
+                            leas_geoip::geodata::load_geosite(&path, std::slice::from_ref(token))
+                        {
+                            return Err(geo_err(*index, "geosite", format!("{token_error:#}")));
+                        }
+                    }
+                    return Err(geo_err(site[0].1, "geosite", format!("{error:#}")));
+                }
+            }
+        }
+        if let Some(path) = self.source.geoip.clone()
+            && !ip.is_empty()
+        {
+            let wanted: Vec<String> = ip.iter().map(|(token, _)| token.clone()).collect();
+            let load = leas_geoip::geodata::load_geoip_lenient(&path, &wanted)
+                .map_err(|error| geo_err(ip[0].1, "geoip", format!("{error:#}")))?;
+            for (raw, nets) in load.loaded {
+                self.ip.insert(raw, Arc::new(nets));
+            }
+            self.ip_missing.extend(load.missing);
+        }
+        Ok(())
+    }
+
+    /// Domains of one `geosite:` token: taken out of the preloaded cache, or
+    /// loaded alone as a fallback.
+    ///
+    /// The value is *removed* rather than cloned: a rule consumes the vectors,
+    /// so the common case (one rule per token) reuses the preloaded parse
+    /// exactly once. A token two rules share costs one extra scan for the
+    /// second rule — the same as before the preload, never worse.
+    #[cfg(feature = "geoip")]
+    fn take_site(
+        &mut self,
+        path: &std::path::Path,
+        token: &str,
+        idx: usize,
+    ) -> Result<leas_geoip::geodata::GeoDomains, RouteError> {
+        if let Some(cached) = self.site.remove(token) {
+            return Ok(Arc::try_unwrap(cached).unwrap_or_else(|shared| (*shared).clone()));
+        }
+        let loaded = leas_geoip::geodata::load_geosite(path, &[token.to_owned()])
+            .map_err(|error| geo_err(idx, "geosite", format!("{error:#}")))?;
+        loaded
+            .into_iter()
+            .next()
+            .map(|(_, domains)| domains)
+            .ok_or_else(|| geo_err(idx, "geosite", format!("geosite:{token}: no category")))
+    }
+
+    /// Ranges of a rule's `geoip:` tokens, plus the codes the dataset lacks.
+    #[cfg(feature = "geoip")]
+    fn ip_load(
+        &mut self,
+        path: &std::path::Path,
+        tokens: &[String],
+        idx: usize,
+        field: &'static str,
+    ) -> Result<(LoadedNets, Vec<String>), RouteError> {
+        let mut nets = Vec::with_capacity(tokens.len());
+        let mut missing = Vec::new();
+        for token in tokens {
+            if let Some(cached) = self.ip.get(token) {
+                nets.push(Arc::clone(cached));
+                continue;
+            }
+            let code = geo_code(token);
+            if self.ip_missing.contains(&code) {
+                missing.push(code);
+                continue;
+            }
+            let load = leas_geoip::geodata::load_geoip_lenient(path, std::slice::from_ref(token))
+                .map_err(|error| geo_err(idx, field, format!("{error:#}")))?;
+            if let Some((_, loaded)) = load.loaded.into_iter().next() {
+                let loaded = Arc::new(loaded);
+                self.ip.insert(token.clone(), Arc::clone(&loaded));
+                nets.push(loaded);
+            } else {
+                missing.push(code.clone());
+                self.ip_missing.insert(code);
+            }
+        }
+        Ok((nets, missing))
     }
 
     #[cfg(feature = "geoip")]
@@ -749,6 +884,73 @@ fn is_country_code(code: &str) -> bool {
     code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
+/// A geo token plus the index of the rule that first referenced it.
+type GeoToken = (String, usize);
+
+/// The per-token `geoip:` ranges the cache hands to one rule.
+#[cfg(feature = "geoip")]
+type LoadedNets = Vec<Arc<Vec<leas_geoip::geodata::GeoNet>>>;
+
+/// Every `geosite:`/`geoip:` token the rule set references, with the index of
+/// the rule that first asks for it (the preload's error attribution).
+fn collect_geo_tokens(rules: &[crate::ir::Rule]) -> (Vec<GeoToken>, Vec<GeoToken>) {
+    let mut site = Vec::new();
+    let mut ip = Vec::new();
+    for (index, rule) in rules.iter().enumerate() {
+        collect_cond_tokens(&rule.cond, index, &mut site, &mut ip);
+    }
+    (site, ip)
+}
+
+fn collect_cond_tokens(
+    cond: &crate::ir::Cond,
+    index: usize,
+    site: &mut Vec<GeoToken>,
+    ip: &mut Vec<GeoToken>,
+) {
+    match cond {
+        crate::ir::Cond::All(items) => {
+            for item in items {
+                match item {
+                    crate::ir::MatchItem::Domain { geosite, .. } => {
+                        for token in geosite {
+                            push_token(site, token, index);
+                        }
+                    }
+                    crate::ir::MatchItem::IpCidr { geo_country, .. }
+                    | crate::ir::MatchItem::SourceIpCidr { geo_country, .. } => {
+                        for token in geo_country {
+                            push_token(ip, token, index);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        crate::ir::Cond::Any(children) => {
+            for child in children {
+                collect_cond_tokens(child, index, site, ip);
+            }
+        }
+        crate::ir::Cond::Invert(inner) => collect_cond_tokens(inner, index, site, ip),
+    }
+}
+
+/// The normalized category code of a geo token: trimmed, `!` stripped, lowercased.
+fn geo_code(token: &str) -> String {
+    let mut rest = token.trim();
+    while let Some(stripped) = rest.strip_prefix('!') {
+        rest = stripped;
+    }
+    rest.trim().to_ascii_lowercase()
+}
+
+fn push_token(list: &mut Vec<GeoToken>, token: &str, index: usize) {
+    if !list.iter().any(|(seen, _)| seen == token) {
+        list.push((token.to_owned(), index));
+    }
+}
+
 fn split_reverse(raw: &str) -> (bool, &str) {
     let mut reverse = false;
     let mut rest = raw;
@@ -759,19 +961,19 @@ fn split_reverse(raw: &str) -> (bool, &str) {
     (reverse, rest)
 }
 
-fn dedup_strings(list: &mut Vec<String>) {
+fn dedup_strings<T: Ord>(list: &mut Vec<T>) {
     list.sort_unstable();
     list.dedup();
 }
 
 fn compile_domain_item(
-    mut exact: Vec<String>,
-    mut suffix: Vec<String>,
-    mut keywords: Vec<String>,
-    mut regexes: Vec<String>,
+    mut exact: Vec<compact_str::CompactString>,
+    mut suffix: Vec<compact_str::CompactString>,
+    mut keywords: Vec<compact_str::CompactString>,
+    mut regexes: Vec<compact_str::CompactString>,
     geosite: &[String],
     idx: usize,
-    geo: &GeoCompiler<'_>,
+    geo: &mut GeoCompiler<'_>,
 ) -> Result<CompiledDomainItem, RouteError> {
     let mut negated_specs: Vec<DomainRulesSpec> = Vec::new();
     if !geosite.is_empty() {
@@ -784,9 +986,8 @@ fn compile_domain_item(
                     format!("geosite:{} needs geosite.dat", geosite.join(",")),
                 )
             })?;
-            let loaded = leas_geoip::geodata::load_geosite(&path, geosite)
-                .map_err(|e| geo_err(idx, "geosite", format!("{e:#}")))?;
-            for (token, domains) in loaded {
+            for token in geosite {
+                let domains = geo.take_site(&path, token, idx)?;
                 let mut spec = DomainRulesSpec {
                     exact: domains.exact,
                     suffix: domains.suffix,
@@ -830,7 +1031,7 @@ fn compile_domain_item(
 }
 
 fn compile_geo_country(
-    geo: &GeoCompiler<'_>,
+    geo: &mut GeoCompiler<'_>,
     tokens: &[String],
     idx: usize,
     field: &'static str,
@@ -843,15 +1044,14 @@ fn compile_geo_country(
         let db = geo.source.country.clone();
         let mut positive = Vec::new();
         let mut negated = Vec::new();
-        let fallback: Vec<String> = if let Some(path) = &geo.source.geoip {
-            let load = leas_geoip::geodata::load_geoip_lenient(path, tokens)
-                .map_err(|e| geo_err(idx, field, format!("{e:#}")))?;
-            for (_raw, nets) in load.loaded {
+        let fallback: Vec<String> = if let Some(path) = geo.source.geoip.clone() {
+            let (loaded, missing) = geo.ip_load(&path, tokens, idx, field)?;
+            for nets in loaded {
                 let mut pos = CidrSetBuilder::default();
                 let mut neg = CidrSetBuilder::default();
                 let mut has_pos = false;
                 let mut has_neg = false;
-                for net in nets {
+                for net in nets.iter().copied() {
                     let cidr = crate::addr::Cidr {
                         addr: net.addr,
                         bits: net.prefix,
@@ -874,8 +1074,7 @@ fn compile_geo_country(
             // Codes the dataset does not carry are the mmdb's job — but only
             // when they can BE a country code: a typo must stay a named build
             // error instead of a rule that silently never matches.
-            if let Some(missing) = load
-                .missing
+            if let Some(missing) = missing
                 .iter()
                 .find(|code| db.is_none() || !is_country_code(code))
             {
@@ -885,7 +1084,7 @@ fn compile_geo_country(
                     format!("{}: no geoip category {:?}", path.display(), missing),
                 ));
             }
-            load.missing
+            missing
         } else if db.is_none() {
             return Err(geo_err(
                 idx,
@@ -1071,8 +1270,8 @@ fn compile_srs_default(
             let extras = CompiledDomain::build(&DomainRulesSpec {
                 exact: Vec::new(),
                 suffix: Vec::new(),
-                keywords: default.keywords.clone(),
-                regexes: default.regexes.clone(),
+                keywords: compact_domains(default.keywords.clone()),
+                regexes: compact_domains(default.regexes.clone()),
             })
             .map_err(|e| reindex(e, idx))?;
             alternatives.push(CompiledCond::All(vec![ItemMatcher::SrsDomain {
@@ -2158,6 +2357,90 @@ mod geo_tests {
             &reversed.decide(&meta("sub.example.cn", 443)),
             "not-cn"
         ));
+    }
+
+    /// One parsed category serves every rule that names it: the second rule's
+    /// polarity is the token's, not the cache entry's.
+    #[test]
+    fn one_category_serves_every_rule_that_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "geosite.dat",
+            &list(&[site_entry(
+                "cn",
+                &[domain(2, "example.cn"), domain(3, "exact.cn")],
+            )]),
+        );
+        let source = GeoSource {
+            geosite: Some(path),
+            ..GeoSource::default()
+        };
+        let engine = Engine::build_with_geo(
+            rs(vec![
+                (
+                    MatchItem::Domain {
+                        exact: vec![],
+                        suffix: vec![],
+                        keywords: vec![],
+                        regexes: vec![],
+                        geosite: vec!["cn".into()],
+                    },
+                    route("cn"),
+                ),
+                (
+                    MatchItem::Domain {
+                        exact: vec![],
+                        suffix: vec![],
+                        keywords: vec![],
+                        regexes: vec![],
+                        geosite: vec!["!cn".into()],
+                    },
+                    route("not-cn"),
+                ),
+            ]),
+            &source,
+        )
+        .unwrap();
+        assert!(routed(&engine.decide(&meta("sub.example.cn", 443)), "cn"));
+        assert!(routed(&engine.decide(&meta("other.cn", 443)), "not-cn"));
+        assert!(!routed(
+            &engine.decide(&meta("sub.example.cn", 443)),
+            "not-cn"
+        ));
+    }
+
+    /// The pre-pass sees tokens nested in `Any`/`Invert` and dedupes them,
+    /// keeping the first rule that asked (the error attribution index).
+    #[test]
+    fn geo_tokens_are_collected_once_across_nested_rules() {
+        let domain = |token: &str| MatchItem::Domain {
+            exact: vec![],
+            suffix: vec![],
+            keywords: vec![],
+            regexes: vec![],
+            geosite: vec![token.into()],
+        };
+        let rule = |cond| crate::ir::Rule {
+            name: None,
+            cond,
+            action: route("x"),
+        };
+        let rules = vec![
+            rule(Cond::Any(vec![Cond::All(vec![domain("ru")])])),
+            rule(Cond::Invert(Box::new(Cond::All(vec![
+                domain("ru"),
+                MatchItem::IpCidr {
+                    cidrs: vec![],
+                    private: false,
+                    geo_country: vec!["cn".into()],
+                },
+            ])))),
+            rule(Cond::All(vec![domain("ir")])),
+        ];
+        let (site, geoip) = collect_geo_tokens(&rules);
+        assert_eq!(site, vec![("ru".to_owned(), 0), ("ir".to_owned(), 2)]);
+        assert_eq!(geoip, vec![("cn".to_owned(), 1)]);
     }
 
     #[test]

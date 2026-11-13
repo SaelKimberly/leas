@@ -3384,6 +3384,7 @@ name = "leas-geoip"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "compact_str 0.10.0",
  "flate2",
  "hex",
  "leas-hakari",
@@ -3536,6 +3537,7 @@ dependencies = [
 name = "leas-hotpath"
 version = "0.1.0"
 dependencies = [
+ "leas-geoip",
  "leas-hakari",
  "leas-memtrace",
  "leas-native",
