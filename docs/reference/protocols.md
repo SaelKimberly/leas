@@ -34,7 +34,7 @@ Legend: build = the backend can produce a valid outbound for the config; Clash =
 | 11 | Hysteria v1 | `hy` | `Hysteria1Config` | no | yes | yes | no | `hysteria://host:port?query` |
 | 12 | WireGuard | `wireguard` | `WireguardConfig` | yes | yes | yes | no | `wireguard://key@host:port?query` |
 | 13 | Naïve | `naive` | `NaiveConfig` | no | yes | yes | no | `naive+https://user:pass@host:port` |
-| 14 | AnyTLS | `any-tls` | `AnyTlsConfig` | no | yes | yes | no | `anytls://host:port?password=` |
+| 14 | AnyTLS | `any-tls` | `AnyTlsConfig` | no | yes | yes | yes | `anytls://host:port?password=` |
 | 15 | ShadowTLS | `shadow-tls` | `ShadowTlsConfig` | no | yes | yes | no | `shadowtls://host:port?password=` |
 | 16 | Tor | `tor` | `TorConfig` | no | yes | yes | no | none, JSON or Clash only |
 | 17 | SSH | `ssh` | `SshConfig` | no | yes | yes | no | none, JSON or Clash only |
@@ -497,6 +497,25 @@ sing-box only. Clash imports and exports. Native has a placeholder.
 
 - TLS is implied by the protocol, but `SecurityConfig` stays empty when the URL carries no TLS key; the builder supplies TLS.
 - No `fp` key is read.
+
+### Native client
+
+`crates/leas-native/src/protocol/anytls/` implements the full client side
+(`thirdparty/anytls-go/docs/protocol.md`):
+
+| Piece | Behaviour |
+|---|---|
+| Auth | `sha256(password) | u16 padding0 len | padding0`, sent before anything else |
+| Session | `cmd:u8 | id:u32 BE | len:u16 BE | data`; commands 0–10 |
+| Padding | the stock `stop=8` scheme; a server `cmdUpdatePaddingScheme` replaces it for later sessions of the same link |
+| Reuse | one session carries many streams; the newest idle session is taken first, idle ones are closed after 60 s (30 s scan, newest 2 kept) |
+| TCP | `cmdSYN` + `cmdPSH(SOCKS5 address)` opens a stream, `cmdFIN` closes it |
+| UDP | sing-box uot v2 on a stream to `sp.v2.udp-over-tcp.arpa`, per-packet addresses (`isConnect=false`) |
+| v2 control | `cmdServerSettings` marks the auth ack ok, `cmdAlert` marks it failed, `cmdHeartRequest` is answered; the reference's missing-`cmdSYNACK` session watchdog is deliberately not implemented |
+
+Only the first link of a chain pools sessions; a chained AnyTLS hop opens one
+stream on the session carried by its upstream tunnel. The e2e oracles are
+sing-box and mihomo (`crates/leas-oracles/tests/anytls.rs`).
 
 ### Backend coverage
 

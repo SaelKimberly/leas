@@ -8,7 +8,7 @@ A profile the engine can serve connects with no core binary, no generated config
 
 The same engine is the probe: real ping dials the native tunnel (`crates/leas/src/ops/ping_native.rs` → `leas_native::probe::fetch`), so the test path has no core lifecycle either. ADR 0004.
 
-The price is scope. The in-process core is proxy-all: one connected profile, no routing rules, no DNS server, no TUN, and six protocol kinds (`NATIVE_KINDS` in `crates/leas-native/src/capability.rs`). Anything outside that runs the subprocess core, and the gate says so.
+The price is scope. The in-process core is proxy-all: one connected profile, no routing rules, no DNS server, no TUN, and seven protocol kinds (`NATIVE_KINDS` in `crates/leas-native/src/capability.rs`). Anything outside that runs the subprocess core, and the gate says so.
 
 ## Seams
 
@@ -79,4 +79,4 @@ Tier-3 note, 2026-09-03: the vmess UDP row fails identically on the clean baseli
 - Hermetic: `cargo test -p leas-native --lib`.
 - Real-core tiers and their commands: [`reference/native-core.md`](../reference/native-core.md) § Verification tiers.
 - Workspace: `cargo test` plus `just quality-gate code`.
-- Manual: import a link for each of the six kinds, connect (no core selection needed), confirm live traffic in the Metrics pane and per-connection rows in the native activity section; kill the network mid-connection and confirm `Failed` rows; confirm SOCKS5 and HTTP CONNECT both work on the effective port, including with `mixed_port` set; set an `xray` entry in `protocol_core_overrides` and confirm the subprocess path is unchanged.
+- Manual: import a link for each of the seven kinds, connect (no core selection needed), confirm live traffic in the Metrics pane and per-connection rows in the native activity section; kill the network mid-connection and confirm `Failed` rows; confirm SOCKS5 and HTTP CONNECT both work on the effective port, including with `mixed_port` set; set an `xray` entry in `protocol_core_overrides` and confirm the subprocess path is unchanged.

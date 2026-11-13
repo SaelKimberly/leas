@@ -1781,3 +1781,72 @@ mod tests {
         assert!(sing["inbounds"][0].get("network").is_none());
     }
 }
+
+/// The AnyTLS password shared by the server configs and the client params.
+pub const ANYTLS_PASSWORD: &str = "anytls-test-password";
+
+/// AnyTLS inbound for `core`.
+///
+/// sing-box: `type: "anytls"` with a `users` array and an explicit TLS block
+/// (`protocol/anytls/inbound.go`). mihomo: an `anytls` listener whose `users`
+/// map is `user -> password` and whose certificate keys are
+/// `certificate`/`private-key` (`listener/config/anytls.go`). xray-core has no
+/// AnyTLS inbound.
+#[must_use]
+pub fn anytls_inbound(core: CoreKind, env: &ServerEnv) -> String {
+    let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
+    let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
+    match core {
+        CoreKind::SingBox => {
+            let inbound = serde_json::json!({
+                "type": "anytls", "listen": "127.0.0.1", "listen_port": env.port,
+                "users": [{ "password": ANYTLS_PASSWORD }],
+                "tls": {
+                    "enabled": true,
+                    "certificate_path": cert_path,
+                    "key_path": key_path
+                }
+            });
+            let json = serde_json::json!({
+                "log": { "level": "warn" },
+                "inbounds": [inbound],
+                "outbounds": [{ "type": "direct" }]
+            });
+            serde_json::to_string(&json).expect("anytls server config serializes")
+        }
+        CoreKind::Mihomo => {
+            let mut listener = mihomo_listener("anytls", "anytls", env);
+            let mut users = yaml_rust2::yaml::Hash::new();
+            users.insert(
+                Yaml::String("leas".into()),
+                Yaml::String(ANYTLS_PASSWORD.into()),
+            );
+            listener.insert(Yaml::String("users".into()), Yaml::Hash(users));
+            listener.insert(Yaml::String("certificate".into()), Yaml::String(cert_path));
+            listener.insert(Yaml::String("private-key".into()), Yaml::String(key_path));
+            mihomo_config(vec![listener])
+        }
+        CoreKind::Xray => {
+            panic!("xray-core has no anytls inbound — keep the row on sing-box/mihomo")
+        }
+    }
+}
+
+/// Native client params dialing an AnyTLS listener.
+///
+/// The typed config carries no TLS block: AnyTLS's TLS is implicit in the
+/// protocol, and the native dial supplies the default (cert-verified) one.
+#[must_use]
+pub fn client_params_anytls(port: u16, target: SocketAddr) -> NativeConnectParams {
+    let protocol_value = serde_json::json!({
+        "schema": "AnyTls",
+        "password": ANYTLS_PASSWORD
+    });
+    let protocol: ProtocolConfig =
+        serde_json::from_value(protocol_value).expect("anytls client config parses");
+    NativeConnectParams::new(
+        protocol,
+        EndpointEssentials::new("127.0.0.1", port),
+        TargetAddr::new(Host::Ip(target.ip()), target.port()),
+    )
+}

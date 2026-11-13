@@ -21,6 +21,7 @@ pub enum ProtocolKind {
     Trojan,
     Hysteria2,
     Shadowsocks,
+    AnyTls,
 }
 
 /// VLESS flow control: `xtls-rprx-vision` (`Vision`) or the XUDP variant
@@ -226,6 +227,30 @@ impl CaseSpec {
             obfs,
             kcp_mask: None,
             single_core: Some(CoreKind::SingBox),
+            ss_method: None,
+        }
+    }
+
+    /// An AnyTLS case: TLS is implicit (the protocol has no plaintext mode)
+    /// and the password is the only credential. Served by sing-box and
+    /// mihomo; xray-core has no AnyTLS inbound.
+    #[must_use]
+    pub fn anytls() -> Self {
+        Self {
+            protocol: ProtocolKind::AnyTls,
+            security: None,
+            tls: None,
+            network: "tcp",
+            xhttp_mode: None,
+            flow: None,
+            app: AppKind::Plain,
+            mux: false,
+            udp: None,
+            vless_enc: None,
+            pq_assert: false,
+            obfs: None,
+            kcp_mask: None,
+            single_core: None,
             ss_method: None,
         }
     }
@@ -447,6 +472,7 @@ impl E2eCase for CaseSpec {
             ProtocolKind::Trojan => "trojan",
             ProtocolKind::Hysteria2 => "hysteria2",
             ProtocolKind::Shadowsocks => "ss",
+            ProtocolKind::AnyTls => "anytls",
         };
         // The SS method is the row's identity: two SS rows differ only by it.
         let meth = self.ss_method.map_or(String::new(), |m| format!("/{m}"));
@@ -512,6 +538,7 @@ impl E2eCase for CaseSpec {
                 self.ss_method.expect("shadowsocks case requires a method"),
                 self.app == AppKind::Udp,
             ),
+            ProtocolKind::AnyTls => config::anytls_inbound(core, env),
         };
         match self.kcp_mask {
             Some((header, seed)) => config::apply_kcp_mask(&json, header, seed),
@@ -555,6 +582,7 @@ impl E2eCase for CaseSpec {
                 self.network,
                 self.ss_method.expect("shadowsocks case requires a method"),
             ),
+            ProtocolKind::AnyTls => config::client_params_anytls(port, target),
         };
         // pq-enc rows: the VLESS outbound carries the mlkem768x25519plus
         // account `encryption` (the client-side PUBLIC key segments).

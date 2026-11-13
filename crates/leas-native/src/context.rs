@@ -177,7 +177,15 @@ impl LinkContext {
         // `security::wrap` returns at its own `is_tls()` guard and a
         // `mode=websocket;tls` row performs a **plaintext** upgrade against a
         // TLS port (the corpus's most common plugin shape, 20:8014).
-        self.security().is_some_and(|s| s.tls.is_some())
+        //
+        // AnyTLS is the other mandatory-TLS family: its wire has no plaintext
+        // mode and an all-default config stores no TLS block (the clash-cycle
+        // identity collapse in `proto_spec/anytls.rs`), so the kind itself is
+        // the TLS statement — `security::wrap` supplies the default config.
+        matches!(
+            self.params.protocol,
+            leas_proto::proto_spec::ProtocolConfig::AnyTls(_)
+        ) || self.security().is_some_and(|s| s.tls.is_some())
             || self.plugin_spec().is_some_and(PluginSpec::needs_tls)
     }
 

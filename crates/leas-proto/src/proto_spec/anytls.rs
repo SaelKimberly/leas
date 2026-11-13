@@ -312,6 +312,13 @@ impl ProtoSpec for AnyTlsConfig {
         None
     }
 
+    /// The stored (possibly empty) TLS overrides. `AnyTLS`'s TLS is implicit:
+    /// an empty `security` means "TLS with defaults", so the native dial
+    /// reads this field for the explicit knobs only and supplies the rest.
+    fn security(&self) -> Option<&SecurityConfig> {
+        Some(&self.security)
+    }
+
     /// # Errors
     ///
     /// If the Clash proxy doesn't match this protocol type.

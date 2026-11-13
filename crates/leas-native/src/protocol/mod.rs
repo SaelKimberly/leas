@@ -137,9 +137,12 @@ pub fn initial_auth_ack(protocol: &ProtocolConfig) -> AuthAck {
         // write), so an unobserved ack is not a rejection — the state starts
         // unknown. Hysteria2's h3 auth exchange verifies status 233
         // (`quic.rs` `runtime_auth`): the ack exists there too.
-        ProtocolConfig::Vless(_) | ProtocolConfig::Vmess(_) | ProtocolConfig::Hysteria2(_) => {
-            AuthAck::Unknown
-        }
+        ProtocolConfig::Vless(_)
+        | ProtocolConfig::Vmess(_)
+        | ProtocolConfig::Hysteria2(_)
+        // AnyTLS: `cmdServerSettings` (Ok) and `cmdAlert` (Failed) are the
+        // only observations; a v1 server never sends either.
+        | ProtocolConfig::AnyTls(_) => AuthAck::Unknown,
         // SS2022: the response header echoes the client's salt. The same
         // laziness argument applies to the reply's arrival. Classic-AEAD
         // Shadowsocks has no server ack at all.
@@ -169,7 +172,7 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         ProtocolConfig::Socks(cfg) => socks::connect(ctx, stream, cfg).await,
         ProtocolConfig::Http(_) => not_impl("http"),
         ProtocolConfig::Naive(_) => not_impl("naive"),
-        ProtocolConfig::AnyTls(_) => not_impl("anytls"),
+        ProtocolConfig::AnyTls(cfg) => anytls::connect(ctx, stream, cfg).await,
         ProtocolConfig::ShadowTls(_) => not_impl("shadowtls"),
         ProtocolConfig::Tor(_) => not_impl("tor"),
         ProtocolConfig::Ssh(_) => not_impl("ssh"),
@@ -246,6 +249,7 @@ pub enum PacketTunnel {
     Trojan(trojan::PacketConn<BoxStream>),
     Hysteria2(hysteria2::udp::UdpConn),
     Ss(ss::udp::SsUdpTunnel),
+    AnyTls(anytls::udp::UdpConn),
 }
 
 impl PacketTunnel {
@@ -273,6 +277,7 @@ impl PacketTunnel {
             Self::Trojan(c) => c.send(dest, payload).await,
             Self::Hysteria2(c) => c.send(dest, payload).await,
             Self::Ss(c) => c.send(dest, payload).await,
+            Self::AnyTls(c) => c.send(dest, payload).await,
         }
     }
 
@@ -290,6 +295,7 @@ impl PacketTunnel {
             Self::Trojan(c) => to_bytes(c.recv().await),
             Self::Hysteria2(c) => to_bytes(c.recv().await),
             Self::Ss(c) => to_bytes(c.recv().await),
+            Self::AnyTls(c) => to_bytes(c.recv().await),
         }
     }
 }
@@ -301,6 +307,7 @@ pub enum PacketReader {
     Trojan(trojan::PacketReader<tokio::io::ReadHalf<BoxStream>>),
     Hysteria2(hysteria2::udp::UdpReader),
     Ss(ss::udp::SsUdpReader),
+    AnyTls(anytls::udp::UdpReader),
 }
 
 /// The write half of a split [`PacketTunnel`] — see [`PacketTunnel::split`].
@@ -310,6 +317,7 @@ pub enum PacketWriter {
     Trojan(trojan::PacketWriter<tokio::io::WriteHalf<BoxStream>>),
     Hysteria2(hysteria2::udp::UdpWriter),
     Ss(ss::udp::SsUdpWriter),
+    AnyTls(anytls::udp::UdpWriter),
 }
 
 impl PacketTunnel {
@@ -347,6 +355,10 @@ impl PacketTunnel {
                 let (r, w) = c.split()?;
                 Ok((PacketReader::Ss(r), PacketWriter::Ss(w)))
             }
+            Self::AnyTls(c) => {
+                let (r, w) = c.split()?;
+                Ok((PacketReader::AnyTls(r), PacketWriter::AnyTls(w)))
+            }
         }
     }
 }
@@ -366,6 +378,7 @@ impl PacketReader {
             Self::Trojan(r) => to_bytes(r.recv().await),
             Self::Hysteria2(r) => to_bytes(r.recv().await),
             Self::Ss(r) => to_bytes(r.recv().await),
+            Self::AnyTls(r) => to_bytes(r.recv().await),
         }
     }
 }
@@ -390,6 +403,7 @@ impl PacketWriter {
             Self::Trojan(w) => w.send(dest, payload).await,
             Self::Hysteria2(w) => w.send(dest, payload).await,
             Self::Ss(w) => w.send(dest, payload).await,
+            Self::AnyTls(w) => w.send(dest, payload).await,
         }
     }
 }
@@ -446,6 +460,9 @@ pub async fn connect_udp(
                 "hysteria2 udp over a stream chain (hy2 is a QUIC dial — use connect_chain_udp)"
                     .into(),
         }),
+        ProtocolConfig::AnyTls(cfg) => Ok(PacketTunnel::AnyTls(
+            anytls::connect_udp(ctx, stream, cfg).await?,
+        )),
         // SOCKS5 UDP (ASSOCIATE) datagrams ride a raw UDP socket to the proxy,
         // not this byte stream — a divergent shape with no PacketTunnel here.
         ProtocolConfig::Socks(_) => Err(NativeError::NotImplemented {

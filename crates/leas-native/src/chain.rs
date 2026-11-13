@@ -75,7 +75,10 @@ fn ss_udp_guard(
 /// finished tunnel and the engine TLS/upgrade must be skipped (spec §5.2:
 /// the QUIC dial replaces dial + security + upgrade; quinn's rustls is
 /// internal).
-async fn secured_upgraded(ctx: &LinkContext, dialed: BoxStream) -> Result<BoxStream, NativeError> {
+pub(crate) async fn secured_upgraded(
+    ctx: &LinkContext,
+    dialed: BoxStream,
+) -> Result<BoxStream, NativeError> {
     if transport::is_self_contained(ctx) {
         return Ok(dialed);
     }
@@ -168,6 +171,19 @@ pub async fn connect_chain(
             // placement rule applies (`quic_guard`).
             quic_guard(links, i, base.as_ref())?;
             base = Some(protocol::connect_quic(&ctx).await?);
+            continue;
+        }
+        // The FIRST link's AnyTLS session is pooled across connections (the
+        // protocol mandates session reuse). A later AnyTLS hop arrives with a
+        // `base` tunnel and takes the per-stream path instead, because its
+        // socket is the upstream tunnel, not a dial to the server.
+        if base.is_none()
+            && matches!(
+                ctx.params.protocol,
+                leas_proto::proto_spec::ProtocolConfig::AnyTls(_)
+            )
+        {
+            base = Some(protocol::anytls::connect_pooled(&ctx).await?);
             continue;
         }
         let dialed = transport::connect(&ctx, base).await?;

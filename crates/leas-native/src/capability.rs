@@ -30,8 +30,8 @@ use std::borrow::Cow;
 
 use leas_proto::proto_spec::common::{KcpConfig, TransportConfig};
 use leas_proto::proto_spec::{
-    Hysteria2Config, MuxSetting, PluginFamily, PluginMode, PluginSpec, ProtocolConfig,
-    ProtocolKind, SsConfig, TrojanConfig, VlessConfig, VlessMux, VmessConfig,
+    AnyTlsConfig, Hysteria2Config, MuxSetting, PluginFamily, PluginMode, PluginSpec,
+    ProtocolConfig, ProtocolKind, SsConfig, TrojanConfig, VlessConfig, VlessMux, VmessConfig,
 };
 use leas_proto::proto_spec::{
     SecurityConfig, TlsConfig,
@@ -45,8 +45,8 @@ use crate::protocol::vless::encryption::EncryptionConfig;
 /// The protocols with a native implementation, in canonical order.
 ///
 /// Must stay exactly `[Vless, Vmess, Trojan, Hysteria2, Shadowsocks,
-/// Shadowsocks2022]` — the e2e-verified protocols the TUI may Auto-resolve
-/// onto native. The two Shadowsocks kinds are separate entries because the
+/// Shadowsocks2022, AnyTls]` — the e2e-verified protocols the TUI may
+/// Auto-resolve onto native. The two Shadowsocks kinds are separate entries because the
 /// typed kind carries the cipher family (`2022-blake3-*` → `Shadowsocks2022`)
 /// even though both share one [`SsConfig`].
 pub const NATIVE_KINDS: &[ProtocolKind] = &[
@@ -56,6 +56,7 @@ pub const NATIVE_KINDS: &[ProtocolKind] = &[
     ProtocolKind::Hysteria2,
     ProtocolKind::Shadowsocks,
     ProtocolKind::Shadowsocks2022,
+    ProtocolKind::AnyTls,
 ];
 
 /// True when the protocol kind has a native implementation at all.
@@ -73,6 +74,7 @@ pub const fn kind_supported(kind: ProtocolKind) -> bool {
             | ProtocolKind::Hysteria2
             | ProtocolKind::Shadowsocks
             | ProtocolKind::Shadowsocks2022
+            | ProtocolKind::AnyTls
     )
 }
 
@@ -139,6 +141,9 @@ pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow
         (ProtocolKind::Hysteria2, ProtocolConfig::Hysteria2(cfg)) => {
             hysteria2_reason(cfg).map(Cow::Borrowed)
         }
+        (ProtocolKind::AnyTls, ProtocolConfig::AnyTls(cfg)) => {
+            anytls_reason(cfg).map(Cow::Borrowed)
+        }
         _ => Some(Cow::Borrowed("protocol kind and config type do not match")),
     }
 }
@@ -150,6 +155,7 @@ fn security_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow<'s
         (_, ProtocolConfig::Vless(c)) => &c.security,
         (_, ProtocolConfig::Vmess(c)) => &c.security,
         (_, ProtocolConfig::Trojan(c)) => &c.security,
+        (_, ProtocolConfig::AnyTls(c)) => &c.security,
         _ => return None,
     };
     if let Some(ech) = security.ech() {
@@ -351,6 +357,18 @@ fn vmess_reason(cfg: &VmessConfig) -> Option<&'static str> {
 /// never refused). So the only refusal left is the transport.
 fn trojan_reason(cfg: &TrojanConfig) -> Option<&'static str> {
     transport_reason(&cfg.transport, cfg.path.as_deref())
+}
+
+/// `AnyTLS` row: the password is the only credential, and the carrier is
+/// certificate TLS — there is no transport to upgrade and no REALITY mode.
+fn anytls_reason(cfg: &AnyTlsConfig) -> Option<&'static str> {
+    if cfg.password.as_deref().is_none_or(str::is_empty) {
+        return Some("anytls: missing password");
+    }
+    if matches!(cfg.security.tls, Some(TlsConfig::Reality(_))) {
+        return Some("anytls: REALITY security does not apply (TLS only)");
+    }
+    None
 }
 
 /// Hysteria2 row: never refused — and it MUST stay that way.
@@ -614,6 +632,14 @@ mod tests {
         }
     }
 
+    fn anytls_cfg() -> AnyTlsConfig {
+        AnyTlsConfig {
+            password: Some("secret".into()),
+            security: SecurityConfig::default(),
+            remarks: None,
+        }
+    }
+
     fn hysteria2_cfg() -> Hysteria2Config {
         Hysteria2Config {
             auth: "secret".into(),
@@ -764,7 +790,35 @@ mod tests {
                 ProtocolKind::Hysteria2,
                 ProtocolKind::Shadowsocks,
                 ProtocolKind::Shadowsocks2022,
+                ProtocolKind::AnyTls,
             ]
+        );
+    }
+
+    #[test]
+    fn anytls_password_is_the_only_required_field_and_reality_is_refused() {
+        assert!(supported(
+            ProtocolKind::AnyTls,
+            &ProtocolConfig::AnyTls(anytls_cfg())
+        ));
+        let mut missing = anytls_cfg();
+        missing.password = None;
+        assert_eq!(
+            support_reason(ProtocolKind::AnyTls, &ProtocolConfig::AnyTls(missing)).as_deref(),
+            Some("anytls: missing password")
+        );
+        let mut empty = anytls_cfg();
+        empty.password = Some(String::new());
+        assert_eq!(
+            support_reason(ProtocolKind::AnyTls, &ProtocolConfig::AnyTls(empty)).as_deref(),
+            Some("anytls: missing password")
+        );
+        // AnyTLS is certificate TLS; a REALITY block has no meaning on it.
+        let mut reality = anytls_cfg();
+        reality.security = reality_security();
+        assert_eq!(
+            support_reason(ProtocolKind::AnyTls, &ProtocolConfig::AnyTls(reality)).as_deref(),
+            Some("anytls: REALITY security does not apply (TLS only)")
         );
     }
 
@@ -1157,7 +1211,6 @@ mod tests {
             ProtocolKind::Tuic,
             ProtocolKind::Hysteria,
             ProtocolKind::Naive,
-            ProtocolKind::AnyTls,
             ProtocolKind::ShadowTls,
             ProtocolKind::Tor,
             ProtocolKind::Ssh,
@@ -1167,7 +1220,7 @@ mod tests {
             ProtocolKind::TProxy,
             ProtocolKind::Mixed,
         ];
-        assert_eq!(non_native.len(), 21);
+        assert_eq!(non_native.len(), 20);
         let fallback = ProtocolConfig::Vless(vless_cfg());
         for kind in non_native {
             assert!(!kind_supported(kind), "{kind:?}");

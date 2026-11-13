@@ -58,6 +58,24 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
     let Some(sec) = ctx.security() else {
         return Ok(stream);
     };
+    // AnyTLS's TLS is implicit in the protocol, and the row stores only the
+    // EXPLICIT overrides (an all-default block collapses to empty so the clash
+    // round-trip stays identity-stable). An empty `tls` therefore means
+    // "default TLS", never "no TLS" — the kind is the TLS statement.
+    let mandatory;
+    let sec = if sec.tls.is_none()
+        && matches!(
+            ctx.params.protocol,
+            leas_proto::proto_spec::ProtocolConfig::AnyTls(_)
+        ) {
+        mandatory = leas_proto::proto_spec::SecurityConfig {
+            tls: Some(TlsConfig::Tls(leas_proto::proto_spec::TlsOpts::default())),
+            enc: None,
+        };
+        &mandatory
+    } else {
+        sec
+    };
     let rng: Arc<dyn SecureRandom> = Arc::new(ring::rand::SystemRandom::new());
     match &sec.tls {
         Some(TlsConfig::Tls(opts)) => {
