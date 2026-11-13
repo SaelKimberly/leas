@@ -49,7 +49,7 @@ TRACE_DIR = os.environ.get("TRACE_DIR", os.path.join(ROOT, "target", "mem-trace"
 DELAY = float(os.environ.get("DELAY", "12"))
 KEYS = os.environ.get("KEYS", "")
 SOAK = os.environ.get("SOAK", "")
-TRIM = int(os.environ.get("TRIM", "3000"))
+TRIM = max(1, int(os.environ.get("TRIM", "3000")))
 TTY_LINES = int(os.environ.get("TTY_LINES", "50"))
 TTY_COLS = int(os.environ.get("TTY_COLS", "200"))
 NAMED_KEYS = {"ESC": b"\x1b", "TAB": b"\t", "ENTER": b"\r",
@@ -109,7 +109,16 @@ def stage() -> str:
     # in the source, so a leftover database from an earlier run would silently
     # become this run's dataset (that is exactly how the audit's "empty DB"
     # control measured 3 000 endpoints). The guard above ran first.
-    shutil.rmtree(dst, ignore_errors=True)
+    try:
+        shutil.rmtree(dst)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        # A wipe that cannot complete leaves the previous run's database in
+        # place, which is exactly the trap above: fail the recipe loudly.
+        print(f"trace-app: could not clear the sandbox ({error}); remove {dst} "
+              "and retry", file=sys.stderr)
+        return None
     os.makedirs(dst, exist_ok=True)
     for entry in ("data.db", "data.db-wal", "config.json", "geoip.dat", "geosite.dat",
                   "GeoLite2-City.mmdb"):
@@ -138,7 +147,7 @@ def stage() -> str:
         kept = f"select id from endpoints limit {TRIM}"
         rows = db.execute("select count(*) from endpoints").fetchone()[0]
         db.commit()
-        if rows > 5000:
+        if rows > TRIM:
             for table in ("endpoint_ip", "profile_stats", "endpoint_rank"):
                 columns = [row[1] for row in db.execute(f"pragma table_info({table})")]
                 if "endpoint_id" in columns:

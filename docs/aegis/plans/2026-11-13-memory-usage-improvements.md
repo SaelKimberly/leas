@@ -278,10 +278,12 @@ test. Until then no code change in `run` is justified.
 the forced collect (`mi_collect(true)`, the only binding that existed) and looked
 like a 24–26 % cut (126 → 93–96 MiB settled), but that gate was firing during the
 boot's own event burst — i.e. while the heap was still growing. Binding the
-non-forced `mi_collect(false)` and gating on real idle (no input, no connection,
-no running job) gave, over six A/B runs of the same 45 s script on the same
-binary (`LEAS_IDLE_PURGE=0|1`): **off 100 / 103 / 117 MiB settled, on 99 / 101 /
-99 MiB**. The workload's own spread (±17 MiB between identical off runs, because
+the call the crate already bound (`release_freed_heap`, a forced
+`mi_collect(true)`) and gating it on real idle (no input, no connection, no
+running job) gave, over six A/B runs of the same 45 s script on the same binary
+(`LEAS_IDLE_PURGE=0|1`): **off 100 / 103 / 117 MiB settled, on 99 / 101 /
+99 MiB**. The non-forced `mi_collect(false)` was bound separately and tested
+once — it reclaimed nothing measurable on the same shape. The workload's own spread (±17 MiB between identical off runs, because
 mimalloc's own delayed purge already reclaims part of the boot peak) is larger
 than the effect. The runtime path, its predicate and its knob were removed rather
 than shipped unproven; what remains is the finding, and the note that a workload

@@ -92,7 +92,7 @@ just memtrace-compare target/mem-trace/a.json target/mem-trace/b.json
 ```
 
 Prints per-module Δallocations/Δbytes, biggest change first, and refuses to diff
-artifacts whose `schema`, `rev` or `roots` differ (`--force` overrides). Two runs
+artifacts whose `schema`, `rev`, `row_grain` or `roots` differ (`--force` overrides). Two runs
 of the same binary are **not** identical: measured run-to-run band on a fixed
 workload is ±0.006 % on a traced row and ±57 % on `<untraced>` (thread timing),
 so treat small deltas on `<untraced>` as noise.

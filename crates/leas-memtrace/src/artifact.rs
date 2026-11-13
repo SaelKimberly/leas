@@ -360,7 +360,7 @@ fn render_text(snapshot: &Snapshot) -> String {
     let _ = writeln!(
         out,
         "\n{:<46} {:>12} {:>9} {:>12} {:>12} {:>9}",
-        "module", "live B", "live #", "peak B", "total B", "total #"
+        snapshot.row_grain, "live B", "live #", "peak B", "total B", "total #"
     );
     for row in &snapshot.rows {
         let _ = writeln!(
@@ -384,7 +384,11 @@ fn render_text(snapshot: &Snapshot) -> String {
             .then_with(|| b.total_bytes.cmp(&a.total_bytes))
     });
     let _ = writeln!(out, "\nby allocations (top 10)");
-    let _ = writeln!(out, "{:<46} {:>12} {:>12}", "module", "total #", "total B");
+    let _ = writeln!(
+        out,
+        "{:<46} {:>12} {:>12}",
+        snapshot.row_grain, "total #", "total B"
+    );
     for row in by_count.iter().take(10) {
         let _ = writeln!(
             out,

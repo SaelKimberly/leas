@@ -13,7 +13,7 @@
 //!
 //! `memtrace compare <a.json> <b.json> [--force]` diffs two artifacts instead of
 //! running a workload: per-module Δallocations/Δbytes, biggest change first. It
-//! refuses runs whose `schema`, `rev` or roots differ unless forced, because a
+//! refuses runs whose `schema`, `rev`, `row_grain` or roots differ unless forced, because a
 //! delta across builds is not a delta of the change under review.
 //!
 //! Unlike the allocation-count gate in `main.rs` this accepts a debug build: it
@@ -134,7 +134,7 @@ fn connect_workload(iterations: usize) {
 /// `memtrace compare a.json b.json [--force]`: per-module deltas between two
 /// artifacts, sorted by absolute allocation change.
 ///
-/// Refuses to diff runs whose `rev`, `schema` or roots differ, because a delta
+/// Refuses to diff runs whose `rev`, `schema`, `row_grain` or roots differ, because a delta
 /// across builds is not a delta of the change under review (`--force` overrides).
 fn compare(args: &[String]) -> ExitCode {
     let paths: Vec<&String> = args.iter().skip(1).filter(|a| *a != "--force").collect();
@@ -195,6 +195,12 @@ fn compare(args: &[String]) -> ExitCode {
         a["totals"]["allocs"],
         b["totals"]["allocs"]
     );
+    // The grain decides what a row name is; the column label follows it.
+    let label = if grain(&a) == "symbol" {
+        "symbol"
+    } else {
+        "module"
+    };
     let rows = |doc: &serde_json::Value| -> std::collections::HashMap<String, (i64, i64)> {
         doc["rows"]
             .as_array()
@@ -209,7 +215,7 @@ fn compare(args: &[String]) -> ExitCode {
             .collect()
     };
     let deltas = compare_deltas(&rows(&a), &rows(&b));
-    println!("\n{:<46} {:>12} {:>12}", "module", "Δ allocs", "Δ bytes");
+    println!("\n{:<46} {:>12} {:>12}", label, "Δ allocs", "Δ bytes");
     for (name, count, bytes) in deltas.iter().take(25) {
         println!("{name:<46} {count:>12} {bytes:>12}");
     }
