@@ -505,55 +505,29 @@ fn config_value(config: &leas_config::AppConfig, section: SettingsSection, key: 
             humantime::format_duration(*config.gui.refresh_interval_secs).to_string()
         }
         (Inbound, "socks_port") => config.inbound.socks_port.to_string(),
-        (Inbound, "http_port") => config
-            .inbound
-            .http_port
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
-        (Inbound, "mixed_port") => config
-            .inbound
-            .mixed_port
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
+        (Inbound, "http_port") => config.inbound.http_port.map_or_default(|p| p.to_string()),
+        (Inbound, "mixed_port") => config.inbound.mixed_port.map_or_default(|p| p.to_string()),
         (Inbound, "listen") => config.inbound.listen.clone(),
         (Inbound, "sniffing") => config.inbound.sniffing.to_string(),
         (SystemProxy, "enabled") => config.system_proxy.enabled.to_string(),
         (SystemProxy, "http_port") => config
             .system_proxy
             .http_port
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
+            .map_or_default(|p| p.to_string()),
         (SystemProxy, "socks_port") => config
             .system_proxy
             .socks_port
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
+            .map_or_default(|p| p.to_string()),
         (SystemProxy, "bypass") => config.system_proxy.bypass.clone().unwrap_or_default(),
         (Tun, "enabled") => config.tun.enabled.to_string(),
         (Tun, "interface_name") => config.tun.interface_name.clone().unwrap_or_default(),
-        (Tun, "mtu") => config.tun.mtu.map(|m| m.to_string()).unwrap_or_default(),
+        (Tun, "mtu") => config.tun.mtu.map_or_default(|m| m.to_string()),
         (Mux, "enabled") => config.mux.enabled.to_string(),
-        (Mux, "concurrency") => config
-            .mux
-            .concurrency
-            .map(|c| c.to_string())
-            .unwrap_or_default(),
+        (Mux, "concurrency") => config.mux.concurrency.map_or_default(|c| c.to_string()),
         (Mux, "protocol") => config.mux.protocol.clone(),
-        (Mux, "max_connections") => config
-            .mux
-            .max_connections
-            .map(|c| c.to_string())
-            .unwrap_or_default(),
-        (Mux, "min_streams") => config
-            .mux
-            .min_streams
-            .map(|c| c.to_string())
-            .unwrap_or_default(),
-        (Mux, "max_streams") => config
-            .mux
-            .max_streams
-            .map(|c| c.to_string())
-            .unwrap_or_default(),
+        (Mux, "max_connections") => config.mux.max_connections.map_or_default(|c| c.to_string()),
+        (Mux, "min_streams") => config.mux.min_streams.map_or_default(|c| c.to_string()),
+        (Mux, "max_streams") => config.mux.max_streams.map_or_default(|c| c.to_string()),
         (Mux, "padding") => config.mux.padding.to_string(),
         (Mux, "fragment_enabled") => config.mux.fragment_enabled.to_string(),
         (Mux, "fragment_packets") => config.mux.fragment_packets.clone().unwrap_or_default(),

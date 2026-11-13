@@ -13,3 +13,4 @@ ralph.yml
 
 # SDD scratch (per-plan workspaces, briefs, review packages)
 .superpowers/
+mem-audit/

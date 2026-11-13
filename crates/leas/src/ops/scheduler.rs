@@ -342,7 +342,7 @@ impl TaskScheduler {
     /// The link's gate state (the default when this process has never touched
     /// it).
     fn state_of(&self, key: (ProtocolId, EndpointId)) -> LinkTasks {
-        self.states.get(&key).map(|s| s.clone()).unwrap_or_default()
+        self.states.get(&key).map_or_default(|s| s.clone())
     }
 
     /// Write a link's gate state. The registry and the state map are only ever

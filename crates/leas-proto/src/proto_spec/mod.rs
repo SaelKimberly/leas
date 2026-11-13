@@ -331,7 +331,7 @@ pub trait ProtoSpec: ProtoIdentity {
     /// Extract country flag emojis detected in this server's remarks string.
     /// Returns deduplicated flag emojis in order of detection.
     fn country_flags(&self) -> SmallVec<[crate::urlx::TinyText; 4]> {
-        self.remarks().map(|_| SmallVec::new()).unwrap_or_default()
+        self.remarks().map_or_default(|_| SmallVec::new())
     }
     /// Parse this protocol from a Clash YAML proxy entry.
     ///

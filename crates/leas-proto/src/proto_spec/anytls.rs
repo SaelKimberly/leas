@@ -177,8 +177,7 @@ impl AnyTlsConfig {
         let fragment = self
             .remarks
             .as_ref()
-            .map(|f| format!("#{}", urlencoding::encode(f)))
-            .unwrap_or_default();
+            .map_or_default(|f| format!("#{}", urlencoding::encode(f)));
 
         Ok(format!("anytls://{hostport}{query_string}{fragment}"))
     }

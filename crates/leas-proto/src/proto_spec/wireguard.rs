@@ -226,8 +226,7 @@ impl WireguardConfig {
         let fragment = self
             .remarks
             .as_ref()
-            .map(|f| format!("#{}", urlencoding::encode(f)))
-            .unwrap_or_default();
+            .map_or_default(|f| format!("#{}", urlencoding::encode(f)));
 
         Ok(format!(
             "wireguard://{private_key}@{hostport}{query_string}{fragment}",
@@ -272,16 +271,13 @@ impl WireguardConfig {
         match proxy {
             ClashProxy::Wireguard(c) => {
                 // ClashWireGuard.ip may not have CIDR suffix; add /32 if missing
-                let address =
-                    c.ip.as_deref()
-                        .map(|ip| {
-                            if ip.contains('/') {
-                                TinyText::from(ip)
-                            } else {
-                                TinyText::from(format!("{ip}/32"))
-                            }
-                        })
-                        .unwrap_or_default();
+                let address = c.ip.as_deref().map_or_default(|ip| {
+                    if ip.contains('/') {
+                        TinyText::from(ip)
+                    } else {
+                        TinyText::from(format!("{ip}/32"))
+                    }
+                });
 
                 let config = Self {
                     private_key: c.private_key.clone(),

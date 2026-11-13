@@ -2027,8 +2027,7 @@ mod tests {
         let referer = req
             .headers()
             .get("referer")
-            .map(|v| v.to_str().unwrap_or_default().to_string())
-            .unwrap_or_default();
+            .map_or_default(|v| v.to_str().unwrap_or_default().to_string());
 
         if method == http::Method::GET {
             // Session open: `{base}/{uuid}` — never a seq segment.
@@ -2066,8 +2065,7 @@ mod tests {
             let content_type = req
                 .headers()
                 .get("content-type")
-                .map(|v| v.to_str().unwrap_or_default().to_string())
-                .unwrap_or_default();
+                .map_or_default(|v| v.to_str().unwrap_or_default().to_string());
             assert_eq!(
                 req.headers().get("x-sid"),
                 None,
@@ -2128,8 +2126,7 @@ mod tests {
             let content_type = req
                 .headers()
                 .get("content-type")
-                .map(|v| v.to_str().unwrap_or_default().to_string())
-                .unwrap_or_default();
+                .map_or_default(|v| v.to_str().unwrap_or_default().to_string());
             record(obs, |o| o.stream_reqs.push((referer, content_type)));
             let resp = http::Response::builder()
                 .status(http::StatusCode::OK)

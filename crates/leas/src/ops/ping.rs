@@ -690,10 +690,7 @@ fn dial_host(endpoint: &Endpoint, addresses: &[std::net::IpAddr]) -> String {
     if endpoint.is_dns() {
         endpoint.dns_name()
     } else {
-        addresses
-            .first()
-            .map(ToString::to_string)
-            .unwrap_or_default()
+        addresses.first().map_or_default(ToString::to_string)
     }
 }
 
@@ -3120,8 +3117,7 @@ fn plan_selected_endpoint(state: &AppState) -> Vec<PlanLink> {
         .endpoints
         .iter()
         .find(|r| r.endpoint.id.get() == ep_id)
-        .map(|row| plan_row_links(row).collect())
-        .unwrap_or_default()
+        .map_or_default(|row| plan_row_links(row).collect())
 }
 
 fn plan_row_links(row: &EndpointRow) -> impl Iterator<Item = PlanLink> + '_ {

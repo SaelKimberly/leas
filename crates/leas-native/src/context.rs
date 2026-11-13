@@ -218,8 +218,7 @@ impl LinkContext {
             .ok()
             .flatten()
             .and_then(|o| o.alpn.as_deref())
-            .map(split_alpn)
-            .unwrap_or_default()
+            .map_or_default(split_alpn)
     }
 
     /// TLS ALPN list: explicit `alpn` tokens (via [`Self::alpn_tokens`]),

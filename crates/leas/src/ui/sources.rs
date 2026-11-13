@@ -164,8 +164,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 .as_deref()
                 .map(str::trim)
                 .filter(|r| !r.is_empty())
-                .map(|r| crate::ui::textfit::truncate(r, 60))
-                .unwrap_or_default();
+                .map_or_default(|r| crate::ui::textfit::truncate(r, 60));
             let status_text = if status == "error" && !error_reason.is_empty() {
                 format!("error: {error_reason}")
             } else {
@@ -267,8 +266,7 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 state
                     .groups
                     .get(selected)
-                    .map(|g| vec![g.id.clone()])
-                    .unwrap_or_default()
+                    .map_or_default(|g| vec![g.id.clone()])
             } else {
                 masked
             };

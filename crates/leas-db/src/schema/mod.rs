@@ -196,7 +196,7 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
 async fn apply_steps(conn: &mut toasty::Connection, steps: &[steps::Step]) -> Result<()> {
     // The version this run reaches: the last step applied (each step's version
     // is what it PRODUCES), logged after the commit.
-    let target_version = steps.last().map(|step| step.version).unwrap_or_default();
+    let target_version = steps.last().map_or_default(|step| step.version);
     let mut tx = conn
         .transaction_builder()
         .mode(TransactionMode::Immediate)

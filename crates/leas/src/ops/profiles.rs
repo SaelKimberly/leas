@@ -51,8 +51,9 @@ pub async fn clear_expired_errors(db: &Database, ttl_hours: Option<i64>) {
         .filter(ProfileStats::fields().updated_at().lt(cutoff))
         .exec(&mut conn)
         .await
-        .map(|rows: Vec<ProfileStats>| rows.into_iter().map(|l| l.endpoint_id.get()).collect())
-        .unwrap_or_default();
+        .map_or_default(|rows: Vec<ProfileStats>| {
+            rows.into_iter().map(|l| l.endpoint_id.get()).collect()
+        });
     if let Err(e) = ProfileStats::filter(ProfileStats::fields().error().is_some())
         .filter(ProfileStats::fields().updated_at().lt(cutoff))
         .update()

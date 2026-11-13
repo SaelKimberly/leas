@@ -499,13 +499,10 @@ mod local {
     fn ja3_canonical(hello: &ParsedClientHello) -> String {
         let ext_types: Vec<u16> = hello.extensions.iter().map(|(t, _)| *t).collect();
         let curves = u16_list(hello.extension(0x000a));
-        let point_formats = hello
-            .extension(0x000b)
-            .map(|body| {
-                let len = usize::from(body[0]);
-                body[1..(1 + len).min(body.len())].to_vec()
-            })
-            .unwrap_or_default();
+        let point_formats = hello.extension(0x000b).map_or_default(|body| {
+            let len = usize::from(body[0]);
+            body[1..(1 + len).min(body.len())].to_vec()
+        });
         format!(
             "{},{},{},{},{}",
             hello.legacy_version,

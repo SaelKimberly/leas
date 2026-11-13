@@ -103,14 +103,13 @@ pub fn confirmation_text(state: &AppState) -> Option<String> {
                 .endpoints
                 .iter()
                 .find(|r| r.endpoint.id.get() == *id)
-                .map(|r| {
+                .map_or_default(|r| {
                     format!(
                         "{}:{}",
                         r.endpoint.display_host(&r.resolved_ips),
                         r.endpoint.port
                     )
-                })
-                .unwrap_or_default();
+                });
             format!(" Delete \"{name}\"? (y/N) ")
         }
         Some(crate::ConfirmAction::DeleteProfiles(ids)) => {
@@ -1399,8 +1398,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     .endpoints
                     .iter()
                     .find(|r| r.endpoint.id.get() == ep_id)
-                    .map(|r| r.endpoint.display_host(&r.resolved_ips))
-                    .unwrap_or_default();
+                    .map_or_default(|r| r.endpoint.display_host(&r.resolved_ips));
                 crate::ops::enrich::spawn_dns_resolve(state, ep_id, true);
                 state.log_trace("info", "tui::ui", &format!("Resolving {host} …"));
             }

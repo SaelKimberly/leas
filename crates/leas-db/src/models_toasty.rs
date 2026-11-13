@@ -8,6 +8,10 @@
 //! [`crate::database`] goes through the typed query API.
 
 #![allow(
+    clippy::used_underscore_items,
+    reason = "clippy 1.100's `used_underscore_items` fires on toasty's macro output: it reports `u64`, `i64`, `Deferred` and `EndpointId` as underscore-prefixed and points the definition at the use site. No handwritten name here begins with an underscore"
+)]
+#![allow(
     clippy::used_underscore_binding,
     reason = "toasty-macros synthesizes `_0`-named parameters in the Update builder setters for unnamed tuple fields (`EndpointId`, `ProtocolId`) and uses them; the generated impls carry the field's span so no narrower scope reaches them, and no handwritten code here uses underscore-prefixed bindings"
 )]

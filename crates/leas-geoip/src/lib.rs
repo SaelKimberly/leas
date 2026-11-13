@@ -368,9 +368,7 @@ where
 fn temp_path(dest: &Path) -> std::path::PathBuf {
     dest.with_file_name(format!(
         "{}.tmp{}",
-        dest.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
+        dest.file_name().map_or_default(|n| n.to_string_lossy()),
         std::process::id()
     ))
 }

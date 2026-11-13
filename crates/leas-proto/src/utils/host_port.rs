@@ -41,7 +41,7 @@ impl<'a> XNom<'a> for &'a str {
 }
 
 #[inline]
-const fn _unchecked_str(s: Span<'_>) -> &str {
+const fn unchecked_str(s: Span<'_>) -> &str {
     unsafe { str::from_utf8_unchecked(s) }
 }
 
@@ -88,7 +88,7 @@ pub fn ipv4(span: Span<'_>) -> RawResult<'_, Ipv4Addr> {
         char('.'),
         digit1,
     ))
-    .map(_unchecked_str)
+    .map(unchecked_str)
     .parse(span)?;
 
     let Ok(ip) = <std::net::Ipv4Addr as FromStr>::from_str(raw_ip).inspect_err(|e| {
@@ -110,7 +110,7 @@ pub fn ipv6(span: Span<'_>) -> RawResult<'_, Ipv6Addr> {
         recognize(preceded(tag("::ffff:"), ipv4)),
         recognize(separated_list1(tag(":"), hex_digit0)),
     ))
-    .map(_unchecked_str)
+    .map(unchecked_str)
     .parse(span)?;
 
     let Ok(ip) = <std::net::Ipv6Addr as FromStr>::from_str(raw_ip).inspect_err(|e| {
@@ -173,7 +173,7 @@ pub fn host_port_spec(span: Span<'_>) -> RawResult<'_, (ServerName<'_>, PortSpec
     if let Ok((tail, host_port)) = separated_pair(host, tag(":"), port_specs).parse(span) {
         Ok((tail, host_port))
     } else if let Ok((_, mut parts)) =
-        span.xnom(separated_list1(tag(":"), hex_digit0.map(_unchecked_str)))
+        span.xnom(separated_list1(tag(":"), hex_digit0.map(unchecked_str)))
     {
         let Some(last_part) = parts.pop() else {
             return Err(nom::Err::Error(Error::new(span, ErrorKind::Verify)));

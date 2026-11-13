@@ -1069,10 +1069,7 @@ impl AppState {
     }
     /// Get the first group ID for new profile assignments (no active group filter).
     pub fn first_group_id(&self) -> String {
-        self.groups
-            .first()
-            .map(|g| g.id.clone())
-            .unwrap_or_default()
+        self.groups.first().map_or_default(|g| g.id.clone())
     }
 
     /// Log to the TUI log buffer AND the actions panel.

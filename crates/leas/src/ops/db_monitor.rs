@@ -142,8 +142,7 @@ impl Registry {
             let slow = s
                 .slowest
                 .as_ref()
-                .map(|(d, sql)| format!("  slowest {d:.1}ms: {}", truncate(sql, 160)))
-                .unwrap_or_default();
+                .map_or_default(|(d, sql)| format!("  slowest {d:.1}ms: {}", truncate(sql, 160)));
             out.push(format!(
                 "  {method}: n={} p50={:.1} p99={:.1} mean={:.1} inv={} retries={} fails={}{}",
                 s.query_count,

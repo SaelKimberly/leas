@@ -296,14 +296,11 @@ async fn sweep_one(entry: GenEntry) -> Result<Row, Box<dyn std::error::Error + S
     let json: serde_json::Value = serde_json::from_slice(&raw)?;
 
     let verdict = &json["verdict"];
-    let reasons: Vec<String> = verdict["reasons"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| r["id"].as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let reasons: Vec<String> = verdict["reasons"].as_array().map_or_default(|arr| {
+        arr.iter()
+            .filter_map(|r| r["id"].as_str().map(String::from))
+            .collect()
+    });
     // Cloudflare Bot Management score lives under `server` in amiabot's
     // response; `server.httpProtocol` is present when the server echoes the
     // negotiated protocol.

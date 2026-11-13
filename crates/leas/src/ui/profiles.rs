@@ -1339,15 +1339,13 @@ fn build_display_rows(
         let outbound_flag = flag_cell(enriched_country.as_deref(), flags_supported());
 
         // Panel content
-        let panel_ips = info
-            .map(|i| {
-                i.resolved_ips
-                    .iter()
-                    .map(|ip| format!("[{ip}]"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
+        let panel_ips = info.map_or_default(|i| {
+            i.resolved_ips
+                .iter()
+                .map(|ip| format!("[{ip}]"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
         let (panel_ips, panel_resolve_hint) = if panel_ips.is_empty() {
             if row.endpoint.is_dns() {
                 ("[?]".to_string(), true)

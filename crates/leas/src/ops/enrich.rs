@@ -449,12 +449,9 @@ pub fn spawn_dns_resolve_host(
         let mut resolved_ok = true;
         // DNS lookup or direct IP parse
         let (ips, resolved_at) = match host_type {
-            HostType::Ipv4 | HostType::Ipv6 => (
-                host.parse::<IpAddr>()
-                    .map(|ip| vec![ip])
-                    .unwrap_or_default(),
-                None,
-            ),
+            HostType::Ipv4 | HostType::Ipv6 => {
+                (host.parse::<IpAddr>().map_or_default(|ip| vec![ip]), None)
+            }
             HostType::Undefined => {
                 resolved_ok = false;
                 (Vec::new(), Some(now))

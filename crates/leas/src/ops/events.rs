@@ -887,8 +887,8 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         &format!("{test_type:?} failed for {name}: {err}"),
                     );
                 } else {
-                    let latency_str = latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_default();
-                    let speed_str = speed_bps.map(|bps| format!("{bps}bps")).unwrap_or_default();
+                    let latency_str = latency_ms.map_or_default(|ms| format!("{ms}ms"));
+                    let speed_str = speed_bps.map_or_default(|bps| format!("{bps}bps"));
                     let detail = if !speed_str.is_empty() {
                         speed_str
                     } else if !latency_str.is_empty() {

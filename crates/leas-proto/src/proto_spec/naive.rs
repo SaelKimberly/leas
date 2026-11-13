@@ -120,8 +120,7 @@ impl NaiveConfig {
         let fragment = self
             .remarks
             .as_ref()
-            .map(|f| format!("#{}", urlencoding::encode(f)))
-            .unwrap_or_default();
+            .map_or_default(|f| format!("#{}", urlencoding::encode(f)));
         Ok(format!(
             "naive+https://{}:{}@{hostport}{fragment}",
             urlencoding::encode(&self.username),

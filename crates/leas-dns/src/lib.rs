@@ -222,8 +222,7 @@ async fn write_dnscrypt_cache(
         "{}.tmp{}",
         cache_file
             .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
+            .map_or_default(|n| n.to_string_lossy()),
         std::process::id()
     ));
     let write = async {

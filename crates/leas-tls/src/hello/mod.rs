@@ -88,7 +88,7 @@ impl<'a> RecordingRng<'a> {
     /// The bytes drawn so far, in draw order.
     #[must_use]
     pub fn recorded(&self) -> Vec<u8> {
-        self.log.lock().map(|l| l.clone()).unwrap_or_default()
+        self.log.lock().map_or_default(|l| l.clone())
     }
 }
 

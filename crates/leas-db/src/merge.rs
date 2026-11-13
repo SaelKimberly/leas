@@ -343,14 +343,11 @@ async fn merge_addresses(
     absorbed: EndpointId,
     addresses: &HashMap<EndpointId, Vec<(std::net::IpAddr, Option<String>)>>,
 ) -> Result<()> {
-    let have: RapidHashSet<Vec<u8>> = addresses
-        .get(&survivor)
-        .map(|ips| {
-            ips.iter()
-                .map(|(ip, _)| crate::endpoint_ip::key_of(*ip))
-                .collect()
-        })
-        .unwrap_or_default();
+    let have: RapidHashSet<Vec<u8>> = addresses.get(&survivor).map_or_default(|ips| {
+        ips.iter()
+            .map(|(ip, _)| crate::endpoint_ip::key_of(*ip))
+            .collect()
+    });
     for (ip, country) in addresses.get(&absorbed).map_or(&[][..], Vec::as_slice) {
         let key = crate::endpoint_ip::key_of(*ip);
         if have.contains(&key) {

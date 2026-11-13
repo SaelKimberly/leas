@@ -465,8 +465,7 @@ fn endpoint_addr_key(row: &EndpointRow) -> Vec<u8> {
     } else {
         row.resolved_ips
             .first()
-            .map(|ip| crate::endpoint_ip::key_of(*ip))
-            .unwrap_or_default()
+            .map_or_default(|ip| crate::endpoint_ip::key_of(*ip))
     }
 }
 

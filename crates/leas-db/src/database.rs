@@ -1950,7 +1950,7 @@ impl Database {
     pub async fn get_route_probes(&self) -> Result<Vec<String>> {
         let mut conn = self.conn().await?;
         let rows: Vec<RouteProbes> = RouteProbes::all().exec(&mut conn).await?;
-        Ok(rows.into_iter().next().map(|r| r.hosts).unwrap_or_default())
+        Ok(rows.into_iter().next().map_or_default(|r| r.hosts))
     }
 
     /// Replace the global probe-hostname list (singleton `id == "global"`).

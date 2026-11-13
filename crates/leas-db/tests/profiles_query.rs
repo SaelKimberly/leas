@@ -208,7 +208,7 @@ fn link_value(
         endpoint_id: EndpointId::new(endpoint_id),
         last_used_at: None,
         last_seen_at: ts(last_seen),
-        latency: delay.map(Latency::real).unwrap_or_default(),
+        latency: delay.map_or_default(Latency::real),
         speed_bps: None,
         error: error_kind.map(|kind| ErrorInfo {
             kind: match kind {
@@ -1188,8 +1188,7 @@ fn oracle_key(row: &leas_db::models::EndpointRow, sort: PageSort) -> OracleKey {
             } else {
                 row.resolved_ips
                     .first()
-                    .map(|ip| leas_db::endpoint_ip::key_of(*ip))
-                    .unwrap_or_default()
+                    .map_or_default(|ip| leas_db::endpoint_ip::key_of(*ip))
             };
             // band = "has a live link" (threshold ts(0)); NO_SEEN-only -> 1.
             let band = i64::from(row.links.iter().all(|l| l.purge_reason.is_some()));
