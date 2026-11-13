@@ -150,7 +150,9 @@ fn compare(args: &[String]) -> ExitCode {
     let (Ok(a), Ok(b)) = (load(left), load(right)) else {
         return ExitCode::FAILURE;
     };
-    for key in ["schema", "rev"] {
+    // `row_grain` belongs with them: a module row and a symbol row never share
+    // a name, so a diff across grain reads as every row removed and added.
+    for key in ["schema", "rev", "row_grain"] {
         if a.get(key) != b.get(key) && !force {
             eprintln!(
                 "compare: {key} differs ({:?} vs {:?}); pass --force to diff anyway",
@@ -170,9 +172,11 @@ fn compare(args: &[String]) -> ExitCode {
         b["scope"].as_str().unwrap_or("b")
     );
     println!(
-        "rev: {} | {}   allocs: {} -> {}",
+        "rev: {} | {}   rows: {} | {}   allocs: {} -> {}",
         a["rev"].as_str().unwrap_or("?"),
         b["rev"].as_str().unwrap_or("?"),
+        a["row_grain"].as_str().unwrap_or("?"),
+        b["row_grain"].as_str().unwrap_or("?"),
         a["totals"]["allocs"],
         b["totals"]["allocs"]
     );

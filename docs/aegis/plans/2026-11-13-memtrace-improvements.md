@@ -256,7 +256,7 @@ checkout), `allocator: system`, `fold: live|allocs`, and the caller's metadata
 (`start_with(roots, min_bytes, &[("bin", "leas")])`; the app and the `memtrace`
 bin both pass their name). `memtrace compare a.json b.json [--force]` prints
 per-module Δallocations/Δbytes, biggest change first, and refuses artifacts whose
-`schema`, `rev` or roots differ. Unit tests pin the delta table (added, removed,
+`schema`, `rev`, `row_grain` or roots differ. Unit tests pin the delta table (added, removed,
 changed modules) and the empty case.
 
 ### T3 — executed 2026-11-13
