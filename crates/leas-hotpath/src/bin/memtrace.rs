@@ -306,7 +306,7 @@ fn report(workload: &str, iterations: usize, artifacts: &leas_memtrace::Artifact
     });
     println!(
         "{:<52} {:>10} {:>10} {:>10}",
-        "module", "peak B", "total B", "allocs"
+        snapshot.row_grain, "peak B", "total B", "allocs"
     );
     for row in rows.iter().take(10) {
         println!(
