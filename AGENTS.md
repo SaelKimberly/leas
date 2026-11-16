@@ -35,6 +35,7 @@ This file is auto-detected project context: commands, structure, conventions. Th
 - NEVER use `ast_edit` — it corrupts session state. Use `edit`.
 - Search contents with `search`, never shell `grep`/`rg`/`awk`.
 - Display files with `read`, never `cat`/`head`/`tail`/`ls`.
+- Probe SQL shapes and `EXPLAIN QUERY PLAN` with the **tursodb CLI** (`~/.turso/tursodb`), never `sqlite3`: production runs the turso engine, and its planner differs (a `NOT IN` anti-join measures 5.4 s in turso against 22.7 ms for the `NOT EXISTS` form). Seed data with chunked `VALUES` statements — the CLI rejects recursive CTEs.
 
 ## Structure
 - `crates/leas` — binary: `main.rs`, `alloc.rs` (the process allocator + purge policy), `state.rs` (`AppState`), `types.rs`, `ops/` (connect, ping, events, scheduler — the PER-LINK ping gate —, **job_scheduler — the job queue / one-job-at-a-time gate**, profiles, enrich, subscriptions, settings, export, stream_import, **telegram — the `t.me/s/<channel>` source that feeds the same import pipeline**, db_monitor, clipboard, native_connect, ping_native, purge, compact, geodata — geo assets + the shared routing `EngineCell`, **routing_defaults — the shipped per-country rulesets**), `ui/` (profiles, settings, logs, statistics, **details** (pane-2 `Details`: three 3:6:3 sections — Server, Link, DB aggregates), **tasks** (pane-2 `Tasks`: the progress bar + the job queue), native_activity, **sniffer** (pane-1 `Sniffer`: per-host traffic for the native session), add_server, export, status_bar, theme, widgets).
