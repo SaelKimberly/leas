@@ -4355,6 +4355,47 @@ mod tests {
         let typed = row_for(&mut conn, 2).await;
         assert_eq!(bulk, typed, "bulk and typed rows must be identical");
 
+        // The columns come from the MODEL fields, never from `config`: a row
+        // whose Security embed disagrees with its JSON must store the embed's
+        // values (the typed writer reads `security.sni`/`insecure`, not
+        // `config.security`). This pins that mapping against a future refactor
+        // that derives the columns from the config.
+        let divergent = Protocol {
+            created_at: 0,
+            id: ProtocolId::new(3),
+            sig: 33,
+            proto_kind: ProtocolKind::Vless,
+            transport: tcp_transport(),
+            security: Security {
+                r#type: SecurityType::Tls,
+                sni: Some("divergent.example".to_string()),
+                fp: Some("chrome".to_string()),
+                insecure: Some(true),
+            },
+            // The default fixture's SecurityConfig is empty: no disagreement
+            // leaks in from the JSON.
+            config: Deferred::from(Json(vless_config())),
+            links: Deferred::default(),
+        };
+        Protocol::upsert_by_id(ProtocolId::new(4))
+            .sig(44)
+            .proto_kind(ProtocolKind::Vless)
+            .transport(tcp_transport())
+            .security(divergent.security.clone())
+            .config(vless_config())
+            .on_create(|create| create.created_at(now_epoch()))
+            .exec(&mut conn)
+            .await
+            .expect("typed divergent");
+        upsert_protocols_bulk(&mut conn, std::slice::from_ref(&divergent))
+            .await
+            .expect("bulk divergent");
+        assert_eq!(
+            row_for(&mut conn, 3).await,
+            row_for(&mut conn, 4).await,
+            "the embeds' columns must match the typed writer even when config disagrees"
+        );
+
         // A re-upsert of the SAME id carries a new config: it must land, while
         // `created_at` (the typed writer's on_create stamp) must not.
         let mut changed = vless_config();

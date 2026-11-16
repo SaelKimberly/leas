@@ -149,6 +149,17 @@ impl Database {
         conn.pragma_update("journal_mode", format!("'{journal}'"))
             .await
             .map_err(turso_error)?;
+        // This reader owns its own raw connection, so it inherits nothing from
+        // the driver's pool hook (`driver/mod.rs::connect`). It holds a read
+        // transaction for a whole-feed stream, so it needs the same busy-wait
+        // as the pooled writers: without it the snapshot request fails
+        // instantly with "database is locked" while an import or flush holds
+        // the writer lock, instead of queuing behind it.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(turso_error)?;
+        conn.execute("PRAGMA synchronous=NORMAL", ())
+            .await
+            .map_err(turso_error)?;
         conn.execute(
             if self.uses_concurrent_writes() {
                 "BEGIN CONCURRENT"

@@ -612,6 +612,158 @@ async fn arm_wal_autocheckpoint(pages: Option<i64>) {
     );
 }
 
+/// `backfill_all` (open-time heal) reads every address row twice: once for the
+/// min key per endpoint and once just to test membership. One grouped statement
+/// can answer both. 74k endpoints, ~1.5 addresses each.
+async fn arm_addr_scan_shape(group_by: bool) {
+    const ENDPOINTS: usize = 74_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    let mut conn = db.connection().await.expect("conn");
+    for start in (1..=ENDPOINTS).step_by(BATCH) {
+        let end = (start + BATCH).min(ENDPOINTS + 1);
+        let mut values = String::new();
+        for i in start..end {
+            for add in 0..2 {
+                if !values.is_empty() {
+                    values.push(',');
+                }
+                let _ = write!(values, "({i}, x'04{:08x}', NULL)", (i * 2 + add) as u32);
+            }
+        }
+        toasty::sql::statement(format!(
+            "INSERT INTO endpoint_ip (endpoint_id, ip_key, country) VALUES {values} \
+             ON CONFLICT(endpoint_id, ip_key) DO NOTHING"
+        ))
+        .exec(&mut conn)
+        .await
+        .expect("seed addresses");
+    }
+    let t0 = Instant::now();
+    let rows = if group_by {
+        toasty::sql::query("SELECT endpoint_id, min(ip_key) FROM endpoint_ip GROUP BY endpoint_id")
+            .exec(&mut conn)
+            .await
+            .expect("grouped")
+    } else {
+        // The old pair of scans: the ordered first-wins read, then DISTINCT.
+        let a = toasty::sql::query(
+            "SELECT endpoint_id, ip_key FROM endpoint_ip ORDER BY endpoint_id, ip_key",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("ordered");
+        let b = toasty::sql::query("SELECT DISTINCT endpoint_id FROM endpoint_ip")
+            .exec(&mut conn)
+            .await
+            .expect("distinct");
+        a.into_iter().chain(b).collect::<Vec<_>>()
+    };
+    println!(
+        "ADDR    shape={:<9} endpoints={ENDPOINTS} address_rows={} rows_returned={} wall={:>8.2?}",
+        if group_by { "group_by" } else { "two_scans" },
+        ENDPOINTS * 2,
+        rows.len(),
+        t0.elapsed()
+    );
+}
+
+/// The orphan purge runs INSIDE the merge transaction, after that pair's
+/// deletes, not in autocommit: does the anti-join hold its cost there?
+async fn arm_purge_in_tx() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    let linked = FEED * 95 / 100;
+    import_burst(&db, 1, linked, true, true).await;
+    import_burst(&db, linked, FEED, false, true).await;
+    let mut conn = db.connection().await.expect("conn");
+    let mut tx = conn.transaction().await.expect("tx");
+    // The merge shape: delete this pair's links first, then purge.
+    toasty::sql::statement("DELETE FROM profile_stats WHERE endpoint_id IN (1, 2)")
+        .exec(&mut tx)
+        .await
+        .expect("pair delete");
+    let t0 = Instant::now();
+    toasty::sql::statement(
+        "DELETE FROM protocols WHERE NOT EXISTS \
+         (SELECT 1 FROM profile_stats p WHERE p.protocol_id = protocols.id)",
+    )
+    .exec(&mut tx)
+    .await
+    .expect("purge");
+    let purge = t0.elapsed();
+    tx.commit().await.expect("commit");
+    println!(
+        "PURGE   in_tx=true protocols={FEED} orphans={} wall={purge:>8.2?}",
+        FEED - linked + 2
+    );
+}
+
+/// What the materialized ordering buys: the page's ORDER BY is index-served
+/// today; an ordering whose first term no index carries (or the same order as a
+/// window) pays a sorter over the whole table.
+async fn arm_order_cost(shape: &str) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    import_burst(&db, 1, FEED, true, true).await;
+    // Rank rows for the feed, so the ordered read has the real row count.
+    let mut conn = db.connection().await.expect("conn");
+    for start in (1..=FEED).step_by(BATCH) {
+        let end = (start + BATCH).min(FEED + 1);
+        let mut values = String::new();
+        for i in start..end {
+            if !values.is_empty() {
+                values.push(',');
+            }
+            let _ = write!(
+                values,
+                "({i}, {}, {}, 0, x'0000000000000000', 'd{i}.example', '', x'04', 1, 1, 0)",
+                i % 5,
+                i % 3
+            );
+        }
+        toasty::sql::statement(format!(
+            "INSERT OR REPLACE INTO endpoint_rank (endpoint_id, rank_bin, rank_stab, rank_proven, \
+             rank_weight, rank_domain, rank_sub_domain, rank_addr, rank_newest_seen, rank_alive, \
+             band) VALUES {values}"
+        ))
+        .exec(&mut conn)
+        .await
+        .expect("seed ranks");
+    }
+    let sql = match shape {
+        // The shipped page shape: the covering index serves the order.
+        "index" => {
+            "SELECT endpoint_id FROM endpoint_rank WHERE band = 0 \
+                    ORDER BY rank_bin, rank_stab, rank_weight DESC, rank_domain, \
+                    rank_sub_domain, rank_addr, endpoint_id LIMIT 200"
+        }
+        // Same rows, an order no index carries: a sorter over the table.
+        "sorter" => {
+            "SELECT endpoint_id FROM endpoint_rank WHERE band = 0 \
+                     ORDER BY rank_stab, rank_bin, rank_weight DESC, rank_domain, \
+                     rank_sub_domain, rank_addr, endpoint_id LIMIT 200"
+        }
+        // The window form the audit asked about: number every row, then take 200.
+        _ => {
+            "SELECT endpoint_id FROM (SELECT endpoint_id, ROW_NUMBER() OVER \
+              (ORDER BY rank_stab, rank_bin, rank_weight DESC, rank_domain, \
+              rank_sub_domain, rank_addr) AS rn FROM endpoint_rank WHERE band = 0) \
+              WHERE rn <= 200"
+        }
+    };
+    let t0 = Instant::now();
+    let rows = toasty::sql::query(sql)
+        .exec(&mut conn)
+        .await
+        .expect("order");
+    println!(
+        "ORDER   shape={shape:<7} rows={FEED} returned={} wall={:>8.2?}",
+        rows.len(),
+        t0.elapsed()
+    );
+}
+
 /// `Database::conn()` issues TWO pragmas on EVERY pooled connection: what do
 /// they cost, per call, against the work a call does?
 async fn arm_conn_setup(n_pragmas: usize) {
@@ -924,6 +1076,36 @@ async fn arm_protocol_shape(chunked: bool) {
     );
 }
 
+/// The per-connection settings moved to the driver's pool hook must actually
+/// REACH a pooled connection: `synchronous` 1 (`NORMAL`), `busy_timeout` 5000,
+/// `foreign_keys` 1. A quoted-vs-bare pragma value, or a hook that runs before
+/// the pool starts handing connections out, would leave the defaults.
+#[tokio::test]
+async fn pooled_connection_carries_the_driver_pragmas() {
+    async fn int(conn: &mut toasty::Connection, sql: &str) -> i64 {
+        let rows = toasty::sql::query(sql).exec(conn).await.expect("pragma");
+        rows.into_iter()
+            .find_map(|row| match row {
+                toasty_core::stmt::Value::Record(r) => match r.fields.first() {
+                    Some(toasty_core::stmt::Value::I64(v)) => Some(*v),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("one row")
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    let mut conn = db.connection().await.expect("conn");
+    let sync = int(&mut conn, "PRAGMA synchronous").await;
+    let busy = int(&mut conn, "PRAGMA busy_timeout").await;
+    let fk = int(&mut conn, "PRAGMA foreign_keys").await;
+    println!("PRAGMAS synchronous={sync} busy_timeout={busy} foreign_keys={fk}");
+    assert_eq!(sync, 1, "synchronous must be NORMAL (1)");
+    assert_eq!(busy, 5000, "busy_timeout must be 5000 ms");
+    assert_eq!(fk, 1, "foreign_keys must be ON");
+}
+
 /// The 0.9.0-pre.5 language surface this layer could use: the full window set
 /// (`COMPAT.md` still claims `lag`/`lead`/`ntile` are missing) and
 /// `WITH RECURSIVE`. Asserts, because a wrong answer here would silently
@@ -955,6 +1137,23 @@ async fn protocol_insert_shape() {
     for chunked in [false, true] {
         arm_protocol_shape(chunked).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn address_scan_and_order_shapes() {
+    for group_by in [false, true] {
+        arm_addr_scan_shape(group_by).await;
+    }
+    for shape in ["index", "sorter", "window"] {
+        arm_order_cost(shape).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn purge_in_transaction() {
+    arm_purge_in_tx().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -1001,16 +1001,22 @@ pub(crate) async fn prune(
     Ok(endpoint_ids.len())
 }
 
-/// The first packed address key per endpoint (for the rank `addr` tiebreak) —
-/// an IP host's literal lives in `endpoint_ip` now (db-rewamp D10).
+/// The smallest packed address key per endpoint — the rank `addr` tiebreak, and
+/// the "this endpoint has a resolved address" answer in the SAME result.
+///
+/// One grouped statement, not two whole-table reads: this used to be
+/// `SELECT endpoint_id, ip_key FROM endpoint_ip ORDER BY endpoint_id, ip_key`
+/// with a first-wins loop, plus a second full scan (`resolved_endpoint_ids`)
+/// that only tested membership. `min(ip_key)` over the PK grouping is the same
+/// key (the column is a big-endian sortable blob), and a present row means
+/// resolved.
 async fn first_ip_keys(
     conn: &mut impl toasty::Executor,
 ) -> crate::Result<std::collections::HashMap<i64, Vec<u8>>> {
-    let rows = toasty::sql::query(
-        "SELECT endpoint_id, ip_key FROM endpoint_ip ORDER BY endpoint_id, ip_key",
-    )
-    .exec(conn)
-    .await?;
+    let rows =
+        toasty::sql::query("SELECT endpoint_id, min(ip_key) FROM endpoint_ip GROUP BY endpoint_id")
+            .exec(conn)
+            .await?;
     let mut out: std::collections::HashMap<i64, Vec<u8>> = std::collections::HashMap::new();
     for row in &rows {
         let Value::Record(record) = row else { continue };
@@ -1018,7 +1024,7 @@ async fn first_ip_keys(
             continue;
         };
         if let Some(key) = record.fields.get(1).and_then(as_blob) {
-            out.entry(id).or_insert(key);
+            out.insert(id, key);
         }
     }
     Ok(out)
@@ -1039,7 +1045,8 @@ pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Res
     // distinct config, shared by every endpoint carrying it) and the deferred
     // `config` JSON stays unloaded.
     let weights = protocol_weights(conn).await?;
-    let resolved = resolved_endpoint_ids(conn).await?;
+    // One grouped read serves both the address tiebreak and the DNS flag: an
+    // endpoint with a row here has a resolved address.
     let addr_keys = first_ip_keys(conn).await?;
     let mut by_endpoint: HashMap<EndpointId, Vec<RankLink>> = HashMap::new();
     for link in links {
@@ -1065,7 +1072,10 @@ pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Res
                 &endpoint.domain,
                 &endpoint.sub_domain,
                 addr,
-                dns_unresolved_endpoint(&endpoint.domain, resolved.contains(&endpoint.id.get())),
+                dns_unresolved_endpoint(
+                    &endpoint.domain,
+                    addr_keys.contains_key(&endpoint.id.get()),
+                ),
                 &links,
             )
         })
@@ -1083,29 +1093,6 @@ pub(crate) async fn protocol_weights(
         .iter()
         .map(|p| (p.id, weight_of_protocol(p)))
         .collect())
-}
-
-/// The endpoints that have at least one resolved address, as a set.
-///
-/// The ordering law's DNS band is the only thing that reads it, and both
-/// readers (the wholesale backfill and the per-window refresh) need the same
-/// answer: "is this endpoint's address set non-empty". One grouped scan for
-/// the backfill, a correlated `EXISTS` for the window refresh.
-async fn resolved_endpoint_ids(
-    conn: &mut impl toasty::Executor,
-) -> crate::Result<std::collections::HashSet<i64>> {
-    let rows = toasty::sql::query("SELECT DISTINCT endpoint_id FROM endpoint_ip")
-        .exec(conn)
-        .await?;
-    let mut out = std::collections::HashSet::new();
-    for row in &rows {
-        if let Value::Record(record) = row
-            && let Some(Value::I64(id)) = record.fields.first()
-        {
-            out.insert(*id);
-        }
-    }
-    Ok(out)
 }
 
 /// Backfill rank rows for endpoints that have links but no row yet.

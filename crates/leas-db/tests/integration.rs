@@ -695,6 +695,54 @@ async fn reband_all_promotes_rows_the_default_backfill_demoted() {
     );
 }
 
+/// A refresh re-materializes `band` from the row's OWN newest-seen and alive
+/// columns: `band` rides the rank INSERT now (it used to be a second
+/// `UPDATE … SET band = CASE …`), so this pins the value the second statement
+/// existed for — crossing the Active TTL demotes the row without any sweep.
+#[tokio::test]
+async fn refresh_rebands_a_row_when_its_newest_link_crosses_the_ttl() {
+    async fn band(conn: &mut toasty::Connection) -> i64 {
+        let rows = toasty::sql::query("SELECT band FROM endpoint_rank WHERE endpoint_id = 1")
+            .exec(conn)
+            .await
+            .expect("read band");
+        rows.into_iter()
+            .find_map(|row| match row {
+                toasty_core::stmt::Value::Record(r) => match r.fields.first() {
+                    Some(toasty_core::stmt::Value::I64(b)) => Some(*b),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("one band")
+    }
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+    let now = leas_db::models::now_epoch();
+    let ttl = 7 * 86_400;
+    db.set_band_ttl_secs(ttl);
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, now).await;
+    seed_ranks(&db).await;
+    assert_ne!(band(&mut conn).await, 2, "a fresh link is Active");
+
+    // Age the link past the TTL, then refresh: the stored band must follow.
+    toasty::sql::query(format!(
+        "UPDATE profile_stats SET last_seen_at = {} WHERE endpoint_id = 1",
+        now - ttl - 60
+    ))
+    .exec(&mut conn)
+    .await
+    .expect("age the link");
+    db.refresh_endpoint_ranks(&[EndpointId::new(1)])
+        .await
+        .expect("refresh");
+    assert_eq!(
+        band(&mut conn).await,
+        2,
+        "aged past the TTL demotes to band 2"
+    );
+}
+
 #[tokio::test]
 async fn backfill_bands_fills_null_band_rows_on_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
