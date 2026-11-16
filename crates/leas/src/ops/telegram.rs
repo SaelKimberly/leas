@@ -158,9 +158,13 @@ fn scan_urls(text: &str) -> Vec<String> {
     let mut from = 0;
     while let Some(found) = text[from..].find("://") {
         let sep = from + found;
+        // The delimiter can be a multi-byte char (an emoji right before the
+        // scheme), so advance by its UTF-8 length, never by one byte.
         let start = text[..sep]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '+'))
-            .map_or(0, |i| i + 1);
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '+'))
+            .map_or(0, |(i, c)| i + c.len_utf8());
         let end = text[sep + 3..]
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`'))
             .map_or(text.len(), |i| sep + 3 + i);
@@ -499,6 +503,22 @@ mod tests {
             parsed[3].urls
         );
         assert!(parsed[3].urls.is_empty(), "{:?}", parsed[3].urls);
+    }
+
+    /// A multi-byte char touching the scheme is a delimiter, not part of it:
+    /// the scheme start must land on a char boundary (a `+ 1` byte step panics
+    /// inside a 4-byte emoji).
+    #[rstest]
+    #[case::emoji_before_scheme("🔔vless://a@b.example.com:443#x", &["vless://a@b.example.com:443#x"])]
+    #[case::emoji_between_text_and_scheme(
+        "post 🔔vless://a@b.example.com:443#x rest",
+        &["vless://a@b.example.com:443#x"]
+    )]
+    fn scan_urls_keeps_the_scheme_after_a_multibyte_delimiter(
+        #[case] text: &str,
+        #[case] expected: &[&str],
+    ) {
+        assert_eq!(scan_urls(text), expected);
     }
 
     /// How long the page server waits for the next request before it stops.
