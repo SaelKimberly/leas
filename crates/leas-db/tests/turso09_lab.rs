@@ -612,6 +612,140 @@ async fn arm_wal_autocheckpoint(pages: Option<i64>) {
     );
 }
 
+/// EXPLAIN QUERY PLAN over every hot statement at feed scale, one line each.
+/// The question is not timing but shape: a `SCAN` of a table the statement's
+/// filter does not need, a sorter, or a temp B-tree.
+async fn arm_plan_sweep() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    import_burst(&db, 1, FEED, true, true).await;
+    let mut conn = db.connection().await.expect("conn");
+    // 200 display ids and a 200-id block are what the page actually passes.
+    let ids: String = (1..=200)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let ip_ids: String = (1..=500)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let queries: [(&str, &str); 13] = [
+        (
+            "purge_candidates",
+            "SELECT e.id FROM endpoints e WHERE NOT EXISTS (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id)",
+        ),
+        (
+            "purge_recheck",
+            &format!(
+                "SELECT e.id FROM endpoints e WHERE e.id IN ({ids}) AND NOT EXISTS (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id AND p.last_seen_at >= 1)"
+            ),
+        ),
+        (
+            "page_count",
+            "SELECT COUNT(*) FROM endpoint_rank k WHERE k.band = 0",
+        ),
+        (
+            "page_ids",
+            "SELECT k.endpoint_id FROM endpoint_rank k WHERE k.band = 0 ORDER BY k.rank_bin, k.rank_stab, k.rank_weight DESC, k.rank_domain, k.rank_sub_domain, k.rank_addr, k.endpoint_id LIMIT 200",
+        ),
+        (
+            "page_projection",
+            &format!(
+                "SELECT e.id, ps.protocol_id, pr.proto_kind, (SELECT group_concat(hex(ip_key), ',') FROM endpoint_ip ip WHERE ip.endpoint_id = e.id) FROM endpoints e LEFT JOIN profile_stats ps ON ps.endpoint_id = e.id LEFT JOIN protocols pr ON pr.id = ps.protocol_id WHERE e.id IN ({ids})"
+            ),
+        ),
+        (
+            "rank_links",
+            &format!(
+                "SELECT ps.endpoint_id, ps.protocol_id, ps.error_kind, ps.latency_real_delay, ps.last_seen_at, pr.transport_type FROM profile_stats ps LEFT JOIN protocols pr ON pr.id = ps.protocol_id WHERE ps.endpoint_id IN ({ids})"
+            ),
+        ),
+        (
+            "rank_endpoints",
+            &format!(
+                "SELECT e.id, e.domain, (SELECT ip.ip_key FROM endpoint_ip ip WHERE ip.endpoint_id = e.id LIMIT 1), EXISTS (SELECT 1 FROM endpoint_ip ip WHERE ip.endpoint_id = e.id) FROM endpoints e WHERE e.id IN ({ids})"
+            ),
+        ),
+        (
+            "repair_missing",
+            "SELECT e.id FROM endpoints e WHERE EXISTS (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id) AND NOT EXISTS (SELECT 1 FROM endpoint_rank k WHERE k.endpoint_id = e.id)",
+        ),
+        (
+            "group_counts",
+            "SELECT group_id, COUNT(*) FROM endpoint_groups GROUP BY group_id",
+        ),
+        (
+            "group_members",
+            &format!(
+                "SELECT endpoint_id FROM endpoint_groups WHERE group_id = 'grp-1' AND endpoint_id IN ({ids})"
+            ),
+        ),
+        (
+            "export_projection",
+            "SELECT e.domain, ps.protocol_id, pr.config FROM profile_stats ps JOIN endpoints e ON e.id = ps.endpoint_id JOIN protocols pr ON pr.id = ps.protocol_id LEFT JOIN endpoint_rank er ON er.endpoint_id = e.id ORDER BY pr.proto_kind, e.domain LIMIT 200",
+        ),
+        (
+            "ip_ordered_reads",
+            &format!(
+                "SELECT endpoint_id, ip_key FROM endpoint_ip WHERE endpoint_id IN ({ip_ids}) ORDER BY endpoint_id, ip_key"
+            ),
+        ),
+        (
+            "ip_by_key_seek",
+            "SELECT endpoint_id FROM endpoint_ip WHERE ip_key >= x'040A0001' AND ip_key <= x'040A00FF' ORDER BY ip_key, endpoint_id LIMIT 200",
+        ),
+    ];
+    for (label, sql) in queries {
+        let rows = toasty::sql::query(format!("EXPLAIN QUERY PLAN {sql}"))
+            .exec(&mut conn)
+            .await
+            .expect("plan");
+        let detail: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row {
+                toasty_core::stmt::Value::Record(r) => match r.fields.get(3) {
+                    Some(toasty_core::stmt::Value::String(v)) => Some(v.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        println!("PLAN2   {label:<18} {}", detail.join(" | "));
+    }
+    // The rank sweeps are UPDATEs: their plan matters as much as a read's.
+    for (label, sql) in [
+        (
+            "reband_expired",
+            "EXPLAIN QUERY PLAN UPDATE endpoint_rank SET band = 2 WHERE band < 2 AND rank_newest_seen < 1",
+        ),
+        (
+            "reband_all",
+            "EXPLAIN QUERY PLAN UPDATE endpoint_rank SET band = CASE WHEN rank_newest_seen < 1 THEN 2 WHEN rank_alive = 1 THEN 0 ELSE 1 END",
+        ),
+        (
+            "stab_seed",
+            "EXPLAIN QUERY PLAN UPDATE profile_stats SET stab_mask = 1, stab_len = 1 WHERE stab_len = 0",
+        ),
+        (
+            "error_sweep",
+            "EXPLAIN QUERY PLAN UPDATE profile_stats SET error = NULL WHERE error IS NOT NULL",
+        ),
+    ] {
+        let rows = toasty::sql::query(sql).exec(&mut conn).await.expect("plan");
+        let detail: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row {
+                toasty_core::stmt::Value::Record(r) => match r.fields.get(3) {
+                    Some(toasty_core::stmt::Value::String(v)) => Some(v.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        println!("PLAN2   {label:<18} {}", detail.join(" | "));
+    }
+}
+
 /// `backfill_all` (open-time heal) reads every address row twice: once for the
 /// min key per endpoint and once just to test membership. One grouped statement
 /// can answer both. 74k endpoints, ~1.5 addresses each.
@@ -1137,6 +1271,12 @@ async fn protocol_insert_shape() {
     for chunked in [false, true] {
         arm_protocol_shape(chunked).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn plan_sweep() {
+    arm_plan_sweep().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
