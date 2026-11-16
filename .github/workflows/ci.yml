@@ -140,6 +140,11 @@ jobs:
         with:
           path: ~/.rustup
           key: rustup-windows2022-${{ hashFiles('rust-toolchain.toml') }}
+      # `rust-toolchain.toml` says `stable`, whose contents move while the file
+      # does not, so the cache above can restore last week's compiler and be
+      # "valid" (2026-11-16: rustc 1.99.1 against a 1.100.0 `rust-version`).
+      - name: Update the floating stable toolchain
+        run: rustup update stable --no-self-update
       - name: nasm (ring assembles its perlasm with it on Windows)
         run: |
           choco install -y nasm
