@@ -252,8 +252,11 @@ where
                             target: "tui::ops::subscriptions",
                             "Feed exceeded the {ceiling} byte budget ({feed_bytes} bytes) — stopping with partial results; raise `import.max_feed_bytes` (0 = unbounded) to accept this feed"
                         );
+                        // The group row renders 60 chars of this reason
+                        // (`ui/sources.rs`), so the actionable tail — the knob
+                        // name — must fit inside that, not after it.
                         ended_early = Some(format!(
-                            "feed over the {ceiling} byte budget — raise import.max_feed_bytes (0 = unbounded)"
+                            "{ceiling} byte budget — raise import.max_feed_bytes"
                         ));
                         break None;
                     }

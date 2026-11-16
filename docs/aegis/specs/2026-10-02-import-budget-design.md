@@ -140,9 +140,10 @@ therefore buys no protection and costs data.
    `state.config.import` — a raised ceiling applied to a hand refresh and not to the scheduled one,
    which is exactly the path that runs unattended over a large feed. It now snapshots the same
    config. This was the defect that made "configure it" unreliable advice.
-3. The truncation reason **names the knob and the ceiling in MiB** (`feed over the 256 MiB byte budget
-   — raise import.max_feed_bytes (0 = unbounded)`), because the previous line was the only place the
-   number existed and a group row could not tell a user what to change.
+3. The truncation reason **names the knob and the ceiling in MiB** (`256 MiB byte budget — raise
+   import.max_feed_bytes`, 50 chars so the group row's 60-char cut keeps the actionable tail; the
+   `(0 = unbounded)` detail stays in the log line), because a group row previously said only
+   `error` and the log was the only place the number existed.
 4. **Still not in Settings.** Raising the ceiling means editing `config.json`. A Settings →
    Subscriptions section was never implemented and is not implemented here; if a user-facing knob is
    wanted, it is its own change with its own tests.
