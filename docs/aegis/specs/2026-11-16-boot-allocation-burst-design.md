@@ -100,6 +100,22 @@ What the Logs tab loses: **TRACE-level events only**. Our own logging is
 spans are INFO and `toasty::query` events are DEBUG, so the DB monitor keeps
 working. turso's per-opcode trace lines are the thing being removed.
 
+**Drift from T2 (recorded):** the plan expected the whole construction — the
+`registry()…try_init()` chain *and* the layers — to move into `logging.rs`. It
+did not: `TuiLogLayer` + `LogVisitor` are ~350 lines whose doc comments carry
+the persisted-message/session-detail split (`specs/2026-09-24-db-query-
+monitoring-design.md` §10 non-goal 10 — a security boundary, not plumbing), and
+the stderr layer's concrete type is built from env inside the chain. The seam
+is therefore `cap_trace(stack)`: the chain stays in `main.rs`, wrapped once
+immediately before `try_init`.
+
+The consequence for the guard: the gate test cannot build the *production*
+stack (the layer types are not nameable from `tests/`), so it asserts the cap's
+effect on a stack whose layer filter asks for `trace` — the mechanism — and the
+*wiring* is covered by `debug_assert!` on the installed subscriber in
+`main.rs` (debug builds only). Accepted: a release-only wiring regression is
+not observable by the test; it would show in any debug run of the app.
+
 ### W2 — conditional: cut aggregate executions
 
 If the post-W1 measurement still shows `profiles_aggregate` in the top three
@@ -156,7 +172,7 @@ plus a scheduling change in W2). Authority: this spec, task order below.
 |---|---|---|---|---|
 | T0 | Count the executions (no product change) | scratch counter in `state.rs::refresh_aggregates` (`eprintln!` under an env flag), same 25 s series | print the call count at exit; remove before T2 | count recorded in `mem-audit/`; §3 matrix picks W1-only vs W1+W2 |
 | T1 | RED: the gate test | `crates/leas/tests/tracing_level_gate.rs` | build the stack, assert `!enabled!(TRACE)`; fails today | `cargo nextest run -p leas --test tracing_level_gate` fails |
-| T2 | Extract the construction | `crates/leas/src/logging.rs`, `main.rs`, `lib.rs` | move the `registry()…try_init()` chain verbatim; `main.rs` calls it | `cargo nextest run -p leas`; `cargo clippy -p leas --all-targets` |
+| T2 | Seam only — **drifted**, see note | `crates/leas/src/logging.rs`, `main.rs`, `lib.rs` | `cap_trace` takes the fully composed stack; `main.rs` keeps the `registry()…try_init()` chain and its `TuiLogLayer`/`LogVisitor` | `cargo nextest run -p leas`; `cargo clippy -p leas --all-targets` |
 | T3 | GREEN: outermost `LevelFilter::DEBUG` | `logging.rs` | one `.with(LevelFilter::DEBUG)` as the last layer + a comment naming turso's gate | T1 passes |
 | T3b | Fallback if T3 has no effect | `Cargo.toml` (workspace `tracing`) | `features = ["release_max_level_debug"]`; T1 gated on `cfg!(not(debug_assertions))` | T1 passes under `--release`; T4 as below |
 | T4 | Measure | `mem-audit/` artifacts | `just memtrace-app`-style series, 3 000-endpoint sandbox, 25 s idle | total ≤ 120 000 allocations; `ui::run` ≤ 30 000; steady state ≤ 400/s |
