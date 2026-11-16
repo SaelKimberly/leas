@@ -677,7 +677,7 @@ const RANK_CHUNK: usize = 400;
 /// rather than merely mis-sort, because the anchor binds each term's value back
 /// into a comparison.
 const RANK_COLUMNS: &str = "endpoint_id, rank_bin, rank_stab, rank_proven, rank_weight, \
-     rank_domain, rank_sub_domain, rank_addr, rank_newest_seen, rank_alive";
+     rank_domain, rank_sub_domain, rank_addr, rank_newest_seen, rank_alive, band";
 
 /// Fill the ordering keys and heal stale ones. The table's DDL (and its
 /// indexes) now lives in `crate::schema::ddl`, run by the migration runner
@@ -820,8 +820,22 @@ pub(crate) async fn write(
             .iter()
             .map(|row| {
                 let r = &row.rank;
+                let alive = i64::from(row.alive);
+                // `band` is a RAW column (not in the toasty model) and is
+                // written IN this tuple: `INSERT OR REPLACE` re-inserts the
+                // whole row, so a column the statement omits comes back NULL,
+                // and the old shape paid a second `UPDATE … SET band = CASE …`
+                // per chunk to restore it. That UPDATE rewrote every index
+                // entry of the chunk (`endpoint_rank_key_v2` starts with
+                // `band`): 5 000 rows measured 192–227 ms as two statements
+                // against 42–63 ms inline.
+                let band = match (r.newest_seen < threshold, alive) {
+                    (true, _) => 2,
+                    (false, 1) => 0,
+                    (false, _) => 1,
+                };
                 format!(
-                    "({},{},{},{},{},{},{},{},{},{})",
+                    "({},{},{},{},{},{},{},{},{},{},{band})",
                     r.endpoint_id.get(),
                     r.bin,
                     r.stab,
@@ -831,32 +845,13 @@ pub(crate) async fn write(
                     crate::database::sql_lit(&r.sub_domain),
                     blob_lit(&r.addr),
                     r.newest_seen,
-                    i64::from(row.alive)
+                    alive
                 )
             })
             .collect::<Vec<_>>()
             .join(",");
         toasty::sql::statement(format!(
             "INSERT OR REPLACE INTO endpoint_rank ({RANK_COLUMNS}) VALUES {values}"
-        ))
-        .exec(conn)
-        .await?;
-        // `band` is a RAW column (not in the toasty model): INSERT OR REPLACE
-        // re-inserts the row and nulls it, so re-set it for this chunk — the
-        // ttl membership from the just-written rank_newest_seen.
-        //
-        // `rank_weight` is NOT re-set here: it is Rust-computed, so it went
-        // into the INSERT's values tuple above and needs no second statement.
-        let ids = chunk
-            .iter()
-            .map(|row| row.rank.endpoint_id.get().to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        toasty::sql::statement(format!(
-            "UPDATE endpoint_rank SET \
-             band = CASE WHEN rank_newest_seen < {threshold} THEN 2 \
-                         WHEN rank_alive = 1 THEN 0 ELSE 1 END \
-             WHERE endpoint_id IN ({ids})"
         ))
         .exec(conn)
         .await?;
@@ -986,11 +981,22 @@ pub(crate) async fn prune(
     conn: &mut impl toasty::Executor,
     endpoint_ids: &[EndpointId],
 ) -> crate::Result<usize> {
-    for id in endpoint_ids {
-        EndpointRank::filter_by_endpoint_id(*id)
-            .delete()
-            .exec(conn)
-            .await?;
+    // One statement per 400 ids, not one per id: the typed `delete` path costs
+    // ~30 µs of round trip and planning each, and the delete owners pass
+    // thousands of ids (a retention sweep), so the loop was thousands of
+    // statements inside one transaction. `endpoint_ip::delete_for` already
+    // deletes its family this way.
+    for chunk in endpoint_ids.chunks(RANK_CHUNK) {
+        let ids = chunk
+            .iter()
+            .map(|id| id.get().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        toasty::sql::statement(format!(
+            "DELETE FROM endpoint_rank WHERE endpoint_id IN ({ids})"
+        ))
+        .exec(&mut *conn)
+        .await?;
     }
     Ok(endpoint_ids.len())
 }

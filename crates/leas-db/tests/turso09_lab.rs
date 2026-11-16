@@ -33,6 +33,12 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+
+/// The allocator the binary ships (default options — the app's
+/// `configure()` retention tuning is its own axis). `--features lab-mimalloc`.
+#[cfg(feature = "lab-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -76,6 +82,26 @@ fn cpu_ms() -> u64 {
     let ticks: u64 =
         fields[11].parse::<u64>().expect("utime") + fields[12].parse::<u64>().expect("stime");
     ticks * 10
+}
+
+/// Current resident set size in KiB (`VmRSS`) — the per-arm delta uses this,
+/// because `VmHWM` is a process-wide high-water mark that never falls.
+fn rss_kb() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("status");
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+        .expect("VmRSS")
+}
+
+const fn alloc_name() -> &'static str {
+    if cfg!(feature = "lab-mimalloc") {
+        "mimalloc"
+    } else {
+        "system"
+    }
 }
 
 /// Peak resident set size in KiB (`VmHWM`).
@@ -291,7 +317,7 @@ async fn arm_import(mvcc: bool) {
     let quiet = quiet_reads(&db).await;
 
     let reader = spawn_reader(Arc::clone(&db), sample_ids(20));
-    let (cpu0, rss0) = (cpu_ms(), vmhwm_kb());
+    let (cpu0, rss0) = (cpu_ms(), rss_kb());
     let t0 = Instant::now();
     import_burst(&db, 40_001, 60_001, true, true).await;
     let wall = t0.elapsed();
@@ -300,11 +326,13 @@ async fn arm_import(mvcc: bool) {
     let lats = reader.finish().await;
     let (db_b, wal_b, log_b) = disk(&path);
     println!(
-        "IMPORT  mvcc={mvcc:<5} +20k rows: wall={wall:>7.2?} cpu={cpu:>6}ms ({:.0}% core) \
-         peakRSS={:>4}MiB (+{}) disk: db={:>6}KiB wal={:>6}KiB log={:>6}KiB",
+        "IMPORT  mvcc={mvcc:<5} alloc={:<8} +20k rows: wall={wall:>7.2?} cpu={cpu:>6}ms \
+         ({:.0}% core) peakRSS={:>4}MiB (rss delta +{}KiB) disk: db={:>6}KiB wal={:>6}KiB \
+         log={:>6}KiB",
+        alloc_name(),
         cpu as f64 * 100.0 / wall.as_millis().max(1) as f64,
         mib(rss),
-        i64::try_from(rss).unwrap_or(0) - i64::try_from(rss0).unwrap_or(0),
+        i64::try_from(rss_kb()).unwrap_or(0) - i64::try_from(rss0).unwrap_or(0),
         db_b / 1024,
         wal_b / 1024,
         log_b / 1024
@@ -330,7 +358,7 @@ async fn arm_single_row(mvcc: bool) {
     let quiet = quiet_reads(&db).await;
 
     let reader = spawn_reader(Arc::clone(&db), sample_ids(20));
-    let (cpu0, rss0) = (cpu_ms(), vmhwm_kb());
+    let (cpu0, rss0) = (cpu_ms(), rss_kb());
     let t0 = Instant::now();
     let mut fails = 0usize;
     for i in 1..=500usize {
@@ -450,9 +478,10 @@ async fn arm_contention(mvcc: bool) {
 
     let (db_b, wal_b, log_b) = disk(&path);
     println!(
-        "CONTEND mvcc={mvcc:<5} writer=20k rows reads: quiet n=200 p50={:>7.2?} p99={:>7.2?}  \
-         during n={:<4} p50={:>7.2?} p95={:>7.2?} p99={:>7.2?} max={:>7.2?}  \
+        "CONTEND mvcc={mvcc:<5} alloc={:<8} writer=20k rows reads: quiet n=200 p50={:>7.2?} \
+         p99={:>7.2?}  during n={:<4} p50={:>7.2?} p95={:>7.2?} p99={:>7.2?} max={:>7.2?}  \
          stall p99/quiet-p50={:.1}x disk: db={}KiB wal={}KiB log={}KiB",
+        alloc_name(),
         pct(&quiet, 0.50),
         pct(&quiet, 0.99),
         during.len(),
@@ -464,6 +493,328 @@ async fn arm_contention(mvcc: bool) {
         db_b / 1024,
         wal_b / 1024,
         log_b / 1024
+    );
+}
+
+/// `endpoint_rank::write` costs TWO statements per 400-row chunk: the
+/// `INSERT OR REPLACE` (which nulls the raw `band` column) and a follow-up
+/// `UPDATE … SET band = CASE …`. Since `band` derives from values this writer
+/// already holds, it can ride the INSERT. Measure both shapes over a real
+/// `endpoint_rank` table with its two indexes in place.
+async fn arm_rank_write_shape(inline_band: bool) {
+    const ROWS: usize = 5_000;
+    const CHUNK: usize = 400;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    let mut conn = db.connection().await.expect("conn");
+    let t0 = Instant::now();
+    let threshold = 1_700_000_000i64;
+    for chunk_start in (1..=ROWS).step_by(CHUNK) {
+        let end = (chunk_start + CHUNK).min(ROWS + 1);
+        let mut values = String::with_capacity((end - chunk_start) * 80);
+        let mut ids = String::with_capacity((end - chunk_start) * 8);
+        for i in chunk_start..end {
+            if i > chunk_start {
+                values.push(',');
+                ids.push(',');
+            }
+            let newest = if i % 3 == 0 {
+                threshold - 10
+            } else {
+                threshold + 10
+            };
+            let alive = i32::from(i % 5 != 0);
+            let band = match (newest < threshold, alive) {
+                (true, _) => 2,
+                (false, 1) => 0,
+                (false, _) => 1,
+            };
+            if inline_band {
+                let _ = write!(
+                    values,
+                    "({i}, {}, {}, 0, x'0000000000000000', 'd{i}.example', '', x'04', {newest}, {alive}, {band})",
+                    i % 5,
+                    i % 3
+                );
+            } else {
+                let _ = write!(
+                    values,
+                    "({i}, {}, {}, 0, x'0000000000000000', 'd{i}.example', '', x'04', {newest}, {alive})",
+                    i % 5,
+                    i % 3
+                );
+                let _ = write!(ids, "{i}");
+            }
+        }
+        let columns = "endpoint_id, rank_bin, rank_stab, rank_proven, rank_weight, \
+                       rank_domain, rank_sub_domain, rank_addr, rank_newest_seen, rank_alive";
+        let sql = if inline_band {
+            format!("INSERT OR REPLACE INTO endpoint_rank ({columns}, band) VALUES {values}")
+        } else {
+            format!("INSERT OR REPLACE INTO endpoint_rank ({columns}) VALUES {values}")
+        };
+        toasty::sql::statement(sql)
+            .exec(&mut conn)
+            .await
+            .expect("insert");
+        if !inline_band {
+            toasty::sql::statement(format!(
+                "UPDATE endpoint_rank SET band = CASE WHEN rank_newest_seen < {threshold} THEN 2 \
+                 WHEN rank_alive = 1 THEN 0 ELSE 1 END WHERE endpoint_id IN ({ids})"
+            ))
+            .exec(&mut conn)
+            .await
+            .expect("band");
+        }
+    }
+    println!(
+        "RANK    shape={:<11} rows={ROWS} wall={:>7.2?}",
+        if inline_band {
+            "band-inline"
+        } else {
+            "two-stmt"
+        },
+        t0.elapsed()
+    );
+}
+
+/// `PRAGMA wal_autocheckpoint` did not exist in 0.8.x (the 2026-09-16 claim
+/// study marked it REJECTED-IMPOSSIBLE); 0.9.0-pre.5 lists it as supported.
+/// Does tuning it change an import's WAL footprint or wall time?
+async fn arm_wal_autocheckpoint(pages: Option<i64>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("lab.db");
+    let db = open(dir.path(), false).await;
+    let mut conn = db.connection().await.expect("conn");
+    let note = if let Some(pages) = pages {
+        toasty::sql::statement(format!("PRAGMA wal_autocheckpoint = {pages}"))
+            .exec(&mut conn)
+            .await
+            .expect("pragma");
+        let rows = toasty::sql::query("PRAGMA wal_autocheckpoint")
+            .exec(&mut conn)
+            .await
+            .expect("readback");
+        format!("set={pages} readback={rows:?}")
+    } else {
+        String::from("default")
+    };
+    drop(conn);
+    let t0 = Instant::now();
+    import_burst(&db, 1, 20_000, true, true).await;
+    let wall = t0.elapsed();
+    let (db_b, wal_b, log_b) = disk(&path);
+    println!(
+        "WAL     autocheckpoint {note}: +20k rows wall={wall:>7.2?} db={}KiB wal={}KiB log={}KiB",
+        db_b / 1024,
+        wal_b / 1024,
+        log_b / 1024
+    );
+}
+
+/// `Database::conn()` issues TWO pragmas on EVERY pooled connection: what do
+/// they cost, per call, against the work a call does?
+async fn arm_conn_setup(n_pragmas: usize) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    let mut conn = db.connection().await.expect("conn");
+    let t0 = Instant::now();
+    for _ in 0..500 {
+        if n_pragmas >= 1 {
+            toasty::sql::query("PRAGMA busy_timeout=5000")
+                .exec(&mut conn)
+                .await
+                .expect("busy");
+        }
+        if n_pragmas >= 2 {
+            toasty::sql::query("PRAGMA synchronous=NORMAL")
+                .exec(&mut conn)
+                .await
+                .expect("sync");
+        }
+    }
+    println!(
+        "SETUP   pragmas_per_call={n_pragmas} calls=500 wall={:>8.2?} ({:.1}µs/call)",
+        t0.elapsed(),
+        t0.elapsed().as_secs_f64() * 1e6 / 500.0
+    );
+}
+
+/// `endpoint_rank::prune` used to delete one row per statement; `delete_for`
+/// style `IN (…)` chunking is the alternative. 2 000 ids, one transaction.
+async fn arm_prune_shape(chunked: bool) {
+    const IDS: usize = 2_000;
+    const CHUNK: usize = 400;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    let mut conn = db.connection().await.expect("conn");
+    let mut values = String::new();
+    for i in 1..=IDS {
+        if i > 1 {
+            values.push(',');
+        }
+        let _ = write!(
+            values,
+            "({i}, 0, 0, 0, x'0000000000000000', 'd', '', x'04', 1, 1, 0)"
+        );
+    }
+    toasty::sql::statement(format!(
+        "INSERT INTO endpoint_rank (endpoint_id, rank_bin, rank_stab, rank_proven, rank_weight, \
+         rank_domain, rank_sub_domain, rank_addr, rank_newest_seen, rank_alive, band) \
+         VALUES {values}"
+    ))
+    .exec(&mut conn)
+    .await
+    .expect("seed ranks");
+    let mut tx = conn.transaction().await.expect("tx");
+    let t0 = Instant::now();
+    if chunked {
+        for start in (1..=IDS).step_by(CHUNK) {
+            let end = (start + CHUNK).min(IDS + 1);
+            let ids = (start..end)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            toasty::sql::statement(format!(
+                "DELETE FROM endpoint_rank WHERE endpoint_id IN ({ids})"
+            ))
+            .exec(&mut tx)
+            .await
+            .expect("delete");
+        }
+    } else {
+        for i in 1..=IDS {
+            toasty::sql::statement(format!("DELETE FROM endpoint_rank WHERE endpoint_id = {i}"))
+                .exec(&mut tx)
+                .await
+                .expect("delete");
+        }
+    }
+    tx.commit().await.expect("commit");
+    println!(
+        "PRUNE   shape={:<8} ids={IDS} wall={:>7.2?}",
+        if chunked { "chunk400" } else { "per-row" },
+        t0.elapsed()
+    );
+}
+
+/// `get_group_member_counts` loaded every membership row and counted in Rust;
+/// `GROUP BY` counts in SQL. 20 000 memberships over 50 groups.
+async fn arm_group_counts(group_by: bool) {
+    const ROWS: usize = 20_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    let mut conn = db.connection().await.expect("conn");
+    for start in (1..=ROWS).step_by(BATCH) {
+        let end = (start + BATCH).min(ROWS + 1);
+        let mut values = String::new();
+        for i in start..end {
+            if i > start {
+                values.push(',');
+            }
+            let _ = write!(values, "({i}, 'grp-{}', 1, 0)", i % 50);
+        }
+        toasty::sql::statement(format!(
+            "INSERT INTO endpoint_groups (endpoint_id, group_id, last_seen_at, sort_order) \
+             VALUES {values} ON CONFLICT(endpoint_id, group_id) DO NOTHING"
+        ))
+        .exec(&mut conn)
+        .await
+        .expect("seed groups");
+    }
+    let t0 = Instant::now();
+    let sql = if group_by {
+        "SELECT group_id, COUNT(*) FROM endpoint_groups GROUP BY group_id"
+    } else {
+        "SELECT endpoint_id, group_id, last_seen_at, sort_order FROM endpoint_groups"
+    };
+    let rows = toasty::sql::query(sql)
+        .exec(&mut conn)
+        .await
+        .expect("counts");
+    println!(
+        "GROUPS  shape={:<8} memberships={ROWS} rows_returned={} wall={:>8.2?}",
+        if group_by { "group_by" } else { "load_all" },
+        rows.len(),
+        t0.elapsed()
+    );
+}
+
+/// What text does the typed writer store for the enum columns and the JSON
+/// config? A hand-written bulk INSERT has to store exactly this.
+#[tokio::test]
+async fn protocol_column_encoding() {
+    let db = Database::in_memory().await.expect("db");
+    let mut conn = db.connection().await.expect("conn");
+    toasty::create!(Protocol {
+        created_at: 1,
+        id: ProtocolId::new(7),
+        sig: 7,
+        proto_kind: ProtocolKind::Vless,
+        transport: Transport {
+            r#type: TransportType::Tcp
+        },
+        security: Security {
+            r#type: SecurityType::Reality,
+            sni: Some("a.example".to_string()),
+            fp: None,
+            insecure: Some(false),
+        },
+        config: Deferred::from(Json(vless_cfg(7, true))),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("protocol");
+    let rows = toasty::sql::query(
+        "SELECT proto_kind, transport_type, security_type, security_sni, security_insecure, \
+         typeof(security_insecure), config FROM protocols",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("read");
+    println!("ENCODE  {rows:?}");
+}
+
+/// Is `index_profile_stats_by_last_seen_at` earning its write cost? Prints the
+/// plans the purge and staleness queries get, then times a 20k-row link upsert
+/// with the index present and after `DROP INDEX`.
+async fn arm_index_audit(drop_index: bool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    import_burst(&db, 1, 20_000, true, true).await;
+    let mut conn = db.connection().await.expect("conn");
+    if drop_index {
+        toasty::sql::statement("DROP INDEX IF EXISTS index_profile_stats_by_last_seen_at")
+            .exec(&mut conn)
+            .await
+            .expect("drop index");
+    }
+    let plans = [
+        (
+            "purge_candidates",
+            "SELECT e.id FROM endpoints e WHERE NOT EXISTS (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id AND p.last_seen_at >= 1)",
+        ),
+        (
+            "stale_links",
+            "SELECT ps.endpoint_id FROM profile_stats ps WHERE ps.last_seen_at < 1",
+        ),
+    ];
+    for (label, sql) in plans {
+        let rows = toasty::sql::query(format!("EXPLAIN QUERY PLAN {sql}"))
+            .exec(&mut conn)
+            .await
+            .expect("plan");
+        println!("PLAN    index_dropped={drop_index} {label} rows={rows:?}");
+    }
+    drop(conn);
+    // 20k MORE rows through the same writers: the upsert path plus the index
+    // maintenance the arm is asking about, on ids that cannot conflict.
+    let t0 = Instant::now();
+    import_burst(&db, 20_001, 40_001, true, true).await;
+    println!(
+        "INDEX   last_seen_index={:<8} 20k link-upsert rerun wall={:>7.2?}",
+        if drop_index { "dropped" } else { "present" },
+        t0.elapsed()
     );
 }
 
@@ -521,34 +872,14 @@ async fn arm_protocol_shape(chunked: bool) {
         let end = (start + BATCH).min(PROTO_ROWS + 1);
         let mut tx = conn.transaction().await.expect("tx");
         if chunked {
-            let mut sql = String::from(
-                "INSERT INTO protocols (id, sig, proto_kind, transport_type, security_type, \
-                 security_sni, security_fp, security_insecure, config, created_at) VALUES ",
-            );
-            for i in start..end {
-                if i > start {
-                    sql.push(',');
-                }
-                let cfg = serde_json::to_string(&vless_cfg(i, true)).expect("json");
-                let _ = write!(
-                    sql,
-                    "({i}, {i}, 'vless', 'tcp', 'reality', 'c{i}.example.com', NULL, 0, \
-                     '{cfg}', 1)"
-                );
-            }
-            toasty::sql::statement(sql)
-                .exec(&mut tx)
-                .await
-                .expect("bulk");
-        } else {
-            for i in start..end {
-                toasty::create!(Protocol {
-                    created_at: 1,
+            let rows: Vec<Protocol> = (start..end)
+                .map(|i| Protocol {
+                    created_at: 0,
                     id: ProtocolId::new(i as i64),
                     sig: i as i64,
                     proto_kind: ProtocolKind::Vless,
                     transport: Transport {
-                        r#type: TransportType::Tcp
+                        r#type: TransportType::Tcp,
                     },
                     security: Security {
                         r#type: SecurityType::Reality,
@@ -557,10 +888,31 @@ async fn arm_protocol_shape(chunked: bool) {
                         insecure: Some(false),
                     },
                     config: Deferred::from(Json(vless_cfg(i, true))),
+                    links: Deferred::default(),
                 })
-                .exec(&mut tx)
+                .collect();
+            leas_db::upsert_protocols_bulk(&mut tx, &rows)
                 .await
-                .expect("protocol");
+                .expect("bulk");
+        } else {
+            for i in start..end {
+                Protocol::upsert_by_id(ProtocolId::new(i as i64))
+                    .sig(i as i64)
+                    .proto_kind(ProtocolKind::Vless)
+                    .transport(Transport {
+                        r#type: TransportType::Tcp,
+                    })
+                    .security(Security {
+                        r#type: SecurityType::Reality,
+                        sni: Some(format!("c{}.example.com", i % 1000)),
+                        fp: None,
+                        insecure: Some(false),
+                    })
+                    .config(vless_cfg(i, true))
+                    .on_create(|create| create.created_at(1))
+                    .exec(&mut tx)
+                    .await
+                    .expect("protocol");
             }
         }
         tx.commit().await.expect("commit");
@@ -602,6 +954,49 @@ async fn window_functions_and_recursive_cte_answer_correctly() {
 async fn protocol_insert_shape() {
     for chunked in [false, true] {
         arm_protocol_shape(chunked).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn conn_setup_overhead() {
+    for n in [0, 1, 2, 0, 1, 2] {
+        arm_conn_setup(n).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn prune_and_group_count_shapes() {
+    for chunked in [false, true, false, true] {
+        arm_prune_shape(chunked).await;
+    }
+    for group_by in [false, true, false, true] {
+        arm_group_counts(group_by).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn index_audit() {
+    for drop_index in [false, true] {
+        arm_index_audit(drop_index).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn rank_write_shape() {
+    for inline in [false, true, false, true] {
+        arm_rank_write_shape(inline).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn wal_autocheckpoint_tuning() {
+    for pages in [None, Some(100), Some(1000), Some(10_000)] {
+        arm_wal_autocheckpoint(pages).await;
     }
 }
 

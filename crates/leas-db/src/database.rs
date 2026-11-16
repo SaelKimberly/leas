@@ -398,21 +398,6 @@ impl Database {
         }
 
         configure_journal_mode(&mut conn, concurrent_writes).await?;
-        toasty::sql::query("PRAGMA busy_timeout=5000")
-            .exec(&mut conn)
-            .await?;
-        // WAL + `synchronous=NORMAL` is the standard durability/throughput
-        // trade: commits are not fsynced individually (a power loss may lose
-        // the most recent transactions, the database stays consistent). The
-        // default FULL costs ~4.2 ms per commit on this engine — a ping batch
-        // over 30k links issues ~90k commits, which froze the UI task that
-        // awaits them (see the 2026-09-11 batch-ping investigation).
-        toasty::sql::query("PRAGMA synchronous=NORMAL")
-            .exec(&mut conn)
-            .await?;
-        toasty::sql::query("PRAGMA foreign_keys=ON")
-            .exec(&mut conn)
-            .await?;
 
         Self::init_default_groups(&mut conn).await?;
         // The ordering keys' DDL now lives in `crate::schema` (run by
@@ -518,23 +503,22 @@ impl Database {
         Ok(db)
     }
 
-    /// Acquire a pooled connection with the `SQLite` busy-wait configured.
-    /// `PRAGMA busy_timeout` is per-connection, so the pragma set in `open()`
-    /// never reaches pool-created connections. Without it, concurrent
-    /// writers (enrichment resolutions, ping-buffer flushes) fail instantly
-    /// with "database is locked" instead of queuing behind the lock holder —
-    /// this was the 850-line "database is locked" class in the dumps.
+    /// Acquire a pooled connection.
+    ///
+    /// The `SQLite` per-connection settings the pooled connections need
+    /// (`busy_timeout` 5 s, `synchronous=NORMAL`, `foreign_keys=ON`) are
+    /// applied once per physical connection by the driver's pool create hook.
+    /// Without the busy-wait, concurrent writers (enrichment resolutions,
+    /// ping-buffer flushes) fail instantly with "database is locked" instead of
+    /// queuing behind the lock holder — the 850-line "database is locked" class
+    /// in the dumps.
     async fn conn(&self) -> Result<toasty::Connection> {
-        let mut conn = self.db.connection().await?;
-        toasty::sql::query("PRAGMA busy_timeout=5000")
-            .exec(&mut conn)
-            .await?;
-        // Per-connection like `busy_timeout`: the pragma set in `open()` never
-        // reaches pool-created connections.
-        toasty::sql::query("PRAGMA synchronous=NORMAL")
-            .exec(&mut conn)
-            .await?;
-        Ok(conn)
+        // The per-connection settings (`busy_timeout`, `synchronous`,
+        // `foreign_keys`) are applied ONCE per physical connection by the
+        // driver's pool create hook (`driver/mod.rs::connect`). They used to be
+        // re-issued here on every checkout — two statements, measured 20–33 µs
+        // per database call — after the first checkout already set them.
+        Ok(self.db.connection().await?)
     }
 
     /// Public pooled-connection accessor for callers building typed
@@ -580,22 +564,6 @@ impl Database {
         // in-memory database the cursor is always 0, so this creates the tables
         // and the raw DDL exactly once.
         crate::schema::migrate(&db, &mut conn).await?;
-
-        toasty::sql::query("PRAGMA busy_timeout=5000")
-            .exec(&mut conn)
-            .await?;
-        // WAL + `synchronous=NORMAL` is the standard durability/throughput
-        // trade: commits are not fsynced individually (a power loss may lose
-        // the most recent transactions, the database stays consistent). The
-        // default FULL costs ~4.2 ms per commit on this engine — a ping batch
-        // over 30k links issues ~90k commits, which froze the UI task that
-        // awaits them (see the 2026-09-11 batch-ping investigation).
-        toasty::sql::query("PRAGMA synchronous=NORMAL")
-            .exec(&mut conn)
-            .await?;
-        toasty::sql::query("PRAGMA foreign_keys=ON")
-            .exec(&mut conn)
-            .await?;
 
         Self::init_default_groups(&mut conn).await?;
         // The ordering keys' DDL now lives in `crate::schema` (run by
@@ -975,10 +943,26 @@ impl Database {
     /// once per tab entry, not per row.
     pub async fn get_group_member_counts(&self) -> Result<RapidHashMap<String, usize>> {
         let mut conn = self.conn().await?;
-        let links: Vec<EndpointGroup> = EndpointGroup::all().exec(&mut conn).await?;
+        // COUNT(*) per group in SQL. The typed form loaded EVERY membership row
+        // — one row per (endpoint, group), tens of thousands — through the
+        // decode layer to count them in Rust; `index_endpoint_groups_by_group_id`
+        // serves this as a covering scan of the group column.
+        let rows =
+            toasty::sql::query("SELECT group_id, COUNT(*) FROM endpoint_groups GROUP BY group_id")
+                .exec(&mut conn)
+                .await?;
         let mut counts: RapidHashMap<String, usize> = RapidHashMap::new();
-        for link in links {
-            *counts.entry(link.group_id).or_default() += 1;
+        for row in &rows {
+            let toasty_core::stmt::Value::Record(record) = row else {
+                continue;
+            };
+            let Some(toasty_core::stmt::Value::String(group_id)) = record.fields.first() else {
+                continue;
+            };
+            let Some(toasty_core::stmt::Value::I64(count)) = record.fields.get(1) else {
+                continue;
+            };
+            counts.insert(group_id.clone(), usize::try_from(*count).unwrap_or(0));
         }
         Ok(counts)
     }
@@ -1926,20 +1910,23 @@ impl Database {
     /// shared protocol table's orphan cleanup (the old per-row model had no
     /// shared table to clean). Runs inside the caller's transaction.
     ///
-    /// `links().all(FALSE)` is vacuously true exactly when the links
-    /// collection is empty, lowering to `id NOT IN (SELECT protocol_id FROM
-    /// profile_stats)`. Returns the number of protocols deleted.
-    pub(crate) async fn purge_orphan_protocols(tx: &mut dyn toasty::Executor) -> Result<usize> {
-        let never: toasty::stmt::Expr<bool> =
-            toasty::stmt::Expr::from_untyped(toasty_core::stmt::Expr::FALSE);
-        let orphans: Vec<Protocol> = Protocol::filter(Protocol::fields().links().all(never))
-            .exec(tx)
-            .await?;
-        let count = orphans.len();
-        for protocol in orphans {
-            protocol.delete().exec(tx).await?;
-        }
-        Ok(count)
+    /// **One statement, raw, and `NOT EXISTS` on purpose.** The typed form
+    /// (`links().all(FALSE)`) lowers to `id NOT IN (SELECT protocol_id FROM
+    /// profile_stats)`, which turso 0.9.0-pre.5 serves as a per-row subquery
+    /// loop: measured at 74k protocols it costs **5.37 s**, against **23 ms**
+    /// for this anti-join (and 29 ms for the DELETE), in every journal mode —
+    /// `docs/research/2026-11-16-turso-0.9-delta.md` §3. The purge runs once
+    /// per merged endpoint inside the merge transaction, where that 5 s is
+    /// what the 2026-11-16 production dump's 556 s compact pass was made of.
+    /// The same convention as `purge_expired_once`'s candidate scan.
+    pub(crate) async fn purge_orphan_protocols(tx: &mut dyn toasty::Executor) -> Result<()> {
+        toasty::sql::statement(
+            "DELETE FROM protocols WHERE NOT EXISTS \
+             (SELECT 1 FROM profile_stats p WHERE p.protocol_id = protocols.id)",
+        )
+        .exec(&mut *tx)
+        .await?;
+        Ok(())
     }
 }
 // ── Route probes (singleton settings row) ───────────────────────────────
@@ -2070,6 +2057,7 @@ fn blob_lit(ports: &[u16]) -> String {
 /// no-op. Same deferred-unloaded guard as `Database::upsert_protocol`.
 #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> Result<()> {
+    use std::fmt::Write as _;
     for p in ps {
         if p.config.is_unloaded() {
             return Err(DatabaseError::Generic(
@@ -2078,16 +2066,59 @@ pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> R
             ));
         }
     }
-    for p in ps {
-        Protocol::upsert_by_id(p.id)
-            .sig(p.sig)
-            .proto_kind(p.proto_kind)
-            .transport(p.transport.clone())
-            .security(p.security.clone())
-            .config(p.config.get().0.clone())
-            .on_create(|create| create.created_at(now_epoch()))
-            .exec(tx)
-            .await?;
+    // One 400-row statement per chunk, not one typed upsert per protocol.
+    // Measured on a realistic VLESS payload (a ~400 B config plus the embed
+    // columns): 20 000 protocols cost 658-713 ms as typed single-row upserts
+    // against 125-155 ms this way — `docs/research/2026-11-16-turso-0.9-delta.md`
+    // §5. The column list, the enum spellings (`as_str`), the INTEGER flag and
+    // the config JSON are the exact forms the typed writer stores; the test
+    // `protocols_bulk_matches_the_typed_writer` pins that equality.
+    let created = now_epoch();
+    for chunk in ps.chunks(IMPORT_STATEMENT_ROWS) {
+        let mut sql = String::with_capacity(chunk.len() * 320 + 320);
+        sql.push_str(
+            "INSERT INTO protocols (id, sig, proto_kind, transport_type, security_type, \
+             security_sni, security_fp, security_insecure, config, created_at) VALUES ",
+        );
+        for (i, p) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            let config = serde_json::to_string(&p.config.get().0).map_err(|e| {
+                DatabaseError::Generic(format!("upsert_protocols_bulk: config json: {e}"))
+            })?;
+            let _ = write!(
+                sql,
+                "({}, {}, {}, {}, {}, {}, {}, {}, {}, {created})",
+                p.id.get(),
+                p.sig,
+                sql_lit(p.proto_kind.as_str()),
+                sql_lit(p.transport.r#type.as_str()),
+                sql_lit(p.security.r#type.as_str()),
+                p.security
+                    .sni
+                    .as_deref()
+                    .map_or_else(|| "NULL".to_owned(), sql_lit),
+                p.security
+                    .fp
+                    .as_deref()
+                    .map_or_else(|| "NULL".to_owned(), sql_lit),
+                p.security
+                    .insecure
+                    .map_or_else(|| "NULL".to_owned(), |b| i64::from(b).to_string()),
+                sql_lit(&config),
+            );
+        }
+        // The typed upsert's conflict action: every field this writer owns
+        // EXCEPT `created_at`, which `on_create` stamps once.
+        sql.push_str(
+            " ON CONFLICT(id) DO UPDATE SET sig = excluded.sig, \
+             proto_kind = excluded.proto_kind, transport_type = excluded.transport_type, \
+             security_type = excluded.security_type, security_sni = excluded.security_sni, \
+             security_fp = excluded.security_fp, \
+             security_insecure = excluded.security_insecure, config = excluded.config",
+        );
+        toasty::sql::statement(sql).exec(&mut *tx).await?;
     }
     Ok(())
 }
@@ -4271,6 +4302,84 @@ mod tests {
                 .unwrap_or_default(),
             vec![(ip("1.1.1.1"), Some("US".to_string()))],
         );
+    }
+
+    /// The chunked protocol writer stores exactly what the typed single-row
+    /// upsert stores — the enum text, the INTEGER flag, the config JSON — and a
+    /// re-upsert updates the config while keeping `created_at`. The two paths
+    /// must never drift: a wrong spelling here is a protocol that no longer
+    /// decodes into its own model.
+    #[tokio::test]
+    async fn protocols_bulk_matches_the_typed_writer() {
+        async fn row_for(conn: &mut toasty::Connection, id: i64) -> toasty_core::stmt::Value {
+            let mut rows = toasty::sql::query(format!(
+                "SELECT proto_kind, transport_type, security_type, security_sni, \
+                 security_fp, security_insecure, config, created_at \
+                 FROM protocols WHERE id = {id}"
+            ))
+            .exec(conn)
+            .await
+            .expect("read");
+            rows.pop().expect("one row")
+        }
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+
+        let bulk_row = Protocol {
+            created_at: 0,
+            id: ProtocolId::new(1),
+            sig: 11,
+            proto_kind: ProtocolKind::Vless,
+            transport: tcp_transport(),
+            security: no_security(),
+            config: Deferred::from(Json(vless_config())),
+            links: Deferred::default(),
+        };
+        // The typed upsert this writer replaced, kept as the reference.
+        Protocol::upsert_by_id(ProtocolId::new(2))
+            .sig(22)
+            .proto_kind(ProtocolKind::Vless)
+            .transport(tcp_transport())
+            .security(no_security())
+            .config(vless_config())
+            .on_create(|create| create.created_at(now_epoch()))
+            .exec(&mut conn)
+            .await
+            .expect("typed upsert");
+
+        upsert_protocols_bulk(&mut conn, std::slice::from_ref(&bulk_row))
+            .await
+            .expect("bulk upsert");
+
+        let bulk = row_for(&mut conn, 1).await;
+        let typed = row_for(&mut conn, 2).await;
+        assert_eq!(bulk, typed, "bulk and typed rows must be identical");
+
+        // A re-upsert of the SAME id carries a new config: it must land, while
+        // `created_at` (the typed writer's on_create stamp) must not.
+        let mut changed = vless_config();
+        if let ProtocolConfig::Vless(cfg) = &mut changed {
+            cfg.uuid = "11111111-1111-4111-8111-111111111111".to_string();
+        }
+        let mut refreshed = bulk_row.clone();
+        refreshed.config = Deferred::from(Json(changed));
+        upsert_protocols_bulk(&mut conn, std::slice::from_ref(&refreshed))
+            .await
+            .expect("re-upsert");
+        let after = row_for(&mut conn, 1).await;
+        let created_before = match &typed {
+            toasty_core::stmt::Value::Record(r) => r.fields.last().cloned(),
+            _ => None,
+        };
+        let created_after = match &after {
+            toasty_core::stmt::Value::Record(r) => r.fields.last().cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            created_before, created_after,
+            "created_at is on_create only"
+        );
+        assert_ne!(bulk, after, "the new config must be stored");
     }
 
     /// The import path's bulk literal writer (db-rewamp D10): an IP literal's

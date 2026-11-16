@@ -3334,6 +3334,7 @@ dependencies = [
  "jiff",
  "leas-hakari",
  "leas-proto",
+ "mimalloc-safe",
  "rapidhash",
  "rstest",
  "serde_json",

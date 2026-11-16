@@ -434,6 +434,23 @@ impl Driver for Turso {
             .connect()
             .map_err(classify_turso_error)?;
 
+        // Per-CONNECTION settings belong here, at the pool's create hook: the
+        // pool hands the same physical connection out many times, so applying
+        // them on every checkout cost two statements per database call
+        // (measured 20–33 µs). `synchronous=NORMAL` is the durability/throughput
+        // trade this app documents: commits are not fsynced individually (a
+        // power loss may drop the newest transactions, the file stays
+        // consistent); the default FULL costs ~4.2 ms per commit and a ping
+        // batch issues tens of thousands of them.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(classify_turso_error)?;
+        conn.pragma_update("synchronous", "NORMAL")
+            .await
+            .map_err(classify_turso_error)?;
+        conn.pragma_update("foreign_keys", "ON")
+            .await
+            .map_err(classify_turso_error)?;
+
         if self.concurrent_writes {
             // `PRAGMA journal_mode = ...` returns the new mode as a row;
             // the `execute` path errors with "unexpected row during
