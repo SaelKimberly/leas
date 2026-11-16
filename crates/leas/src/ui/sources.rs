@@ -604,6 +604,50 @@ mod flow_tests {
         drop(dir);
     }
 
+    /// A truncated import's reason must be legible in the row, not just the
+    /// word `error`: the Status column is what clips it, so at a wide pane the
+    /// text after `error: ` has to survive to the reason's words. Before the
+    /// 40-cell tier this row showed `error: 256 MiB byt` and nothing else.
+    #[tokio::test]
+    async fn an_error_row_shows_its_reason_words() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (dir, mut state) = state_with_groups(1).await;
+        let mut group = state.groups[0].clone();
+        group.status = Some(leas_db::models::GroupStatus::Error);
+        group.error_message = Some(
+            "256 MiB byte budget — raise import.max_feed_bytes — subscription import ended \
+             early after 12 link(s) stored; the feed is incomplete, stored rows were kept"
+                .into(),
+        );
+        state.db.upsert_group(&group).await.unwrap();
+        state.reload_groups().await;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        let painted: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            painted.contains("byte budget"),
+            "the reason must reach the row, not stop at `error:`: {painted}"
+        );
+        assert!(
+            painted.contains("raise"),
+            "the action the user has to take must be visible too: {painted}"
+        );
+        drop(dir);
+    }
+
     /// `Space` toggles the mask at the cursor; the table keeps the widest
     /// column set at 120 columns with no column past the pane.
     #[tokio::test]
