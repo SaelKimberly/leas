@@ -144,8 +144,9 @@ therefore buys no protection and costs data.
    import.max_feed_bytes`, 50 chars so the group row's 60-char cut keeps the actionable tail; the
    `(0 = unbounded)` detail stays in the log line), because a group row previously said only
    `error` and the log was the only place the number existed. The partial-import message now leads
-   with the reason and puts the stored count after it — the row renders 60 chars, and a reason at
-   the end is the part a user never sees.
+   with the reason and puts the stored count after it. The Status column is the binding limit (20
+   cells, 40 on a pane ≥ 90 wide — previously 20 at every width), so the reason LEADS and the full
+   text stays in the activity log.
 4. **Still not in Settings.** Raising the ceiling means editing `config.json`. A Settings →
    Subscriptions section was never implemented and is not implemented here; if a user-facing knob is
    wanted, it is its own change with its own tests.

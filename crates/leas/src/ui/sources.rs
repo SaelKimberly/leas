@@ -31,9 +31,13 @@ fn columns_for(width: u16) -> Vec<Column<'static>> {
         Column::new("Enabled", ColumnWidth::Fixed(7)),
     ];
     if width >= 52 {
+        // An error row puts its REASON here (`error: <reason>`), and 20 cells
+        // shows about a twelfth of one. 40 fits only once the fixed columns
+        // plus the remaining URL minimum stop overflowing, hence the tier.
+        let status = if width >= 90 { 40 } else { 20 };
         cols.push(Column::new(
             "Status",
-            ColumnWidth::Fixed(20.min(width.saturating_sub(40))),
+            ColumnWidth::Fixed(status.min(width.saturating_sub(40))),
         ));
     }
     if width >= 64 {
@@ -159,6 +163,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             // 2026-10-01 truncated import undiagnosable — the reason was in
             // the activity log, which the user has to know to look in.
             // `specs/2026-10-02-import-budget-design.md` §5.
+            //
+            // 60 here is only an upper bound: the Status column clips it (20
+            // cells, 40 on a wide pane), so the reason must LEAD with what the
+            // user can act on, and the full text stays in the activity log.
             let error_reason = g
                 .error_message
                 .as_deref()

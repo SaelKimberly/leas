@@ -607,9 +607,10 @@ pub(crate) fn partial_import_message_for_test(outcome: &ImportOutcome) -> String
 #[must_use]
 pub(crate) fn partial_import_message(outcome: &ImportOutcome) -> Option<String> {
     outcome.ended_early.as_ref().map(|reason| {
-        // Reason FIRST: the group row renders 60 chars of this message
-        // (`ui/sources.rs`), and a reason at the end is exactly what the user
-        // never sees. The count still says what survived.
+        // Reason FIRST: the group row clips this message to the Status column
+        // (20 cells, 40 on a wide pane — `ui/sources.rs`), so a reason at the
+        // end is exactly what the user never sees. The count still says what
+        // survived; the log line carries the full text.
         format!(
             "{reason} — subscription import ended early after {} link(s) stored; the feed is incomplete, stored rows were kept",
             outcome.links
