@@ -398,7 +398,7 @@ pub fn render_inner(frame: &mut Frame, area: Rect, state: &AppState) {
         .checked_sub(offset)
         .filter(|&s| s < log_rows.len());
 
-    let data_table = DataTable::new(columns, &log_rows)
+    let data_table = DataTable::new(&columns, &log_rows)
         .column_spacing(1)
         .selection_style(ThemeStyles::table_row_selected(theme))
         // The slice is the visible window; the scrollbar still reports the

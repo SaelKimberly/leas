@@ -17,10 +17,10 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 
 use crate::types::EndpointInfo;
-use leas_db::models::ProfileStats;
 use ratatui::widgets::Paragraph;
 
 use crate::AppState;
+use crate::ui::FmtBuf;
 use crate::ui::theme::ThemeStyles;
 
 /// Below this width the three columns stack (facts first, aggregates after).
@@ -63,25 +63,48 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
+/// Padding for the label column, sliced to the shortfall (labels are static
+/// and all fit `LABEL_WIDTH`).
+const LABEL_PAD: &str = "             ";
+
 /// One label/value line: a muted label column, then the value.
-fn field<'a>(label: &str, value: &str, theme: &opaline::Theme) -> Line<'a> {
-    let padded = format!("{label:<LABEL_WIDTH$}");
+///
+/// Borrows both halves: the pane is rebuilt every frame, and the old shape
+/// formatted the padded label, copied the value with `to_string()` and then
+/// collected a `Vec` — three allocations per field, ~50 per frame.
+fn field<'a>(label: &'static str, value: &'a str, theme: &opaline::Theme) -> Line<'a> {
+    let label_width = unicode_width::UnicodeWidthStr::width(label);
+    debug_assert!(label_width <= LABEL_WIDTH, "label wider than its column");
+    let pad = &LABEL_PAD[..LABEL_WIDTH.saturating_sub(label_width)];
     let value_style = if value == EMPTY {
         ThemeStyles::hint(theme)
     } else {
         ThemeStyles::footer_value(theme)
     };
     Line::from(vec![
-        Span::styled(padded, ThemeStyles::hint(theme)),
-        Span::styled(value.to_string(), value_style),
+        Span::styled(label, ThemeStyles::hint(theme)),
+        Span::raw(pad),
+        Span::styled(value, value_style),
     ])
 }
 
-fn group_header<'a>(name: &str, theme: &opaline::Theme) -> Line<'a> {
-    Line::from(Span::styled(
-        name.to_string(),
-        ThemeStyles::container_title(theme),
-    ))
+fn group_header(name: &'static str, theme: &opaline::Theme) -> Line<'static> {
+    Line::from(Span::styled(name, ThemeStyles::container_title(theme)))
+}
+
+/// `Addr1, Addr2, …` for a stack buffer: `join` needs an intermediate `Vec`.
+struct IpList<'a>(&'a [std::net::IpAddr]);
+
+impl std::fmt::Display for IpList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, ip) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{ip}")?;
+        }
+        Ok(())
+    }
 }
 
 /// A single vertical rule between two sections.
@@ -101,15 +124,16 @@ fn draw_separator(frame: &mut Frame, area: Rect, theme: &opaline::Theme) {
 /// Profiles pane's bottom line.
 pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
+    let mut text_buf = FmtBuf::<160>::default();
     let line = state.aggregates.as_ref().map_or_else(
         || Line::from(Span::styled("  computing…", ThemeStyles::hint(theme))),
         |cache| {
             let c = &cache.counts;
             Line::from(Span::styled(
-                format!(
+                text_buf.put(format_args!(
                     "{} total · {} alive · {} active · {} proven · {} untested · {} failed",
                     c.total, c.alive, c.active, c.proven, c.untested, c.failed
-                ),
+                )),
                 ThemeStyles::footer_value(theme),
             ))
         },
@@ -133,6 +157,10 @@ fn render_server(frame: &mut Frame, area: Rect, state: &AppState, theme: &opalin
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(group_header("Server", theme));
+    // Hoisted above the match: the pushed lines borrow these buffers and the
+    // pane renders after the arm ends.
+    let mut address_buf = FmtBuf::<96>::default();
+    let mut ips_buf = FmtBuf::<256>::default();
     match row {
         None => {
             lines.push(Line::from(Span::styled(
@@ -148,30 +176,20 @@ fn render_server(frame: &mut Frame, area: Rect, state: &AppState, theme: &opalin
             // (the grid's own law — `profiles.rs:1155`); `endpoint_info` is a
             // display cache and must not replace them.
             let host = endpoint.display_host(&row.resolved_ips);
-            lines.push(field(
-                "Address",
-                &format!("{host}:{}", endpoint.port),
-                theme,
-            ));
+            let address = address_buf.put(format_args!("{host}:{}", endpoint.port));
+            let ips = if row.resolved_ips.is_empty() {
+                EMPTY
+            } else {
+                ips_buf.put(format_args!("{}", IpList(&row.resolved_ips)))
+            };
+            lines.push(field("Address", address, theme));
             lines.push(field(
                 "Country",
                 info.and_then(|i| i.country.as_deref()).unwrap_or(EMPTY),
                 theme,
             ));
-            lines.push(field(
-                "Resolved IPs",
-                &if row.resolved_ips.is_empty() {
-                    EMPTY.to_string()
-                } else {
-                    row.resolved_ips
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                },
-                theme,
-            ));
-            lines.push(field("Whitelist", &white_tokens(info), theme));
+            lines.push(field("Resolved IPs", ips, theme));
+            lines.push(field("Whitelist", white_tokens(info), theme));
         }
     }
     finish_lines(frame, area, lines, 0);
@@ -206,18 +224,19 @@ fn render_link(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline:
         return finish_lines(frame, area, lines, state.details_scroll);
     };
 
+    let mut url_buf = FmtBuf::<64>::default();
     lines.push(field(
         "Leas URL",
-        &format!(
+        url_buf.put(format_args!(
             "leas://{:x}/{:x}",
             row.endpoint.id.get(),
             link.protocol_id.get()
-        ),
+        )),
         theme,
     ));
     // The protocol config: names only — no credentials, paths, or keys.
     if let Some(proto) = row.protocols.get(&link.protocol_id) {
-        lines.push(field("Protocol", &proto.proto_kind.to_string(), theme));
+        lines.push(field("Protocol", proto.proto_kind.as_str(), theme));
         lines.push(field("Transport", proto.transport.r#type.as_str(), theme));
         lines.push(field("Security", proto.security.r#type.as_str(), theme));
         if let Some(sni) = &proto.security.sni {
@@ -228,68 +247,77 @@ fn render_link(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline:
         }
     }
 
-    lines.push(field("Last Seen", &format_epoch(link.last_seen_at), theme));
+    // Each volatile value gets its own stack buffer: the spans borrow it for
+    // the life of the line, and the pane is rebuilt every frame.
+    let mut real_buf = FmtBuf::<24>::default();
+    let real = link
+        .latency
+        .real_delay
+        .map_or(EMPTY, |d| real_buf.put(format_args!("{d}ms")));
+    let mut fast_buf = FmtBuf::<24>::default();
+    let fast = link
+        .latency
+        .fast_delay
+        .map_or(EMPTY, |d| fast_buf.put(format_args!("{d}ms")));
+    let mut speed_buf = FmtBuf::<24>::default();
+    let speed = link.speed_bps.map_or(EMPTY, |s| {
+        speed_buf.put(format_args!("{:.1}MiB/s", s as f64 / 8.0 / 1_048_576.0))
+    });
+    let mut stab_buf = FmtBuf::<24>::default();
+    let stab = if link.stab_len == 0 {
+        EMPTY
+    } else {
+        stab_buf.put(format_args!(
+            "{}/{}",
+            link.stab_mask.count_ones(),
+            link.stab_len
+        ))
+    };
+    // The timestamp formatter owns the format (jiff), so its `String` is kept
+    // whole: copying it into a stack buffer would be a second allocation.
+    let seen_text = (link.last_seen_at > 0).then(|| format_epoch(link.last_seen_at));
+    let used_text = link.last_used_at.map(format_epoch);
+
+    lines.push(field(
+        "Last Seen",
+        seen_text.as_deref().unwrap_or(EMPTY),
+        theme,
+    ));
     lines.push(field(
         "Last Used",
-        &link
-            .last_used_at
-            .map_or_else(|| EMPTY.to_string(), format_epoch),
+        used_text.as_deref().unwrap_or(EMPTY),
         theme,
     ));
-    lines.push(field(
-        "Real Delay",
-        &link
-            .latency
-            .real_delay
-            .map_or_else(|| EMPTY.to_string(), |d| format!("{d}ms")),
-        theme,
-    ));
-    lines.push(field(
-        "Fast Delay",
-        &link
-            .latency
-            .fast_delay
-            .map_or_else(|| EMPTY.to_string(), |d| format!("{d}ms")),
-        theme,
-    ));
+    lines.push(field("Real Delay", real, theme));
+    lines.push(field("Fast Delay", fast, theme));
     lines.push(field("Auth", auth_label(link.latency.auth), theme));
-    lines.push(field(
-        "Speed",
-        &link.speed_bps.map_or_else(
-            || EMPTY.to_string(),
-            |s| format!("{:.1}MiB/s", s as f64 / 8.0 / 1_048_576.0),
-        ),
-        theme,
+    lines.push(field("Speed", speed, theme));
+    lines.push(field("Stability", stab, theme));
+    // `format_bytes` is the crate-wide formatter (it owns the unit thresholds);
+    // its two strings are the only allocations left on this line.
+    let mut traffic_buf = FmtBuf::<48>::default();
+    let traffic = traffic_buf.put(format_args!(
+        "↑{} ↓{}",
+        format_bytes(link.traffic.today_up),
+        format_bytes(link.traffic.today_down),
     ));
-    lines.push(field("Stability", &stability(link), theme));
-    lines.push(field(
-        "Traffic",
-        &format!(
-            "↑{} ↓{}",
-            format_bytes(link.traffic.today_up),
-            format_bytes(link.traffic.today_down),
-        ),
-        theme,
-    ));
+    lines.push(field("Traffic", traffic, theme));
 
     // The ACTIVE link's persisted real-ping IP wins; the display cache is the
-    // fallback — the grid's exact precedence (`profiles.rs:1183`).
+    // fallback — the grid's exact precedence (`profiles.rs:1183`). Borrowed,
+    // not cloned: the old path cloned the `Option<String>` every frame.
     let info = state.endpoint_info.get(&row.endpoint.id.get());
-    let active_ip = row
-        .active_link()
-        .and_then(|l| l.latency.ip.clone())
-        .or_else(|| info.and_then(|i| i.outbound_ip.map(|ip| ip.to_string())));
-    lines.push(field(
-        "Exit IP",
-        active_ip.as_deref().unwrap_or(EMPTY),
-        theme,
-    ));
+    let mut ip_buf = FmtBuf::<64>::default();
+    let persisted_ip = row.active_link().and_then(|l| l.latency.ip.as_deref());
+    let active_ip = persisted_ip.or_else(|| {
+        info.and_then(|i| i.outbound_ip)
+            .map(|ip| ip_buf.put(format_args!("{ip}")))
+    });
+    lines.push(field("Exit IP", active_ip.unwrap_or(EMPTY), theme));
+    let country = persisted_ip.and_then(|ip| state.outbound_country_for(ip));
     lines.push(field(
         "Exit Country",
-        row.active_link()
-            .and_then(|l| l.latency.ip.clone())
-            .as_deref()
-            .and_then(|ip| state.outbound_country_for(ip))
+        country
             .as_deref()
             .or_else(|| info.and_then(|i| i.outbound_country.as_deref()))
             .unwrap_or(EMPTY),
@@ -306,18 +334,16 @@ fn render_link(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline:
 
 /// Render the accumulated lines with a scroll offset.
 fn finish_lines(frame: &mut Frame, area: Rect, lines: Vec<Line>, offset: usize) {
+    // `Paragraph::scroll` clips to the area itself; collecting a second `Vec`
+    // of the visible lines was one more per-frame allocation.
     let offset = offset.min(lines.len().saturating_sub(1));
-    let visible: Vec<Line> = lines
-        .into_iter()
-        .skip(offset)
-        .take(area.height as usize)
-        .collect();
-    frame.render_widget(Paragraph::new(visible), area);
+    let scroll = u16::try_from(offset).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
 }
 
-fn white_tokens(info: Option<&EndpointInfo>) -> String {
+fn white_tokens(info: Option<&EndpointInfo>) -> &'static str {
     let Some(info) = info else {
-        return EMPTY.to_string();
+        return EMPTY;
     };
     let sni = info.sni_whitelisted.unwrap_or(false)
         || info.host_features.sni_whitelisted
@@ -325,10 +351,10 @@ fn white_tokens(info: Option<&EndpointInfo>) -> String {
         || info.host_features.cidr_whitelisted;
     let cidr = info.host_features.ip_whitelisted || info.host_features.cidr_whitelisted;
     match (sni, cidr) {
-        (true, true) => "SNI+CIDR".to_string(),
-        (true, false) => "SNI".to_string(),
-        (false, true) => "CIDR".to_string(),
-        (false, false) => EMPTY.to_string(),
+        (true, true) => "SNI+CIDR",
+        (true, false) => "SNI",
+        (false, true) => "CIDR",
+        (false, false) => EMPTY,
     }
 }
 
@@ -354,14 +380,6 @@ const fn error_label(kind: leas_db::models::ProfileErr) -> &'static str {
         ProfileErr::Fast => "fast",
         ProfileErr::Name => "name",
     }
-}
-
-fn stability(link: &ProfileStats) -> String {
-    if link.stab_len == 0 {
-        return EMPTY.to_string();
-    }
-    let successes = link.stab_mask.count_ones();
-    format!("{successes}/{}", link.stab_len)
 }
 
 /// The stored epoch seconds as `YYYY-MM-DD HH:MM:SS` (the crate's single
@@ -391,45 +409,65 @@ fn render_aggregates(frame: &mut Frame, area: Rect, state: &AppState, theme: &op
         return;
     };
     let c = &cache.counts;
+    // One stack buffer per counter, formatted once and reused by both blocks
+    // (each block shows the same four partition numbers).
+    let mut total_buf = FmtBuf::<24>::default();
+    let mut proven_buf = FmtBuf::<24>::default();
+    let mut untested_buf = FmtBuf::<24>::default();
+    let mut failed_buf = FmtBuf::<24>::default();
+    let mut other_buf = FmtBuf::<24>::default();
+    let mut alive_buf = FmtBuf::<24>::default();
+    let mut active_buf = FmtBuf::<24>::default();
+    let mut reliable_buf = FmtBuf::<24>::default();
+    let total = total_buf.put(format_args!("{}", c.total));
+    let proven = proven_buf.put(format_args!("{}", c.proven));
+    let untested = untested_buf.put(format_args!("{}", c.untested));
+    let failed = failed_buf.put(format_args!("{}", c.failed));
+    let other = other_buf.put(format_args!("{}", c.other));
+    let alive = alive_buf.put(format_args!("{}", c.alive));
+    let active = active_buf.put(format_args!("{}", c.active));
+    let reliable = reliable_buf.put(format_args!("{}", c.reliable));
 
     lines.push(Line::from(vec![
         Span::styled("DB ", ThemeStyles::container_title(theme)),
-        Span::styled(format!("{}", c.total), ThemeStyles::footer_value(theme)),
+        Span::styled(total, ThemeStyles::footer_value(theme)),
     ]));
     // The partition block.
     for (label, value) in [
-        ("proven", c.proven),
-        ("untested", c.untested),
-        ("failed", c.failed),
-        ("other", c.other),
+        ("proven", proven),
+        ("untested", untested),
+        ("failed", failed),
+        ("other", other),
     ] {
-        lines.push(field(label, &value.to_string(), theme));
+        lines.push(field(label, value, theme));
     }
     lines.push(Line::raw(""));
     // The orthogonal block — separated so it cannot be summed into the above.
     // Alive and Active are distinct bands, not one "recent" bucket.
-    lines.push(field("alive", &c.alive.to_string(), theme));
-    lines.push(field("active", &c.active.to_string(), theme));
-    lines.push(field("reliable", &c.reliable.to_string(), theme));
+    lines.push(field("alive", alive, theme));
+    lines.push(field("active", active, theme));
+    lines.push(field("reliable", reliable, theme));
 
     lines.push(Line::raw(""));
+    // The view label owns its `String` (it may append the search query).
+    let view = view_label(state);
     lines.push(Line::from(Span::styled(
-        format!("View: {}", view_label(state)),
+        view,
         ThemeStyles::container_title(theme),
     )));
     for (label, value) in [
-        ("proven", c.proven),
-        ("untested", c.untested),
-        ("failed", c.failed),
-        ("other", c.other),
+        ("proven", proven),
+        ("untested", untested),
+        ("failed", failed),
+        ("other", other),
     ] {
-        lines.push(field(label, &value.to_string(), theme));
+        lines.push(field(label, value, theme));
     }
 
     // Pinned at the top, clipped from the bottom: the global numbers are the
-    // ones the user asked for first, so a short pane must not eat them.
-    let visible: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
-    frame.render_widget(Paragraph::new(visible), area);
+    // ones the user asked for first, so a short pane must not eat them — and
+    // `Paragraph` clips to `area` on its own, with no second `Vec`.
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn view_label(state: &AppState) -> String {

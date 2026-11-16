@@ -6,6 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
+use crate::ui::FmtBuf;
 use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::data_table::{
     Column, ColumnWidth, DataTable, DataTableRow, DataTableState,
@@ -262,8 +263,9 @@ impl DataTableRow for DisplayRowData {
                     );
                 }
             } else if logical == 2 {
-                let host = truncate_host(text, max_w);
-                buf.set_stringn(x, y, &host, max_w, style);
+                let mut host_buf = FmtBuf::<HOST_TEXT_BUF>::default();
+                let host = truncate_host(text, max_w, &mut host_buf);
+                buf.set_stringn(x, y, host, max_w, style);
             } else {
                 buf.set_stringn(x, y, text, max_w, style);
             }
@@ -364,10 +366,21 @@ impl DisplayRowData {
         let inner_x = x0 + 1;
         let inner_w = (panel_w - 2) as usize;
 
-        // IPs line (y0+1 is inside the top border)
+        // IPs line (y0+1 is inside the top border). Drawn as two borrowed
+        // writes: `format!(" IPs: {}", …)` allocated on every frame an
+        // expanded row was visible.
         if y0 + 1 < clip_bottom {
-            let ips_text = format!(" IPs: {}", self.panel_ips);
-            buf.set_stringn(inner_x, y0 + 1, &ips_text, inner_w, row_style);
+            let prefix = " IPs: ";
+            buf.set_stringn(inner_x, y0 + 1, prefix, inner_w, row_style);
+            if inner_w > prefix.len() {
+                buf.set_stringn(
+                    inner_x + prefix.len() as u16,
+                    y0 + 1,
+                    &self.panel_ips,
+                    inner_w - prefix.len(),
+                    row_style,
+                );
+            }
             if self.panel_resolve_hint {
                 let hint = "(x resolve)";
                 let hx = inner_x + (inner_w.saturating_sub(hint.len())) as u16;
@@ -387,8 +400,17 @@ impl DisplayRowData {
         if y0 + 2 < clip_bottom {
             let sep_x = inner_x;
             let sep_y = y0 + 2;
-            let sep_line = "\u{2500}".repeat(inner_w);
-            buf.set_stringn(sep_x, sep_y, &sep_line, inner_w, Style::default());
+            // A char loop, not `"─".repeat(inner_w)`: the separator is one
+            // frame-local row, never worth a heap string. Clamped to the
+            // buffer — `set_stringn` clipped, and a panel wider than the
+            // terminal (a narrow buffer in tests) must not index past it.
+            let rule_style = Style::default();
+            let right = (sep_x + inner_w as u16).min(buf.area().right());
+            if sep_y < buf.area().bottom() {
+                for x in sep_x..right {
+                    buf[(x, sep_y)].set_char('\u{2500}').set_style(rule_style);
+                }
+            }
             for (off, w, label) in PANEL_COLS.iter().take(fitting) {
                 let (off, w) = (*off, *w);
                 if label.is_empty() || off >= inner_w {
@@ -406,9 +428,11 @@ impl DisplayRowData {
                 // Windowed: the separator carries the visible range (rows N-M
                 // of T) so the panel signals the rows scrolled out of view.
                 // It owns the panel's right edge, past the last column.
-                let label = format!(" {}-{}/{} ", win + 1, win + visible, total);
+                let mut label_buf = FmtBuf::<32>::default();
+                let label =
+                    label_buf.put(format_args!(" {}-{}/{} ", win + 1, win + visible, total));
                 let lx = inner_x + (inner_w.saturating_sub(label.len())) as u16;
-                buf.set_stringn(lx, sep_y, &label, label.len(), row_style);
+                buf.set_stringn(lx, sep_y, label, label.len(), row_style);
             }
         }
 
@@ -1112,27 +1136,54 @@ fn white_cell(cidr: bool, sni: bool) -> String {
 /// registrable domain intact and elides the subdomain's tail
 /// (`verylongsub….example.com`). IP literals and overflowed hosts plain
 /// right-truncate with a trailing `…`.
-fn truncate_host(host: &str, width: usize) -> String {
+/// Stack room for the rewritten host: the widest Address column is 30 cells,
+/// so even 4-byte glyphs and a `….example.com` suffix fit many times over.
+const HOST_TEXT_BUF: usize = 128;
+
+/// Fit `host` into `width` cells without allocating.
+///
+/// The common case (it already fits) is returned verbatim — the old version
+/// `to_string()`ed it, one allocation per visible row per frame. A long DNS
+/// name keeps its registrable domain (`….example.com`); an IP literal or a
+/// pathological name is right-truncated with an ellipsis. The rewritten forms
+/// go into `out`, a stack buffer.
+fn truncate_host<'a>(host: &'a str, width: usize, out: &'a mut FmtBuf<HOST_TEXT_BUF>) -> &'a str {
     use unicode_width::UnicodeWidthStr;
     if host.width() <= width {
-        return host.to_string();
+        return host;
     }
-    let labels: Vec<&str> = host.split('.').collect();
-    let dns_name = labels.len() > 2 && labels.iter().all(|l| !l.is_empty());
-    if dns_name {
-        let domain = labels[labels.len() - 2..].join(".");
-        let suffix = format!("….{domain}");
-        let budget = width.saturating_sub(suffix.width());
+    let mut labels = host.split('.');
+    let first = labels.next().unwrap_or_default();
+    let mut label_count = 1usize;
+    let mut all_nonempty = !first.is_empty();
+    for label in labels {
+        label_count += 1;
+        all_nonempty &= !label.is_empty();
+    }
+    if label_count > 2 && all_nonempty {
+        // The registrable domain is the last two labels.
+        let mut tail = host.rsplitn(3, '.');
+        let tld = tail.next().unwrap_or_default();
+        let domain = tail.next().unwrap_or_default();
+        let suffix_width = UnicodeWidthStr::width("….")
+            + UnicodeWidthStr::width(domain)
+            + UnicodeWidthStr::width(".")
+            + UnicodeWidthStr::width(tld);
+        let budget = width.saturating_sub(suffix_width);
         if budget >= 1 {
-            let mut out: String = host.chars().take(budget).collect();
-            out.push_str(&suffix);
-            return out;
+            let end = host
+                .char_indices()
+                .nth(budget)
+                .map_or(host.len(), |(i, _)| i);
+            return out.put(format_args!("{}….{domain}.{tld}", &host[..end]));
         }
     }
     // IP literal (or a pathological name): right-truncate with an ellipsis.
-    let mut out: String = host.chars().take(width.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    let end = host
+        .char_indices()
+        .nth(width.saturating_sub(1))
+        .map_or(host.len(), |(i, _)| i);
+    out.put(format_args!("{}…", &host[..end]))
 }
 
 /// Does this terminal render regional-indicator (flag) emoji? Probed once:
@@ -1551,6 +1602,82 @@ const GRID_COLUMNS: [(usize, &str, u16); 18] = [
     (17, "Exit", 14), // exit IP
 ];
 
+/// The Profiles grid's header, cached per `(pane width, header role)`.
+///
+/// Width-aware drop (tui-polish D7, re-derived for the §7 grid): the inner
+/// width decides which columns survive. `Real` is protected — a row without
+/// its verdict is useless. Drop order: Exit, Out, White, Streak, Stab, Auth,
+/// Fast, Speed; then Address shrinks toward a 12-cell floor. The three
+/// separator columns are structural and stay. Surviving columns carry their
+/// LOGICAL id through `order`, so a drop never shifts another column's
+/// meaning.
+///
+/// The geometry is derived from the pane width alone, so the frame reuses it:
+/// rebuilding per draw cost a widths `Vec`, an order `Vec` and one `Vec<Span>`
+/// per header line (18 of them) on every single frame.
+#[derive(Default)]
+pub struct GridHeaderCache {
+    width: u16,
+    header_style: Style,
+    filled: bool,
+    columns: Vec<Column<'static>>,
+    order: Vec<usize>,
+}
+
+impl GridHeaderCache {
+    /// The header columns and their positional -> logical order for `width`.
+    pub fn for_width(&mut self, width: u16, header_style: Style) -> (&[Column<'static>], &[usize]) {
+        if !self.filled || self.width != width || self.header_style != header_style {
+            self.rebuild(width, header_style);
+        }
+        (&self.columns, &self.order)
+    }
+
+    fn rebuild(&mut self, width: u16, header_style: Style) {
+        let mut widths = [0u16; GRID_COLUMNS.len()];
+        for (slot, (_, _, w)) in widths.iter_mut().zip(GRID_COLUMNS.iter()) {
+            *slot = *w;
+        }
+        let inner_w = width.saturating_sub(2); // frameless inset
+        for &drop in &[17usize, 16, 4, 13, 12, 10, 9, 14] {
+            if widths.iter().sum::<u16>() > inner_w {
+                widths[drop] = 0;
+            }
+        }
+        let excess = widths.iter().sum::<u16>().saturating_sub(inner_w);
+        if excess > 0 {
+            // Address shrinks toward a 12-cell floor; anything still over clips.
+            let shrink = excess.min(widths[2].saturating_sub(12));
+            widths[2] -= shrink;
+        }
+        self.columns.clear();
+        self.order.clear();
+        for (logical, (_, label, _)) in GRID_COLUMNS.iter().enumerate() {
+            if widths[logical] == 0 {
+                continue;
+            }
+            self.order.push(logical);
+            let header = if label.is_empty() {
+                Line::raw("")
+            } else if logical == 6 {
+                // The Protocol column is right-aligned: pad the header the
+                // same way the row cell pads its kind.
+                Line::from(Span::styled(
+                    format!("{label:>PROTOCOL_WIDTH$}"),
+                    header_style,
+                ))
+            } else {
+                Line::from(Span::styled(*label, header_style))
+            };
+            self.columns
+                .push(Column::new(header, ColumnWidth::Fixed(widths[logical])));
+        }
+        self.width = width;
+        self.header_style = header_style;
+        self.filled = true;
+    }
+}
+
 fn render_data_grid(
     frame: &mut Frame,
     area: Rect,
@@ -1563,66 +1690,23 @@ fn render_data_grid(
     // one cell per side to preserve the geometry the old Block's border gave.
 
     let header_style = ThemeStyles::table_header(theme);
-    // Width-aware drop (tui-polish D7, re-derived for the §7 grid): the inner
-    // width decides which columns survive. `Real` is protected — a row without
-    // its verdict is useless. Drop order: Exit, Out, White, Streak, Stab,
-    // Auth, Fast, Speed; then Address shrinks toward a 12-cell floor. The
-    // three separator columns are structural and stay. Surviving columns carry
-    // their LOGICAL id through `order`, so a drop never shifts another
-    // column's meaning.
-    let logical: &[(usize, &str, u16); 18] = &GRID_COLUMNS;
-    let mut widths: Vec<u16> = logical.iter().map(|(_, _, w)| *w).collect();
-    let inner_w = area.width.saturating_sub(2); // frameless inset
-    for &drop in &[17usize, 16, 4, 13, 12, 10, 9, 14] {
-        if widths.iter().sum::<u16>() > inner_w {
-            widths[drop] = 0;
-        }
-    }
-    let excess = widths.iter().sum::<u16>().saturating_sub(inner_w);
-    if excess > 0 {
-        // Address shrinks toward a 12-cell floor; anything still over clips.
-        let shrink = excess.min(widths[2].saturating_sub(12));
-        widths[2] -= shrink;
-    }
-    let order: Vec<usize> = widths
-        .iter()
-        .enumerate()
-        .filter(|(_, w)| **w > 0)
-        .map(|(i, _)| i)
-        .collect();
-    let columns: Vec<Column> = order
-        .iter()
-        .map(|&l| {
-            let (_, label, _) = logical[l];
-            if label.is_empty() {
-                Column::new(Line::raw(""), ColumnWidth::Fixed(widths[l]))
-            } else if l == 6 {
-                // The Protocol column is right-aligned: pad the header the
-                // same way the row cell pads its kind.
-                Column::new(
-                    Line::from(Span::styled(
-                        format!("{label:>PROTOCOL_WIDTH$}"),
-                        header_style,
-                    )),
-                    ColumnWidth::Fixed(widths[l]),
-                )
-            } else {
-                Column::new(
-                    Line::from(Span::styled(label, header_style)),
-                    ColumnWidth::Fixed(widths[l]),
-                )
-            }
-        })
-        .collect();
+    // Column geometry is a function of the pane width and the header role
+    // alone. Recomputing it per frame allocated a `Vec` of widths, a `Vec` of
+    // logical ids and one `Vec<Span>` per header line, every draw; the cache
+    // rebuilds only when one of those two inputs changes.
+    let mut header_cache = state.grid_header_cache.borrow_mut();
+    let (columns, order) = header_cache.for_width(area.width, header_style);
 
     // Scroll offset: keep the selected row roughly centered, in line units —
     // expanded rows are taller than 1, so row-index math would strand the
-    // last rows below the viewport.
-    let heights: Vec<u16> = display_rows
-        .iter()
-        .map(|r| r.height(area.width.saturating_sub(2)))
-        .collect();
-    let data_offset = compute_scroll_offset(&heights, selected_display_idx, area.height);
+    // last rows below the viewport. Heights are read straight off the rows
+    // (each is an O(1) match), so they never need a per-frame `Vec`.
+    let data_offset = compute_scroll_offset(
+        display_rows.len(),
+        |index| display_rows[index].height(area.width.saturating_sub(2)),
+        selected_display_idx,
+        area.height,
+    );
     let scrollbar_total = usize::try_from(state.page_total).unwrap_or(usize::MAX);
     let scrollbar_offset = state.page_offset.saturating_add(data_offset);
 
@@ -1677,19 +1761,32 @@ fn panel_window(total: usize, selected: Option<usize>, max_visible: usize) -> us
 }
 
 /// First visible row index that keeps the selected row roughly centered.
-/// `heights[i]` is row i's height (expanded rows are taller than 1). The
+/// `height_at(i)` is row i's height (expanded rows are taller than 1). The
 /// return value is a row index because [`DataTableState::offset`] indexes
 /// `DataTable::rows`, even though vertical positioning uses line heights.
-fn compute_scroll_offset(heights: &[u16], selected: usize, viewport_height: u16) -> usize {
+///
+/// Heights come from a closure, not a slice, so a frame never has to collect
+/// them into a `Vec`: every caller can read them off the row (`height` is an
+/// O(1) match on `expanded`).
+fn compute_scroll_offset(
+    row_count: usize,
+    height_at: impl Fn(usize) -> u16,
+    selected: usize,
+    viewport_height: u16,
+) -> usize {
     let inner_height = viewport_height.saturating_sub(3) as usize;
-    let Some(selected_height) = heights.get(selected).copied() else {
+    if selected >= row_count {
         return 0;
-    };
+    }
+    let selected_height = height_at(selected);
     if selected_height as usize >= inner_height {
-        return selected.min(heights.len().saturating_sub(1));
+        return selected.min(row_count.saturating_sub(1));
     }
 
-    let selected_start: usize = heights[..selected].iter().map(|h| *h as usize).sum();
+    let mut selected_start = 0usize;
+    for index in 0..selected {
+        selected_start += height_at(index) as usize;
+    }
     let ideal_line =
         selected_start.saturating_sub(inner_height.saturating_sub(selected_height as usize) / 2);
 
@@ -1700,37 +1797,36 @@ fn compute_scroll_offset(heights: &[u16], selected: usize, viewport_height: u16)
         .saturating_sub(inner_height);
     let mut line = 0usize;
     let mut minimum_offset = selected;
-    for (index, height) in heights.iter().enumerate() {
+    for index in 0..row_count {
         if line >= minimum_line {
             minimum_offset = index;
             break;
         }
-        line += *height as usize;
+        line += height_at(index) as usize;
     }
 
     // Latest row offset that still fills the viewport from the end. A row
     // taller than the viewport remains partially visible at the last index.
     let mut rows_from_end = 0usize;
     let mut height_from_end = 0usize;
-    for height in heights.iter().rev() {
-        let height = *height as usize;
+    for index in (0..row_count).rev() {
+        let height = height_at(index) as usize;
         if height_from_end + height > inner_height {
             break;
         }
         height_from_end += height;
         rows_from_end += 1;
     }
-    let maximum_offset = heights
-        .len()
+    let maximum_offset = row_count
         .saturating_sub(rows_from_end)
-        .min(heights.len().saturating_sub(1));
+        .min(row_count.saturating_sub(1));
     let minimum_offset = minimum_offset.min(maximum_offset);
 
     // Convert the ideal LINE position to the closest actual ROW start.
     let mut best = minimum_offset;
     let mut best_distance = usize::MAX;
     line = 0;
-    for (index, height) in heights.iter().enumerate().take(maximum_offset + 1) {
+    for index in 0..=maximum_offset {
         if index >= minimum_offset {
             let distance = line.abs_diff(ideal_line);
             if distance < best_distance {
@@ -1738,7 +1834,7 @@ fn compute_scroll_offset(heights: &[u16], selected: usize, viewport_height: u16)
                 best_distance = distance;
             }
         }
-        line += *height as usize;
+        line += height_at(index) as usize;
     }
     best
 }
@@ -1800,40 +1896,39 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &opalin
         return;
     }
 
-    let line = footer_row(state).map_or_else(
-        || {
-            Line::from(Span::styled(
-                " Server: (none selected)",
-                ThemeStyles::footer_label(theme),
-            ))
-        },
-        |row| {
+    let label = ThemeStyles::footer_label(theme);
+    let value = ThemeStyles::footer_value(theme);
+    // Two stack buffers, both alive for the whole line: the footer is rebuilt
+    // every frame, so its `format!`/`to_string` pairs were per-frame churn.
+    let mut address_buf = FmtBuf::<160>::default();
+    let mut rows_buf = FmtBuf::<96>::default();
+    let mut spans: Vec<Span> = Vec::with_capacity(4);
+    match footer_row(state) {
+        None => spans.push(Span::styled(" Server: (none selected)", label)),
+        Some(row) => {
             let host = row.endpoint.display_host(&row.resolved_ips);
-            let addr = if host.is_empty() {
-                "-".to_string()
-            } else {
-                host
-            };
-            let port = row.endpoint.port.to_string();
-            Line::from(vec![
-                Span::styled(" Server: ", ThemeStyles::footer_label(theme)),
-                Span::styled(format!("{addr}:{port}  "), ThemeStyles::footer_value(theme)),
-            ])
-        },
-    );
+            let addr = if host.is_empty() { "-" } else { host.as_str() };
+            spans.push(Span::styled(" Server: ", label));
+            spans.push(Span::styled(
+                address_buf.put(format_args!("{addr}:{}  ", row.endpoint.port)),
+                value,
+            ));
+        }
+    }
     // Page position: a 200-row window must not look like a 200-entry feed.
-    let line = line.patch_style(ThemeStyles::status_footer(theme));
-    let mut spans = line.spans;
     if state.profiles_total() > 0 {
         let first = state.page_offset as u64 + 1;
         let last = state.page_offset as u64 + state.endpoints.len() as u64;
-        spans.push(Span::styled(" ", ThemeStyles::footer_label(theme)));
+        spans.push(Span::styled(" ", label));
         spans.push(Span::styled(
-            format!("rows {first}-{last} of {}", state.profiles_total()),
-            ThemeStyles::footer_label(theme),
+            rows_buf.put(format_args!(
+                "rows {first}-{last} of {}",
+                state.profiles_total()
+            )),
+            label,
         ));
     }
-    let line = Line::from(spans);
+    let line = Line::from(spans).patch_style(ThemeStyles::status_footer(theme));
     let footer = Paragraph::new(line).style(ThemeStyles::status_footer(theme));
     frame.render_widget(footer, area);
 }
@@ -1844,20 +1939,26 @@ fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         leas_db::models::PurgatoryView::Purgatory => "Purgatory",
         leas_db::models::PurgatoryView::All => "All",
     };
-    let view_text = format!(" View: {view_label} [P]");
-    let view_span = Span::styled(view_text, ThemeStyles::container_title(theme));
-    let search_text = if state.search_focused {
-        format!("/ {}▉", state.search_query)
+    let title = ThemeStyles::container_title(theme);
+    let warning = ThemeStyles::warning(theme);
+    // Borrowed pieces into ONE span vec: the strip is rebuilt every frame, and
+    // the old shape allocated two `String`s plus a wrapper `Vec` for them.
+    let mut spans = Vec::with_capacity(6);
+    spans.push(Span::styled(" View: ", title));
+    spans.push(Span::styled(view_label, title));
+    spans.push(Span::styled(" [P]", title));
+    spans.push(Span::raw("  "));
+    if state.search_focused {
+        spans.push(Span::styled("/ ", warning));
+        spans.push(Span::styled(state.search_query.as_str(), warning));
+        spans.push(Span::styled("▉", warning));
     } else if state.search_query.is_empty() {
-        " /  (press / to search)".to_string()
+        spans.push(Span::styled(" /  (press / to search)", warning));
     } else {
-        format!("/ {}", state.search_query)
-    };
-    let search_span = Span::styled(search_text, ThemeStyles::warning(theme));
-
-    let line = Line::from(vec![view_span, Span::raw("  "), search_span]);
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+        spans.push(Span::styled("/ ", warning));
+        spans.push(Span::styled(state.search_query.as_str(), warning));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 #[cfg(test)]
@@ -2501,13 +2602,23 @@ mod tests {
         // A long subdomain elides its tail; the registrable domain survives.
         // 36-cell host, 33-cell column: 20 subdomain cells + `….example.com`.
         assert_eq!(
-            truncate_host("abcdefghijklmnopqrstuvwxyz.example.com", 33),
+            truncate_host(
+                "abcdefghijklmnopqrstuvwxyz.example.com",
+                33,
+                &mut FmtBuf::default()
+            ),
             "abcdefghijklmnopqrst….example.com"
         );
         // Fits: verbatim.
-        assert_eq!(truncate_host("edge-a.example", 33), "edge-a.example");
+        assert_eq!(
+            truncate_host("edge-a.example", 33, &mut FmtBuf::default()),
+            "edge-a.example"
+        );
         // IP literals right-truncate with an ellipsis.
-        assert_eq!(truncate_host("2001:db8::dead:beef", 10), "2001:db8:…");
+        assert_eq!(
+            truncate_host("2001:db8::dead:beef", 10, &mut FmtBuf::default()),
+            "2001:db8:…"
+        );
     }
 
     #[test]
@@ -2787,11 +2898,11 @@ mod tests {
     #[test]
     fn scroll_offset_reaches_last_row_when_tail_expanded() {
         // 30 collapsed + 10 expanded (6 lines), 40-line viewport (37 inner).
-        let mut heights = vec![1u16; 40];
+        let mut heights = [1u16; 40];
         for h in heights.iter_mut().skip(30) {
             *h = 6;
         }
-        let offset = compute_scroll_offset(&heights, 39, 40);
+        let offset = compute_scroll_offset(heights.len(), |index| heights[index], 39, 40);
         // Rows from the offset must fit the viewport…
         let fit: u16 = heights[offset..].iter().sum();
         assert!(fit <= 37);
@@ -2802,23 +2913,29 @@ mod tests {
 
     #[test]
     fn scroll_offset_small_list_stays_top() {
-        let heights = vec![1u16; 5];
-        assert_eq!(compute_scroll_offset(&heights, 4, 40), 0);
+        let heights = [1u16; 5];
+        assert_eq!(
+            compute_scroll_offset(heights.len(), |index| heights[index], 4, 40),
+            0
+        );
     }
 
     #[test]
     fn scroll_offset_centers_mid_list() {
         // 100 one-line rows, 21-line viewport (18 inner) → row 50 centered
         // at line 8 → offset 42.
-        let heights = vec![1u16; 100];
-        assert_eq!(compute_scroll_offset(&heights, 50, 21), 42);
+        let heights = [1u16; 100];
+        assert_eq!(
+            compute_scroll_offset(heights.len(), |index| heights[index], 50, 21),
+            42
+        );
     }
 
     #[test]
     fn scroll_offset_does_not_push_selection_offscreen() {
         // Selection in the middle of a tall list must stay visible.
-        let heights = vec![1u16; 40];
-        let offset = compute_scroll_offset(&heights, 20, 21);
+        let heights = [1u16; 40];
+        let offset = compute_scroll_offset(heights.len(), |index| heights[index], 20, 21);
         assert!(offset <= 20);
         let sel_start: u16 = heights[offset..20].iter().sum();
         assert!(sel_start < 18);
@@ -2828,8 +2945,8 @@ mod tests {
     fn rows_taller_than_viewport_do_not_blank_table() {
         // heights where the selected (tall) row exceeds the viewport:
         // old code produced offset == len → nothing rendered.
-        let heights = vec![1u16, 1, 1, 1, 1, 10];
-        let offset = compute_scroll_offset(&heights, 5, 8);
+        let heights = [1u16, 1, 1, 1, 1, 10];
+        let offset = compute_scroll_offset(heights.len(), |index| heights[index], 5, 8);
         assert!(
             offset < heights.len(),
             "offset must stay inside the row list"
@@ -2840,21 +2957,27 @@ mod tests {
     fn scroll_offset_tall_selected_row_mid_list_stays_inside() {
         // Expanded row in the middle of the list: the offset must never
         // escape the row list even though the row is taller than the viewport.
-        let heights = vec![1u16, 1, 10, 1, 1];
-        let offset = compute_scroll_offset(&heights, 2, 8);
+        let heights = [1u16, 1, 10, 1, 1];
+        let offset = compute_scroll_offset(heights.len(), |index| heights[index], 2, 8);
         assert_eq!(offset, 2, "offset must select the tall row, not exceed it");
     }
 
     #[test]
     fn scroll_offset_returns_row_index_for_mixed_heights() {
         let heights = [3, 10, 8, 8, 8];
-        assert_eq!(compute_scroll_offset(&heights, 1, 14), 1);
+        assert_eq!(
+            compute_scroll_offset(heights.len(), |index| heights[index], 1, 14),
+            1
+        );
     }
 
     #[test]
     fn scroll_offset_converts_line_position_after_expanded_prefix() {
         let heights = [8, 8, 8, 1, 1, 1, 1, 1];
-        assert_eq!(compute_scroll_offset(&heights, 5, 8), 3);
+        assert_eq!(
+            compute_scroll_offset(heights.len(), |index| heights[index], 5, 8),
+            3
+        );
     }
 
     /// A selection move patches only the two affected rows: the rest of the

@@ -38,6 +38,64 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tui_popup::{KnownSizeWrapper, Popup};
 
+/// A stack buffer for `format_args!` on a render path.
+///
+/// `format!` allocates a `String` per call; a frame formats the same short
+/// numbers and labels dozens of times (details fields, geometry labels, status
+/// bar counters), so every one of those is churn the frame does not need. A
+/// value longer than `N` is truncated at the `io::Write` boundary, which cannot
+/// split a UTF-8 character (the writer refuses the whole partial write).
+pub(crate) struct FmtBuf<const N: usize>([u8; N]);
+
+impl<const N: usize> Default for FmtBuf<N> {
+    fn default() -> Self {
+        Self([0; N])
+    }
+}
+
+impl<const N: usize> FmtBuf<N> {
+    /// Write `args` and return the text. A value longer than `N` is TRUNCATED
+    /// at a character boundary, never dropped: a field whose content outgrew
+    /// its buffer must still show its prefix, not disappear.
+    pub(crate) fn put(&mut self, args: std::fmt::Arguments<'_>) -> &str {
+        use std::io::Write as _;
+        let mut writer = &mut self.0[..];
+        // A full buffer ends the formatter with `WriteZero`, having written
+        // the prefix; the count is all that matters.
+        let _ = writer.write_fmt(args);
+        let written = N - writer.len();
+        match std::str::from_utf8(&self.0[..written]) {
+            Ok(text) => text,
+            // The cut landed inside a multi-byte character: keep the valid head.
+            Err(error) => std::str::from_utf8(&self.0[..error.valid_up_to()]).unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod fmt_buf_tests {
+    use super::FmtBuf;
+
+    #[test]
+    fn a_value_that_fits_is_written_whole() {
+        let mut buf = FmtBuf::<16>::default();
+        assert_eq!(buf.put(format_args!("{}-{}", 12, "ms")), "12-ms");
+    }
+
+    #[test]
+    fn an_overlong_value_truncates_instead_of_vanishing() {
+        let mut buf = FmtBuf::<8>::default();
+        assert_eq!(buf.put(format_args!("{}-{}", 123_456, "ms")), "123456-m");
+    }
+
+    #[test]
+    fn a_cut_inside_a_multibyte_char_keeps_the_valid_prefix() {
+        let mut buf = FmtBuf::<5>::default();
+        // "aaaa" + a 2-byte `é` cannot fit; the half character is dropped.
+        assert_eq!(buf.put(format_args!("aaaaé")), "aaaa");
+    }
+}
+
 pub fn render_confirmation_overlay(
     frame: &mut Frame,
     area: Rect,
@@ -1532,27 +1590,25 @@ fn render_pane2(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState
 fn pane_title(
     index: &'static str,
     tabs: &[(&'static str, bool)],
-    counter: Option<String>,
+    counter: Option<&'static str>,
     theme: &opaline::Theme,
 ) -> Line<'static> {
     let accent = ThemeStyles::container_title(theme);
     let muted = ThemeStyles::hint(theme);
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(index.to_string(), accent.add_modifier(Modifier::BOLD)),
-        Span::raw(" "),
-    ];
+    let bold = accent.add_modifier(Modifier::BOLD);
+    // Every piece is a `&'static str`: the title is rebuilt each frame, so a
+    // `String` per tab (and a `format!("[{label}]")` per active tab) was churn.
+    let mut spans = vec![Span::raw(" "), Span::styled(index, bold), Span::raw(" ")];
     for (i, (label, active)) in tabs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
         if *active {
-            spans.push(Span::styled(
-                format!("[{label}]"),
-                accent.add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled("[", bold));
+            spans.push(Span::styled(*label, bold));
+            spans.push(Span::styled("]", bold));
         } else {
-            spans.push(Span::styled((*label).to_string(), muted));
+            spans.push(Span::styled(*label, muted));
         }
     }
     if let Some(counter) = counter {
@@ -1829,17 +1885,17 @@ fn render(frame: &mut Frame, state: &AppState) {
     // The shell-level log row: dropped when pane 2 is compact (no room) and on
     // small terminals, where pane 1 keeps the viewport.
     let log_row = pane2_rows > 1 && !small;
-    let mut constraints = vec![
+    // At most four rows: pane 1, pane 2, the optional log row, the status bar.
+    let constraints = [
         Constraint::Min(6),             // 0: pane 1
         Constraint::Length(pane2_rows), // 1: pane 2
+        Constraint::Length(1),          // 2: log row (when present)
+        Constraint::Length(1),          // last: status bar
     ];
-    if log_row {
-        constraints.push(Constraint::Length(1)); // 2: log row
-    }
-    constraints.push(Constraint::Length(1)); // last: status bar
+    let constraint_count = if log_row { 4 } else { 3 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints(&constraints[..constraint_count])
         .split(area);
     let status_index = chunks.len() - 1;
 
@@ -1912,12 +1968,14 @@ fn render(frame: &mut Frame, state: &AppState) {
         let line = newest.map_or_else(
             || Line::from(Span::styled("  —", ThemeStyles::hint(theme))),
             |entry| {
+                // Borrowed, not formatted: this row is rebuilt every frame.
                 Line::from(vec![
-                    Span::styled(format!("  {} ", entry.level), ThemeStyles::hint(theme)),
-                    Span::styled(
-                        format!("[{}] {}", entry.target, entry.message),
-                        ThemeStyles::footer_value(theme),
-                    ),
+                    Span::raw("  "),
+                    Span::styled(entry.level.as_str(), ThemeStyles::hint(theme)),
+                    Span::raw(" ["),
+                    Span::styled(entry.target.as_str(), ThemeStyles::footer_value(theme)),
+                    Span::raw("] "),
+                    Span::styled(entry.message.as_str(), ThemeStyles::footer_value(theme)),
                 ])
             },
         );

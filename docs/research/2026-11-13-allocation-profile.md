@@ -346,9 +346,9 @@ report should say so: the same 11 s boot run allocates 2 476 911 times in
 1 615 for the whole geo pipeline. The geo compile was the largest *single
 redundancy* (14 identical scans), not the largest consumer.
 
-Still open, in the order the numbers now argue for them: `leas::ui` per-frame
-work → `leas::ops::profiles` → F3 (lazy first-use compile) → F4 (whitelist
-footprint/lazy load).
+Still open, in the order the numbers now argue for them: `leas::ops::profiles`
+→ F3 (lazy first-use compile) → F4 (whitelist footprint/lazy load). The
+`leas::ui` per-frame work that sat first is done (see below).
 Memoizing the parsed `GeoDomains` across rebuilds (path + mtime) was **not**
 implemented — the shipped cache is per-build only — so a rebuild still re-parses
 each dataset once.
@@ -367,6 +367,54 @@ each dataset once.
 | F4 | Lazy whitelist load + compact SNI set | defers 4.0 MB and the boot-time download | medium |
 | ✅ F5 | VLESS header: constant addons + one caller-owned buffer | shipped: 2 → 1 alloc per Vision connect (measured: 5 000 allocs / 5 000 connects) | done |
 | ✅ F6 | Relay buffer pool | shipped: 0 allocator calls per tunnel after warm-up, capped at 2 MiB | done |
+
+## Render path (2026-11-16)
+
+The `leas::ui` rows above are per-draw work: every frame rebuilt the same
+chrome and every details field formatted three strings. Measured with the same
+driver and the same sandbox, two runs per build differing by 40 Down presses
+(each key → one draw), `LEAS_MEM_TRACE_ROWS=symbol`:
+
+| symbol | allocations / frame, before | after |
+| --- | ---: | ---: |
+| `ui::details::field` | 50.2 | 3.2 |
+| `ui::profiles::render` | 29.3 | 1.1 |
+| `ui::render` | 9.0 | 0.7 |
+| `ui::details::render_aggregates` | 9.0 | 0.5 |
+| `ui::pane_title` | 5.5 | 0.2 |
+| `ui::details::render_link` | 6.0 | 0.5 |
+| `ui::status_bar::render` | 3.5 | 0.3 |
+| **`leas::ui*` total** | **131.4** | **11.9** |
+
+What changed (all inside `terminal.draw`):
+
+- `ui/mod.rs`: `FmtBuf<N>` (a stack `format_args!` sink), borrowed pane-title
+  labels, one span vec for the log row, `[Constraint; 4]` instead of a `Vec`.
+- `ui/details.rs`: `field` borrows its label (padded from a static run) and its
+  value instead of `format!` + `to_string()`; every numeric/URL/exit cell is
+  formatted into a stack buffer; timestamps keep the formatter's own `String`;
+  `Paragraph::scroll` replaces the visible-lines `collect`.
+- `ui/profiles.rs`: the grid header (columns + order) is cached on `AppState`
+  keyed by `(pane width, header style)`; row heights come from a closure, not a
+  `Vec`; the Address cell truncates into a stack buffer; the expansion panel's
+  `format!`/`"─".repeat` are gone; footer and filter strip borrow.
+- `ui/widgets/data_table.rs`: `columns`/`order` are borrowed slices (the widget
+  cloned the order and rebuilt `row_heights` per frame); identity order is a
+  stack array.
+- `ui/status_bar.rs`: status segment formats into a stack buffer, hints are a
+  `Cow`, padding slices a static blank run.
+
+The residual is ~7/frame: line `Vec`s (details) plus the one
+`Vec<&EndpointRow>` the profiles pane collects from the filtered page. The
+reported 11.9 carries one-off event work in the second run (a rebuild's
+`truncate_pad`/`iso_to_flag` appear +2.3/frame each, `poll_core_events`
++3.7/frame; their absolute counts are identical between the two runs in the
+before build, so they are run noise, not per-frame cost).
+
+Scope: only the Profiles pane and the shell chrome it shares. Logs and Sources
+still build their `DataTable` column `Vec` (and Sources its row `String`s) on
+every frame; they were not measured or changed. The `ROWS_DIRTY_*` rebuild
+granularity (`leas::ops::profiles` mass, P3/P4 in the memory plan) is untouched.
 
 ## Steady state
 

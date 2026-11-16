@@ -70,7 +70,7 @@ measurement that decided it.
 
 | item | measured | decision |
 |---|---|---|
-| P2 (per-frame `Vec`s) | 5 allocations, ~12 KiB per frame; the boot mass is 2.5 M | **closed as rejected** — below the noise floor (R11). Re-open only if a frame-rate change makes it visible. |
+| P2 (per-frame `Vec`s) | 5 allocations, ~12 KiB per frame; the boot mass is 2.5 M | **reopened 2026-11-16** by the render-path allocation spec, not by a perf number: a symbol-grain trace measured **29.3 `leas::ui::profiles` allocations/frame** (the header rebuild — 18 `Line`s — was outside P2's original scope) against 5 estimated; the landed fix takes it to **1.1/frame** for 1 of the 5 named sites. Still not a churn or latency win (R11); accepted for the zero-alloc render-path requirement. See `docs/research/2026-11-13-allocation-profile.md` §Render path. |
 | P3 (`DisplayRowData` cells) | `build_display_rows` 18 617 allocations at n = 1 000 (2.0 % of boot), 41 614 in a 50 s interactive run (1.4 %); the rebuild is already cache-gated | **deferred**: the `CompactString` swap is the mechanism if the rebuild frequency rises; it cannot move a 2.5 M boot today. |
 | P4 (patch rows by id) | `load_profiles_rows` 21 460 at boot, **428 834** when a search keystroke invalidates the page — interaction-bound, not boot-bound | **deferred with a measurement**: count reloads per keystroke first; the patch path touches the ordering law and is not justified by a number yet. |
 | P5 (duplicate crates) | `compact_str` 0.9.1 via `ratatui-core`, `parking_lot` 0.12.5 via arboard/crossterm/hickory | **closed**: our copies are the direct ones; the bumps belong to upstreams; no memory effect. |

@@ -630,6 +630,14 @@ fn apply_settings_fields(
                     Ok(theme) => {
                         theme_slug.clone_into(&mut state.config.theme_name);
                         state.theme = theme;
+                        // The display-row cache keeps the styles baked into its
+                        // rows; without this, a theme switch left the grid in the
+                        // previous theme until the next dirty event.
+                        state.mark_rows_dirty(
+                            crate::ui::profiles::ROWS_DIRTY_TRAFFIC
+                                | crate::ui::profiles::ROWS_DIRTY_TEST
+                                | crate::ui::profiles::ROWS_DIRTY_COUNTRY,
+                        );
                     }
                     Err(error) => state.log_trace(
                         "error",

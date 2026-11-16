@@ -1,13 +1,18 @@
 use crate::AppState;
 use crate::SettingsSection;
+use crate::ui::FmtBuf;
 use crate::ui::theme::ThemeStyles;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Blank cells for the status bar's middle padding, sliced to the shortfall.
+const BLANK_RUN: &str = "                                                                                                    ";
 static SPINNER_TICK: AtomicU16 = AtomicU16::new(0);
 
 fn spinner_char() -> char {
@@ -41,62 +46,6 @@ fn running_task_meters(state: &AppState) -> (u32, u32) {
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
-    let (left_text, left_style) = if state.connecting {
-        (
-            format!(" {} Connecting... ", spinner_char()),
-            ThemeStyles::spinner(theme),
-        )
-    } else if state.speed_test_stop.load(Ordering::Relaxed) {
-        (" ■ Stopping...".to_string(), ThemeStyles::error(theme))
-    } else if let Some(task) = &state.running_task {
-        // The at-a-glance surface: the RUNNING task's name + done/total. The
-        // Tasks pane carries the queue; both read the same meters.
-        let (done, total) = running_task_meters(state);
-        let text = match total {
-            0 => format!(" {} …", task.label),
-            _ => format!(" {}: {done}/{total}", task.label),
-        };
-        (text, ThemeStyles::warning(theme))
-    } else if state.batch_progress.is_some() || !state.testing_profiles.is_empty() {
-        let progress_text = state.batch_progress.as_ref().map_or_else(
-            || " Testing...".to_string(),
-            |m| {
-                let done = m.main.done.load(Ordering::Relaxed);
-                let total = m.main.total.load(Ordering::Relaxed);
-                match total {
-                    0 => " Testing...".to_string(),
-                    total => format!(" Testing: {done}/{total}"),
-                }
-            },
-        );
-        (progress_text, ThemeStyles::warning(theme))
-    } else if let Some(m) = &state.maint_progress {
-        use Ordering::Relaxed;
-        let name = (m.name.done.load(Relaxed), m.name.total.load(Relaxed));
-        let comp = (m.comp.done.load(Relaxed), m.comp.total.load(Relaxed));
-        // Only a phase with a denominator renders: a Compact run shows no
-        // Name (no lookups), a retry run shows no Comp (no merges) — the
-        // same dead-second-label rule the bars follow. The table walk shows
-        // only in the Actions-Log panel ("scan n/rows"), like the batch's
-        // "planning n/m pages".
-        let text = match (name.1, comp.1) {
-            (0, 0) => " Maintenance...".to_owned(),
-            (0, c) => format!(" Comp: {}/{}", comp.0, c),
-            (n, 0) => format!(" Name: {}/{}", name.0, n),
-            (n, c) => format!(" Name: {}/{} · Comp: {}/{}", name.0, n, comp.0, c),
-        };
-        (text, ThemeStyles::warning(theme))
-    } else if let Some(err) = &state.connection_error {
-        (format!(" Error: {err}"), ThemeStyles::error(theme))
-    } else if state.connected {
-        (
-            " Connected [native]".to_string(),
-            ThemeStyles::success(theme),
-        )
-    } else {
-        (" Disconnected".to_string(), ThemeStyles::error(theme))
-    };
-
     // Mode indicator prefix
     let mode_prefix = match &state.mode {
         crate::AppMode::Settings { mode } => match mode {
@@ -116,22 +65,84 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         _ => "",
     };
 
-    let left_text = format!("{mode_prefix}{left_text}");
+    // The status segment is rebuilt every frame; the old shape allocated a
+    // `String` per branch and then a second one to prepend the mode prefix.
+    let mut text_buf = FmtBuf::<96>::default();
+    let (left_text, left_style): (&str, ratatui::style::Style) = if state.connecting {
+        (
+            text_buf.put(format_args!(" {} Connecting... ", spinner_char())),
+            ThemeStyles::spinner(theme),
+        )
+    } else if state.speed_test_stop.load(Ordering::Relaxed) {
+        (" ■ Stopping...", ThemeStyles::error(theme))
+    } else if let Some(task) = &state.running_task {
+        // The at-a-glance surface: the RUNNING task's name + done/total. The
+        // Tasks pane carries the queue; both read the same meters.
+        let (done, total) = running_task_meters(state);
+        let text = match total {
+            0 => text_buf.put(format_args!(" {} …", task.label)),
+            _ => text_buf.put(format_args!(" {}: {done}/{total}", task.label)),
+        };
+        (text, ThemeStyles::warning(theme))
+    } else if state.batch_progress.is_some() || !state.testing_profiles.is_empty() {
+        let progress_text = state.batch_progress.as_ref().map_or(" Testing...", |m| {
+            let done = m.main.done.load(Ordering::Relaxed);
+            let total = m.main.total.load(Ordering::Relaxed);
+            match total {
+                0 => " Testing...",
+                total => text_buf.put(format_args!(" Testing: {done}/{total}")),
+            }
+        });
+        (progress_text, ThemeStyles::warning(theme))
+    } else if let Some(m) = &state.maint_progress {
+        use Ordering::Relaxed;
+        let name = (m.name.done.load(Relaxed), m.name.total.load(Relaxed));
+        let comp = (m.comp.done.load(Relaxed), m.comp.total.load(Relaxed));
+        // Only a phase with a denominator renders: a Compact run shows no
+        // Name (no lookups), a retry run shows no Comp (no merges) — the
+        // same dead-second-label rule the bars follow. The table walk shows
+        // only in the Actions-Log panel ("scan n/rows"), like the batch's
+        // "planning n/m pages".
+        let text = match (name.1, comp.1) {
+            (0, 0) => " Maintenance...",
+            (0, c) => text_buf.put(format_args!(" Comp: {}/{}", comp.0, c)),
+            (n, 0) => text_buf.put(format_args!(" Name: {}/{}", name.0, n)),
+            (n, c) => text_buf.put(format_args!(
+                " Name: {}/{} · Comp: {}/{}",
+                name.0, n, comp.0, c
+            )),
+        };
+        (text, ThemeStyles::warning(theme))
+    } else if let Some(err) = &state.connection_error {
+        (
+            text_buf.put(format_args!(" Error: {err}")),
+            ThemeStyles::error(theme),
+        )
+    } else if state.connected {
+        (" Connected [native]", ThemeStyles::success(theme))
+    } else {
+        (" Disconnected", ThemeStyles::error(theme))
+    };
 
     // Dynamic right-side hints
     let budget = width_available(area.width as usize);
-    let right_text = fit_hints(build_hints(state), budget);
+    let hints = build_hints(state);
+    let right_text = fit_hints(&hints, budget);
     let right_style = ThemeStyles::status_bar_hint(theme);
 
     let width = area.width as usize;
-    let left_len = left_text.len();
+    let left_len = mode_prefix.len() + left_text.len();
     let padding = width.saturating_sub(left_len + right_text.len());
 
-    let spans = vec![
-        Span::styled(left_text, left_style),
-        Span::raw(" ".repeat(padding)),
-        Span::styled(right_text, right_style),
-    ];
+    let mut spans = Vec::with_capacity(4);
+    if !mode_prefix.is_empty() {
+        spans.push(Span::styled(mode_prefix, left_style));
+    }
+    spans.push(Span::styled(left_text, left_style));
+    // Static blank run sliced to the padding: `" ".repeat(padding)` allocated
+    // a fresh string every frame just to pad the middle.
+    spans.push(Span::raw(&BLANK_RUN[..padding.min(BLANK_RUN.len())]));
+    spans.push(Span::styled(right_text, right_style));
 
     let line = Line::from(spans);
 
@@ -150,13 +161,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 /// list still offered `Expand`, and the Settings tree never mentioned that `Tab`
 /// leaves the screen. All four are asserted by
 /// `docs/guides/tui/2026-10-14-132534-scenario-profiles-menus-states.md`.
-fn build_hints(state: &AppState) -> String {
+fn build_hints(state: &AppState) -> Cow<'static, str> {
     // A modal owns the keyboard: its own keys, nothing else.
     if state.confirmation.is_some() {
-        return " [y] Confirm  [n/Esc] Cancel ".to_string();
+        return " [y] Confirm  [n/Esc] Cancel ".into();
     }
     if matches!(&state.mode, crate::AppMode::Help) {
-        return " [Esc] Close help ".to_string();
+        return " [Esc] Close help ".into();
     }
     match &state.mode {
         // Form modes own the keyboard: their field keys, not the pane's.
@@ -164,22 +175,22 @@ fn build_hints(state: &AppState) -> String {
         | crate::AppMode::EditServer { .. }
         | crate::AppMode::ImportUrl { .. }
         | crate::AppMode::BatchImport { .. } => {
-            " [Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel  [q/Ctrl+C] Quit ".to_string()
+            " [Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel  [q/Ctrl+C] Quit ".into()
         }
         // One string for every list-shaped overlay: the keys are the same, so
         // splitting them into arms only invites the two copies to drift.
         crate::AppMode::SpeedTestMenu { .. }
         | crate::AppMode::ExportScope { .. }
         | crate::AppMode::ExportDestination { .. } => {
-            " [↑↓] Navigate  [Enter] Select  [Esc] Close ".to_string()
+            " [↑↓] Navigate  [Enter] Select  [Esc] Close ".into()
         }
         crate::AppMode::ExportPath {
             overwrite: true, ..
-        } => " [Y] Overwrite  [N] Cancel ".to_string(),
-        crate::AppMode::ExportPath { .. } => " [Enter] Write  [Esc] Cancel ".to_string(),
+        } => " [Y] Overwrite  [N] Cancel ".into(),
+        crate::AppMode::ExportPath { .. } => " [Enter] Write  [Esc] Cancel ".into(),
         // The Settings popup carries its own hints in its bottom border
         // (spec D9), so the app status bar does not repeat them.
-        crate::AppMode::Settings { .. } => String::new(),
+        crate::AppMode::Settings { .. } => Cow::Borrowed(""),
 
         _ => {
             // Pane-shell hints (spec D2): keys are pane-scoped.
@@ -187,56 +198,56 @@ fn build_hints(state: &AppState) -> String {
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Profiles) => {
                     if state.connected {
                         " [Ctrl+D] Disconnect  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
-                            .to_string()
+                            .into()
                     } else if state.connecting {
-                        " [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit ".to_string()
+                        " [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit ".into()
                     } else if state.search_focused || !state.search_query.is_empty() {
                         // A prefix filter that matched nothing is not an empty
                         // store: say what filtered it out, and how to undo it.
                         if state.endpoints.is_empty() {
-                            format!(
+                            Cow::Owned(format!(
                                 " No match for \"{}\"  [Esc] Clear  [q/Ctrl+C] Quit ",
                                 state.search_query
-                            )
+                            ))
                         } else {
                             " [Esc] Clear filter  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
-                                .to_string()
+                                .into()
                         }
                     } else if state.endpoints.is_empty() {
                         // Nothing loaded: the row keys have nothing to act on.
                         " [a] Add  [Ctrl+V] Import  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
-                            .to_string()
+                            .into()
                     } else {
                         " [→] Expand  [↑↓] Variant  [Ctrl+Enter/Ctrl+G] Connect  [,] Settings  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
-                            .to_string()
+                            .into()
                     }
                 }
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Sniffer) => {
-                    " [↑↓] Scroll  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit ".to_string()
+                    " [↑↓] Scroll  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit ".into()
                 }
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Sources) => {
                     " [a] Add  [e] Edit  [d] Delete  [u] Update  [Space] Select  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
-                        .to_string()
+                        .into()
                 }
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Logs) => {
                     // The tab's own keys are the scroll keys (documented in its
                     // manual section); the hints name what else is live here.
                     " [↑↓] Scroll  [c] Clear  [t] Targets  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
-                        .to_string()
+                        .into()
                 }
                 (crate::FocusedPane::Pane2, _) => {
                     match state.pane2_tab {
                         crate::Pane2Tab::Metrics => {
                             " [↑↓] Scroll  [Alt+↑↓] Resize  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
-                                .to_string()
+                                .into()
                         }
                         crate::Pane2Tab::Details => {
                             " [↑↓] Scroll  [F1] Compact  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
-                                .to_string()
+                                .into()
                         }
                         crate::Pane2Tab::Tasks => {
                             " [↑↓] Select  [d] Delete  [s] Stop  [r] Resume  [1] Pane 1  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
-                                .to_string()
+                                .into()
                         }
                     }
                 }
@@ -291,19 +302,24 @@ fn width_available(total: usize) -> usize {
     total.saturating_sub(used).max(20)
 }
 
+/// The hint segments: double-space separated, trimmed, empties dropped.
+fn hint_segments(text: &str) -> impl Iterator<Item = &str> {
+    text.split("  ").map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// Fit the hint segments into `budget` cells, dropping from the LEFT so the
 /// right-most group (`Quit`) always survives (tui-polish D7). A dropped
 /// prefix is marked with `…`.
-pub(crate) fn fit_hints(hints: String, budget: usize) -> String {
-    let segments: Vec<&str> = hints
-        .split("  ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let total: usize = segments.iter().map(|s| s.len() + 2).sum();
+///
+/// Borrows the caller's text when everything fits (the common case), so the
+/// status bar's per-frame call allocates nothing.
+pub(crate) fn fit_hints(hints: &str, budget: usize) -> Cow<'_, str> {
+    let total: usize = hint_segments(hints).map(|s| s.len() + 2).sum();
     if total <= budget {
-        return hints;
+        return Cow::Borrowed(hints);
     }
+    // Only the truncating path allocates from here on.
+    let segments: Vec<&str> = hint_segments(hints).collect();
     let mut kept: Vec<&str> = Vec::new();
     let mut used = 0;
     for seg in segments.iter().rev() {
@@ -315,15 +331,12 @@ pub(crate) fn fit_hints(hints: String, budget: usize) -> String {
         used += cost;
     }
     kept.reverse();
-    if kept.len() == segments.len() {
-        return hints;
-    }
     let mut out = String::from("…");
     for seg in kept {
         out.push(' ');
         out.push_str(seg);
     }
-    out
+    Cow::Owned(out)
 }
 
 const fn status_bar_section_label(section: SettingsSection) -> &'static str {

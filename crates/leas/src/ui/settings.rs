@@ -907,7 +907,8 @@ pub fn footer_hints(state: &AppState, popup_width: u16) -> String {
     } else {
         hints
     };
-    crate::ui::status_bar::fit_hints(hints, popup_width.saturating_sub(2).max(20) as usize)
+    crate::ui::status_bar::fit_hints(&hints, popup_width.saturating_sub(2).max(20) as usize)
+        .into_owned()
 }
 pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     handle_split_key(state, key).await;

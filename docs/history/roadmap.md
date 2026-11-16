@@ -583,3 +583,7 @@ batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes
   is the three-core axis (41 entries); the rest stays on the cores that serve it, and a row
   outside its `with_single_core` set prints why it was not dialed. The vless/vmess/trojan mihomo
   builders are still traps (`mihomo_unsupported`), so those rows stay on the first two cores.
+
+## Render-path allocations (2026-11-16) ✅
+
+- ✅ Profiles pane + shared shell chrome allocate nothing per draw — the grid header (columns, widths, order) is cached on `AppState` keyed by `(pane width, header style)`; row heights come from a closure instead of a per-frame `Vec`; borrowed labels replace per-tab `String`s; short values format into `ui::FmtBuf` (a stack `format_args!` sink that truncates at a UTF-8 boundary); the Address cell truncates into a stack buffer and the expansion panel loses `format!`/`"─".repeat`. Measured with the memtrace driver (two key-count runs, `ROWS=symbol`): `leas::ui*` 131.4 → 11.9 allocations per frame (Profiles pane 29.3 → 1.1). The display-row and header caches are both invalidated on a theme switch. Recorded as a requirement, not a latency win: the memory plan's P2 verdict (below the noise floor) stands and now carries the reopen note. Logs/Sources still rebuild their column `Vec` per frame.

@@ -376,6 +376,11 @@ pub struct AppState {
     /// `&self`; the UI loop is single-threaded and only this cache sits
     /// behind the cell.
     pub display_rows_cache: RefCell<crate::ui::profiles::DisplayRowsCache>,
+    /// Profiles grid header cache: the column definitions and the
+    /// positional -> logical order for one pane width. The header is a pure
+    /// function of the width and the header role, so rebuilding it per frame
+    /// (a `Vec` plus one `Vec<Span>` per column) was pure churn.
+    pub grid_header_cache: RefCell<crate::ui::profiles::GridHeaderCache>,
 }
 
 impl AppState {
@@ -900,6 +905,7 @@ impl AppState {
             ))),
             dns_cache_ttl_secs: 300,
             display_rows_cache: RefCell::new(crate::ui::profiles::DisplayRowsCache::default()),
+            grid_header_cache: RefCell::new(crate::ui::profiles::GridHeaderCache::default()),
         };
         // Cheap constructors — no I/O until first lookup.
         let config_dir = dirs::config_dir()

@@ -181,7 +181,7 @@ Stats cadence: the xray arm polls `query_stats` every 3 s and `get_sys_stats` ev
 | Enrichment | `endpoint_info`, `outbound_country_cache`, `geo_ip`, `dns_resolver`, `host_features`, `dns_cache_ttl_secs` | `endpoint_info` survives `reload_profiles`; country cache is a 512-entry LRU |
 | Aggregates | `aggregates`, `aggregates_dirty`, `details_scroll` | Details panel counts, keyed by the current filter |
 | Layout and mode | `mode`, `previous_mode`, `confirmation`, `clipboard`, `actions_compact`, `term_height`, `should_quit` | |
-| Display cache | `display_rows_cache` | display rows rebuilt only when a fingerprint changes |
+| Display cache | `display_rows_cache`, `grid_header_cache` | display rows rebuilt only when a fingerprint changes; the grid header only when `(pane width, header style)` changes |
 | Subscriptions, updates | `groups`, `updating_groups`, `update_status` | |
 | Shutdown | `shutdown_token: Arc<AtomicBool>` | the one flag every background loop polls |
 

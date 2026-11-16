@@ -105,11 +105,14 @@ pub trait DataTableRow {
 /// column sorting indicators, a header row with optional divider, and an
 /// optional block border.
 pub struct DataTable<'a, R: DataTableRow> {
-    pub columns: Vec<Column<'a>>,
+    /// Borrowed, not owned: the caller's header geometry is cached across
+    /// frames (a width-dropped grid is stable per pane width), and owning it
+    /// here forced a per-frame rebuild plus a clone of the order.
+    pub columns: &'a [Column<'a>],
     pub rows: &'a [R],
     pub highlight_style: Style,
     /// Positional -> logical column id (default identity).
-    pub order: Vec<usize>,
+    pub order: &'a [usize],
     pub selection_style: Style,
     pub sort_column: Option<usize>,
     pub sort_direction: SortDirection,
@@ -129,8 +132,8 @@ pub struct DataTable<'a, R: DataTableRow> {
 impl<R: DataTableRow> Default for DataTable<'_, R> {
     fn default() -> Self {
         Self {
-            order: Vec::new(),
-            columns: Vec::new(),
+            order: &[],
+            columns: &[],
             rows: &[],
             highlight_style: Style::default().add_modifier(Modifier::REVERSED),
             selection_style: Style::default(),
@@ -150,12 +153,23 @@ impl<R: DataTableRow> Default for DataTable<'_, R> {
 
 impl<'a, R: DataTableRow> DataTable<'a, R> {
     #[must_use]
-    pub fn new(columns: Vec<Column<'a>>, rows: &'a [R]) -> Self {
+    pub const fn new(columns: &'a [Column<'a>], rows: &'a [R]) -> Self {
         Self {
-            order: Vec::new(),
+            order: &[],
             columns,
             rows,
-            ..Self::default()
+            highlight_style: Style::new().add_modifier(Modifier::REVERSED),
+            selection_style: Style::new(),
+            sort_column: None,
+            sort_direction: SortDirection::Ascending,
+            column_spacing: 1,
+            block: None,
+            header_divider: None,
+            show_scrollbar: false,
+            scrollbar_thumb_style: Style::new(),
+            scrollbar_track_style: Style::new(),
+            total_rows: None,
+            scrollbar_offset: None,
         }
     }
 
@@ -173,7 +187,7 @@ impl<'a, R: DataTableRow> DataTable<'a, R> {
 
     /// Positional -> logical column ids for width-aware column drops.
     #[must_use]
-    pub fn column_order(mut self, order: Vec<usize>) -> Self {
+    pub const fn column_order(mut self, order: &'a [usize]) -> Self {
         self.order = order;
         self
     }
@@ -363,7 +377,7 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
         // Compute column pixel widths (stack arrays — no per-frame heap).
         let mut widths_buf = [0u16; MAX_COLS];
         let ncols = compute_widths(
-            &self.columns,
+            self.columns,
             content_inner.width,
             self.column_spacing,
             &mut widths_buf,
@@ -441,20 +455,16 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
             header_y += 1;
         }
 
-        // Compute row heights
-        let row_heights: Vec<u16> = self
-            .rows
-            .iter()
-            .map(|row| row.height(content_inner.width))
-            .collect();
-
         // Clamp offset — count rows from the end so max_offset is the
-        // earliest visible row that still fills the viewport.
+        // earliest visible row that still fills the viewport. Heights are read
+        // from the rows directly (`height` is O(1)); a collected `Vec<u16>`
+        // here allocated once per frame on a 3 000-row page.
         let total_rows = self.rows.len();
         let visible_height = content_inner.bottom().saturating_sub(header_y);
         let mut rows_from_end = 0usize;
         let mut h_sum = 0u16;
-        for h in row_heights.iter().rev() {
+        for row in self.rows.iter().rev() {
+            let h = row.height(content_inner.width);
             if h_sum + h > visible_height {
                 break;
             }
@@ -471,15 +481,21 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
         // partially-visible row still draws and never writes past the frame.
         let bottom = content_inner.bottom();
         // Positional -> logical ids: identity unless a width-aware drop set one.
-        let order: Vec<usize> = if self.order.is_empty() {
-            (0..self.columns.len()).collect()
+        // The identity table lives on the stack, so the empty case (every
+        // caller except the profiles grid) allocates nothing.
+        let mut identity = [0usize; MAX_COLS];
+        let order: &[usize] = if self.order.is_empty() {
+            for (i, slot) in identity.iter_mut().enumerate() {
+                *slot = i;
+            }
+            &identity[..ncols]
         } else {
-            self.order.clone()
+            self.order
         };
         let mut y = header_y;
         let mut row_idx = state.offset;
         while y < bottom && row_idx < total_rows {
-            let rh = row_heights[row_idx];
+            let rh = self.rows[row_idx].height(content_inner.width);
             if rh == 0 {
                 row_idx += 1;
                 continue;
@@ -508,7 +524,7 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
             self.rows[row_idx].render(
                 col_xs,
                 col_widths,
-                &order,
+                order,
                 buf,
                 y,
                 bottom,
@@ -592,8 +608,11 @@ mod tests {
         }
     }
 
-    fn one_column_table(rows: &[ClipRow]) -> DataTable<'_, ClipRow> {
-        DataTable::new(vec![Column::new("h", ColumnWidth::Fixed(10))], rows)
+    fn one_column_table<'a>(
+        columns: &'a [Column<'a>],
+        rows: &'a [ClipRow],
+    ) -> DataTable<'a, ClipRow> {
+        DataTable::new(columns, rows)
     }
 
     #[test]
@@ -605,6 +624,7 @@ mod tests {
             marker: 'A',
             clip_seen: std::cell::Cell::new(0),
         }];
+        let columns = [Column::new("h", ColumnWidth::Fixed(10))];
         let area = Rect::new(0, 0, 20, 4);
         let mut buf = Buffer::empty(area);
         let mut state = DataTableState {
@@ -612,7 +632,12 @@ mod tests {
             selected: Some(0),
             multi_selected: HashSet::new(),
         };
-        StatefulWidget::render(one_column_table(&rows), area, &mut buf, &mut state);
+        StatefulWidget::render(
+            one_column_table(&columns, &rows),
+            area,
+            &mut buf,
+            &mut state,
+        );
 
         // The row must have been told to clip exactly at the area bottom…
         assert_eq!(
@@ -637,6 +662,7 @@ mod tests {
                 clip_seen: std::cell::Cell::new(0),
             })
             .collect();
+        let columns = [Column::new("h", ColumnWidth::Fixed(10))];
         let area = Rect::new(0, 0, 20, 6);
         let mut buf = Buffer::empty(area);
         let mut state = DataTableState {
@@ -644,7 +670,12 @@ mod tests {
             selected: None,
             multi_selected: HashSet::new(),
         };
-        StatefulWidget::render(one_column_table(&rows), area, &mut buf, &mut state);
+        StatefulWidget::render(
+            one_column_table(&columns, &rows),
+            area,
+            &mut buf,
+            &mut state,
+        );
 
         assert!(
             rows.iter().all(|r| r.clip_seen.get() <= 6),

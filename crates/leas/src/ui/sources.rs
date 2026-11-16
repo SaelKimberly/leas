@@ -202,7 +202,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             }
         })
         .collect();
-    let table = DataTable::new(columns_for(area.width), &rows)
+    let columns = columns_for(area.width);
+    let table = DataTable::new(&columns, &rows)
         .highlight_style(ThemeStyles::table_row_selected(theme).add_modifier(Modifier::BOLD));
     let mut table_state = DataTableState {
         offset: state.sources_selected.saturating_sub(1),
