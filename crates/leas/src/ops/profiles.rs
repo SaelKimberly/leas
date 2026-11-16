@@ -47,13 +47,10 @@ pub async fn clear_expired_errors(db: &Database, ttl_hours: Option<i64>) {
     // The swept endpoints' ordering keys are derived state: collect them
     // before the update and refresh after, so a cleared marker cannot leave a
     // stale position behind (the page reads the keys, not the links).
-    let cleared: Vec<i64> = ProfileStats::filter(ProfileStats::fields().error().is_some())
-        .filter(ProfileStats::fields().updated_at().lt(cutoff))
-        .exec(&mut conn)
+    let cleared: Vec<i64> = db
+        .endpoint_ids_with_errors_before(cutoff)
         .await
-        .map_or_default(|rows: Vec<ProfileStats>| {
-            rows.into_iter().map(|l| l.endpoint_id.get()).collect()
-        });
+        .map_or_default(|ids| ids.iter().map(|id| id.get()).collect());
     if let Err(e) = ProfileStats::filter(ProfileStats::fields().error().is_some())
         .filter(ProfileStats::fields().updated_at().lt(cutoff))
         .update()

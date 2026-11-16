@@ -1906,6 +1906,34 @@ impl Database {
 }
 
 impl Database {
+    /// The endpoints whose links carry a failure marker older than `cutoff` —
+    /// the error-TTL sweep's id set.
+    ///
+    /// A projection, not a model load: the caller only needs `endpoint_id` to
+    /// refresh the ordering keys, and decoding every link row to keep one
+    /// integer cost 25.9 ms against 9.0 ms for this at 74k rows / 14.8k swept
+    /// links (`docs/research/2026-11-16-turso-0.9-delta.md` §7).
+    pub async fn endpoint_ids_with_errors_before(&self, cutoff: i64) -> Result<Vec<EndpointId>> {
+        let mut conn = self.conn().await?;
+        let rows = toasty::sql::query(format!(
+            "SELECT endpoint_id FROM profile_stats \
+             WHERE error IS NOT NULL AND updated_at < {cutoff}"
+        ))
+        .exec(&mut conn)
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| match row {
+                toasty_core::stmt::Value::Record(record) => record.fields.first(),
+                _ => None,
+            })
+            .filter_map(|v| match v {
+                toasty_core::stmt::Value::I64(id) => Some(EndpointId::new(*id)),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Delete `Protocol` rows with no remaining `profile_stats` links — the
     /// shared protocol table's orphan cleanup (the old per-row model had no
     /// shared table to clean). Runs inside the caller's transaction.

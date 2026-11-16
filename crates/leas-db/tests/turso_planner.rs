@@ -249,6 +249,88 @@ async fn every_scope_plan_is_index_served_without_a_sorter() {
     );
 }
 
+/// The two reload/open-time `profile_stats` sweeps: the error-TTL pass
+/// (`docs/research/2026-11-16-turso-0.9-delta.md` §7 measured 9.0 ms for its
+/// projection and 16.2 ms for its update at 74k) and the one-time stability
+/// seed. Both scan by design — a partial index was measured and declined — so
+/// what this gate pins is the absence of a SORTER or a TEMP B-TREE: a future
+/// statement edit that adds `ORDER BY`, a `DISTINCT`, or a join must not slip
+/// one in unnoticed.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "perf-lab")]
+#[ignore = "turso planner gate for the profile_stats sweeps (run with --features perf-lab -- --ignored)"]
+async fn profile_stats_sweep_plans() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sweeps.db");
+    let db = Builder::new_local(path.to_str().expect("path"))
+        .build()
+        .await
+        .expect("build");
+    let conn = db.connect().expect("connect");
+    conn.execute(
+        "CREATE TABLE profile_stats (\
+         protocol_id INTEGER NOT NULL, endpoint_id INTEGER NOT NULL, \
+         latency_real_delay INTEGER, latency_fast_delay INTEGER, \
+         error INTEGER, error_kind TEXT, error_text TEXT, \
+         updated_at INTEGER NOT NULL, stab_mask INTEGER NOT NULL DEFAULT 0, \
+         stab_len INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (protocol_id, endpoint_id))",
+        (),
+    )
+    .await
+    .expect("create");
+
+    const ROWS: usize = 20_000;
+    for chunk in (1..=ROWS).collect::<Vec<_>>().chunks(2000) {
+        let values = chunk
+            .iter()
+            .map(|i| {
+                let error = if i % 5 == 0 {
+                    "1, 'fast', 'timeout'"
+                } else {
+                    "NULL, NULL, NULL"
+                };
+                format!("({i}, {i}, 12, NULL, {error}, 1, 0, 0)")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute(
+            format!(
+                "INSERT INTO profile_stats (protocol_id, endpoint_id, latency_real_delay, \
+                 latency_fast_delay, error, error_kind, error_text, updated_at, stab_mask, \
+                 stab_len) VALUES {values}"
+            ),
+            (),
+        )
+        .await
+        .expect("seed");
+    }
+
+    let sweeps = [
+        (
+            "error_sweep_select",
+            "SELECT endpoint_id FROM profile_stats WHERE error IS NOT NULL AND updated_at < 2",
+        ),
+        (
+            "error_sweep_update",
+            "UPDATE profile_stats SET error = NULL WHERE error IS NOT NULL AND updated_at < 2",
+        ),
+        (
+            "stab_seed",
+            "UPDATE profile_stats SET stab_mask = 1, stab_len = 1 \
+             WHERE latency_real_delay IS NOT NULL",
+        ),
+    ];
+    for (label, sql) in sweeps {
+        let p = plan(&conn, sql).await;
+        let joined = p.join(" | ").to_lowercase();
+        assert!(
+            !joined.contains("sorter") && !joined.contains("temp b-tree"),
+            "{label} must not sort or spill to a temp b-tree, plan was {p:?}"
+        );
+        println!("SWEEP PLAN {label}: {}", p.join(" | "));
+    }
+}
+
 /// T14 gate: does turso 0.7.2 actually support `WITHOUT ROWID` behind its
 /// experimental flag, and does it round-trip data through it?
 ///

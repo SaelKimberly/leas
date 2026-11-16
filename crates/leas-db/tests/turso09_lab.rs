@@ -612,6 +612,74 @@ async fn arm_wal_autocheckpoint(pages: Option<i64>) {
     );
 }
 
+/// The two statements the plan sweep flagged as full `profile_stats` scans, in
+/// their REAL form: the one-time stability seed (gated by an `app_meta` marker)
+/// and the error-TTL sweep (on reload). Both filter on an embed presence column,
+/// so ask what they cost at 74k before reaching for an index.
+async fn arm_sweep_statement_costs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path(), false).await;
+    import_burst(&db, 1, FEED, true, true).await;
+    let mut conn = db.connection().await.expect("conn");
+    // Give 20 % of the links an error and a measurement, the states the two
+    // statements act on.
+    toasty::sql::statement(
+        "UPDATE profile_stats SET error = 1, error_kind = 'fast', error_text = 'timeout' \
+         WHERE endpoint_id % 5 = 0",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("seed errors");
+    for (label, sql) in [
+        (
+            "error_sweep_select",
+            "SELECT endpoint_id FROM profile_stats WHERE error IS NOT NULL AND updated_at < 2",
+        ),
+        (
+            // The typed reader decodes the whole model to collect endpoint ids;
+            // this is what that costs against the id-only projection above.
+            "error_sweep_select_all",
+            "SELECT * FROM profile_stats WHERE error IS NOT NULL AND updated_at < 2",
+        ),
+        (
+            "error_sweep_update",
+            "UPDATE profile_stats SET error = NULL WHERE error IS NOT NULL AND updated_at < 2",
+        ),
+        (
+            "stab_seed_count",
+            "SELECT COUNT(*) FROM profile_stats WHERE latency_real_delay IS NOT NULL",
+        ),
+        (
+            "stab_seed_update",
+            "UPDATE profile_stats SET stab_mask = 1, stab_len = 1 \
+             WHERE latency_real_delay IS NOT NULL",
+        ),
+    ] {
+        let plan = toasty::sql::query(format!("EXPLAIN QUERY PLAN {sql}"))
+            .exec(&mut conn)
+            .await
+            .expect("plan");
+        let detail: Vec<String> = plan
+            .iter()
+            .filter_map(|row| match row {
+                toasty_core::stmt::Value::Record(r) => match r.fields.get(3) {
+                    Some(toasty_core::stmt::Value::String(v)) => Some(v.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let t0 = Instant::now();
+        let rows = toasty::sql::query(sql).exec(&mut conn).await.expect("run");
+        println!(
+            "SWEEP   {label:<20} rows={:<6} wall={:>8.2?}  {}",
+            rows.len(),
+            t0.elapsed(),
+            detail.join(" | ")
+        );
+    }
+}
+
 /// EXPLAIN QUERY PLAN over every hot statement at feed scale, one line each.
 /// The question is not timing but shape: a `SCAN` of a table the statement's
 /// filter does not need, a sorter, or a temp B-tree.
@@ -1271,6 +1339,12 @@ async fn protocol_insert_shape() {
     for chunked in [false, true] {
         arm_protocol_shape(chunked).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn sweep_statement_costs() {
+    arm_sweep_statement_costs().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
