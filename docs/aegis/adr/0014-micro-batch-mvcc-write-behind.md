@@ -66,6 +66,11 @@ WAL carries 330–835 ms tail stalls at every size ≥16 (writer serialization);
 MVCC's p99 never exceeds 67 ms at any measured size. Wall time for 4,096
 1-row updates: WAL 3.40 s, MVCC 0.63 s.
 
+Re-measured on `turso 0.9.0-pre.5` (2026-11-16,
+`docs/research/2026-11-16-turso-0.9-delta.md`): the shape split still holds —
+a 20k-row batch import and every page read favour WAL, 500 one-row transactions
+favour MVCC, and no part of this decision changes at the newer pin.
+
 The rank-decoupling premise is measured separately (rank_ref=false rows): the
 in-tx refresh is the dominant cost at batch 1 (WAL p50 717 µs → 92 µs without),
 confirming that moving it out of the MVCC transaction removes the widest page

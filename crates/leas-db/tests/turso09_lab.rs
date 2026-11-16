@@ -409,6 +409,64 @@ async fn arm_purge(mvcc: bool) {
     println!("{out}");
 }
 
+/// Reader contention with the writer on its OWN OS thread and its OWN runtime,
+/// so a slow statement in one cannot hide the other behind a shared worker: the
+/// writer imports on a `std::thread`, the reader polls a ONE-id page every 5 ms
+/// on the test runtime, and the reported quantity is p99 over the quiet p50.
+async fn arm_contention(mvcc: bool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("lab.db");
+    let db = open(dir.path(), mvcc).await;
+    import_burst(&db, 1, 20_000, true, true).await;
+
+    // Quiet baseline: 200 point reads, no writer.
+    let one = vec![EndpointId::new(1)];
+    let mut quiet = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let t = Instant::now();
+        db.load_page_rows(&one, false).await.expect("read");
+        quiet.push(t.elapsed());
+    }
+    quiet.sort_unstable();
+
+    let writer_db = Arc::clone(&db);
+    let writer = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("writer runtime");
+        rt.block_on(import_burst(&writer_db, 20_001, 40_001, true, true));
+    });
+
+    let mut during = Vec::with_capacity(1024);
+    while !writer.is_finished() {
+        let t = Instant::now();
+        db.load_page_rows(&one, false).await.expect("read");
+        during.push(t.elapsed());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    writer.join().expect("writer thread");
+    during.sort_unstable();
+
+    let (db_b, wal_b, log_b) = disk(&path);
+    println!(
+        "CONTEND mvcc={mvcc:<5} writer=20k rows reads: quiet n=200 p50={:>7.2?} p99={:>7.2?}  \
+         during n={:<4} p50={:>7.2?} p95={:>7.2?} p99={:>7.2?} max={:>7.2?}  \
+         stall p99/quiet-p50={:.1}x disk: db={}KiB wal={}KiB log={}KiB",
+        pct(&quiet, 0.50),
+        pct(&quiet, 0.99),
+        during.len(),
+        pct(&during, 0.50),
+        pct(&during, 0.95),
+        pct(&during, 0.99),
+        pct(&during, 1.0),
+        pct(&during, 0.99).as_secs_f64() / pct(&quiet, 0.50).as_secs_f64(),
+        db_b / 1024,
+        wal_b / 1024,
+        log_b / 1024
+    );
+}
+
 /// The two anti-join shapes the orphan purge can use, timed one after the other
 /// on the same connection pool.
 async fn time_antijoins(db: &Database) -> (Duration, Duration) {
@@ -560,6 +618,14 @@ async fn config_width_anti_join() {
 async fn import_wal_vs_mvcc() {
     for mvcc in [false, true] {
         arm_import(mvcc).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "research lab; prints a table, asserts nothing"]
+async fn reader_contention_wal_vs_mvcc() {
+    for mvcc in [false, true] {
+        arm_contention(mvcc).await;
     }
 }
 
