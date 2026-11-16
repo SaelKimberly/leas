@@ -416,6 +416,31 @@ still build their `DataTable` column `Vec` (and Sources its row `String`s) on
 every frame; they were not measured or changed. The `ROWS_DIRTY_*` rebuild
 granularity (`leas::ops::profiles` mass, P3/P4 in the memory plan) is untouched.
 
+## Boot burst (2026-11-16) — measured, then fixed
+
+The 2.46 M-allocation boot burst was turso's traced VDBE interpreter loop: with
+`TRACE` enabled process-wide (`tracing::enabled!(TRACE)` at
+`turso_core/vdbe/mod.rs:2598`), it builds one explain `String` per opcode
+(`:4159`) for the aggregate statement the UI loop issues. Valgrind DHAT named
+it (our own tracer stops at the first workspace frame; the shipped mimalloc
+build hides every allocation from external profilers — 250 blocks seen against
+2.46 M under `std-alloc`).
+
+Cap landed the same day (`logging::cap_trace`, an outermost
+`LevelFilter::DEBUG`):
+
+| metric | before | after |
+|---|---:|---:|
+| allocations per boot | 2 574 862 | **103 659** |
+| `leas::ui::run` bucket | 2 455 961 | 2 934 |
+| churn in that bucket | 91.6 MiB | 1.5 MiB |
+| traced-boot CPU | 6.29 s | **0.50 s** |
+| peak live heap | 9.3 MiB | 9.4 MiB |
+
+Design, A/Bs and the open question about per-layer filters:
+`docs/aegis/specs/2026-11-16-boot-allocation-burst-design.md`. Guard:
+`crates/leas/tests/tracing_level_gate.rs`.
+
 ## Steady state
 
 After the boot compile the app is cheap: 143 464 allocations at 10 s versus

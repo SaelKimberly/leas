@@ -11,6 +11,7 @@
 )]
 
 pub mod alloc;
+pub mod logging;
 pub mod ops;
 pub mod route_compile;
 pub mod state;

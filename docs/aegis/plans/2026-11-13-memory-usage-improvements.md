@@ -23,7 +23,7 @@ Acceptance (same sandbox, same 3 000-endpoint copy, `KEYS` script from
 
 | stage | metric | now | target |
 | --- | --- | ---: | ---: |
-| P0 | share of the 2.46 M `leas::ui` boot allocations attributed to a named function | 0 % (module rows only) | ≥ 80 % named |
+| P0 | share of the 2.46 M `leas::ui` boot allocations attributed to a named function | ~~0 % (module rows only)~~ **answered 2026-11-16**: one program point, 2 545 487 blocks | ≥ 80 % named |
 | P1 | RSS 60 s after an idle burst (shipped mimalloc build) | 116 MiB, of which 63.5 MiB anon | anon ≥ 50 % lower; CPU of the collect reported, not gated |
 | P2 | allocations per rendered frame (`row_heights` + filter `collect`) | ≥ 2 | 0 |
 | P3 | allocations for one full display-row rebuild | ~14 per endpoint | ≤ 4 per endpoint |
@@ -62,6 +62,37 @@ the cost is in `<dep>` reached from X" verdict) covering ≥ 80 % of the 2.46 M,
 written into this plan with the run's `rev`.
 **Rollback.** None needed (artifact addition; schema stays 2 unless a field is
 dropped — additive fields are fine).
+
+### Resolution (2026-11-16) — the cost is one turso program point, not render
+
+Valgrind DHAT (`--tool=dhat`, full stacks, `std-alloc` build; the shipped
+mimalloc build hides every allocation from external profilers — 250 blocks seen
+against 2.46 M) names it:
+
+```
+insn_to_str <- Program::trace_step <- dispatch_loop_traced <- Statement::_step
+  <- Rows::next <- Sql::exec_raw <- Database::profiles_aggregate
+  <- leas::ui::run::{closure#0}
+```
+
+`turso_core` gates its traced interpreter loop on `tracing::enabled!(TRACE)`
+(`vdbe/mod.rs:2598`) and then builds one explain `String` per opcode
+(`:4159`). The aggregate statement is issued from `state.refresh_aggregates`
+via `ui/mod.rs:320`, twice per call. **2 545 487** of the process's 4 706 814
+blocks are that point.
+
+Per-layer log filters cannot shut it off (four rebuilt A/Bs: `turso_core=off`,
+`debug`, `off` all leave the bucket at 2 455 98x, and an instrumented probe
+shows `enabled!(TRACE)` true even for a bogus target with every filter at
+`off`). The implementation spec for the fix and its result are
+`../specs/2026-11-16-boot-allocation-burst-design.md`: the outermost
+`LevelFilter::DEBUG` landed 2026-11-16, taking the boot from **2 574 862 to
+103 659** allocations (bucket 2 455 961 → 2 934) and traced-boot CPU 6.29 →
+0.50 s; the conditional aggregate cut was cancelled — the counter showed one
+execution per boot. The "≈810 allocations
+per endpoint" figure from this plan's scale runs is the same fact with a wrong
+denominator: it is opcode count × one `String`, and it is protocol-independent
+(0 `protocols` rows: 2 455 836 vs 2 455 961).
 
 ## 2a. Re-ranked after P0 (decisions, with numbers)
 

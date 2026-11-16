@@ -465,7 +465,7 @@ async fn run_app() -> Result<()> {
         .with_filter(tracing_subscriber::EnvFilter::new(
             "off,toasty::query=debug,db_method=trace",
         ));
-    if tracing_subscriber::registry()
+    let stack = tracing_subscriber::registry()
         .with(stderr_log)
         .with(
             TuiLogLayer {
@@ -484,12 +484,21 @@ async fn run_app() -> Result<()> {
                 "trace,hickory_net::h2=error",
             )),
         )
-        .with(db_monitor_layer)
-        .try_init()
-        .is_err()
-    {
+        .with(db_monitor_layer);
+    // The cap is not a logging preference: `turso_core` asks
+    // `tracing::enabled!(TRACE)` and takes its traced VDBE loop — one explain
+    // `String` per opcode — when the answer is yes, which measured 2 545 487
+    // allocations of a 2.57 M boot. Per-layer `EnvFilter` directives never
+    // reach that question; an outermost level cap does
+    // (`docs/aegis/specs/2026-11-16-boot-allocation-burst-design.md`).
+    if leas::logging::cap_trace(stack).try_init().is_err() {
         eprintln!("leas: tracing subscriber already set — skipping TUI log layer");
     }
+    let trace_enabled = tracing::enabled!(tracing::Level::TRACE);
+    debug_assert!(
+        !trace_enabled,
+        "the installed subscriber must keep TRACE off: a dependency gates a costlier path on it"
+    );
 
     // 5. Spawn TTL maintenance task for old logs (uses heed directly — infrequent)
     let ttl_heed = heed.clone();
