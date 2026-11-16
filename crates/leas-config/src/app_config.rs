@@ -63,9 +63,16 @@ pub struct AppConfig {
 /// surfaced in Settings it is a runtime change, not a rebuild.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ImportConfig {
-    /// Decoded-feed ceiling in bytes; `0` disables it. 64 MiB is the value that
-    /// was hard-coded, and it is MARGINAL: the 2026-10-01 feed decoded to just
-    /// over it (67,112,960 bytes) and was truncated.
+    /// Decoded-feed ceiling in bytes; `0` disables it.
+    ///
+    /// 256 MiB, NOT the 64 MiB that was hard-coded: that value truncated two
+    /// real feeds by a few kilobytes (67,112,960 bytes on 2026-10-01, 67,114,816
+    /// on 2026-11-16) because it sat just under what a large curated list
+    /// decodes to. The ceiling is a wall-clock abuse guard, not a memory one —
+    /// the streaming import holds one chunk plus the batcher queue, and the
+    /// lab measures the same peak RSS (99 vs 111 MiB) for an 80 MiB and an
+    /// 8 MiB feed carrying the same row count — so it is set above any feed
+    /// that the link ceiling (200,000) admits at a real link density.
     #[serde(default = "default_max_feed_bytes")]
     pub max_feed_bytes: u64,
     /// Stored-link ceiling; `0` disables it. A runaway guard, not a real limit —
@@ -75,7 +82,7 @@ pub struct ImportConfig {
 }
 
 const fn default_max_feed_bytes() -> u64 {
-    64 * 1024 * 1024
+    256 * 1024 * 1024
 }
 
 const fn default_max_feed_links() -> usize {
@@ -304,7 +311,11 @@ fn default_config_path() -> PathBuf {
 #[test]
 fn a_config_without_an_import_section_loads_with_the_previous_defaults() {
     let cfg: AppConfig = serde_json::from_str("{}").expect("empty config must load");
-    assert_eq!(cfg.import.max_feed_bytes, 64 * 1024 * 1024);
+    assert_eq!(cfg.import.max_feed_bytes, 256 * 1024 * 1024);
+    // Every byte-budget truncation on record (67,112,960 on 2026-10-01,
+    // 67,114,816 on 2026-11-16) must sit BELOW the default, or the same feed
+    // is cut off again the moment it grows by a few kilobytes.
+    assert!(cfg.import.max_feed_bytes > 67_114_816);
     assert_eq!(cfg.import.max_feed_links, 200_000);
 }
 

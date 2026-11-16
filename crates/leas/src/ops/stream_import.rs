@@ -240,11 +240,21 @@ where
                 Some(Ok(chunk)) => {
                     feed_bytes = feed_bytes.saturating_add(chunk.len());
                     if feed_bytes > max_feed_bytes {
+                        // Name the knob: the recorded occurrences were both a
+                        // few kilobytes over a 64 MiB ceiling, and the log line
+                        // was the only place the number existed.
+                        let ceiling = if max_feed_bytes % (1024 * 1024) == 0 {
+                            format!("{} MiB", max_feed_bytes / (1024 * 1024))
+                        } else {
+                            format!("{max_feed_bytes} bytes")
+                        };
                         tracing::warn!(
                             target: "tui::ops::subscriptions",
-                            "Feed exceeded the {max_feed_bytes}-byte budget ({feed_bytes} bytes) — stopping with partial results"
+                            "Feed exceeded the {ceiling} byte budget ({feed_bytes} bytes) — stopping with partial results; raise `import.max_feed_bytes` (0 = unbounded) to accept this feed"
                         );
-                        ended_early = Some(format!("feed over the {max_feed_bytes}-byte budget"));
+                        ended_early = Some(format!(
+                            "feed over the {ceiling} byte budget — raise import.max_feed_bytes (0 = unbounded)"
+                        ));
                         break None;
                     }
                     if let Err(e) = batcher.feed(&chunk) {
@@ -910,11 +920,14 @@ mod tests {
     async fn streaming_import_stops_at_the_byte_budget() {
         let db = Arc::new(Database::in_memory().await.expect("db"));
         let validation = ValidationSettings::default();
-        // One chunk over the 64 MiB decode budget; content is irrelevant —
-        // the budget is checked before the bytes are decoded.
-        let huge = bytes::Bytes::from(vec![b'x'; 64 * 1024 * 1024 + 1]);
+        // A configured ceiling, not the default one: the default is a policy
+        // number that moves (256 MiB since the 2026-11-16 large-feed fix), and
+        // pinning it here would need a 256 MiB allocation to exercise the same
+        // path. Content is irrelevant — the budget is checked before the bytes
+        // are decoded, so nothing is buffered and `links` stays 0.
+        let chunk = bytes::Bytes::from(vec![b'x'; 4096]);
         let mut source = ScriptedSource {
-            chunks: std::iter::once(Ok(huge)),
+            chunks: std::iter::once(Ok(chunk)),
         };
         let outcome = run_streaming_import(
             &mut source,
@@ -923,7 +936,10 @@ mod tests {
             &validation,
             2,
             None::<&fn(usize)>,
-            leas_config::app_config::ImportConfig::default(),
+            leas_config::app_config::ImportConfig {
+                max_feed_bytes: 1024,
+                max_feed_links: 0,
+            },
         )
         .await;
         let reason = outcome.ended_early.expect("budget must end the run early");
@@ -1115,11 +1131,11 @@ mod tests {
     async fn a_short_run_names_its_reason() {
         let db = Arc::new(Database::in_memory().await.expect("db"));
         let validation = ValidationSettings::default();
-        // One chunk over the 64 MiB decode budget: a guaranteed-early exit whose
+        // A configured ceiling over a small chunk: a guaranteed-early exit whose
         // reason must survive into the outcome and the user-facing message.
-        let huge = bytes::Bytes::from(vec![b'x'; 64 * 1024 * 1024 + 1]);
+        let chunk = bytes::Bytes::from(vec![b'x'; 4096]);
         let mut source = ScriptedSource {
-            chunks: std::iter::once(Ok(huge)),
+            chunks: std::iter::once(Ok(chunk)),
         };
         let outcome = run_streaming_import(
             &mut source,
@@ -1128,7 +1144,10 @@ mod tests {
             &validation,
             2,
             None::<&fn(usize)>,
-            leas_config::app_config::ImportConfig::default(),
+            leas_config::app_config::ImportConfig {
+                max_feed_bytes: 1024,
+                max_feed_links: 0,
+            },
         )
         .await;
 
@@ -1347,5 +1366,110 @@ mod tests {
             &mut seen.2,
         )
         .0
+    }
+
+    /// Perf lab (not a gate): a feed over the OLD 64 MiB ceiling must import
+    /// whole once the byte ceiling is lifted, and peak RSS must track ROWS, not
+    /// feed bytes — the run holds one chunk plus the batcher queue, never the
+    /// feed, so a byte ceiling cannot be a memory guard.
+    ///
+    /// `LEAS_LAB_FEED_MB` (default 80) sets the decoded feed size;
+    /// `LEAS_LAB_LINK_PAD` pads each link so a large byte count can carry few
+    /// rows. Measured on this machine:
+    ///
+    /// | decoded | links | wall | peak RSS |
+    /// | --- | --- | --- | --- |
+    /// | 8 MiB | 27,855 | 2.3 s | 111 MiB |
+    /// | 80 MiB, 3 KB links | 25,440 | 1.6 s | 99 MiB |
+    /// | 80 MiB, dense | 277,444 | 140.7 s | 187 MiB |
+    #[cfg(feature = "perf-lab")]
+    #[tokio::test]
+    #[ignore = "perf lab: over-64-MiB feed import; run with --features perf-lab -- --ignored"]
+    async fn perf_lab_a_feed_over_the_default_ceiling_imports_whole() {
+        fn peak_mb() -> f64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("VmHWM:"))
+                        .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+                })
+                .map_or(f64::NAN, |kb| kb as f64 / 1024.0)
+        }
+
+        const CHUNK: usize = 1 << 20;
+        // Same byte count with 10x fewer links isolates row cost from byte
+        // cost: peak RSS must follow ROWS, because a run holds one chunk plus
+        // the per-row dedup sets, never the feed.
+        let pad: usize = std::env::var("LEAS_LAB_LINK_PAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mb: usize = std::env::var("LEAS_LAB_FEED_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(80);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(dir.path().join("lab.db")).await.expect("db"));
+        let validation = ValidationSettings::default();
+
+        // Unique host per line: the run dedups links, so a repeated URL would
+        // stage one row and measure nothing.
+        let mut n: u32 = 0;
+        let chunks = std::iter::from_fn(move || {
+            let mut body = String::with_capacity(CHUNK + 256);
+            while body.len() < CHUNK {
+                n = n.wrapping_add(1);
+                let (a, b) = (n >> 16 & 0xff, n >> 8 & 0xff);
+                let host = format!("203.{a}.{b}.{}", n & 0xff);
+                let mut line = valid_vmess_url(&host);
+                if pad > 0 {
+                    line.reserve(pad + 2);
+                    line.push('#');
+                    line.extend(std::iter::repeat_n('p', pad));
+                }
+                body.push_str(&line);
+                body.push('\n');
+            }
+            Some(Ok(bytes::Bytes::from(body)))
+        })
+        .take(mb);
+
+        let mut source = ScriptedSource { chunks };
+        let base = peak_mb();
+        let started = std::time::Instant::now();
+        let outcome = run_streaming_import(
+            &mut source,
+            &db,
+            Some("lab"),
+            &validation,
+            400,
+            None::<&fn(usize)>,
+            if std::env::var("LEAS_LAB_DEFAULT_BUDGET").is_ok() {
+                // The regression check: the shipped defaults must admit a feed
+                // that the old 64 MiB ceiling truncated.
+                leas_config::app_config::ImportConfig::default()
+            } else {
+                leas_config::app_config::ImportConfig {
+                    max_feed_bytes: 0,
+                    max_feed_links: 0,
+                }
+            },
+        )
+        .await;
+        let wall = started.elapsed().as_secs_f64();
+        println!("LAB outcome {outcome:?}");
+        println!(
+            "LAB feed {mb} MiB: links={} stored={} wall={wall:.1}s peak_rss {base:.0} -> {:.0} MiB ended_early={:?}",
+            outcome.links,
+            outcome.links,
+            peak_mb(),
+            outcome.ended_early.as_deref().unwrap_or("none"),
+        );
+        assert_eq!(
+            outcome.ended_early, None,
+            "an unbounded budget must not truncate a large feed",
+        );
+        assert!(outcome.links > 0, "the feed must import links");
     }
 }

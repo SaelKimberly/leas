@@ -821,6 +821,11 @@ pub fn spawn_auto_update(state: &mut AppState) {
     let live_proxy = state.live_proxy.clone();
     let routing_engine = Arc::clone(&state.routing_engine);
     let validation: ValidationSettings = state.config.parsing.clone().into();
+    // The ceilings are configuration everywhere else; the auto-update loop
+    // used to pass `ImportConfig::default()`, so a raised ceiling applied to a
+    // manual refresh and NOT to the scheduled one (which is the path that runs
+    // unattended over a large feed).
+    let budget = state.config.import;
     let shutdown = state.shutdown_token.clone();
     // Snapshot for the loop's route gate; the selection changes rarely and
     // the gate only decides whether the fetch uses the tunnel.
@@ -872,7 +877,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
                     gid.clone(),
                     db.clone(),
                     validation.clone(),
-                    leas_config::app_config::ImportConfig::default(),
+                    budget,
                     live_proxy.get(),
                     &routing_engine,
                     rules.clone(),

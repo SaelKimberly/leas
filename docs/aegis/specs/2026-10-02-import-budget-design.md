@@ -83,8 +83,10 @@ experiences:
 
 My recommendation, offered as a recommendation and not applied: **128 MiB / 200,000**. It keeps the
 runaway guard, removes the marginal failure the run actually hit, and 128 MiB is still small enough
-that the decoded buffer cannot exhaust memory on a normal machine. Both fields are editable at
-runtime through Settings → Subscriptions, so the ceiling is not a one-shot decision.
+that the decoded buffer cannot exhaust memory on a normal machine.
+
+**Correction (2026-11-16):** the last sentence above was wrong — no Settings section reads these
+fields. They are `config.json`-only. See §9, which also supersedes the 128 MiB recommendation.
 
 ## 7. Verification
 
@@ -99,3 +101,54 @@ runtime through Settings → Subscriptions, so the ceiling is not a one-shot dec
 
 No path is retired. The two function-local `const`s are removed and the values become parameters;
 nothing else changes shape.
+
+---
+
+## 9. Decision (2026-11-16) — the ceiling is 256 MiB, and the auto-update path now honours it
+
+A second real feed was cut off by the 64 MiB default:
+
+```
+Feed exceeded the 67108864-byte budget (67114816 bytes) — stopping with partial results
+```
+
+5,952 bytes over, on a feed the import was streaming correctly. The §6 question, left open, cost
+another truncated import.
+
+**The byte ceiling is not a memory guard, and the lab now says so.** `crates/leas/src/ops/stream_import.rs`
+lab `perf_lab_a_feed_over_the_default_ceiling_imports_whole` (`--features perf-lab`, ignored) streams
+a feed with the byte ceiling lifted:
+
+| decoded feed | links | wall | peak RSS |
+| --- | --- | --- | --- |
+| 8 MiB | 27,855 | 2.3 s | 111 MiB |
+| 80 MiB (3 KB per link) | 25,440 | 1.6 s | 99 MiB |
+| 80 MiB (dense) | 277,444 | 140.7 s | 187 MiB |
+
+10x the bytes at the same row count costs NOTHING in time or memory: the run holds one chunk plus the
+batcher queue, and what does grow is per-row (the run-wide dedup sets and the persist windows), which
+the link ceiling already bounds. So the byte ceiling's only job is to stop a junk stream that carries
+no usable links — a wall-clock guard. A number below what a legitimate curated list decodes to
+therefore buys no protection and costs data.
+
+**Decisions.**
+
+1. Default byte ceiling **64 MiB → 256 MiB** (`ImportConfig::default`, `leas-config`). Above any feed
+   the 200,000-link ceiling admits at a real link density, so the byte guard can only fire on a feed
+   that is byte-heavy relative to its links. The link ceiling stays 200,000.
+2. **`spawn_auto_update` passed `ImportConfig::default()`** while the manual and batch paths passed
+   `state.config.import` — a raised ceiling applied to a hand refresh and not to the scheduled one,
+   which is exactly the path that runs unattended over a large feed. It now snapshots the same
+   config. This was the defect that made "configure it" unreliable advice.
+3. The truncation reason **names the knob and the ceiling in MiB** (`feed over the 256 MiB byte budget
+   — raise import.max_feed_bytes (0 = unbounded)`), because the previous line was the only place the
+   number existed and a group row could not tell a user what to change.
+4. **Still not in Settings.** Raising the ceiling means editing `config.json`. A Settings →
+   Subscriptions section was never implemented and is not implemented here; if a user-facing knob is
+   wanted, it is its own change with its own tests.
+
+**Verification.** `a_config_without_an_import_section_loads_with_the_previous_defaults` now asserts
+the default is above every recorded truncation (67,114,816). The two budget tests that leaned on the
+64 MiB default to force an early exit configure a 1 KiB ceiling instead, so the default is no longer
+pinned by a 64 MiB allocation. The lab row above is the memory evidence; `cargo nextest run -p leas
+-p leas-config` is the behavioural one.
