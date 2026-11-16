@@ -47,7 +47,7 @@ chacha20 = { version = "0.10.2", features = ["xchacha", "zeroize"] }
 ctr = { version = "0.10.1", features = ["zeroize"] }
 hmac = { version = "0.13.0", features = ["zeroize"] }
 sha2 = { workspace = true, features = ["zeroize"] }
-crc32fast = "1.5.3"
+crc32fast = "1.5.5"
 md-5 = { workspace = true, features = ["zeroize"] }
 blake2 = { version = "0.11.0", features = ["zeroize"] }
 # Classic-AEAD subkey KDF: HKDF-SHA1(psk, salt, b"ss-subkey").
@@ -65,7 +65,7 @@ shake = "0.1.0"
 # forbids raw setsockopt); SO_MARK/SO_BINDTODEVICE/TCP_CONGESTION need an ADR.
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
 wide = "1.7.1"
-inout = "0.2.5"
+inout = "0.2.6"
 
 # Secret wiping for the key material we own ourselves: VMess cmd/session
 # keys, VLESS UUIDs, Shadowsocks subkeys, the mlkem768x25519plus state.

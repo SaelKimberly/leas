@@ -17,7 +17,7 @@ compact_str.workspace = true
 # 0.32 REMOVED the `simdutf8` feature outright (upstream measured no win on
 # production GeoIP2 databases), so the whole feature list is deleted rather
 # than renamed. Every read API this crate uses is source-identical.
-maxminddb = { version = "0.32", features = ["mmap"] }
+maxminddb = { version = "0.33", features = ["mmap"] }
 
 # ============ Async Runtime & I/O ============
 tokio = { workspace = true, features = ["sync", "fs", "io-util", "rt"] }

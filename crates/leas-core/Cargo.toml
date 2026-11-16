@@ -64,7 +64,7 @@ workspace = true
 
 [dev-dependencies]
 
-[package.metadata.cargo-machete]
+[package.metadata.cargo-shear]
 # Deliberate transitive backend override (ring pin), see the comment in
 # [dependencies].
 ignored = ["tokio-rustls"]

@@ -51,7 +51,7 @@ rustls = { workspace = true, features = ["ring"] }
 # Servo html5ever + selectors: parses the `t.me/s/<channel>` public web preview
 # for the Telegram source (`ops/telegram.rs`). Single-crate dep, so it lives
 # here rather than in `[workspace.dependencies]`.
-scraper = "0.27.0"
+scraper = "0.29.0"
 
 # ============ Config & Filesystem ============
 dirs.workspace = true

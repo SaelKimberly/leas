@@ -4,7 +4,7 @@ How the workspace is put together: which crates exist, what each one owns, where
 
 ## Workspace layout
 
-`Cargo.toml` declares `members = ["crates/*"]`, resolver 3, edition 2024, rust-version `1.99.1`, workspace version `0.1.0`. Fifteen crates exist:
+`Cargo.toml` declares `members = ["crates/*"]`, resolver 3, edition 2024, rust-version `1.100.0`, workspace version `0.1.0`. Fifteen crates exist:
 
 `leas`, `leas-config`, `leas-core`, `leas-db`, `leas-dns`, `leas-geoip`, `leas-hakari`, `leas-host-features`, `leas-hotpath`, `leas-memtrace`, `leas-native`, `leas-oracles`, `leas-proto`, `leas-route`, `leas-tls`. (`leas-oracles` is dev-only and excluded from `default-members`; `leas-hotpath` is a dev benchmark pair of binaries, also absent from `default-members`. `leas-memtrace` is a library and a default member, so its unit tests run in the normal suite; it is also the optional `mem-trace` allocator of the `leas` binary — see [`decisions.md`](decisions.md) §30.)
 
@@ -43,7 +43,7 @@ Notes that the manifests enforce:
 - `leas` depends on `leas-proto` and `leas-route` directly, in addition to the crates listed above.
 - `leas-memtrace` is an optional dependency of `leas` (feature `mem-trace`, which implies `std-alloc` and swaps the default mimalloc allocator out) and a plain dependency of the dev-only `leas-hotpath`, whose `memtrace` bin drives real code paths under it (workloads `header`, `connect`, `geosite`, `record`), diffs two artifacts (`compare`), and therefore also reads `leas-geoip` and `serde_json`.
 
-`leas-hakari` is a cargo-hakari generated feature-unification crate. Every member depends on it; its own dependencies are never referenced from code and exist only to unify feature flags. Regenerate after a `Cargo.lock` change with `cargo hakari generate`; the `hakari-check` gate runs `cargo hakari generate --diff`, `cargo hakari manage-deps --dry-run` and `cargo hakari verify`, and `--dry-run` is what catches a member missing the dependency.
+`leas-hakari` is a cargo-hakari generated feature-unification crate. Every member depends on it; its own dependencies are never referenced from code and exist only to unify feature flags. `cargo hakari generate` manages only the part between the `### BEGIN/END HAKARI SECTION` markers, so tail tables such as `[lints]` survive regeneration. Regenerate after a `Cargo.lock` change with `cargo hakari generate`; the `hakari-check` gate runs `cargo hakari generate --diff`, `cargo hakari manage-deps --dry-run` and `cargo hakari verify`, and `--dry-run` is what catches a member missing the dependency. `cargo shear` recognises the crate from the same marker and skips both it and the members' edges to it, so neither needs an ignore list.
 
 ## Crate responsibilities
 

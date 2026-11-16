@@ -33,8 +33,8 @@ x25519-dalek.workspace = true
 # async I/O seam
 tokio = { workspace = true, features = ["io-util", "time", "rt", "sync"] }
 # cert verification
-rustls-webpki = { version = "0.103.16", default-features = false, features = ["ring", "std"] }
-rustls-pki-types = "1.15.1"
+rustls-webpki = { version = "0.103.17", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.16.0"
 webpki-roots.workspace = true
 # JA3 hash
 md-5.workspace = true
@@ -55,7 +55,7 @@ hex.workspace = true
 # `zeroize` wipes the decapsulation key on drop; `default-features = false`
 # keeps ciphertexts and shared secrets inline (no heap), which the
 # allocation-free `encapsulate_into` path depends on.
-ml-kem = { version = "0.3.3", default-features = false, features = ["zeroize"] }
+ml-kem = { version = "0.3.4", default-features = false, features = ["zeroize"] }
 # REALITY's ML-DSA-65 certificate extension verification (Xray
 # `realitySettings.mldsa65Verify`, FIPS 204). Verify-only: no signing key is
 # ever constructed, so the RNG/PKCS#8 default features are off.
@@ -71,7 +71,7 @@ rand_core = { version = "0.10.1", default-features = false }
 # are already in the workspace lockfile; brotli is new.
 flate2.workspace = true
 brotli = "9.1.1"
-zstd = "0.14.3"
+zstd = "0.14.4"
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 [lints]
 workspace = true

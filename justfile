@@ -3,7 +3,7 @@
 #
 # `just quality-gate`            — every check, verbose report, all checks run even on failure
 # `just quality-gate code`       — source checks only (fmt-check, clippy, nextest)
-# `just quality-gate deps`       — dependency checks only (hakari-check, deny, machete, outdated, audit)
+# `just quality-gate deps`       — dependency checks only (hakari-check, deny, shear, outdated, audit)
 # `just quality-gate-ci`         — every check, minimal output, stops at first failure (exit 0/1, for CI)
 # `just quality-gate-ci code|deps` — the same subsets in CI mode
 
@@ -86,9 +86,12 @@ nextest mode='report':
 deny mode='report':
     @cargo deny check bans licenses sources
 
-# Unused dependencies (ignores live in `[package/workspace.metadata.cargo-machete]`)
-machete mode='report':
-    @cargo machete --with-metadata --skip-target-dir
+# Unused/misplaced dependencies and unlinked source files. `cargo-shear`
+# recognises the generated `leas-hakari` crate from its `### BEGIN HAKARI
+# SECTION` marker, so neither the crate's hundred dependencies nor the members'
+# edges to it need an ignore list. Ignores: `[package.metadata.cargo-shear]`.
+shear mode='report':
+    @cargo shear
 
 # Outdated direct dependencies. Informational by design (`--exit-code 0`):
 # direct deps are kept at latest (the 2026-10-22 pass moved every direct dep to
@@ -122,8 +125,8 @@ _gate mode target:
     target="{{target}}"
     case "$target" in
         code) tools=(fmt-check clippy nextest) ;;
-        deps) tools=(hakari-check deny machete outdated audit) ;;
-        all)  tools=(fmt-check clippy nextest hakari-check deny machete outdated audit) ;;
+        deps) tools=(hakari-check deny shear outdated audit) ;;
+        all)  tools=(fmt-check clippy nextest hakari-check deny shear outdated audit) ;;
         *)
             echo "unknown gate target: $target (expected code | deps | all)" >&2
             exit 2

@@ -17,8 +17,8 @@ name: ci
 #   * `taiki-e/install-action` — prebuilt, checksum- and attestation-verified
 #     binaries for `just` / `cargo-nextest` / the `deps` tools. This replaces
 #     `cargo install`, which used to compile every tool on every run. Note it
-#     covers `cargo-deny`, `cargo-machete` and `cargo-audit` from its manifest
-#     list but falls back to cargo-binstall for `cargo-hakari` and
+#     covers `cargo-deny` and `cargo-audit` from its manifest list but falls
+#     back to cargo-binstall for `cargo-shear`, `cargo-hakari` and
 #     `cargo-outdated`, which are not in it.
 #   * `actions/cache` for `~/.rustup`, where rust-cache does not reach — used by
 #     the Windows job only. Two measured decisions are behind that:
@@ -173,7 +173,7 @@ jobs:
           tool: |
             just
             cargo-deny
-            cargo-machete
+            cargo-shear
             cargo-audit
             cargo-hakari
             cargo-outdated
@@ -181,5 +181,5 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "false"
-      - name: Gate — hakari, deny, machete, outdated, audit
+      - name: Gate — hakari, deny, shear, outdated, audit
         run: just quality-gate-ci deps

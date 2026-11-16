@@ -29,7 +29,7 @@ is created owner-only (`0700`) because `data.db` holds proxy credentials.
 | `endpoint_rank.rs` | the ordering law's materialization and the `endpoint_rank` writes |
 | `endpoint_ip.rs` | the packed address key and the address-set writes |
 | `write_behind.rs` | the micro-batch write-behind driver |
-| `driver/` | the in-tree toasty driver over `turso` (`=0.9.0-pre.2`), replacing `toasty-driver-turso` |
+| `driver/` | the in-tree toasty driver over `turso` (`=0.9.0-pre.5`), replacing `toasty-driver-turso` |
 | `export.rs`, `merge.rs`, `retry.rs` | streaming export, endpoint merge, busy retry |
 
 The typed layer is toasty 0.11 with the owned driver above. The driver creates

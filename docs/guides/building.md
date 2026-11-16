@@ -10,12 +10,12 @@ they are the numbers the toolchain printed.
 
 | Need | Why | Notes |
 | --- | --- | --- |
-| `rustup` (or a system Rust at least the workspace `rust-version`, 1.99.1) | `rust-toolchain.toml` pins the `stable` channel, `rustfmt`/`clippy`, and three targets | `rustup show` installs what the file asks for |
+| `rustup` (or a system Rust at least the workspace `rust-version`, 1.100.0) | `rust-toolchain.toml` pins the `stable` channel, `rustfmt`/`clippy`, and three targets | `rustup show` installs what the file asks for |
 | a C compiler (`build-essential`, `gcc`, or MSVC's `cl.exe`) | `ring`, `zstd-sys` and `libsqlite3-sys` compile C | verified: a clean build does its C work through `cc`/`cc1` |
 | `git`, `curl`, `tar` | `just plugin-bins` fetches one prebuilt plugin and builds another | optional: only the plugin e2e rows need it |
 | `just` | every documented task is a recipe | `cargo install --locked just` |
 | `cargo-nextest` | the suite (`cargo nextest run --workspace`) | `cargo install --locked cargo-nextest` |
-| `cargo-hakari`, `cargo-deny`, `cargo-machete`, `cargo-audit`, `cargo-outdated` | the `deps` half of the gate | `cargo install --locked …` |
+| `cargo-hakari`, `cargo-deny`, `cargo-shear`, `cargo-audit`, `cargo-outdated` | the `deps` half of the gate | `cargo install --locked …` |
 | `python3` | regenerating the TLS fingerprint catalog (`crates/leas-tls/src/fingerprints/catalog/gen_specs.py`) | optional |
 
 **Not required:** `protoc`. `crates/leas-core/build.rs` compiles the stats
@@ -115,7 +115,7 @@ that is not mine".
 ```sh
 just quality-gate            # everything, verbose, all checks run even on failure
 just quality-gate code       # fmt-check, clippy (all targets/features), nextest
-just quality-gate deps       # hakari-check, deny, machete, outdated, audit
+just quality-gate deps       # hakari-check, deny, shear, outdated, audit
 just quality-gate-ci code    # what CI runs: minimal output, stops at first failure
 ```
 
@@ -123,8 +123,8 @@ just quality-gate-ci code    # what CI runs: minimal output, stops at first fail
 --all-features -- -D warnings`, and `cargo nextest run` (the `ci` mode uses the
 `ci` profile). `deps` runs `cargo hakari generate --diff`, `cargo hakari
 manage-deps --dry-run`, `cargo hakari verify`, `cargo deny check bans licenses
-sources`, `cargo machete --with-metadata`, `cargo outdated` (informational,
-`--exit-code 0`), and `cargo audit`.
+sources`, `cargo shear` (it recognises the generated hakari crate and skips it),
+`cargo outdated` (informational, `--exit-code 0`), and `cargo audit`.
 
 ## CI
 
