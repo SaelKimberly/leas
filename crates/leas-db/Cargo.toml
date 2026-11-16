@@ -78,6 +78,8 @@ workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+# the protocol-shape lab writes the same JSON text the typed writer produces
+serde_json.workspace = true
 toasty = { workspace = true, features = ["serde", "jiff"] }
 jiff = { workspace = true }
 leas-proto = { path = "../leas-proto", version = "0.1.0" }
