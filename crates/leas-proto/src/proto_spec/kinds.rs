@@ -152,6 +152,47 @@ impl ProtocolKind {
             Self::Mixed => "mixed",
         }
     }
+
+    /// The label the toasty `Embed` derive stores for this kind — the
+    /// `snake_case` of the Rust variant, which is NOT [`Self::as_str`].
+    ///
+    /// The `protocols.proto_kind` column is text with a `CHECK` constraint
+    /// listing exactly these labels (`wire_guard`, `hysteria2`, `any_tls`,
+    /// `t_proxy`, …), so a raw-SQL writer that uses the wire spelling fails
+    /// the insert. [`FromStr`](std::str::FromStr) accepts both, which is why
+    /// reading the column back as text still parses.
+    #[must_use]
+    pub const fn as_db_label(self) -> &'static str {
+        match self {
+            Self::Vmess => "vmess",
+            Self::Vless => "vless",
+            Self::Shadowsocks => "shadowsocks",
+            Self::Shadowsocks2022 => "shadowsocks2022",
+            Self::Socks => "socks",
+            Self::Http => "http",
+            Self::Trojan => "trojan",
+            Self::WireGuard => "wire_guard",
+            Self::Hysteria2 => "hysteria2",
+            Self::DokodemoDoor => "dokodemo_door",
+            Self::Freedom => "freedom",
+            Self::Blackhole => "blackhole",
+            Self::Dns => "dns",
+            Self::Loopback => "loopback",
+            Self::Custom => "custom",
+            Self::Tuic => "tuic",
+            Self::Hysteria => "hysteria",
+            Self::Naive => "naive",
+            Self::AnyTls => "any_tls",
+            Self::ShadowTls => "shadow_tls",
+            Self::Tor => "tor",
+            Self::Ssh => "ssh",
+            Self::Tailscale => "tailscale",
+            Self::ShadowsocksR => "shadowsocks_r",
+            Self::Redirect => "redirect",
+            Self::TProxy => "t_proxy",
+            Self::Mixed => "mixed",
+        }
+    }
 }
 
 impl std::fmt::Display for ProtocolKind {
@@ -255,6 +296,24 @@ impl TransportType {
             Self::Kcp => "kcp",
             Self::HttpUpgrade => "httpupgrade",
             Self::XHttp => "xhttp",
+        }
+    }
+
+    /// The label toasty stores for this transport — the inverse of
+    /// [`Self::from_db_label`], and NOT [`Self::as_str`] (`http_upgrade`,
+    /// `x_http`). A raw-SQL writer must use it: the column's `CHECK`
+    /// constraint lists the `snake_case` labels only.
+    #[must_use]
+    pub const fn as_db_label(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Ws => "ws",
+            Self::Grpc => "grpc",
+            Self::Http => "http",
+            Self::Quic => "quic",
+            Self::Kcp => "kcp",
+            Self::HttpUpgrade => "http_upgrade",
+            Self::XHttp => "x_http",
         }
     }
 }

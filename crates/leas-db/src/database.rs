@@ -2098,8 +2098,9 @@ pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> R
     // Measured on a realistic VLESS payload (a ~400 B config plus the embed
     // columns): 20 000 protocols cost 658-713 ms as typed single-row upserts
     // against 125-155 ms this way — `docs/research/2026-11-16-turso-0.9-delta.md`
-    // §5. The column list, the enum spellings (`as_str`), the INTEGER flag and
-    // the config JSON are the exact forms the typed writer stores; the test
+    // §5. The column list, the enum labels (`as_db_label`, the toasty embed
+    // spelling — never the wire `as_str`), the INTEGER flag and the config
+    // JSON are the exact forms the typed writer stores; the test
     // `protocols_bulk_matches_the_typed_writer` pins that equality.
     let created = now_epoch();
     for chunk in ps.chunks(IMPORT_STATEMENT_ROWS) {
@@ -2120,8 +2121,8 @@ pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> R
                 "({}, {}, {}, {}, {}, {}, {}, {}, {}, {created})",
                 p.id.get(),
                 p.sig,
-                sql_lit(p.proto_kind.as_str()),
-                sql_lit(p.transport.r#type.as_str()),
+                sql_lit(p.proto_kind.as_db_label()),
+                sql_lit(p.transport.r#type.as_db_label()),
                 sql_lit(p.security.r#type.as_str()),
                 p.security
                     .sni
@@ -4449,6 +4450,75 @@ mod tests {
             "created_at is on_create only"
         );
         assert_ne!(bulk, after, "the new config must be stored");
+    }
+
+    /// Every kind and transport stores the same checked-column labels through
+    /// the raw writer as through the typed writer.
+    ///
+    /// The single VLESS+TCP row above cannot see the label split: `vless` and
+    /// `tcp` are spelled identically in the wire dialect and the embed one. 20
+    /// of 27 kinds and 2 of 8 transports differ (`ss`/`shadowsocks`,
+    /// `hy2`/`hysteria2`, `any-tls`/`any_tls`, `xhttp`/`x_http`, …), and the
+    /// column is `CHECK`-constrained to the embed spelling — the wire spelling
+    /// fails the whole import chunk (`CHECK constraint failed: proto_kind`).
+    #[tokio::test]
+    async fn every_protocol_kind_and_transport_bulk_matches_the_typed_writer() {
+        async fn labels(conn: &mut toasty::Connection, id: i64) -> toasty_core::stmt::Value {
+            let mut rows = toasty::sql::query(format!(
+                "SELECT proto_kind, transport_type, security_type \
+                 FROM protocols WHERE id = {id}"
+            ))
+            .exec(conn)
+            .await
+            .expect("read");
+            rows.pop().expect("one row")
+        }
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        let transports = [
+            TransportType::Tcp,
+            TransportType::Ws,
+            TransportType::Grpc,
+            TransportType::Http,
+            TransportType::Quic,
+            TransportType::Kcp,
+            TransportType::HttpUpgrade,
+            TransportType::XHttp,
+        ];
+        let mut id = 100;
+        for kind in (1_i32..=27).filter_map(ProtocolKind::try_from_i32) {
+            for transport in transports {
+                let bulk = Protocol {
+                    created_at: 0,
+                    id: ProtocolId::new(id),
+                    sig: id,
+                    proto_kind: kind,
+                    transport: Transport { r#type: transport },
+                    security: no_security(),
+                    config: Deferred::from(Json(vless_config())),
+                    links: Deferred::default(),
+                };
+                Protocol::upsert_by_id(ProtocolId::new(id + 1))
+                    .sig(id + 1)
+                    .proto_kind(kind)
+                    .transport(Transport { r#type: transport })
+                    .security(no_security())
+                    .config(vless_config())
+                    .on_create(|create| create.created_at(0))
+                    .exec(&mut conn)
+                    .await
+                    .expect("typed upsert");
+                upsert_protocols_bulk(&mut conn, std::slice::from_ref(&bulk))
+                    .await
+                    .expect("bulk upsert");
+                assert_eq!(
+                    labels(&mut conn, id).await,
+                    labels(&mut conn, id + 1).await,
+                    "{kind:?} / {transport:?}"
+                );
+                id += 2;
+            }
+        }
     }
 
     /// The import path's bulk literal writer (db-rewamp D10): an IP literal's
