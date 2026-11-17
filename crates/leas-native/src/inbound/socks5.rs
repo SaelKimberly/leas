@@ -211,20 +211,25 @@ async fn read_greeting<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<Metho
 }
 
 /// Write the server's method selection: `VER, METHOD`.
+///
+/// ONE write per frame, never one per byte. With `TCP_NODELAY` set on the
+/// accepted socket, byte-wise writes leave as separate segments, and a
+/// client that reads the frame with a non-blocking descriptor sees the first
+/// segment arrive alone: its second `read` returns `EAGAIN` instead of the
+/// remaining byte. apt's `SOCKS5h` client does exactly that and fails with
+/// `Reading the greet back from SOCKS proxy ... failed` (errno 11).
 async fn write_selection<S: AsyncWrite + Unpin>(
     stream: &mut S,
     method: Method,
 ) -> Result<(), Socks5Error> {
-    stream.write_u8(VERSION).await?;
-    stream.write_u8(method as u8).await?;
+    stream.write_all(&[VERSION, method as u8]).await?;
     stream.flush().await?;
     Ok(())
 }
 
 /// Write `VER=0x05, METHOD=0xFF` — no acceptable method.
 async fn write_no_acceptable<S: AsyncWrite + Unpin>(stream: &mut S) -> Result<(), Socks5Error> {
-    stream.write_u8(VERSION).await?;
-    stream.write_u8(0xFF).await?;
+    stream.write_all(&[VERSION, 0xFF]).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -246,13 +251,13 @@ async fn read_credentials<S: AsyncRead + Unpin>(
     Ok((String::from_utf8(username)?, String::from_utf8(password)?))
 }
 
-/// Write the RFC 1929 auth response: `VER=1, STATUS`.
+/// Write the RFC 1929 auth response: `VER=1, STATUS` (one write, see
+/// [`write_selection`]).
 async fn write_auth_status<S: AsyncWrite + Unpin>(
     stream: &mut S,
     ok: bool,
 ) -> Result<(), Socks5Error> {
-    stream.write_u8(0x01).await?;
-    stream.write_u8(u8::from(!ok)).await?;
+    stream.write_all(&[0x01, u8::from(!ok)]).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -314,41 +319,22 @@ pub(crate) async fn read_target<S: AsyncRead + Unpin>(
 }
 
 /// Write a reply: `VER, REP, RSV, ATYP, BND.ADDR, BND.PORT`.
+///
+/// ONE write for the whole frame (header + address + port): apt reads the
+/// header (4 bytes) and then the address with a non-blocking descriptor, so a
+/// frame split across segments can hand it `EAGAIN` mid-reply. See
+/// [`write_selection`].
 pub async fn write_reply<S: AsyncWrite + Unpin>(
     stream: &mut S,
     reply: ReplyCode,
     bind: &TargetAddr,
 ) -> Result<(), Socks5Error> {
-    stream.write_u8(VERSION).await?;
-    stream.write_u8(reply as u8).await?;
-    stream.write_u8(0x00).await?;
-    write_addr(stream, bind).await?;
+    // 3 header bytes + the largest wire address (ATYP + 255-byte domain + port).
+    let mut frame = Vec::with_capacity(3 + 1 + 255 + 2);
+    frame.extend_from_slice(&[VERSION, reply as u8, 0x00]);
+    crate::addr::write_addr_port_last(&mut frame, bind).map_err(|_| Socks5Error::DomainTooLong)?;
+    stream.write_all(&frame).await?;
     stream.flush().await?;
-    Ok(())
-}
-
-/// Write one wire address in port-last (SOCKS5) order.
-async fn write_addr<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    addr: &TargetAddr,
-) -> Result<(), Socks5Error> {
-    match &addr.host {
-        Host::Ip(IpAddr::V4(ip)) => {
-            stream.write_u8(0x01).await?;
-            stream.write_all(&ip.octets()).await?;
-        }
-        Host::Ip(IpAddr::V6(ip)) => {
-            stream.write_u8(0x04).await?;
-            stream.write_all(&ip.octets()).await?;
-        }
-        Host::Domain(domain) => {
-            let len = u8::try_from(domain.len()).map_err(|_| Socks5Error::DomainTooLong)?;
-            stream.write_u8(0x03).await?;
-            stream.write_u8(len).await?;
-            stream.write_all(domain.as_bytes()).await?;
-        }
-    }
-    stream.write_u16(addr.port).await?;
     Ok(())
 }
 
@@ -595,6 +581,64 @@ mod tests {
         let mut rest = [0u8; 4 + 2];
         client.read_exact(&mut rest).await.unwrap();
         assert_eq!(&rest, b"x.io\0\x09");
+    }
+
+    /// Records each `poll_write` chunk, so frame segmentation is assertable.
+    ///
+    /// A client that reads a frame with a non-blocking descriptor (apt's
+    /// `SOCKS5h` client does) gets `EAGAIN`, not the rest of the frame, when a
+    /// frame arrives as several segments: `TCP_NODELAY` is set on the accepted
+    /// socket, so each server write is its own segment.
+    #[derive(Default)]
+    struct Writes {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl AsyncWrite for Writes {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.chunks.push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn server_frames_leave_in_one_write_each() {
+        let mut out = Writes::default();
+        write_selection(&mut out, Method::None).await.unwrap();
+        write_auth_status(&mut out, false).await.unwrap();
+        write_no_acceptable(&mut out).await.unwrap();
+        let bind = TargetAddr::new(Host::Domain("x.io".into()), 9);
+        write_reply(&mut out, ReplyCode::ConnectionNotAllowed, &bind)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.chunks,
+            vec![
+                vec![0x05, 0x00],
+                vec![0x01, 0x01],
+                vec![0x05, 0xFF],
+                b"\x05\x02\x00\x03\x04x.io\x00\x09".to_vec(),
+            ],
+            "every server frame must leave in ONE write"
+        );
     }
 
     // Command discriminants and the greeting rewrite

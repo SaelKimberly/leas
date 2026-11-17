@@ -587,3 +587,17 @@ batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes
 ## Render-path allocations (2026-11-16) ✅
 
 - ✅ Profiles pane + shared shell chrome allocate nothing per draw — the grid header (columns, widths, order) is cached on `AppState` keyed by `(pane width, header style)`; row heights come from a closure instead of a per-frame `Vec`; borrowed labels replace per-tab `String`s; short values format into `ui::FmtBuf` (a stack `format_args!` sink that truncates at a UTF-8 boundary); the Address cell truncates into a stack buffer and the expansion panel loses `format!`/`"─".repeat`. Measured with the memtrace driver (two key-count runs, `ROWS=symbol`): `leas::ui*` 131.4 → 11.9 allocations per frame (Profiles pane 29.3 → 1.1). The display-row and header caches are both invalidated on a theme switch. Recorded as a requirement, not a latency win: the memory plan's P2 verdict (below the noise floor) stands and now carries the reopen note. Logs/Sources still rebuild their column `Vec` per frame.
+
+## SOCKS5 server frames leave in one write (2026-11-17) ✅
+
+- ✅ apt's SOCKS5h client (`methods/connect.cc`: `WaitFd` then `FileFd::Read`, where
+  a `read` returning `EAGAIN` is a hard failure) failed intermittently with
+  `Reading the greet back from SOCKS proxy ... failed` (errno 11) against the
+  mixed inbound. Cause: the server built every reply frame with one `write_u8`
+  per field, and `TCP_NODELAY` is set on the accepted socket, so the 2-byte
+  method selection left as two segments; apt read the first, then hit `EAGAIN`
+  on the second. `write_selection`, `write_no_acceptable`, `write_auth_status`
+  and `write_reply` now write one buffer per frame (the reply through
+  `addr::write_addr_port_last`, the SOCKS5 port-last encoder).
+  `server_frames_leave_in_one_write_each` pins the invariant; 800 apt-pattern
+  handshakes against a direct-routed inbound showed 0 `EAGAIN`.
