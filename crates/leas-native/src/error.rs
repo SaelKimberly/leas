@@ -210,4 +210,10 @@ pub mod timeouts {
     pub const SECURITY: Duration = Duration::from_secs(10);
     pub const PROTOCOL: Duration = Duration::from_secs(10);
     pub const TUNNEL_READ: Duration = Duration::from_secs(30);
+    /// One carrier build's aggregate ceiling, per chain link (spec 2026-11-17 §6).
+    ///
+    /// The four stage limits above bound each step; this bounds their sum
+    /// so a hung carrier cannot hold a SOCKS CONNECT reply past a client's own
+    /// read timeout. Chains multiply it by their link count.
+    pub const CONNECT: Duration = Duration::from_secs(15);
 }

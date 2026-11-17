@@ -53,6 +53,13 @@ pub struct NativeConnectParams {
     /// row — never the stored key, and never for a QUIC mode, which replaces the
     /// dial entirely.
     pub mux: bool,
+    /// Whether the row itself spells a mux request, independent of magnitude.
+    ///
+    /// `Some(true)`/`Some(false)` for a row that names `mux`/`muxtype`
+    /// (`Limited(0)` and `Invalid` are explicit *off*); `None` for a row that
+    /// never mentions mux, so the profile default (`MuxPolicy::enabled`) can
+    /// apply without overriding an explicit `mux=false`.
+    pub mux_explicit: Option<bool>,
 }
 
 impl NativeConnectParams {
@@ -63,6 +70,10 @@ impl NativeConnectParams {
         target: crate::addr::TargetAddr,
     ) -> Self {
         let mux = Self::resolved_mux(&protocol);
+        let mux_explicit = match &protocol {
+            ProtocolConfig::Vless(cfg) => cfg.mux.as_ref().map(VlessMux::is_active),
+            _ => None,
+        };
         Self {
             protocol,
             server,
@@ -70,6 +81,7 @@ impl NativeConnectParams {
             resolved_ip: None,
             reality_provisioner: HelloProvisionerChoice::FixedChrome130Hybrid,
             udp: None,
+            mux_explicit,
             // **Derived here, once.** The mux decision is the row's RESOLVED
             // plugin mux (`PluginSpec::mux_active`: the resolved value, never the
             // stored key, and never a QUIC mode), so the app's `proxy_params`, the
@@ -104,6 +116,10 @@ pub struct LinkContext {
     /// family connect functions seed their streams with it; the probe reads
     /// it when the attempt is over.
     pub ack: crate::protocol::AuthAckSlot,
+    /// Whether this link is the chain's first hop (a direct dial). The xhttp
+    /// h2 pool may only pool a direct connection: a later hop's bytes traverse
+    /// the earlier proxy (spec S3 fast path).
+    pub direct_hop: bool,
 }
 
 impl LinkContext {
@@ -123,6 +139,7 @@ impl LinkContext {
             params,
             target,
             ack: crate::protocol::AuthAckSlot::new(ack),
+            direct_hop: true,
         }
     }
 
@@ -132,6 +149,7 @@ impl LinkContext {
             params,
             target,
             ack: crate::protocol::AuthAckSlot::new(crate::protocol::AuthAck::NotApplicable),
+            direct_hop: true,
         }
     }
 

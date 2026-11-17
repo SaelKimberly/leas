@@ -1034,7 +1034,9 @@ async fn direct_dial_disables_nagle() {
         let _ = listener.accept().await;
     });
     let target = TargetAddr::new(Host::new("127.0.0.1"), addr.port());
-    let stream = super::outbound::dial(&OutboundKind::Direct, &target)
+    let pool = crate::mux_pool::MuxPool::new();
+    let policy = crate::mux_pool::MuxPolicy::default();
+    let stream = super::outbound::dial(&OutboundKind::Direct, &target, &pool, &policy)
         .await
         .expect("dial direct");
     let any = &*stream as &dyn Any;
@@ -1411,4 +1413,133 @@ async fn udp_datagrams_are_accounted_per_host_and_one_conn_per_association() {
     assert!(row.down > 0, "reply bytes counted");
     drop(stream);
     handle.abort();
+}
+
+// ── Pooled carriers through the real inbound (spec A1/A10, hermetic) ─────────
+//
+// A fake carrier whose peer only drains frames stands in for the proxy
+// server: the pool is seeded with it, so a successful SOCKS CONNECT proves the
+// leg reused that carrier rather than dialing the (unreachable) server.
+mod pooled_carrier {
+    use std::sync::Arc;
+
+    use leas_proto::proto_spec::endpoint::EndpointEssentials;
+    use leas_proto::proto_spec::{ProtocolConfig, ProtocolKind, VlessConfig, VlessMux};
+    use tokio::io::{AsyncReadExt, duplex};
+
+    use super::*;
+    use crate::inbound::outbound::ProxyOutbound;
+    use crate::mux_pool::{MuxKey, MuxPolicy, MuxPool};
+    use crate::protocol::MuxTunnel;
+    use crate::protocol::vless::MuxClient;
+    use crate::{BoxStream, NativeConnectParams};
+
+    fn vless(mux: Option<VlessMux>) -> ProtocolConfig {
+        let mut cfg: VlessConfig = serde_json::from_value(serde_json::json!({
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "transport": { "type": "tcp" }
+        }))
+        .expect("vless config");
+        cfg.mux = mux;
+        ProtocolConfig::Vless(cfg)
+    }
+
+    /// A tunnel whose peer drains frames: enough for `open_session`, which
+    /// returns once the `New` frame is queued.
+    fn draining_tunnel() -> MuxTunnel {
+        let (client, mut peer) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while peer.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+        MuxTunnel::Vless(Arc::new(MuxClient::new(Box::new(client) as BoxStream)))
+    }
+
+    async fn run(
+        mux: Option<VlessMux>,
+        policy: MuxPolicy,
+        connects: usize,
+    ) -> (Vec<u8>, (usize, usize)) {
+        let protocol = vless(mux);
+        let proxy = ProxyOutbound {
+            protocol: protocol.clone(),
+            kind: ProtocolKind::Vless,
+            // Unreachable on purpose: a leg that dials instead of reusing the
+            // seeded carrier fails here.
+            server: EndpointEssentials::new("127.0.0.1", 1),
+            resolved_ip: None,
+        };
+        let engine = engine(Vec::new(), route_default("proxy"));
+        let mut config = Socks5InboundConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            engine,
+            vec![Outbound {
+                tag: "proxy".to_owned(),
+                kind: OutboundKind::Proxy(Box::new(proxy.clone())),
+            }],
+        );
+        config.udp = false;
+        config.mux_policy = policy.clone();
+
+        let target = TargetAddr::new(Host::Domain("target.example".into()), 443);
+        let params: NativeConnectParams = crate::inbound::outbound::proxy_params(&proxy, &target);
+        let key = MuxKey::of(&params, &policy);
+        config
+            .mux_pool
+            .seed_tunnel_for_test(key.clone(), draining_tunnel());
+        let pool: Arc<MuxPool> = Arc::clone(&config.mux_pool);
+
+        let (addr, handle) = spawn_inbound(config).await;
+        let mut codes = Vec::new();
+        let mut streams = Vec::new();
+        for _ in 0..connects {
+            match client_connect(addr, None, &target).await {
+                ClientResult::Connected { code, stream } => {
+                    codes.push(code);
+                    streams.push(stream);
+                }
+                ClientResult::AuthRejected => codes.push(0xFF),
+            }
+        }
+        let stats = pool.stats_for_test(&key);
+        drop(streams);
+        handle.abort();
+        (codes, stats)
+    }
+
+    #[tokio::test]
+    async fn pooled_socks_connects_reuse_one_carrier() {
+        let (codes, (carriers, live)) =
+            run(Some(VlessMux::Limited(8)), MuxPolicy::production(), 2).await;
+        assert_eq!(
+            codes,
+            vec![0, 0],
+            "both CONNECTs succeeded on the seeded carrier"
+        );
+        assert_eq!(carriers, 1, "one carrier for two legs");
+        // Deterministic: `dial` increments the carrier's live count before the
+        // SOCKS reply is written, and the test holds both client streams open.
+        assert_eq!(live, 2, "both sessions counted on it");
+    }
+
+    #[tokio::test]
+    async fn default_on_applies_only_when_the_row_says_nothing() {
+        // Row with no mux key + production policy → pooled (seeded carrier).
+        let (codes, (carriers, _)) = run(None, MuxPolicy::production(), 1).await;
+        assert_eq!(codes, vec![0]);
+        assert_eq!(carriers, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_row_off_and_policy_off_dial_per_connection() {
+        // Row `mux=false`: the pool is never asked; the unreachable server
+        // fails the leg (no seeded carrier is used).
+        let (codes, (carriers, _)) =
+            run(Some(VlessMux::Limited(0)), MuxPolicy::production(), 1).await;
+        assert_ne!(codes, vec![0], "explicit off must dial, not reuse");
+        assert_eq!(carriers, 1, "the seeded carrier was not consumed");
+
+        let (codes, _) = run(None, MuxPolicy::default(), 1).await;
+        assert_ne!(codes, vec![0], "policy off must dial, not reuse");
+    }
 }

@@ -157,6 +157,130 @@ pub(crate) fn http_version(security: Option<&SecurityConfig>) -> &'static str {
     }
 }
 
+// ── The xmux-style h2 connection pool (spec 2026-11-17 S3) ─────────────────
+//
+// XHTTP over h2 builds a fresh HTTP/2 client per dial today. Xray's `xmux`
+// reuses one h2 connection for several xhttp sessions, keyed by the transport
+// identity (the reference's `globalDialerMap`). The chain checks this pool
+// BEFORE dialing, so a hit skips dial + TLS + h2 handshake entirely.
+//
+// The entry holds one `SendRequest` clone; a session's upload task holds its
+// own clone, so evicting the pool's clone never cuts an active session — the
+// hyper connection ends when the last clone drops.
+
+struct XhttpEntry {
+    sender: hyper::client::conn::http2::SendRequest<ReqBody>,
+    last_used: std::time::Instant,
+}
+
+#[derive(Default)]
+struct XhttpPool {
+    entries: std::sync::Mutex<std::collections::HashMap<String, XhttpEntry>>,
+}
+
+/// Idle window for a pooled h2 connection (same order as the mux pool's).
+const XHTTP_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(16);
+
+static XHTTP_POOL: std::sync::LazyLock<XhttpPool> = std::sync::LazyLock::new(XhttpPool::default);
+
+/// The pool identity: the h2 connection's peer plus the TLS identity it
+/// authenticated (a different SNI/fingerprint is a different connection).
+fn pool_key(ctx: &LinkContext) -> String {
+    format!(
+        "{}:{}|{}|{:?}",
+        ctx.params.server.host,
+        ctx.params.server.port,
+        ctx.server_name(),
+        ctx.security()
+    )
+}
+
+/// Lease the pooled h2 sender for `ctx`, if one is alive and idle-eligible.
+pub(crate) fn pooled(
+    ctx: &LinkContext,
+) -> Option<hyper::client::conn::http2::SendRequest<ReqBody>> {
+    if http_version(ctx.security()) != "2" {
+        return None;
+    }
+    let key = pool_key(ctx);
+    let now = std::time::Instant::now();
+    let mut entries = XHTTP_POOL
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    entries.retain(|_, entry| now.duration_since(entry.last_used) < XHTTP_POOL_IDLE);
+    let leased = if entries
+        .get(&key)
+        .is_some_and(|entry| entry.sender.is_closed())
+    {
+        // A finished h2 connection: evict it so the caller dials a fresh one.
+        entries.remove(&key);
+        None
+    } else {
+        entries.get_mut(&key).map(|entry| {
+            entry.last_used = now;
+            entry.sender.clone()
+        })
+    };
+    drop(entries);
+    leased
+}
+
+/// Register a freshly handshaken h2 sender (its connection task is already
+/// spawned by `h2_client_with`).
+fn register(ctx: &LinkContext, sender: hyper::client::conn::http2::SendRequest<ReqBody>) {
+    // Only a DIRECT first hop may be pooled: a later hop's bytes traverse the
+    // earlier proxy, so leasing it for a direct row would route through that
+    // chain (spec S3 fast path is first-hop only).
+    if !ctx.direct_hop || http_version(ctx.security()) != "2" {
+        return;
+    }
+    XHTTP_POOL
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            pool_key(ctx),
+            XhttpEntry {
+                sender,
+                last_used: std::time::Instant::now(),
+            },
+        );
+}
+
+/// Evict a pooled connection whose session failed (the sender is likely dead).
+fn forget(ctx: &LinkContext) {
+    XHTTP_POOL
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&pool_key(ctx));
+}
+
+/// Build one xhttp tunnel on a leased h2 sender.
+async fn connect_pooled(
+    ctx: &LinkContext,
+    sender: hyper::client::conn::http2::SendRequest<ReqBody>,
+) -> Result<BoxStream, NativeError> {
+    let result = match xhttp_mode(ctx)? {
+        "stream-one" => stream_one_h2_with(ctx, sender).await,
+        "stream-up" => stream_up_h2_with(ctx, sender).await,
+        _ => packet_up_h2_with(ctx, sender).await,
+    };
+    if result.is_err() {
+        forget(ctx);
+    }
+    result
+}
+
+/// The chain's fast path: a pooled h2 connection replaces dial + TLS + the h2
+/// handshake for an xhttp+h2 link. `None` when no connection is pooled (or the
+/// transport is not xhttp+h2).
+pub(crate) async fn try_pooled(ctx: &LinkContext) -> Option<Result<BoxStream, NativeError>> {
+    let sender = pooled(ctx)?;
+    Some(connect_pooled(ctx, sender).await)
+}
+
 /// E2E-only view of [`http_version`] for the external oracle crate's config
 /// tests.
 #[cfg(feature = "e2e-support")]
@@ -884,10 +1008,19 @@ async fn packet_up_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
 
 /// packet-up over HTTP/2 (TLS): one conn, GET stream + POST streams.
 async fn packet_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    let sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
+    register(ctx, sender.clone());
+    packet_up_h2_with(ctx, sender).await
+}
+
+/// [`packet_up_h2`] on an already-handshaken sender (pooled or fresh).
+async fn packet_up_h2_with(
+    ctx: &LinkContext,
+    mut sender: hyper::client::conn::http2::SendRequest<ReqBody>,
+) -> Result<BoxStream, NativeError> {
     let host = http_host(ctx);
     let session = session_id();
     let get_path = path_with(ctx, &session, None);
-    let mut sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
     let get_req = build_request(ctx, "GET", &get_path, &host)?.map(|()| V3Body::Empty);
     let resp = send_200(&mut sender, get_req, "xhttp download GET").await?;
     let reader = resp.reader;
@@ -948,10 +1081,19 @@ async fn stream_up_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
 
 /// stream-up over h2 (TLS): GET + POST streams on one h2 conn.
 async fn stream_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    let sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
+    register(ctx, sender.clone());
+    stream_up_h2_with(ctx, sender).await
+}
+
+/// [`stream_up_h2`] on an already-handshaken sender.
+async fn stream_up_h2_with(
+    ctx: &LinkContext,
+    mut sender: hyper::client::conn::http2::SendRequest<ReqBody>,
+) -> Result<BoxStream, NativeError> {
     let host = http_host(ctx);
     let session = session_id();
     let url = path_with(ctx, &session, None);
-    let mut sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
     let get_req = build_request(ctx, "GET", &url, &host)?.map(|()| V3Body::Empty);
     let resp = send_200(&mut sender, get_req, "xhttp stream-up GET").await?;
     let reader = resp.reader;
@@ -1015,9 +1157,18 @@ async fn stream_one_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream
 /// stream-one over h2 (TLS): the single full-duplex request on the one h2
 /// conn.
 async fn stream_one_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    let sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
+    register(ctx, sender.clone());
+    stream_one_h2_with(ctx, sender).await
+}
+
+/// [`stream_one_h2`] on an already-handshaken sender.
+async fn stream_one_h2_with(
+    ctx: &LinkContext,
+    mut sender: hyper::client::conn::http2::SendRequest<ReqBody>,
+) -> Result<BoxStream, NativeError> {
     let host = http_host(ctx);
     let url = base_path(ctx);
-    let mut sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
     let (wt, wrx) = mpsc::channel::<Bytes>(16);
     let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::PipeFull(wrx));
     req.headers_mut().insert(
@@ -2545,5 +2696,149 @@ mod tests {
         };
         assert_eq!(obs_data, 3, "expected 3 X-blobs");
         server_task.await.expect("server task");
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::*;
+    use crate::addr::{Host, TargetAddr};
+    use crate::context::NativeConnectParams;
+    use leas_proto::proto_spec::endpoint::EndpointEssentials;
+
+    fn ctx(port: u16) -> LinkContext {
+        let protocol: leas_proto::proto_spec::ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "x_http", "path": "/x", "host": "localhost", "mode": "stream-one" },
+            "security": { "type": "tls" }
+        }))
+        .expect("config parses");
+        LinkContext::new(
+            NativeConnectParams::new(
+                protocol,
+                EndpointEssentials::new("127.0.0.1".to_string(), port),
+                TargetAddr::new(Host::Domain("dest.test".into()), 80),
+            ),
+            TargetAddr::new(Host::Domain("dest.test".into()), 80),
+        )
+    }
+
+    /// One h2 server: count handshakes, answer each POST with 200 + an echo.
+    async fn serve(io: tokio::io::DuplexStream, handshakes: Arc<AtomicUsize>) {
+        let Ok(mut conn) = h2::server::handshake(io).await else {
+            return;
+        };
+        handshakes.fetch_add(1, Ordering::AcqRel);
+        while let Some(accepted) = conn.accept().await {
+            let Ok((request, mut respond)) = accepted else {
+                return;
+            };
+            tokio::spawn(async move {
+                let response = http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .body(())
+                    .expect("response");
+                let Ok(mut send) = respond.send_response(response, false) else {
+                    return;
+                };
+                let mut body = request.into_body();
+                while let Some(chunk) = body.data().await {
+                    let Ok(chunk) = chunk else { return };
+                    let len = chunk.len();
+                    send.reserve_capacity(len);
+                    std::future::poll_fn(|cx| {
+                        match std::pin::Pin::new(&mut send).poll_capacity(cx) {
+                            std::task::Poll::Ready(_) => std::task::Poll::Ready(()),
+                            std::task::Poll::Pending => std::task::Poll::Pending,
+                        }
+                    })
+                    .await;
+                    let _ = send.send_data(chunk, false);
+                }
+                let _ = send.send_data(bytes::Bytes::new(), true);
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_h2_reuses_one_connection_across_dials() {
+        // A unique port isolates this test's key in the process-global pool.
+        let ctx = ctx(45731);
+        forget(&ctx);
+        let first_handshakes = Arc::new(AtomicUsize::new(0));
+        let (client, server) = duplex(1 << 20);
+        let server = tokio::spawn(serve(server, Arc::clone(&first_handshakes)));
+
+        let mut first = connect(&ctx, Box::new(client))
+            .await
+            .expect("first stream-one session");
+        assert_eq!(first_handshakes.load(Ordering::Acquire), 1);
+
+        // The dummy stream a pooled dial would have used: it must see NO
+        // handshake, which proves the second session reused the first conn.
+        let dummy_handshakes = Arc::new(AtomicUsize::new(0));
+        let (_dummy_client, dummy_server) = duplex(1 << 20);
+        let dummy = tokio::spawn(serve(dummy_server, Arc::clone(&dummy_handshakes)));
+
+        let mut pooled = try_pooled(&ctx)
+            .await
+            .expect("pool hit")
+            .expect("pooled session");
+        pooled.write_all(b"ping").await.expect("write");
+        let mut echo = [0u8; 4];
+        pooled.read_exact(&mut echo).await.expect("echo");
+        assert_eq!(&echo, b"ping");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            dummy_handshakes.load(Ordering::Acquire),
+            0,
+            "the pooled dial must not handshake the dummy stream"
+        );
+        assert_eq!(first_handshakes.load(Ordering::Acquire), 1);
+
+        // The first session still works on the same connection.
+        first.write_all(b"pong").await.expect("second stream write");
+        let mut second_echo = [0u8; 4];
+        first
+            .read_exact(&mut second_echo)
+            .await
+            .expect("second echo");
+        assert_eq!(&second_echo, b"pong");
+
+        forget(&ctx);
+        server.abort();
+        dummy.abort();
+    }
+
+    #[tokio::test]
+    async fn chain_uses_the_pooled_connection_without_dialing() {
+        // Server 127.0.0.1:1 is a refused dial: the chain can only succeed
+        // through the pooled fast path, which skips dial + TLS entirely.
+        let ctx = ctx(1);
+        forget(&ctx);
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let (client, server) = duplex(1 << 20);
+        let server = tokio::spawn(serve(server, Arc::clone(&handshakes)));
+        let _primed = connect(&ctx, Box::new(client))
+            .await
+            .expect("prime the pool");
+        assert_eq!(handshakes.load(Ordering::Acquire), 1);
+
+        let params = ctx.params.clone();
+        let target = crate::addr::TargetAddr::new(Host::Domain("dest.test".into()), 80);
+        let tunnel = crate::connect_chain(std::slice::from_ref(&params), target)
+            .await
+            .expect("the chain must reuse the pooled connection, not dial port 1");
+        drop(tunnel);
+        assert_eq!(handshakes.load(Ordering::Acquire), 1, "no second handshake");
+        forget(&ctx);
+        server.abort();
     }
 }

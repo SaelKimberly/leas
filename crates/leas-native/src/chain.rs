@@ -151,8 +151,46 @@ pub async fn finish_chain_mux(
     protocol::connect_mux(ctx, upgraded).await
 }
 
+/// The aggregate deadline for one chain build: [`timeouts::CONNECT`] per link,
+/// so a multi-hop chain gets its own ceiling per hop rather than one global
+/// value (spec 2026-11-17 §6).
+fn chain_budget(links: usize) -> std::time::Duration {
+    crate::error::timeouts::CONNECT.saturating_mul(u32::try_from(links.max(1)).unwrap_or(u32::MAX))
+}
+
+/// Run one chain build under [`chain_budget`]. `step` names the build in the
+/// timeout error so a hung carrier is diagnosable.
+async fn with_connect_budget<T, F>(
+    links: usize,
+    step: &'static str,
+    build: F,
+) -> Result<T, NativeError>
+where
+    F: Future<Output = Result<T, NativeError>>,
+{
+    let budget = chain_budget(links);
+    tokio::time::timeout(budget, build)
+        .await
+        .map_err(|_| NativeError::Timeout {
+            step,
+            limit: budget,
+        })?
+}
+
 /// Connect through a chain of proxies to the final `target`.
 pub async fn connect_chain(
+    links: &[NativeConnectParams],
+    target: TargetAddr,
+) -> Result<NativeTunnel, NativeError> {
+    with_connect_budget(
+        links.len(),
+        "connect chain",
+        connect_chain_inner(links, target),
+    )
+    .await
+}
+
+async fn connect_chain_inner(
     links: &[NativeConnectParams],
     target: TargetAddr,
 ) -> Result<NativeTunnel, NativeError> {
@@ -163,7 +201,19 @@ pub async fn connect_chain(
         // points and a borrow would lifetime-infect the struct plus every
         // `&ctx` consumer for a per-connection, usually-single-hop clone.
         // Deliberately kept (memory-diet Task 6 ruling).
-        let ctx = LinkContext::new(link.clone(), to);
+        let mut ctx = LinkContext::new(link.clone(), to);
+        ctx.direct_hop = base.is_none();
+        // xhttp over h2 is pooled (S3): a hit skips dial + TLS + the h2
+        // handshake entirely. A later hop (base is Some) cannot use it — the
+        // pooled connection was made to the server directly, not through the
+        // chain.
+        if base.is_none()
+            && ctx.transport_type() == Some("xhttp")
+            && let Some(Ok(upgraded)) = crate::transport::xhttp::try_pooled(&ctx).await
+        {
+            base = Some(protocol::connect(&ctx, upgraded).await?);
+            continue;
+        }
         if protocol::is_quic_link(&ctx) {
             // QUIC-family protocols (Hysteria2/Hysteria1/TUIC) are a
             // divergent dial: `protocol::connect_quic` performs the QUIC dial
@@ -213,10 +263,33 @@ pub async fn connect_chain_udp(
     links: &[NativeConnectParams],
     target: TargetAddr,
 ) -> Result<PacketTunnel, NativeError> {
+    with_connect_budget(
+        links.len(),
+        "connect chain (udp)",
+        connect_chain_udp_inner(links, target),
+    )
+    .await
+}
+
+async fn connect_chain_udp_inner(
+    links: &[NativeConnectParams],
+    target: TargetAddr,
+) -> Result<PacketTunnel, NativeError> {
     let mut base: Option<BoxStream> = None;
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
-        let ctx = LinkContext::new(link.clone(), to);
+        let mut ctx = LinkContext::new(link.clone(), to);
+        ctx.direct_hop = base.is_none();
+        if base.is_none()
+            && ctx.transport_type() == Some("xhttp")
+            && let Some(Ok(upgraded)) = crate::transport::xhttp::try_pooled(&ctx).await
+        {
+            if i + 1 == links.len() {
+                return protocol::connect_udp(&ctx, upgraded).await;
+            }
+            base = Some(protocol::connect(&ctx, upgraded).await?);
+            continue;
+        }
         if protocol::is_quic_link(&ctx) {
             // QUIC-family protocols are a divergent dial: the hysteria2 UDP
             // path dials a fresh QUIC connection and runs its own datagram
@@ -276,10 +349,33 @@ pub async fn connect_chain_mux(
     links: &[NativeConnectParams],
     target: TargetAddr,
 ) -> Result<protocol::MuxTunnel, NativeError> {
+    with_connect_budget(
+        links.len(),
+        "connect chain (mux)",
+        connect_chain_mux_inner(links, target),
+    )
+    .await
+}
+
+async fn connect_chain_mux_inner(
+    links: &[NativeConnectParams],
+    target: TargetAddr,
+) -> Result<protocol::MuxTunnel, NativeError> {
     let mut base: Option<BoxStream> = None;
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
-        let ctx = LinkContext::new(link.clone(), to);
+        let mut ctx = LinkContext::new(link.clone(), to);
+        ctx.direct_hop = base.is_none();
+        if base.is_none()
+            && ctx.transport_type() == Some("xhttp")
+            && let Some(Ok(upgraded)) = crate::transport::xhttp::try_pooled(&ctx).await
+        {
+            if i + 1 == links.len() {
+                return protocol::connect_mux(&ctx, upgraded).await;
+            }
+            base = Some(protocol::connect(&ctx, upgraded).await?);
+            continue;
+        }
         if protocol::is_quic_link(&ctx) {
             return Err(NativeError::Config(
                 "a QUIC-family protocol (Hysteria2/Hysteria1/TUIC) is not supported by the                  mux tunnel path".into(),
@@ -333,6 +429,14 @@ mod tests {
             TargetAddr::new(Host::Domain("b.example".into()), 20)
         );
         assert_eq!(next_target(&links, 1, &final_target), final_target);
+    }
+
+    #[test]
+    fn chain_budget_is_per_link_and_never_zero() {
+        let one = crate::error::timeouts::CONNECT;
+        assert_eq!(chain_budget(1), one, "single hop = one CONNECT");
+        assert_eq!(chain_budget(3), one * 3, "a chain pays per hop");
+        assert_eq!(chain_budget(0), one, "empty chain still names a budget");
     }
 
     #[test]

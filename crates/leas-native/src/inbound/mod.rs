@@ -38,6 +38,7 @@ use tokio::sync::{mpsc, watch};
 use crate::BoxStream;
 use crate::addr::{Host, TargetAddr};
 use crate::error::{NativeError, timeouts};
+use crate::mux_pool::{MuxPolicy, MuxPool};
 use crate::telemetry::{
     Counted, Telemetry, TraceFailReason, TraceGuard, TraceKind, TraceSecurity, UNKNOWN_HOST,
 };
@@ -107,6 +108,12 @@ pub struct Socks5InboundConfig {
     /// When set, `serve` stops accepting and in-flight connections abort
     /// once the sender marks shutdown (`send(true)` or drop).
     pub shutdown: Option<watch::Receiver<bool>>,
+    /// Mux carriers shared by this inbound's legs (spec 2026-11-17 §6). One
+    /// pool per inbound: a profile switch drops the inbound and every carrier
+    /// with it.
+    pub mux_pool: Arc<MuxPool>,
+    /// Mux policy for this inbound (default-on, caps, idle window).
+    pub mux_policy: MuxPolicy,
 }
 
 impl Socks5InboundConfig {
@@ -123,6 +130,8 @@ impl Socks5InboundConfig {
             udp: true,
             trace: None,
             shutdown: None,
+            mux_pool: Arc::new(MuxPool::new()),
+            mux_policy: MuxPolicy::default(),
         }
     }
 
@@ -143,6 +152,7 @@ impl fmt::Debug for Socks5InboundConfig {
             .field("outbounds", &self.outbounds)
             .field("trace", &self.trace.is_some())
             .field("shutdown", &self.shutdown.is_some())
+            .field("mux", &self.mux_policy)
             .finish_non_exhaustive()
     }
 }
@@ -415,20 +425,24 @@ async fn handle_connect(
                     let target = override_addr
                         .map(|a| net_to_target(&a))
                         .unwrap_or(request.target);
-                    let upstream = match outbound::dial(kind, &target).await {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            tracing::warn!(
-                                %tag,
-                                ?target,
-                                %error,
-                                "socks5 inbound: outbound dial failed"
-                            );
-                            fail(TraceFailReason::Dial, Some(&outbound.tag));
-                            socks5::write_reply(&mut conn, reply_for(&error), &BIND_ZERO).await?;
-                            return Ok(());
-                        }
-                    };
+                    let upstream =
+                        match outbound::dial(kind, &target, &config.mux_pool, &config.mux_policy)
+                            .await
+                        {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %tag,
+                                    ?target,
+                                    %error,
+                                    "socks5 inbound: outbound dial failed"
+                                );
+                                fail(TraceFailReason::Dial, Some(&outbound.tag));
+                                socks5::write_reply(&mut conn, reply_for(&error), &BIND_ZERO)
+                                    .await?;
+                                return Ok(());
+                            }
+                        };
                     socks5::write_reply(&mut conn, socks5::ReplyCode::Succeeded, &BIND_ZERO)
                         .await?;
                     match &config.trace {
@@ -1217,6 +1231,8 @@ impl UdpRelay {
                 Arc::clone(&self.dns_cache),
                 Arc::clone(&queued_bytes),
                 self.config.trace.clone(),
+                Arc::clone(&self.config.mux_pool),
+                self.config.mux_policy.clone(),
                 rx,
             )));
             self.proxy = Some(ProxyLeg {
@@ -1288,14 +1304,41 @@ async fn run_proxy_leg(
     dns_cache: Arc<DnsCache>,
     queued_bytes: Arc<AtomicUsize>,
     trace: Option<TraceCtx>,
+    mux_pool: Arc<crate::mux_pool::MuxPool>,
+    mux_policy: crate::mux_pool::MuxPolicy,
     mut queue: mpsc::Receiver<ProxyDatagram>,
 ) {
     let params = outbound::proxy_params(&proxy, &session_target);
-    let tunnel = match crate::connect_udp(&params).await {
-        Ok(tunnel) => tunnel,
-        Err(error) => {
-            tracing::debug!(%error, "socks5 inbound: proxy udp tunnel open failed");
-            return;
+    // Resolved once, for reply headers from a carrier that reports no
+    // per-packet address (and for the sbox UDP destination check). A domain
+    // that will not resolve costs only those replies (the tunnel itself
+    // carries the domain).
+    let session_addr = resolve_cached(&dns_cache, &session_target).await;
+    // A VLESS row with effective mux rides a pooled carrier (A12): XUDP on the
+    // mux.cool wire, a UDP stream on an sbox wire. The lease holds the carrier
+    // for this association's lifetime. A plugin row's mux is TCP-only.
+    let pooled = matches!(
+        params.protocol,
+        leas_proto::proto_spec::ProtocolConfig::Vless(_)
+    ) && crate::mux_pool::effective_mux(&params, &mux_policy);
+    let (tunnel, _lease) = if pooled {
+        match mux_pool
+            .open_udp(&params, &session_target, session_addr, &mux_policy)
+            .await
+        {
+            Ok((tunnel, lease)) => (tunnel, Some(lease)),
+            Err(error) => {
+                tracing::debug!(%error, "socks5 inbound: pooled udp tunnel open failed");
+                return;
+            }
+        }
+    } else {
+        match crate::connect_udp(&params).await {
+            Ok(tunnel) => (tunnel, None),
+            Err(error) => {
+                tracing::debug!(%error, "socks5 inbound: proxy udp tunnel open failed");
+                return;
+            }
         }
     };
     let (mut reader, mut writer) = match tunnel.split() {
@@ -1305,10 +1348,6 @@ async fn run_proxy_leg(
             return;
         }
     };
-    // Resolved once, for reply headers from a carrier that reports no
-    // per-packet address. A domain that will not resolve costs only those
-    // replies (the tunnel itself carries the domain).
-    let session_addr = resolve_cached(&dns_cache, &session_target).await;
 
     // The reader owns its half, so its multi-await frame read is never
     // cancelled — the desync this split exists to prevent. The handle rides an
@@ -1384,6 +1423,14 @@ async fn run_proxy_leg(
             };
             Some(addr)
         };
+        // XUDP names its destination on the first frame; the relay's `None`
+        // shortcut (same destination as the session) is not accepted there.
+        let per_packet = per_packet.or_else(|| {
+            writer
+                .requires_destination()
+                .then_some(session_addr)
+                .flatten()
+        });
         match writer.send(per_packet, &datagram.payload).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {

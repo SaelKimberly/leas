@@ -122,6 +122,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     // One core at a time: hand the previous session's task to the new one so it
     // can wait out that teardown before binding its own listeners.
     let db = state.db.clone();
+    let mux_config = state.config.mux.clone();
     let prev_task = state.core_task_handle.take();
     let handle = tokio::spawn(async move {
         // 0a. Wait out the previous session's teardown — the stop signal above
@@ -202,6 +203,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             stop_rx,
             protocol_id.get(),
             engine,
+            &mux_config,
         )
         .await;
     });

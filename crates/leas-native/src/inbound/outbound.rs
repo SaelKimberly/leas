@@ -75,6 +75,8 @@ pub fn proxy_params(proxy: &ProxyOutbound, target: &TargetAddr) -> NativeConnect
 pub(crate) async fn dial(
     kind: &OutboundKind,
     target: &TargetAddr,
+    mux_pool: &crate::mux_pool::MuxPool,
+    mux_policy: &crate::mux_pool::MuxPolicy,
 ) -> Result<BoxStream, NativeError> {
     match kind {
         OutboundKind::Direct => Ok(Box::new(dial_direct(target).await?)),
@@ -97,15 +99,11 @@ pub(crate) async fn dial(
                 return Err(NativeError::Config(reason.into_owned()));
             }
             // ONE predicate for both families, so VLESS and a plugin row cannot
-            // drift: mux requested → the mux protocol phase, then one session
-            // on the tunnel; otherwise today's plain chain.
-            if params.mux {
-                let tunnel = crate::connect_mux(&params).await?;
-                // The session OWNS the tunnel: `MuxClient::new` spawns the
-                // demux/writer/keepalive tasks and does not hold the tunnel
-                // itself, so returning the bare session would stop the keepalive
-                // at return and let an idle session be reaped server-side.
-                return crate::mux_session::open_session(tunnel, target).await;
+            // drift: effective mux → a pooled carrier session (the row's
+            // request wins; otherwise the profile default applies to VLESS);
+            // otherwise today's plain chain.
+            if crate::mux_pool::effective_mux(&params, mux_policy) {
+                return mux_pool.open_session(&params, target, mux_policy).await;
             }
             Ok(Box::new(crate::connect(params).await?))
         }
@@ -479,7 +477,11 @@ mod tests {
             resolved_ip: None,
         }));
         let target = TargetAddr::new(Host::Domain("example.com".into()), 80);
-        let mut tunnel = super::dial(&kind, &target).await.expect("dial");
+        let pool = crate::mux_pool::MuxPool::new();
+        let policy = crate::mux_pool::MuxPolicy::default();
+        let mut tunnel = super::dial(&kind, &target, &pool, &policy)
+            .await
+            .expect("dial");
         // The request header now leaves with the first payload (`first_flight`),
         // so the application's first byte is what makes the command byte
         // observable at all. This test still asserts the branch through the
@@ -543,7 +545,9 @@ mod tests {
                 resolved_ip: None,
             }));
             let target = TargetAddr::new(Host::Domain("example.com".into()), 80);
-            let result = super::dial(&outbound, &target).await;
+            let pool = crate::mux_pool::MuxPool::new();
+            let policy = crate::mux_pool::MuxPolicy::default();
+            let result = super::dial(&outbound, &target, &pool, &policy).await;
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
             if expect_refused {
@@ -682,7 +686,9 @@ mod tests {
                 resolved_ip: None,
             }));
             let target = TargetAddr::new(Host::Domain("example.com".into()), 80);
-            let _ = super::dial(&kind, &target).await;
+            let pool = crate::mux_pool::MuxPool::new();
+            let policy = crate::mux_pool::MuxPolicy::default();
+            let _ = super::dial(&kind, &target, &pool, &policy).await;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(

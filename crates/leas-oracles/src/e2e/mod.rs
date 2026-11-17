@@ -243,16 +243,36 @@ pub async fn run_against(
             continue;
         }
         if case.app() == AppKind::Udp {
-            // UDP rows: the probe drives its own `connect_udp` (the tunnel
-            // is a datagram tunnel, not a byte stream) and requires every
-            // datagram's echo back. Mux+UDP rows probe through the mux
-            // tunnel instead (`probe_udp_mux` — the udp443 flow forces the
-            // same path, so `case.mux()` covers it).
-            let (sent, received) = if case.mux() {
-                probe_udp_mux(&params).await
-            } else {
-                probe_udp(&params).await
-            };
+            // UDP rows: non-mux rows drive `connect_udp` directly; mux rows go
+            // through the REAL SOCKS inbound UDP ASSOCIATE, so the pooled
+            // carrier (XUDP or an sbox UDP stream) is the thing under test —
+            // A12 requires ONE carrier for all datagrams.
+            if case.mux() {
+                let pooled = leas_native::e2e_support::probe_pooled_socks_udp(
+                    params.protocol.clone(),
+                    case.protocol_kind().proto_kind(),
+                    params.server.clone(),
+                    case.probe_target(&env),
+                    UDP_PROBE_COUNT,
+                    case.mux_padding_enabled(),
+                )
+                .await;
+                if pooled.sent == UDP_PROBE_COUNT
+                    && pooled.replies == UDP_PROBE_COUNT
+                    && pooled.accepted == 1
+                {
+                    return Ok(());
+                }
+                eprintln!(
+                    "[e2e] {}: attempt {attempt}/{ATTEMPTS} pooled udp sent {} replies {} accepted {}",
+                    case.label(),
+                    pooled.sent,
+                    pooled.replies,
+                    pooled.accepted
+                );
+                continue;
+            }
+            let (sent, received) = probe_udp(&params).await;
             if sent == UDP_PROBE_COUNT && received == UDP_PROBE_COUNT {
                 return Ok(());
             }
@@ -263,16 +283,34 @@ pub async fn run_against(
             continue;
         }
         if case.mux() {
-            // Mux rows: the probe drives its own `connect_mux` (one tunnel,
-            // N concurrent sessions) and requires every session's response
-            // back — the single-stream `connect` never runs.
-            let (opened, ok) = probe_mux(&params, case.probe_target(&env)).await;
-            if opened == MUX_SESSION_COUNT && ok == MUX_SESSION_COUNT {
+            // Mux rows: the REAL path — N SOCKS CONNECTs through a local
+            // `Socks5Inbound` whose proxy outbound dials the core through a
+            // counting TCP proxy. One carrier handshake for N sessions is the
+            // A10 contract; a per-leg row would report one per session.
+            let target = case.probe_target(&env);
+            let pooled = leas_native::e2e_support::probe_pooled_socks(
+                params.protocol.clone(),
+                case.protocol_kind().proto_kind(),
+                params.server.clone(),
+                target,
+                MUX_SESSION_COUNT,
+                case.mux_padding_enabled(),
+            )
+            .await;
+            let ok = pooled
+                .bodies
+                .iter()
+                .filter(|body| body.as_str() == crate::e2e::config::BODY)
+                .count();
+            let all_succeeded = pooled.codes.iter().all(|code| *code == 0);
+            if pooled.accepted == 1 && ok == MUX_SESSION_COUNT && all_succeeded {
                 return Ok(());
             }
             eprintln!(
-                "[e2e] {}: attempt {attempt}/{ATTEMPTS} mux probe opened {opened} ok {ok}",
-                case.label()
+                "[e2e] {}: attempt {attempt}/{ATTEMPTS} pooled mux accepted {} codes {:?} ok {ok}",
+                case.label(),
+                pooled.accepted,
+                pooled.codes
             );
             continue;
         }

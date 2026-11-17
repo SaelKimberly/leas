@@ -278,8 +278,8 @@ fn vless_reason(cfg: &VlessConfig) -> Option<Cow<'static, str>> {
             // own key/value, and the plugin family already interpolates the same
             // way (`ss_reason`).
             "muxtype" => Cow::Owned(format!(
-                "vless multiplexer `{key}={value}` is not implemented — only the default \
-                 v1.mux.cool codec"
+                "vless multiplexer `{key}={value}` is not implemented — use muxcool, h2mux, smux \
+                 or yamux"
             )),
             // An unusable value: named, because "the row asked for mux and we
             // cannot honour it" is the diagnosis, and silently treating it as "no
@@ -293,19 +293,22 @@ fn vless_reason(cfg: &VlessConfig) -> Option<Cow<'static, str>> {
             }
         });
     }
-    // Vision × mux: the row is refused rather than dialed, because a vision
-    // account may only carry XUDP mux (Xray's `command=Mux` with port 666), and
-    // we send the plain `v1.mux.cool` form, which Xray's inbound rejects
-    // (`isMuxAndNotXUDP`, `thirdparty/Xray-core/proxy/vless/inbound/inbound.go:180-184`).
+    // Vision × mux: MUX.Cool is dialable (the codec ships `connect_mux_vision`;
+    // Xray rejects TCP mux under XRV server-side, sing-box/mihomo accept it —
+    // spec 2026-11-17 D9). An sbox wire has no vision story, so it is refused
+    // by name rather than silently downgraded.
     if cfg.mux.as_ref().is_some_and(VlessMux::is_active)
         && let Some(flow) = cfg.flow.as_deref()
         && flow.starts_with("xtls-rprx-vision")
+        && cfg
+            .mux
+            .as_ref()
+            .and_then(VlessMux::wire)
+            .is_some_and(|wire| wire != leas_proto::proto_spec::MuxWire::MuxCool)
     {
-        // Named with its value, like every other refusal here (§8): "your
-        // `flow` was X" is what a row needs to say to be actionable.
         return Some(Cow::Owned(format!(
-            "vless flow `{flow}` with plain mux is not implemented — a vision account may only \
-             carry XUDP mux (port 666)"
+            "vless flow `{flow}` with sbox mux is not implemented — vision may only carry \
+             Mux.Cool"
         )));
     }
     transport_reason(&cfg.transport, cfg.path.as_deref()).map(Cow::Borrowed)
@@ -903,29 +906,42 @@ mod tests {
         }
     }
 
-    /// The refusal the parse-time check used to be: vision + plain mux is Xray's
-    /// `isMuxAndNotXUDP` rejection (its inbound refuses it; its XRV outbound
-    /// turns vision UDP into `command=Mux` with port 666 — an XUDP path this
-    /// change explicitly leaves out of scope). It lives HERE, not at parse, so
-    /// the row imports, exports, carries `[untestable]` and is purge-safe.
+    /// Vision pairs with MUX.Cool only (spec 2026-11-17 D9): the codec ships
+    /// `connect_mux_vision`, Xray rejects it server-side, sing-box/mihomo accept
+    /// it. An sbox wire has no vision story, so the combination is refused by
+    /// name HERE (not at parse), keeping the row importable and purge-safe.
     #[test]
-    fn vision_with_mux_is_refused_by_name() {
+    fn vision_with_sbox_mux_is_refused_by_name() {
         for flow in ["xtls-rprx-vision", "xtls-rprx-vision-udp443"] {
             let mut cfg = vless_cfg();
             cfg.flow = Some(TinyText::from(flow));
-            cfg.mux = Some(VlessMux::Limited(8));
+            cfg.mux = Some(VlessMux::Named {
+                wire: leas_proto::proto_spec::MuxWire::Smux,
+                cap: 8,
+            });
             assert!(
                 !supported(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg)),
-                "{flow} + plain mux must not be served"
+                "{flow} + sbox mux must not be served"
             );
             let mut cfg = vless_cfg();
             cfg.flow = Some(TinyText::from(flow));
-            cfg.mux = Some(VlessMux::Limited(8));
+            cfg.mux = Some(VlessMux::Named {
+                wire: leas_proto::proto_spec::MuxWire::Smux,
+                cap: 8,
+            });
             let reason = support_reason(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg))
-                .unwrap_or_else(|| panic!("{flow} + mux must be refused"));
+                .unwrap_or_else(|| panic!("{flow} + sbox mux must be refused"));
             assert!(
                 reason.contains("mux") && reason.contains(flow),
                 "the refusal names the row's own combination, got {reason}"
+            );
+            // MUX.Cool is allowed under a flow (D9).
+            let mut cfg = vless_cfg();
+            cfg.flow = Some(TinyText::from(flow));
+            cfg.mux = Some(VlessMux::Limited(8));
+            assert!(
+                supported(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg)),
+                "{flow} + MUX.Cool is dialable"
             );
             // And the row itself is NOT refused — only the combination is.
             let mut cfg = vless_cfg();

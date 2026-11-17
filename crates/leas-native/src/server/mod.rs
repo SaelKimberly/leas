@@ -29,6 +29,7 @@ use crate::inbound::http::HttpInboundConfig;
 use crate::inbound::mixed::MixedInbound;
 use crate::inbound::outbound::{Outbound, OutboundKind, ProxyOutbound};
 use crate::inbound::{Socks5InboundConfig, TraceCtx};
+use crate::mux_pool::MuxPolicy;
 use crate::telemetry::{Telemetry, TraceKind, TraceSecurity};
 
 /// Configuration for a [`NativeCoreServer`] session.
@@ -45,6 +46,8 @@ pub struct ServerConfig {
     /// Compiled routing engine. Callers pass a proxy-all engine when no rules
     /// exist; the server never compiles rules itself.
     pub engine: Arc<Engine>,
+    /// Mux carrier policy for the mixed listener (spec 2026-11-17 §6).
+    pub mux_policy: MuxPolicy,
 }
 
 impl ServerConfig {
@@ -63,6 +66,7 @@ impl ServerConfig {
             telemetry,
             udp: true,
             engine,
+            mux_policy: MuxPolicy::production(),
         }
     }
 }
@@ -122,6 +126,7 @@ impl NativeCoreServer {
         let mut socks_config =
             Socks5InboundConfig::new(cfg.listen, engine.clone(), outbounds.clone());
         socks_config.udp = cfg.udp;
+        socks_config.mux_policy = cfg.mux_policy;
         socks_config.trace = Some(TraceCtx {
             telemetry: cfg.telemetry.clone(),
             kind: TraceKind::Tcp,
@@ -131,6 +136,10 @@ impl NativeCoreServer {
         });
         socks_config.shutdown = Some(shutdown_rx.clone());
         let mut http_config = HttpInboundConfig::new(cfg.listen, engine, outbounds);
+        // One pool per session: SOCKS and HTTP legs of the same profile share
+        // carriers (the key is the carrier identity, not the inbound).
+        http_config.mux_pool = Arc::clone(&socks_config.mux_pool);
+        http_config.mux_policy = socks_config.mux_policy.clone();
         http_config.trace = Some(TraceCtx {
             telemetry: cfg.telemetry.clone(),
             kind: TraceKind::Http,

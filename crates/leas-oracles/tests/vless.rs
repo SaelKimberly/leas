@@ -23,6 +23,7 @@ use leas_native::protocol::vless::PacketMode;
 use leas_oracles::e2e::{
     AppKind, CaseSpec, Certs, CoreKind, EchoServer, Flow, TlsEchoServer, TlsVariant, run_against,
 };
+use leas_proto::proto_spec::MuxWire;
 use rstest::rstest;
 
 /// `CaseSpec::vless()` plus the network axis; these helpers keep the
@@ -141,6 +142,9 @@ fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
 // (order-independent). Over tls and reality, both cores (the probe
 // smoke-passed 4/4 real-core in Task 5).
 #[case::mux_tls(vless("tcp").with_mux(true))]
+// A12: pooled UDP. XUDP rides mux.cool; the sbox rows ride a UDP stream on
+// smux. One carrier must serve every datagram.
+#[case::mux_tls_mihomo(vless("tcp").with_mux(true).with_single_core(CoreKind::Mihomo))]
 #[case::mux_reality(vless_tls("tcp", reality()).with_mux(true))]
 // VLESS XUDP axis (spec §7.3): UDP over the mux tunnel — the probe's
 // `connect_udp` dispatches XUDP on `params.mux`, carrying each datagram
@@ -259,6 +263,32 @@ async fn vless_against_cores(
 // connection ("we will break Mux connections that contain TCP requests").
 // Hence sing-box single-core.
 #[case::mux_vision_singbox(vless("tcp").with_flow(Flow::Vision).with_mux(true), CoreKind::SingBox)]
+#[case::udp_smux_singbox(
+    vless("tcp").with_app(AppKind::Udp).with_mux(true).with_wire(MuxWire::Smux),
+    CoreKind::SingBox
+)]
+#[case::udp_smux_mihomo(
+    vless("tcp").with_app(AppKind::Udp).with_mux(true).with_wire(MuxWire::Smux),
+    CoreKind::Mihomo
+)]
+#[case::mux_vision_mihomo(vless("tcp").with_flow(Flow::Vision).with_mux(true), CoreKind::Mihomo)]
+// sbox wires (spec 2026-11-17 D5): sing-box and mihomo serve all three; the
+// server opts in via `multiplex` / `mux-option`.
+#[case::mux_h2mux_singbox(vless("tcp").with_mux(true).with_wire(MuxWire::H2Mux), CoreKind::SingBox)]
+#[case::mux_smux_singbox(vless("tcp").with_mux(true).with_wire(MuxWire::Smux), CoreKind::SingBox)]
+#[case::mux_yamux_singbox(vless("tcp").with_mux(true).with_wire(MuxWire::Yamux), CoreKind::SingBox)]
+// mihomo's h2mux fork (metacubex/sing-mux v0.3.12) ends most streams right
+// after the 200 headers (3/4 legs: no DATA, or DATA without END_STREAM), while
+// the identical server code in sing-box passes and mihomo's smux/yamux pass.
+// Tracked as a client interop gap; the row stays visible, not deleted.
+#[ignore = "mihomo h2mux: streams end after 200 (3/4 legs); sing-box passes with the same server code"]
+#[case::mux_h2mux_mihomo(vless("tcp").with_mux(true).with_wire(MuxWire::H2Mux), CoreKind::Mihomo)]
+#[case::mux_smux_mihomo(vless("tcp").with_mux(true).with_wire(MuxWire::Smux), CoreKind::Mihomo)]
+#[case::mux_yamux_mihomo(vless("tcp").with_mux(true).with_wire(MuxWire::Yamux), CoreKind::Mihomo)]
+// Padding is a handshake property (A11): the server must opt in too.
+#[case::mux_h2mux_padding_singbox(vless("tcp").with_mux(true).with_wire(MuxWire::H2Mux).with_mux_padding(), CoreKind::SingBox)]
+#[ignore = "mihomo h2mux: same interop gap as mux_h2mux_mihomo"]
+#[case::mux_h2mux_padding_mihomo(vless("tcp").with_mux(true).with_wire(MuxWire::H2Mux).with_mux_padding(), CoreKind::Mihomo)]
 // mKCP (SP4) is xray-single-core: sing-box has no kcp transport. Spec §7.3
 // asked for three arms (plain/tls/reality) — the reality arm is dropped by
 // controller ruling: xray-core 26.3.27's StreamConfig.Build() rejects

@@ -52,9 +52,13 @@ pub mod capability;
 pub mod chain;
 pub mod context;
 pub mod crypto;
+/// Test-only helpers for `leas-oracles` (`e2e-support`).
+#[cfg(feature = "e2e-support")]
+pub mod e2e_support;
 pub mod error;
 pub mod headers;
 pub mod inbound;
+pub mod mux_pool;
 pub mod mux_session;
 /// The MSS policy for proxy dials (see the module docs).
 pub(crate) mod path_mss;
@@ -75,6 +79,7 @@ pub use chain::{connect_chain, connect_chain_mux, connect_chain_udp};
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
 pub use inbound::{Outbound, OutboundKind, ProxyOutbound, Socks5Inbound, Socks5InboundConfig};
+pub use mux_pool::{MuxKey, MuxPolicy, MuxPool, MuxWire, effective_mux};
 pub use protocol::MuxTunnel;
 pub use protocol::PacketTunnel;
 pub use protocol::vless::{

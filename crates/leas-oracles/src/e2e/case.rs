@@ -24,6 +24,21 @@ pub enum ProtocolKind {
     AnyTls,
 }
 
+impl ProtocolKind {
+    /// The crate-level kind the dial path expects (config and kind must agree).
+    #[must_use]
+    pub const fn proto_kind(self) -> leas_proto::proto_spec::ProtocolKind {
+        match self {
+            Self::Vless => leas_proto::proto_spec::ProtocolKind::Vless,
+            Self::Vmess => leas_proto::proto_spec::ProtocolKind::Vmess,
+            Self::Trojan => leas_proto::proto_spec::ProtocolKind::Trojan,
+            Self::Hysteria2 => leas_proto::proto_spec::ProtocolKind::Hysteria2,
+            Self::Shadowsocks => leas_proto::proto_spec::ProtocolKind::Shadowsocks,
+            Self::AnyTls => leas_proto::proto_spec::ProtocolKind::AnyTls,
+        }
+    }
+}
+
 /// VLESS flow control: `xtls-rprx-vision` (`Vision`) or the XUDP variant
 /// `xtls-rprx-vision-udp443` (`Udp443`).
 ///
@@ -109,6 +124,10 @@ pub struct CaseSpec {
     /// echo target instead of the single-stream probe. The row's `app`
     /// stays [`AppKind::Plain`] (the probe sends HTTP over the sessions).
     mux: bool,
+    /// The sbox wire a row asks for (`muxtype=`); `None` = MUX.Cool.
+    mux_wire: Option<leas_proto::proto_spec::MuxWire>,
+    /// Whether an sbox row asks the server to pad its handshake.
+    mux_padding: bool,
     /// UDP packet mode for UDP rows: `None` = the TCP path (default);
     /// `Some(mode)` selects the VLESS UDP datagram tunnel ([`PacketMode`]
     /// `Raw` = header-dest, `PacketAddr` = per-packet address header
@@ -154,6 +173,8 @@ impl CaseSpec {
             flow: None,
             app: AppKind::Plain,
             mux: false,
+            mux_wire: None,
+            mux_padding: false,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -175,6 +196,8 @@ impl CaseSpec {
             flow: None,
             app: AppKind::Plain,
             mux: false,
+            mux_wire: None,
+            mux_padding: false,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -198,6 +221,8 @@ impl CaseSpec {
             flow: None,
             app: AppKind::Plain,
             mux: false,
+            mux_wire: None,
+            mux_padding: false,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -221,6 +246,8 @@ impl CaseSpec {
             flow: None,
             app: AppKind::Plain,
             mux: false,
+            mux_wire: None,
+            mux_padding: false,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -245,6 +272,8 @@ impl CaseSpec {
             flow: None,
             app: AppKind::Plain,
             mux: false,
+            mux_wire: None,
+            mux_padding: false,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -274,6 +303,8 @@ impl CaseSpec {
             flow: None,
             app: AppKind::Plain,
             mux: false,
+            mux_wire: None,
+            mux_padding: false,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -402,14 +433,46 @@ impl CaseSpec {
         self
     }
 
-    /// Whether the row probes the VLESS mux path (`run_against` routes it
-    /// to [`super::harness::probe_mux`] / [`super::harness::probe_udp_mux`]).
+    /// Whether the row exercises the mux path (`run_against` drives it through
+    /// the real SOCKS inbound + carrier pool, or `probe_udp_mux` for datagrams).
     /// The `xtls-rprx-vision-udp443` flow forces the mux tunnel regardless
     /// of the flag (spec §4.3 — `connect_udp` rewrites UDP to XUDP under
     /// the udp443 flow).
     #[must_use]
     pub const fn mux(&self) -> bool {
         self.mux || matches!(self.flow, Some(Flow::Udp443))
+    }
+
+    /// Request an sbox wire (`muxtype=`) for this row.
+    #[must_use]
+    pub const fn with_wire(mut self, wire: leas_proto::proto_spec::MuxWire) -> Self {
+        self.mux_wire = Some(wire);
+        self
+    }
+
+    /// Ask the server to pad an sbox handshake.
+    #[must_use]
+    pub const fn with_mux_padding(mut self) -> Self {
+        self.mux_padding = true;
+        self
+    }
+
+    /// The row's requested wire (the reuse probe/runner reads it).
+    #[must_use]
+    pub const fn mux_wire(&self) -> Option<leas_proto::proto_spec::MuxWire> {
+        self.mux_wire
+    }
+
+    /// Whether the row asks for padded sbox frames.
+    #[must_use]
+    pub const fn mux_padding_enabled(&self) -> bool {
+        self.mux_padding
+    }
+
+    /// The protocol this case dials (the reuse probe needs it).
+    #[must_use]
+    pub const fn protocol_kind(&self) -> ProtocolKind {
+        self.protocol
     }
 
     /// Select the TLS transport variant (fingerprint engine or REALITY).
@@ -523,6 +586,7 @@ impl E2eCase for CaseSpec {
                 self.tls(),
                 self.network,
                 self.vless_enc.as_ref().map(|(_, server)| server.as_str()),
+                self.mux_wire.map(|wire| (wire, self.mux_padding)),
             ),
             ProtocolKind::Vmess => {
                 let security = self.security.as_ref().and_then(|s| s.server_security(core));
@@ -555,6 +619,8 @@ impl E2eCase for CaseSpec {
                 self.tls(),
                 self.network,
                 self.xhttp_mode,
+                self.mux_wire,
+                self.mux,
             ),
             ProtocolKind::Vmess => {
                 let enc = self

@@ -61,8 +61,8 @@ pub use tailscale::TailscaleConfig;
 pub use tor::TorConfig;
 pub use trojan::TrojanConfig;
 pub use tuic::TuicConfig;
-pub use vless::VlessMux;
 pub use vless::{MlkemEncryption, MlkemMode, VlessConfig, parse_mlkem_encryption};
+pub use vless::{MuxWire, VlessMux};
 pub use vmess::VmessConfig;
 pub use wireguard::WireguardConfig;
 #[derive(Debug, thiserror::Error)]

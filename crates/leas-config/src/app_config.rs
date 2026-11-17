@@ -195,13 +195,18 @@ pub struct TunConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MuxConfig {
-    #[serde(default)]
+    /// Mux is on by default (spec 2026-11-17 D2); a profile's explicit
+    /// `mux=false` still wins.
+    #[serde(default = "default_mux_enabled")]
     pub enabled: bool,
     pub concurrency: Option<u8>,
-    #[serde(default = "default_mux_protocol")]
-    pub protocol: String,
+    /// Default wire for rows that do not spell `muxtype`. A row's own wire
+    /// always wins; the retired `protocol` key is ignored (it defaulted to
+    /// `"smux"`, which would silently point default rows at a wire most
+    /// servers do not serve).
+    #[serde(default = "default_wire_default")]
+    pub wire_default: String,
     pub max_connections: Option<u8>,
-    pub min_streams: Option<u8>,
     pub max_streams: Option<u16>,
     #[serde(default)]
     pub padding: bool,
@@ -212,18 +217,21 @@ pub struct MuxConfig {
     pub fragment_interval: Option<String>,
 }
 
-fn default_mux_protocol() -> String {
-    "smux".to_owned()
+fn default_wire_default() -> String {
+    "muxcool".to_owned()
+}
+
+const fn default_mux_enabled() -> bool {
+    true
 }
 
 impl Default for MuxConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_mux_enabled(),
             concurrency: None,
-            protocol: default_mux_protocol(),
+            wire_default: default_wire_default(),
             max_connections: None,
-            min_streams: None,
             max_streams: None,
             padding: false,
             fragment_enabled: false,

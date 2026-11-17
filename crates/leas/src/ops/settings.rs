@@ -139,22 +139,16 @@ const MUX_DEFS: &[FieldDef] = &[
         description: "Streams per connection, empty = auto",
     },
     FieldDef {
-        key: "protocol",
-        label: "Protocol",
-        ftype: "Select:smux,yamux,h2mux",
-        description: "Mux protocol the core speaks",
+        key: "wire_default",
+        label: "Wire",
+        ftype: "Select:muxcool,h2mux,smux,yamux",
+        description: "Default mux wire for rows without muxtype",
     },
     FieldDef {
         key: "max_connections",
         label: "Max Connections",
         ftype: "Number",
         description: "Connection pool cap",
-    },
-    FieldDef {
-        key: "min_streams",
-        label: "Min Streams",
-        ftype: "Number",
-        description: "Min streams before a new connection",
     },
     FieldDef {
         key: "max_streams",
@@ -524,9 +518,8 @@ fn config_value(config: &leas_config::AppConfig, section: SettingsSection, key: 
         (Tun, "mtu") => config.tun.mtu.map_or_default(|m| m.to_string()),
         (Mux, "enabled") => config.mux.enabled.to_string(),
         (Mux, "concurrency") => config.mux.concurrency.map_or_default(|c| c.to_string()),
-        (Mux, "protocol") => config.mux.protocol.clone(),
+        (Mux, "wire_default") => config.mux.wire_default.clone(),
         (Mux, "max_connections") => config.mux.max_connections.map_or_default(|c| c.to_string()),
-        (Mux, "min_streams") => config.mux.min_streams.map_or_default(|c| c.to_string()),
         (Mux, "max_streams") => config.mux.max_streams.map_or_default(|c| c.to_string()),
         (Mux, "padding") => config.mux.padding.to_string(),
         (Mux, "fragment_enabled") => config.mux.fragment_enabled.to_string(),
@@ -675,11 +668,10 @@ fn apply_settings_fields(
         Mux => {
             state.config.mux.enabled = get_str("enabled") == "true";
             state.config.mux.concurrency = get_str("concurrency").parse::<u8>().ok();
-            if !get_str("protocol").is_empty() {
-                state.config.mux.protocol = get("protocol");
+            if !get_str("wire_default").is_empty() {
+                state.config.mux.wire_default = get("wire_default");
             }
             state.config.mux.max_connections = get_str("max_connections").parse::<u8>().ok();
-            state.config.mux.min_streams = get_str("min_streams").parse::<u8>().ok();
             state.config.mux.max_streams = get_str("max_streams").parse::<u16>().ok();
             state.config.mux.padding = get_str("padding") == "true";
             state.config.mux.fragment_enabled = get_str("fragment_enabled") == "true";

@@ -97,7 +97,9 @@ impl MixedInbound {
             let http = Arc::clone(&self.http);
             let shutdown = socks.shutdown.clone();
             tokio::spawn(async move {
-                let handle = handle_conn(socks, http, conn, peer);
+                // The handler future now carries the pool and both inbound
+                // configs; pinning it keeps the spawned task's frame bounded.
+                let handle = Box::pin(handle_conn(socks, http, conn, peer));
                 match shutdown {
                     Some(rx) => {
                         let mut rx = rx;

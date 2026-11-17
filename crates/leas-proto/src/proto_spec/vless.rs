@@ -111,8 +111,11 @@ pub enum VlessMux {
     Limited(u32),
     /// `mux=-1`: unlimited. **Active.**
     Unlimited,
-    /// A mux spelling we cannot serve — an unparseable `mux` value, or a named
-    /// multiplexer (`muxtype=smux`). The **key** is kept with the value so an
+    /// A named multiplexer (`muxtype=`): the wire plus its stream cap.
+    /// `cap == u32::MAX` is the `-1` (unlimited) spelling; `0` is explicit off.
+    Named { wire: MuxWire, cap: u32 },
+    /// A mux spelling we cannot serve — an unparseable `mux` value, or an
+    /// unknown named multiplexer. The **key** is kept with the value so an
     /// export writes back the spelling the row arrived with, and so the refusal
     /// can name it.
     ///
@@ -124,6 +127,52 @@ pub enum VlessMux {
     Invalid { key: String, value: String },
 }
 
+/// The multiplexer wire a row asks for (`muxtype=`), or the profile default.
+///
+/// A VLESS link cannot say which server implementation answers it: Xray/v2ray
+/// speak MUX.Cool, sing-box/mihomo speak the sbox protocols. The wire is
+/// therefore per-row (spec 2026-11-17 D5), defaulting to MUX.Cool.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxWire {
+    /// Xray/sing-box/mihomo `v1.mux.cool` (VLESS command 0x03).
+    #[default]
+    MuxCool,
+    /// sing-box / mihomo `h2mux`.
+    H2Mux,
+    /// sing-box / mihomo `smux` (the `SagerNet` fork).
+    Smux,
+    /// sing-box / mihomo `yamux`.
+    Yamux,
+}
+
+impl MuxWire {
+    /// The wire's `muxtype=` spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MuxCool => "muxcool",
+            Self::H2Mux => "h2mux",
+            Self::Smux => "smux",
+            Self::Yamux => "yamux",
+        }
+    }
+
+    /// Parse a `muxtype=` value (case-insensitive).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "muxcool" | "mux.cool" | "mux_cool" => Some(Self::MuxCool),
+            "h2mux" | "h2" => Some(Self::H2Mux),
+            "smux" => Some(Self::Smux),
+            "yamux" => Some(Self::Yamux),
+            _ => None,
+        }
+    }
+}
+
 impl VlessMux {
     /// Whether this request multiplexes at all.
     ///
@@ -133,6 +182,7 @@ impl VlessMux {
         match self {
             Self::Limited(n) => *n > 0,
             Self::Unlimited => true,
+            Self::Named { cap, .. } => *cap > 0,
             Self::Invalid { .. } => false,
         }
     }
@@ -143,6 +193,13 @@ impl VlessMux {
         match self {
             Self::Limited(n) => n.to_string(),
             Self::Unlimited => "-1".to_string(),
+            Self::Named { cap, .. } => {
+                if *cap == u32::MAX {
+                    "-1".to_string()
+                } else {
+                    cap.to_string()
+                }
+            }
             Self::Invalid { value, .. } => value.clone(),
         }
     }
@@ -163,7 +220,17 @@ impl VlessMux {
         match self {
             Self::Limited(n) => format!("cap:{n}"),
             Self::Unlimited => "cap:unlimited".to_string(),
+            Self::Named { wire, cap } => format!("named:{}:cap:{cap}", wire.as_str()),
             Self::Invalid { key, value } => format!("invalid:{key}={value}"),
+        }
+    }
+
+    /// The named wire, when the row asked for one.
+    #[must_use]
+    pub const fn wire(&self) -> Option<MuxWire> {
+        match self {
+            Self::Named { wire, .. } => Some(*wire),
+            _ => None,
         }
     }
 
@@ -392,12 +459,16 @@ impl VlessConfig {
         // clamp: stored as-is so the row stays importable and exportable, and
         // refused by name at connect. Xray's own inbound rejects anything but
         // its default (`thirdparty/Xray-core/proxy/vless/inbound/inbound.go:180-184`).
-        let named_multiplexer = mux_key("muxtype").map(|kind| VlessMux::Invalid {
-            key: "muxtype".to_string(),
-            value: kind,
-        });
+        let named_value = mux_key("muxtype");
+        let named_wire = named_value.as_deref().and_then(MuxWire::parse);
+        let named_invalid = named_value
+            .filter(|value| MuxWire::parse(value).is_none())
+            .map(|kind| VlessMux::Invalid {
+                key: "muxtype".to_string(),
+                value: kind,
+            });
         // SIGNED, because `-1` means unlimited and a `u32` cannot hold it.
-        let cap = ["muxConcurrency", "muxconcurrency", "muxmaxc"]
+        let cap_override = ["muxConcurrency", "muxconcurrency", "muxmaxc"]
             .into_iter()
             .find_map(mux_key)
             .and_then(|v| v.parse::<i64>().ok());
@@ -419,11 +490,35 @@ impl VlessConfig {
                     // An explicit cap WINS over the boolean's default: `mux=true`
                     // says *that* the row multiplexes and `muxConcurrency=-1`
                     // says how many.
-                    cap.map_or(request, VlessMux::from_i64)
+                    cap_override.map_or(request, VlessMux::from_i64)
                 },
             )
         });
-        let mux = named_multiplexer.or(from_mux_key);
+        let mux = match (named_invalid, named_wire) {
+            (Some(invalid), _) => Some(invalid),
+            (None, Some(wire)) => {
+                // A named multiplexer requests mux; the cap comes from `mux`
+                // (bool/number) or `muxConcurrency`, defaulting to the
+                // ecosystem's 8.
+                let cap = cap_override.map_or_else(
+                    || match mux_key("mux").as_deref().and_then(VlessMux::parse) {
+                        Some(VlessMux::Limited(n)) => n,
+                        Some(VlessMux::Unlimited) => u32::MAX,
+                        Some(VlessMux::Invalid { .. }) => 0,
+                        _ => 8,
+                    },
+                    |n| {
+                        if n < 0 {
+                            u32::MAX
+                        } else {
+                            u32::try_from(n).unwrap_or(u32::MAX)
+                        }
+                    },
+                );
+                Some(VlessMux::Named { wire, cap })
+            }
+            (None, None) => from_mux_key,
+        };
 
         // Vision × mux is NOT refused here: the combination STORES (`flow` present
         // and a mux request present) and `capability::vless_reason` refuses it by
@@ -526,11 +621,21 @@ impl VlessConfig {
             // about how the row dials, and dropping it would make an export of
             // `mux=false` indistinguishable from a row that never said.
             if let Some(mux) = &self.mux {
-                // Under the key the row ARRIVED with, not a canonical one: a
-                // `muxtype=smux` row exported as `mux=smux` would re-import as a
-                // different stored state — a different uid — and the exported
-                // row would duplicate instead of matching (§3.1 rule 2).
-                q.append_pair(mux.as_key(), &mux.as_value());
+                match mux {
+                    // A named wire is TWO keys: `muxtype` names the wire and
+                    // `mux` carries the cap.
+                    VlessMux::Named { wire, .. } => {
+                        q.append_pair("mux", &mux.as_value());
+                        q.append_pair("muxtype", wire.as_str());
+                    }
+                    // Under the key the row ARRIVED with, not a canonical one: a
+                    // `muxtype=smux` row exported as `mux=smux` would re-import as a
+                    // different stored state — a different uid — and the exported
+                    // row would duplicate instead of matching (§3.1 rule 2).
+                    _ => {
+                        q.append_pair(mux.as_key(), &mux.as_value());
+                    }
+                }
             }
             match &self.transport {
                 TransportConfig::Ws(cfg) => {
@@ -2185,18 +2290,38 @@ mod mux_tests {
     /// ever be named.
     #[test]
     fn an_unusable_mux_spelling_is_stored_not_dropped() {
-        // A named multiplexer is preserved WITH the key it arrived under, so an
-        // export writes back the spelling the row used.
+        // A named multiplexer is a real request now (spec 2026-11-17 D5): the
+        // wire is stored and the cap follows `mux`, defaulting to 8.
         let named = mux_of(&format!("{BASE}&muxtype=smux")).expect("stored");
         assert_eq!(
             named,
-            VlessMux::Invalid {
-                key: "muxtype".into(),
-                value: "smux".into()
+            VlessMux::Named {
+                wire: MuxWire::Smux,
+                cap: 8
             }
         );
-        assert!(!named.is_active(), "and it is never a mux request");
-        assert_eq!(named.as_key(), "muxtype");
+        assert!(named.is_active(), "a named multiplexer requests mux");
+        assert_eq!(named.as_key(), "mux");
+
+        let capped = mux_of(&format!("{BASE}&muxtype=yamux&mux=4")).expect("stored");
+        assert_eq!(
+            capped,
+            VlessMux::Named {
+                wire: MuxWire::Yamux,
+                cap: 4
+            }
+        );
+
+        // An UNKNOWN wire is still preserved as an unusable spelling.
+        let unknown = mux_of(&format!("{BASE}&muxtype=quantum")).expect("stored");
+        assert_eq!(
+            unknown,
+            VlessMux::Invalid {
+                key: "muxtype".into(),
+                value: "quantum".into()
+            }
+        );
+        assert!(!unknown.is_active());
 
         // An unusable VALUE is equally unusable, and equally preserved.
         let unusable = mux_of(&format!("{BASE}&mux=many")).expect("stored");

@@ -15,6 +15,7 @@ use leas_core::grpc_client::SysStats;
 use leas_core::log_heed::LogMessage;
 use leas_db::models::{Endpoint, Protocol};
 use leas_native::inbound::outbound::ProxyOutbound;
+use leas_native::mux_pool::MuxPolicy;
 use leas_native::server::{NativeCoreServer, ServerConfig};
 use leas_native::telemetry::{NativeEvent, Telemetry};
 use leas_proto::proto_spec::{EndpointEssentials, HostKind};
@@ -46,6 +47,7 @@ pub async fn run_native_session(
     mut stop_rx: oneshot::Receiver<()>,
     protocol_id: i64,
     engine: std::sync::Arc<leas_route::Engine>,
+    mux: &leas_config::MuxConfig,
 ) {
     if protocol.config.is_unloaded() {
         try_send_or_warn(
@@ -78,14 +80,9 @@ pub async fn run_native_session(
         resolved_ip: None,
     };
     let (telemetry, mut events_rx) = Telemetry::new(TELEMETRY_CAP);
-    let server = match NativeCoreServer::start(ServerConfig::new(
-        listen_addr,
-        proxy,
-        telemetry.clone(),
-        engine,
-    ))
-    .await
-    {
+    let mut server_config = ServerConfig::new(listen_addr, proxy, telemetry.clone(), engine);
+    server_config.mux_policy = mux_policy(mux);
+    let server = match NativeCoreServer::start(server_config).await {
         Ok(server) => server,
         Err(e) => {
             try_send_or_warn(
@@ -178,6 +175,27 @@ pub async fn run_native_session(
 
     server.shutdown().await;
     try_send_or_warn(tx, CoreEvent::Disconnected, "disconnected");
+}
+
+/// The app's Mux settings as the pool's policy. `wire_default`/sbox lands in
+/// S2; this slice drives the MUX.Cool wire with the configured caps.
+fn mux_policy(cfg: &leas_config::MuxConfig) -> MuxPolicy {
+    let mut policy = MuxPolicy::production();
+    policy.enabled = cfg.enabled;
+    policy.cap = cfg
+        .max_streams
+        .map(usize::from)
+        .or_else(|| cfg.concurrency.map(usize::from))
+        .unwrap_or(policy.cap)
+        .max(1);
+    policy.carriers = cfg
+        .max_connections
+        .map_or(policy.carriers, usize::from)
+        .max(1);
+    policy.padding = cfg.padding;
+    policy.wire = leas_proto::proto_spec::MuxWire::parse(&cfg.wire_default)
+        .unwrap_or(leas_proto::proto_spec::MuxWire::MuxCool);
+    policy
 }
 
 /// Map a db `Endpoint` to the proto `EndpointEssentials` the proxy outbound

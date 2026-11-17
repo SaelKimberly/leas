@@ -378,6 +378,9 @@ pub fn vless_inbound(
     // PRIVATE key segments (xray-only — sing-box has no VLESS account
     // encryption).
     decryption: Option<&str>,
+    // An sbox mux request: the server must opt in (`multiplex` on sing-box,
+    // `mux-option` on mihomo). MUX.Cool needs no server config.
+    mux: Option<(leas_proto::proto_spec::MuxWire, bool)>,
 ) -> String {
     if let Some(private_key) = tls.reality_private_key() {
         let sid = tls
@@ -397,8 +400,48 @@ pub fn vless_inbound(
         "xhttp3" => serde_json::json!(["h3"]),
         _ => serde_json::json!(["http/1.1"]),
     };
+    if core == CoreKind::Mihomo {
+        // mihomo serves VLESS from `listeners:` (inline PEM, not file paths).
+        // Only the plain TCP arm is wired: ws/grpc/xhttp rows stay on the
+        // JSON cores until a row needs them.
+        assert!(
+            network == "tcp",
+            "mihomo's vless listener builder covers tcp only"
+        );
+        let mut l = mihomo_listener("vless", "vless", env);
+        let mut user = yaml_rust2::yaml::Hash::new();
+        user.insert(Yaml::String("uuid".into()), Yaml::String(UUID.into()));
+        if let Some(flow) = flow {
+            user.insert(
+                Yaml::String("flow".into()),
+                Yaml::String(flow.server_str().into()),
+            );
+        }
+        l.insert(
+            Yaml::String("users".into()),
+            Yaml::Array(vec![Yaml::Hash(user)]),
+        );
+        if tls.tls_enabled() {
+            l.insert(
+                Yaml::String("certificate".into()),
+                Yaml::String(env.certs.cert_pem.clone()),
+            );
+            l.insert(
+                Yaml::String("private-key".into()),
+                Yaml::String(env.certs.key_pem.clone()),
+            );
+        }
+        if let Some((wire, padding)) = mux
+            && wire != leas_proto::proto_spec::MuxWire::MuxCool
+        {
+            let mut option = yaml_rust2::yaml::Hash::new();
+            option.insert(Yaml::String("padding".into()), Yaml::Boolean(padding));
+            l.insert(Yaml::String("mux-option".into()), Yaml::Hash(option));
+        }
+        return mihomo_config(vec![l]);
+    }
     let json = match core {
-        CoreKind::Mihomo => mihomo_unsupported("vless"),
+        CoreKind::Mihomo => unreachable!("mihomo's vless listener is built above"),
         CoreKind::Xray => {
             // `NoTls` (the kcp_plain row) emits streamSettings WITHOUT
             // tlsSettings — genuinely no security layer, not cert TLS.
@@ -504,6 +547,14 @@ pub fn vless_inbound(
                 }
                 _ => {}
             }
+            if let Some((wire, padding)) = mux
+                && wire != leas_proto::proto_spec::MuxWire::MuxCool
+            {
+                inbound["multiplex"] = serde_json::json!({
+                    "enabled": true,
+                    "padding": padding
+                });
+            }
             serde_json::json!({
                 "log": { "level": "warn" },
                 "inbounds": [inbound],
@@ -511,6 +562,15 @@ pub fn vless_inbound(
             })
         }
     };
+    if let Some((wire, _)) = mux
+        && wire != leas_proto::proto_spec::MuxWire::MuxCool
+    {
+        assert_ne!(
+            core,
+            CoreKind::Xray,
+            "xray-core serves MUX.Cool only; sbox rows are single-core"
+        );
+    }
     let mut json = json;
     if let Some(flow) = flow {
         set_flow(&mut json, core, flow);
@@ -841,6 +901,8 @@ pub fn client_params_vless(
     tls: &dyn TlsVariant,
     network: &str,
     xhttp_mode: Option<&'static str>,
+    mux_wire: Option<leas_proto::proto_spec::MuxWire>,
+    mux: bool,
 ) -> NativeConnectParams {
     let transport = match network {
         "ws" => serde_json::json!({ "type": "ws", "path": "/ws" }),
@@ -889,8 +951,15 @@ pub fn client_params_vless(
     if let Some(flow) = flow {
         protocol_value["flow"] = serde_json::json!(flow.as_str());
     }
-    let protocol: ProtocolConfig =
+    let mut protocol: ProtocolConfig =
         serde_json::from_value(protocol_value).expect("vless client config parses");
+    if let ProtocolConfig::Vless(cfg) = &mut protocol {
+        cfg.mux = match mux_wire {
+            Some(wire) => Some(leas_proto::proto_spec::VlessMux::Named { wire, cap: 8 }),
+            None if mux => Some(leas_proto::proto_spec::VlessMux::Limited(8)),
+            None => None,
+        };
+    }
     let server = EndpointEssentials::new("127.0.0.1", port);
     NativeConnectParams::new(
         protocol,
@@ -1302,6 +1371,7 @@ mod tests {
             &tls,
             "tcp",
             None,
+            None,
         ))
         .unwrap();
         let settings = &xray["inbounds"][0]["streamSettings"]["realitySettings"];
@@ -1317,6 +1387,7 @@ mod tests {
             None,
             &tls,
             "tcp",
+            None,
             None,
         ))
         .unwrap();
@@ -1348,7 +1419,7 @@ mod tests {
         // every other variant carries its own security object (kcp vs tcp does
         // not matter for the non-reality ALPN dialect here).
         let network = if tls.tls_enabled() { "tcp" } else { "kcp" };
-        let params = client_params_vless(12345, target, None, &*tls, network, None);
+        let params = client_params_vless(12345, target, None, &*tls, network, None, None, false);
         let sec = params.protocol.security();
         assert_eq!(sec.and_then(SecurityConfig::type_str), expected_type);
         assert_eq!(sec.and_then(SecurityConfig::fp), expected_fp);
@@ -1375,7 +1446,16 @@ mod tests {
         // Default (None) → the mode key is omitted (the native dial
         // auto-selects: packet-up, stream-one under reality); an explicit
         // mode passes through.
-        let packet = client_params_vless(12345, target, None, &StandardTls, "xhttp", None);
+        let packet = client_params_vless(
+            12345,
+            target,
+            None,
+            &StandardTls,
+            "xhttp",
+            None,
+            None,
+            false,
+        );
         assert_eq!(mode_of(packet).as_deref(), None);
         let stream = client_params_vless(
             12345,
@@ -1384,6 +1464,8 @@ mod tests {
             &StandardTls,
             "xhttp",
             Some("stream-up"),
+            None,
+            false,
         );
         assert_eq!(mode_of(stream).as_deref(), Some("stream-up"));
     }
@@ -1410,6 +1492,7 @@ mod tests {
             &StandardTls,
             "xhttp3",
             None,
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -1423,7 +1506,16 @@ mod tests {
 
         // Client: xhttp transport + the h3 ALPN → the QUIC dispatch decision.
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, None, &StandardTls, "xhttp3", None);
+        let params = client_params_vless(
+            12345,
+            target,
+            None,
+            &StandardTls,
+            "xhttp3",
+            None,
+            None,
+            false,
+        );
         assert_eq!(params.protocol.transport_type(), Some("xhttp"));
         let sec = params.protocol.security().unwrap();
         assert_eq!(sec.alpn(), Some("h3"));
@@ -1448,6 +1540,7 @@ mod tests {
             Some(Flow::Vision),
             &StandardTls,
             "tcp",
+            None,
             None,
         ))
         .unwrap();
@@ -1476,6 +1569,7 @@ mod tests {
             &StandardTls,
             "tcp",
             None,
+            None,
         ))
         .unwrap();
         assert_eq!(sing["inbounds"][0]["users"][0]["flow"], "xtls-rprx-vision");
@@ -1501,6 +1595,7 @@ mod tests {
             &reality,
             "tcp",
             None,
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -1513,8 +1608,16 @@ mod tests {
     #[test]
     fn vless_flow_in_client_params() {
         let target = "1.2.3.4:80".parse().unwrap();
-        let params =
-            client_params_vless(12345, target, Some(Flow::Vision), &StandardTls, "tcp", None);
+        let params = client_params_vless(
+            12345,
+            target,
+            Some(Flow::Vision),
+            &StandardTls,
+            "tcp",
+            None,
+            None,
+            false,
+        );
         let ProtocolConfig::Vless(vless) = &params.protocol else {
             panic!("expected a vless client config");
         };
@@ -1546,6 +1649,7 @@ mod tests {
                 &StandardTls,
                 "tcp",
                 None,
+                None,
             ))
             .unwrap();
             let flow = &server["inbounds"][0]["settings"]["clients"][0]["flow"];
@@ -1560,8 +1664,16 @@ mod tests {
 
         // Client JSON: the native client's VlessConfig keeps the full
         // udp443 name — connect_udp dispatches on it (mux-forced XUDP).
-        let params =
-            client_params_vless(12345, target, Some(Flow::Udp443), &StandardTls, "tcp", None);
+        let params = client_params_vless(
+            12345,
+            target,
+            Some(Flow::Udp443),
+            &StandardTls,
+            "tcp",
+            None,
+            None,
+            false,
+        );
         let ProtocolConfig::Vless(vless) = &params.protocol else {
             panic!("expected a vless client config");
         };
@@ -1583,14 +1695,22 @@ mod tests {
 
         // Neither xray's clients[0] nor sing-box's users[0] carry a flow key.
         for core in [CoreKind::Xray, CoreKind::SingBox] {
-            let server: serde_json::Value =
-                serde_json::from_str(&vless_inbound(core, &env, None, &StandardTls, "tcp", None))
-                    .unwrap();
+            let server: serde_json::Value = serde_json::from_str(&vless_inbound(
+                core,
+                &env,
+                None,
+                &StandardTls,
+                "tcp",
+                None,
+                None,
+            ))
+            .unwrap();
             assert!(server["inbounds"][0]["settings"]["clients"][0]["flow"].is_null());
             assert!(server["inbounds"][0]["users"][0]["flow"].is_null());
         }
 
-        let params = client_params_vless(12345, target, None, &StandardTls, "tcp", None);
+        let params =
+            client_params_vless(12345, target, None, &StandardTls, "tcp", None, None, false);
         let ProtocolConfig::Vless(vless) = &params.protocol else {
             panic!("expected a vless client config");
         };
@@ -1618,6 +1738,7 @@ mod tests {
             &NoTls,
             "kcp",
             None,
+            None,
         ))
         .unwrap();
         let stream = &xray["inbounds"][0]["streamSettings"];
@@ -1632,6 +1753,7 @@ mod tests {
             None,
             &NoTls,
             "kcp",
+            None,
             None,
         ))
         .unwrap();

@@ -250,6 +250,9 @@ pub enum PacketTunnel {
     Hysteria2(hysteria2::udp::UdpConn),
     Ss(ss::udp::SsUdpTunnel),
     AnyTls(anytls::udp::UdpConn),
+    /// A sing-box/mihomo sbox UDP association (length-prefixed datagrams on a
+    /// session stream).
+    Sbox(crate::transport::sbox::udp::SboxUdpTunnel),
 }
 
 impl PacketTunnel {
@@ -278,6 +281,7 @@ impl PacketTunnel {
             Self::Hysteria2(c) => c.send(dest, payload).await,
             Self::Ss(c) => c.send(dest, payload).await,
             Self::AnyTls(c) => c.send(dest, payload).await,
+            Self::Sbox(c) => c.send(dest, payload).await,
         }
     }
 
@@ -296,6 +300,7 @@ impl PacketTunnel {
             Self::Hysteria2(c) => to_bytes(c.recv().await),
             Self::Ss(c) => to_bytes(c.recv().await),
             Self::AnyTls(c) => to_bytes(c.recv().await),
+            Self::Sbox(c) => c.recv().await,
         }
     }
 }
@@ -303,21 +308,29 @@ impl PacketTunnel {
 /// The read half of a split [`PacketTunnel`] — see [`PacketTunnel::split`].
 pub enum PacketReader {
     Vless(vless::PacketReader<tokio::io::ReadHalf<BoxStream>>),
+    /// VLESS XUDP: the mux UDP session's event channel (no byte stream).
+    VlessXudp(crate::transport::mux::UdpReader),
     Vmess(vmess::udp::PacketReader<tokio::io::ReadHalf<BoxStream>>),
     Trojan(trojan::PacketReader<tokio::io::ReadHalf<BoxStream>>),
     Hysteria2(hysteria2::udp::UdpReader),
     Ss(ss::udp::SsUdpReader),
     AnyTls(anytls::udp::UdpReader),
+    /// sbox UDP association reader.
+    Sbox(crate::transport::sbox::udp::SboxUdpReader),
 }
 
 /// The write half of a split [`PacketTunnel`] — see [`PacketTunnel::split`].
 pub enum PacketWriter {
     Vless(vless::PacketWriter<tokio::io::WriteHalf<BoxStream>>),
+    /// VLESS XUDP: the mux UDP session's writer (owns the End on drop).
+    VlessXudp(crate::transport::mux::UdpWriter),
     Vmess(vmess::udp::PacketWriter<tokio::io::WriteHalf<BoxStream>>),
     Trojan(trojan::PacketWriter<tokio::io::WriteHalf<BoxStream>>),
     Hysteria2(hysteria2::udp::UdpWriter),
     Ss(ss::udp::SsUdpWriter),
     AnyTls(anytls::udp::UdpWriter),
+    /// sbox UDP association writer.
+    Sbox(crate::transport::sbox::udp::SboxUdpWriter),
 }
 
 impl PacketTunnel {
@@ -330,14 +343,18 @@ impl PacketTunnel {
     /// future is never cancelled.
     ///
     /// # Errors
-    /// Returns [`std::io::ErrorKind::InvalidInput`] for a carrier that has no
-    /// halves — the VLESS XUDP mode, whose datagrams ride a shared mux tunnel
-    /// rather than a stream.
+    /// VLESS XUDP has halves too (the mux session's event channel and writer),
+    /// so a pooled datagram association relays like a stream one.
     pub fn split(self) -> std::io::Result<(PacketReader, PacketWriter)> {
         match self {
             Self::Vless(c) => {
-                let (r, w) = c.split()?;
-                Ok((PacketReader::Vless(r), PacketWriter::Vless(w)))
+                if c.is_xudp() {
+                    let (r, w) = c.split_xudp()?;
+                    Ok((PacketReader::VlessXudp(r), PacketWriter::VlessXudp(w)))
+                } else {
+                    let (r, w) = c.split()?;
+                    Ok((PacketReader::Vless(r), PacketWriter::Vless(w)))
+                }
             }
             Self::Vmess(c) => {
                 let (r, w) = c.split()?;
@@ -359,6 +376,10 @@ impl PacketTunnel {
                 let (r, w) = c.split()?;
                 Ok((PacketReader::AnyTls(r), PacketWriter::AnyTls(w)))
             }
+            Self::Sbox(c) => {
+                let (r, w) = c.split();
+                Ok((PacketReader::Sbox(r), PacketWriter::Sbox(w)))
+            }
         }
     }
 }
@@ -374,11 +395,13 @@ impl PacketReader {
     ) -> std::io::Result<Option<(Option<std::net::SocketAddr>, bytes::Bytes)>> {
         match self {
             Self::Vless(r) => r.recv().await,
+            Self::VlessXudp(r) => Ok(r.recv().await?.map(|(dest, payload)| (Some(dest), payload))),
             Self::Vmess(r) => r.recv().await,
             Self::Trojan(r) => to_bytes(r.recv().await),
             Self::Hysteria2(r) => to_bytes(r.recv().await),
             Self::Ss(r) => to_bytes(r.recv().await),
             Self::AnyTls(r) => to_bytes(r.recv().await),
+            Self::Sbox(r) => r.recv().await,
         }
     }
 }
@@ -391,6 +414,15 @@ fn to_bytes(
 }
 
 impl PacketWriter {
+    /// Whether this carrier needs an explicit destination on every datagram.
+    ///
+    /// XUDP's first `New` frame names the association, so the relay's `None`
+    /// shortcut (same destination as the session) is not valid there.
+    #[must_use]
+    pub const fn requires_destination(&self) -> bool {
+        matches!(self, Self::VlessXudp(_))
+    }
+
     /// Send one datagram — the same contract as [`PacketTunnel::send`].
     pub async fn send(
         &mut self,
@@ -399,11 +431,21 @@ impl PacketWriter {
     ) -> std::io::Result<()> {
         match self {
             Self::Vless(w) => w.send(dest, payload).await,
+            Self::VlessXudp(w) => {
+                let dest = dest.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "vless xudp send requires a destination",
+                    )
+                })?;
+                w.send(dest, payload).await
+            }
             Self::Vmess(w) => w.send(dest, payload).await,
             Self::Trojan(w) => w.send(dest, payload).await,
             Self::Hysteria2(w) => w.send(dest, payload).await,
             Self::Ss(w) => w.send(dest, payload).await,
             Self::AnyTls(w) => w.send(dest, payload).await,
+            Self::Sbox(w) => w.send(dest, payload).await,
         }
     }
 }
@@ -495,6 +537,9 @@ pub enum MuxTunnel {
     Vless(std::sync::Arc<crate::protocol::vless::MuxClient<BoxStream>>),
     /// Shadowsocks with a plugin: sessions still need their codec.
     Ss(std::sync::Arc<ss::mux::SsMux>),
+    /// A sing-box/mihomo sbox carrier (`h2mux`/`smux`/`yamux`): frames are
+    /// already stream-level, so a session is one stream.
+    Sbox(std::sync::Arc<crate::transport::sbox::SboxTunnel>),
 }
 
 impl MuxTunnel {
@@ -517,6 +562,18 @@ impl MuxTunnel {
                 Ok(Box::new(session))
             }
             Self::Ss(mux) => mux.open_session(target).await,
+            Self::Sbox(tunnel) => tunnel.open(target),
+        }
+    }
+
+    /// Whether the carrier is dead. A Shadowsocks plugin tunnel has no
+    /// liveness flag of its own; its sessions surface the failure instead.
+    #[must_use]
+    pub fn is_dead(&self) -> bool {
+        match self {
+            Self::Vless(client) => client.is_dead(),
+            Self::Ss(_) => false,
+            Self::Sbox(tunnel) => tunnel.is_dead(),
         }
     }
 }

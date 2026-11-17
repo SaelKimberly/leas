@@ -487,6 +487,20 @@ enum SessionEvent {
     Error(io::Error),
 }
 
+/// Next free session id: skip 0 (the `KeepAlive` frame's id) and every id
+/// that is still live. The scan is bounded by the 16-bit id space, so a
+/// long-lived pooled carrier that has wrapped the counter never overwrites a
+/// live session's channel (spec 2026-11-17 §6).
+fn allocate_id(next: &AtomicU16, is_live: impl Fn(u16) -> bool) -> Option<u16> {
+    for _ in 0..=u16::MAX as usize {
+        let id = next.fetch_add(1, Ordering::Relaxed);
+        if id != 0 && !is_live(id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
 /// Locks the session map, recovering from poisoning (a panicked holder
 /// leaves the map intact; the lock is only ever held across short,
 /// non-awaiting sections).
@@ -558,6 +572,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
         }
     }
 
+    /// Whether the demux task has exited — the tunnel can no longer route
+    /// sessions. The pool's eviction signal.
+    #[must_use]
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
     /// Opens a new TCP session to `target` and returns its byte stream.
     ///
     /// The `New` frame is sent eagerly (spec §8 deviation 1) so the server
@@ -567,15 +588,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
         if self.dead.load(Ordering::Acquire) {
             return Err(tunnel_closed());
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        // Reject id 0 — the KeepAlive frames' session id. The counter
-        // wraps around only after 65k live sessions (impossible in
-        // practice), and a wrap to 0 is caught here.
-        if id == 0 {
-            return Err(io::Error::other("vless mux session id exhausted"));
-        }
         let (tx, rx) = mpsc::channel(SESSION_CHANNEL_CAPACITY);
-        lock_map(&self.sessions).insert(id, tx);
+        // Allocate and register under ONE lock: a bare `fetch_add` can hand
+        // out an id still held by a live session after the u16 wraps.
+        let id = {
+            let mut sessions = lock_map(&self.sessions);
+            let Some(id) = allocate_id(&self.next_id, |id| sessions.contains_key(&id)) else {
+                return Err(io::Error::other("vless mux session id exhausted"));
+            };
+            sessions.insert(id, tx);
+            id
+        };
         let frame = Frame {
             session_id: id,
             status: STATUS_NEW,
@@ -620,14 +643,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
         if self.dead.load(Ordering::Acquire) {
             return Err(tunnel_closed());
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        // Reject id 0 — the KeepAlive frames' session id (same wrap guard
-        // as open_session).
-        if id == 0 {
-            return Err(io::Error::other("vless mux session id exhausted"));
-        }
         let (tx, rx) = mpsc::channel(SESSION_CHANNEL_CAPACITY);
-        lock_map(&self.sessions).insert(id, tx);
+        // Same skip-live allocation as `open_session` (one lock).
+        let id = {
+            let mut sessions = lock_map(&self.sessions);
+            let Some(id) = allocate_id(&self.next_id, |id| sessions.contains_key(&id)) else {
+                return Err(io::Error::other("vless mux session id exhausted"));
+            };
+            sessions.insert(id, tx);
+            id
+        };
         // Re-check the demux (same race as open_session): an entry
         // inserted after its exit-clear would never be routed.
         if self.dead.load(Ordering::Acquire) {
@@ -640,6 +665,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
             write_tx: self.write_tx.clone(),
             sessions: Arc::clone(&self.sessions),
             global_id,
+            taken: AtomicBool::new(false),
             first: AtomicBool::new(true),
         })
     }
@@ -1241,6 +1267,9 @@ pub struct UdpSession {
     /// The tunnel's `GlobalID` (xudp, spec §4.2), written in the New frame
     /// only.
     global_id: [u8; 8],
+    /// Set when `split` handed the state to the halves: `Drop` must then not
+    /// send End/unregister (the writer half owns that).
+    taken: AtomicBool,
     /// The first `send_to` writes the `New` frame; afterwards `Keep`.
     /// Atomic so `send_to` (&self) is safe to call concurrently — exactly
     /// one caller wins the New (see [`UdpSession::send_to`] for the
@@ -1318,6 +1347,30 @@ impl UdpSession {
         }
     }
 
+    /// Split into read/write halves for a relay that needs both directions
+    /// concurrently (the inbound's UDP leg). The writer owns the session's
+    /// close/End bookkeeping; the reader owns the demux channel.
+    #[must_use]
+    pub(crate) fn split(mut self) -> (UdpReader, UdpWriter) {
+        self.taken.store(true, Ordering::Release);
+        let (_placeholder_tx, placeholder_rx) = mpsc::channel(1);
+        let (placeholder_write, _placeholder_write_rx) = mpsc::channel::<Frame>(1);
+        let rx = std::mem::replace(&mut self.rx, placeholder_rx);
+        let write_tx = std::mem::replace(&mut self.write_tx, placeholder_write);
+        let sessions = std::mem::take(&mut self.sessions);
+        let first = std::mem::replace(&mut self.first, AtomicBool::new(false));
+        (
+            UdpReader { rx },
+            UdpWriter {
+                id: self.id,
+                write_tx,
+                sessions,
+                global_id: self.global_id,
+                first,
+            },
+        )
+    }
+
     /// Removes this session from the demux's routing map. Idempotent.
     fn unregister(&self) {
         lock_map(&self.sessions).remove(&self.id);
@@ -1326,11 +1379,81 @@ impl UdpSession {
 
 impl Drop for UdpSession {
     fn drop(&mut self) {
+        if self.taken.load(Ordering::Acquire) {
+            return;
+        }
         // Fire-and-forget End + unregister (spec §4.3), mirroring
         // SessionStream: the peer must see the session close even when
         // the app never sends one.
         queue_end_fire_and_forget(self.id, &self.write_tx);
         self.unregister();
+    }
+}
+
+/// The read half of a split XUDP session.
+pub struct UdpReader {
+    rx: mpsc::Receiver<SessionEvent>,
+}
+
+impl UdpReader {
+    /// One datagram: `(destination, payload)`; `Ok(None)` on a clean close.
+    pub(crate) async fn recv(&mut self) -> io::Result<Option<(SocketAddr, Bytes)>> {
+        loop {
+            match self.rx.recv().await {
+                Some(SessionEvent::Data { dest, bytes }) => {
+                    let dest = dest.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vless mux: udp packet without a destination",
+                        )
+                    })?;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    return Ok(Some((dest, bytes)));
+                }
+                Some(SessionEvent::End) | None => return Ok(None),
+                Some(SessionEvent::Error(e)) => return Err(e),
+            }
+        }
+    }
+}
+
+/// The write half of a split XUDP session (owns the End on drop).
+pub struct UdpWriter {
+    id: u16,
+    write_tx: mpsc::Sender<Frame>,
+    sessions: Arc<Mutex<HashMap<u16, mpsc::Sender<SessionEvent>>>>,
+    global_id: [u8; 8],
+    first: AtomicBool,
+}
+
+impl UdpWriter {
+    /// Sends one datagram (same wire rules as [`UdpSession::send_to`]).
+    pub(crate) async fn send(&self, dest: SocketAddr, payload: &[u8]) -> io::Result<()> {
+        if payload.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vless mux: udp datagram exceeds the 2-byte data length (65535)",
+            ));
+        }
+        let is_first = self.first.swap(false, Ordering::AcqRel);
+        let frame = Frame {
+            session_id: self.id,
+            status: if is_first { STATUS_NEW } else { STATUS_KEEP },
+            option: OPT_DATA,
+            target: Some(MuxTarget::Udp(dest)),
+            global_id: is_first.then_some(self.global_id),
+            payload: Bytes::copy_from_slice(payload),
+        };
+        self.write_tx.send(frame).await.map_err(|_| tunnel_closed())
+    }
+}
+
+impl Drop for UdpWriter {
+    fn drop(&mut self) {
+        queue_end_fire_and_forget(self.id, &self.write_tx);
+        lock_map(&self.sessions).remove(&self.id);
     }
 }
 
@@ -3337,5 +3460,90 @@ mod tests {
         .await
         .expect("hermetic xudp flow timed out");
         server.await.expect("fake mux server task failed");
+    }
+
+    #[test]
+    fn allocate_id_skips_zero_and_live_ids() {
+        let next = AtomicU16::new(65534);
+        let live = |id: u16| id == 65535 || id == 1;
+        assert_eq!(allocate_id(&next, live), Some(65534), "first free id");
+        assert_eq!(allocate_id(&next, live), Some(2), "wrap skips live and 0");
+    }
+
+    #[test]
+    fn allocate_id_from_zero_never_returns_zero() {
+        let next = AtomicU16::new(0);
+        assert_eq!(allocate_id(&next, |id| id == 0), Some(1));
+    }
+
+    #[test]
+    fn allocate_id_finds_the_only_free_slot_after_a_full_scan() {
+        let next = AtomicU16::new(0);
+        assert_eq!(allocate_id(&next, |_| true), None, "no free id");
+        let next = AtomicU16::new(0);
+        assert_eq!(
+            allocate_id(&next, |id| id != 42),
+            Some(42),
+            "the scan reaches the one free slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_session_never_overwrites_a_live_id_across_the_wrap() {
+        use tokio::io::AsyncReadExt as _;
+
+        use crate::BoxStream;
+
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while peer.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+        let mux = MuxClient::new(Box::new(client) as BoxStream);
+        let target = MuxTarget::Tcp("127.0.0.1:1".parse().expect("addr"));
+
+        let first = mux.open_session(target.clone()).await.expect("first");
+        mux.next_id.store(0, Ordering::Relaxed);
+        let second = mux.open_session(target).await.expect("second");
+
+        assert_ne!(first.id, second.id, "a live id was reissued");
+        assert_eq!(
+            lock_map(&mux.sessions).len(),
+            2,
+            "the second insert must add, not overwrite the live entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn xudp_split_halves_relay_both_directions() {
+        use crate::BoxStream;
+
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let mux = MuxClient::new(Box::new(client) as BoxStream);
+        let session = mux.open_udp_session([0x11; 8]).expect("session");
+        let (mut reader, writer) = session.split();
+
+        let dest: SocketAddr = "127.0.0.1:53".parse().expect("dest");
+        writer.send(dest, b"q").await.expect("send");
+        let frame = read_frame(&mut peer).await.expect("read").expect("frame");
+        assert_eq!(
+            frame.status, STATUS_NEW,
+            "the first datagram opens the session"
+        );
+        assert!(matches!(frame.target, Some(MuxTarget::Udp(d)) if d == dest));
+        assert_eq!(frame.global_id, Some([0x11; 8]));
+
+        let reply = Frame {
+            session_id: frame.session_id,
+            status: STATUS_KEEP,
+            option: OPT_DATA,
+            target: Some(MuxTarget::Udp(dest)),
+            global_id: None,
+            payload: Bytes::from_static(b"r"),
+        };
+        write_frame(&mut peer, &reply).await.expect("reply");
+        let (got_dest, payload) = reader.recv().await.expect("recv").expect("datagram");
+        assert_eq!(got_dest, dest);
+        assert_eq!(&payload[..], b"r");
     }
 }

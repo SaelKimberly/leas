@@ -82,6 +82,10 @@ pub struct HttpInboundConfig {
     /// When set, `serve` stops accepting and in-flight connections abort
     /// once the sender marks shutdown (`send(true)` or drop).
     pub shutdown: Option<watch::Receiver<bool>>,
+    /// Mux carriers shared with the mixed listener's SOCKS half.
+    pub mux_pool: Arc<crate::mux_pool::MuxPool>,
+    /// Mux policy for this inbound.
+    pub mux_policy: crate::mux_pool::MuxPolicy,
 }
 
 impl HttpInboundConfig {
@@ -96,6 +100,8 @@ impl HttpInboundConfig {
             outbounds,
             trace: None,
             shutdown: None,
+            mux_pool: Arc::new(crate::mux_pool::MuxPool::new()),
+            mux_policy: crate::mux_pool::MuxPolicy::default(),
         }
     }
 
@@ -305,24 +311,27 @@ async fn handle_connect(
                 }
                 kind => {
                     let target = override_addr.map(|a| net_to_target(&a)).unwrap_or(target);
-                    let mut upstream = match outbound::dial(kind, &target).await {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            tracing::warn!(
-                                %tag,
-                                ?target,
-                                %error,
-                                "http inbound: outbound dial failed"
-                            );
-                            trace_failure(
-                                config,
-                                &dest,
-                                TraceFailReason::Dial,
-                                Some(&outbound.tag),
-                            );
-                            return write_refusal(&mut conn, Refusal::BadGateway).await;
-                        }
-                    };
+                    let mut upstream =
+                        match outbound::dial(kind, &target, &config.mux_pool, &config.mux_policy)
+                            .await
+                        {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %tag,
+                                    ?target,
+                                    %error,
+                                    "http inbound: outbound dial failed"
+                                );
+                                trace_failure(
+                                    config,
+                                    &dest,
+                                    TraceFailReason::Dial,
+                                    Some(&outbound.tag),
+                                );
+                                return write_refusal(&mut conn, Refusal::BadGateway).await;
+                            }
+                        };
                     write_established(&mut conn).await?;
                     if let Some(trace) = &config.trace {
                         // The traced path replays `pending` inside its byte

@@ -317,6 +317,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
         }
     }
 
+    /// Whether this is the XUDP (mux-session) mode.
+    #[must_use]
+    pub const fn is_xudp(&self) -> bool {
+        matches!(self.inner, PacketInner::XUdp(_))
+    }
+
+    /// Split the XUDP mode into mux-session halves (the stream split cannot:
+    /// there is no byte stream, only the session's event channel and writer).
+    pub(crate) fn split_xudp(
+        self,
+    ) -> io::Result<(
+        crate::transport::mux::UdpReader,
+        crate::transport::mux::UdpWriter,
+    )> {
+        match self.inner {
+            PacketInner::XUdp(session) => Ok(session.split()),
+            PacketInner::Stream(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vless xudp split requires the XUDP carrier",
+            )),
+        }
+    }
+
     /// Sends one datagram.
     ///
     /// The stream modes (Raw / `PacketAddr`) run [`WriteState::send_to`] —
