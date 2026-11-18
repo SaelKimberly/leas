@@ -362,6 +362,9 @@ pub struct Ss2022Stream<S> {
     target: TargetAddr,
     /// The transport reported end-of-stream.
     eof: bool,
+    /// The ack slot: a validated response header (the salt echo) IS the
+    /// acceptance, observed lazily on the first read (spec D3).
+    ack_slot: crate::protocol::AuthAckSlot,
 }
 
 impl<S> Ss2022Stream<S> {
@@ -372,6 +375,10 @@ impl<S> Ss2022Stream<S> {
     /// `pub(crate)`: the constructor and [`Self::write_handshake`] are a
     /// pair — calling the handshake twice reuses counters 0 and 1 under the
     /// same subkey, so neither escapes the crate.
+    ///
+    /// Test-only: the live path uses [`Self::with_ack_slot`] so the probe sees
+    /// the response header's acceptance.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(
         inner: S,
@@ -379,6 +386,26 @@ impl<S> Ss2022Stream<S> {
         key: Zeroizing<Vec<u8>>,
         salt: Vec<u8>,
         target: TargetAddr,
+    ) -> Self {
+        Self::with_ack_slot(
+            inner,
+            method,
+            key,
+            salt,
+            target,
+            crate::protocol::AuthAckSlot::default(),
+        )
+    }
+
+    /// [`Self::new`] reporting the validated response header into `ack_slot`
+    /// (the probe's channel, spec D3).
+    pub(crate) fn with_ack_slot(
+        inner: S,
+        method: SsMethod,
+        key: Zeroizing<Vec<u8>>,
+        salt: Vec<u8>,
+        target: TargetAddr,
+        ack_slot: crate::protocol::AuthAckSlot,
     ) -> Self {
         let write = Half::new(method, &key, &salt);
         // The handshake is the only write whose size is known up front;
@@ -406,6 +433,7 @@ impl<S> Ss2022Stream<S> {
             request_salt: salt,
             target,
             eof: false,
+            ack_slot,
         }
     }
 
@@ -635,6 +663,9 @@ impl<S: AsyncRead + Unpin> Ss2022Stream<S> {
                     &self.staging[..self.step_len()],
                     &self.server_salt,
                 )?;
+                // The header validated (type, timestamp, our salt echo): the
+                // server accepted this config.
+                self.ack_slot.set(crate::protocol::AuthAck::Ok);
                 self.read = Some(half);
                 // Both subkeys exist now; the master key has no further use,
                 // so it is zeroized from here on.
@@ -757,7 +788,7 @@ pub async fn connect(
     cfg: &SsConfig,
     method: SsMethod,
 ) -> Result<BoxStream, NativeError> {
-    connect_to(&ctx.target, stream, cfg, method).await
+    connect_to(&ctx.target, stream, cfg, method, ctx.ack.clone()).await
 }
 
 /// The same handshake against an **explicit** target — the mux path's
@@ -767,6 +798,7 @@ pub async fn connect_to(
     stream: BoxStream,
     cfg: &SsConfig,
     method: SsMethod,
+    ack: crate::protocol::AuthAckSlot,
 ) -> Result<BoxStream, NativeError> {
     if method.family() != SsFamily::Blake3_2022 {
         return Err(NativeError::Config(format!(
@@ -777,7 +809,8 @@ pub async fn connect_to(
     let key = password_key(method, &cfg.password)?;
     let mut salt = Zeroizing::new(vec![0u8; method.aead().salt_len()]);
     crate::rand::fill_nonsecret(&mut salt);
-    let mut stream = Ss2022Stream::new(stream, method, key, salt.to_vec(), target.clone());
+    let mut stream =
+        Ss2022Stream::with_ack_slot(stream, method, key, salt.to_vec(), target.clone(), ack);
     let timeout = timeouts::PROTOCOL;
     tokio::time::timeout(timeout, stream.write_handshake())
         .await
@@ -1035,12 +1068,14 @@ mod tests {
         let key = [0x42u8; 32];
         let ours = [0x43u8; 32];
         let (client, mut server) = duplex(4096);
-        let mut stream = Ss2022Stream::new(
+        let slot = crate::protocol::AuthAckSlot::new(crate::protocol::AuthAck::Unknown);
+        let mut stream = Ss2022Stream::with_ack_slot(
             client,
             method,
             Zeroizing::new(key.to_vec()),
             ours.to_vec(),
             TargetAddr::new(Host::Ip(IpAddr::from([127, 0, 0, 1])), 443),
+            slot.clone(),
         );
 
         // The server's own salt leads its header; the header's length field
@@ -1068,6 +1103,11 @@ mod tests {
         let mut got = Vec::new();
         stream.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"hello world");
+        assert_eq!(
+            slot.get(),
+            crate::protocol::AuthAck::Ok,
+            "a validated response header IS the acceptance"
+        );
     }
 
     /// A tampered seal must reach the caller as a `Shadowsocks2022` protocol

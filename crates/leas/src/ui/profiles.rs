@@ -639,6 +639,7 @@ const fn purge_label(reason: leas_db::models::PurgeReason) -> &'static str {
         PurgeReason::ConfigInvalid => "cfg",
         PurgeReason::TransportRejected => "http",
         PurgeReason::OriginUnreachable => "origin",
+        PurgeReason::CredentialRejected => "cred",
     }
 }
 

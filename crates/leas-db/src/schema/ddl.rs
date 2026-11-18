@@ -170,3 +170,24 @@ pub const V19_LATENCY_RESHAPE: &[&str] = &[
 /// and the pane treats them as belonging to whichever country's custom set is
 /// active until an edit stamps them.
 pub const V20_ROUTING_RULESET: &[&str] = &["ALTER TABLE routing_rules ADD COLUMN ruleset TEXT"];
+
+/// v21: the credential purge reason (spec `2026-09-17-purge-reason-design.md`,
+/// amendment 2026-11-18 D8/D9).
+///
+/// SQLite cannot widen a `CHECK` in place, so the table is rebuilt: the new
+/// shape (8-value `purge_reason` CHECK, `error_kind` CHECK and composite PK
+/// unchanged) is created under a temporary name, the rows are copied by an
+/// explicit column list, the old table is dropped, the new one renamed, and
+/// the two secondary indexes are recreated under the names `push_schema`
+/// emits. PK values are copied verbatim — no re-key, no row loss.
+///
+/// The non-idempotence is safe because the cursor gates the step (see
+/// `steps.rs`).
+pub const V21_CREDENTIAL_PURGE: &[&str] = &[
+    "CREATE TABLE profile_stats_v21 (\"protocol_id\" BIGINT NOT NULL, \"endpoint_id\" BIGINT NOT NULL, \"last_used_at\" BIGINT, \"last_seen_at\" BIGINT NOT NULL, \"latency_real_delay\" INTEGER, \"latency_fast_delay\" INTEGER, \"latency_ip\" TEXT, \"latency_auth\" BIGINT, \"speed_bps\" BIGINT, \"error\" BOOLEAN, \"error_kind\" TEXT CHECK (\"error_kind\" IN ('real', 'fast', 'name')), \"error_text\" TEXT, \"purge_reason\" TEXT CHECK (\"purge_reason\" IN ('reality_fallback', 'certificate_mismatch', 'certificate_expired', 'not_tls', 'config_invalid', 'transport_rejected', 'origin_unreachable', 'credential_rejected')), \"stab_mask\" BIGINT NOT NULL, \"stab_len\" BIGINT NOT NULL, \"traffic_today_up\" BIGINT NOT NULL, \"traffic_today_down\" BIGINT NOT NULL, \"traffic_total_up\" BIGINT NOT NULL, \"traffic_total_down\" BIGINT NOT NULL, \"created_at\" BIGINT NOT NULL, \"updated_at\" BIGINT NOT NULL, \"version\" INTEGER NOT NULL, PRIMARY KEY (\"protocol_id\", \"endpoint_id\"))",
+    "INSERT INTO profile_stats_v21 (\"protocol_id\", \"endpoint_id\", \"last_used_at\", \"last_seen_at\", \"latency_real_delay\", \"latency_fast_delay\", \"latency_ip\", \"latency_auth\", \"speed_bps\", \"error\", \"error_kind\", \"error_text\", \"purge_reason\", \"stab_mask\", \"stab_len\", \"traffic_today_up\", \"traffic_today_down\", \"traffic_total_up\", \"traffic_total_down\", \"created_at\", \"updated_at\", \"version\") SELECT \"protocol_id\", \"endpoint_id\", \"last_used_at\", \"last_seen_at\", \"latency_real_delay\", \"latency_fast_delay\", \"latency_ip\", \"latency_auth\", \"speed_bps\", \"error\", \"error_kind\", \"error_text\", \"purge_reason\", \"stab_mask\", \"stab_len\", \"traffic_today_up\", \"traffic_today_down\", \"traffic_total_up\", \"traffic_total_down\", \"created_at\", \"updated_at\", \"version\" FROM profile_stats",
+    "DROP TABLE profile_stats",
+    "ALTER TABLE profile_stats_v21 RENAME TO profile_stats",
+    "CREATE INDEX \"index_profile_stats_by_endpoint_id\" ON \"profile_stats\" (\"endpoint_id\")",
+    "CREATE INDEX \"index_profile_stats_by_last_seen_at\" ON \"profile_stats\" (\"last_seen_at\")",
+];

@@ -207,6 +207,11 @@ pub enum PurgeReason {
     TransportRejected,
     /// The CDN answered an origin error (530/521/522/526).
     OriginUnreachable,
+    /// The server's own authentication answer rejected this config's secret
+    /// (spec 2026-09-17, amendment 2026-11-18 D8/D9). The only reason the
+    /// AUTH column's `Failed` may produce: `AnyTLS` closed/alerted before any
+    /// session frame, or hysteria2's auth status was not `233`.
+    CredentialRejected,
 }
 
 /// Traffic accounting for an endpoint/group.
@@ -348,10 +353,11 @@ impl Latency {
 pub enum AuthState {
     /// The ack arrived — the server accepted this config.
     Ok,
-    /// POSITIVE rejection evidence (an EOF during the peel, an auth error, a
-    /// framing error). An unobserved ack is never `Failed`: sing-box writes
-    /// the VLESS response header lazily, so a slow target yields no ack at
-    /// all.
+    /// Credential-grade evidence: the server's authentication answer rejected
+    /// this config's secret (spec 2026-09-17, amendment 2026-11-18 D8). An
+    /// unobserved ack is never `Failed`, and neither is a silent close:
+    /// sing-box writes the VLESS response header lazily, so a slow or failed
+    /// target yields no ack at all.
     Failed,
     /// The family has no server ack (Trojan, SS-AEAD), or the native engine
     /// cannot serve the row at all.

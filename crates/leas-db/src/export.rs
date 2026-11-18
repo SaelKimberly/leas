@@ -410,6 +410,7 @@ fn purge_reason(value: &str) -> Result<PurgeReason> {
         "config_invalid" => Ok(PurgeReason::ConfigInvalid),
         "transport_rejected" => Ok(PurgeReason::TransportRejected),
         "origin_unreachable" => Ok(PurgeReason::OriginUnreachable),
+        "credential_rejected" => Ok(PurgeReason::CredentialRejected),
         other => Err(DatabaseError::Generic(format!(
             "unknown purge reason {other}"
         ))),

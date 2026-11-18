@@ -50,8 +50,13 @@ fn not_impl(feature: &str) -> Result<BoxStream, NativeError> {
 /// between an ack that was OBSERVED and one that was merely POSSIBLE:
 ///
 /// - `Ok` — the ack arrived. The server accepted this config.
-/// - `Failed` — POSITIVE rejection evidence: an EOF during the peel, an auth
-///   error, a framing error. Only positive evidence may produce this state.
+/// - `Failed` — credential-grade evidence: the peer's own authentication answer
+///   rejected this config's secret (an `AnyTLS` close before the first session
+///   frame or `cmdAlert`, hysteria2's auth status). Only this evidence may
+///   produce the state, because `Failed` is also the `[cred]` purge trigger
+///   (spec 2026-09-17, amendment 2026-11-18 D8). A silent close is `Unknown`:
+///   sing-box writes the VLESS response header lazily, so the same EOF is also
+///   a target failure.
 /// - `NotApplicable` — the family has no server ack at all (Trojan, SS-AEAD),
 ///   or the engine cannot serve the row.
 /// - `Unknown` — the ack was possible but was not observed in time (a lazy
@@ -99,8 +104,15 @@ impl AuthAckSlot {
     }
 
     /// Record an observation.
+    ///
+    /// `Ok` is terminal: once the server accepted the config, a later close or
+    /// alert is not credential evidence and must not downgrade the verdict the
+    /// `cred` purge reads (spec amendment D10).
     pub fn set(&self, ack: AuthAck) {
-        *self.0.lock().expect("auth-ack slot poisoned") = ack;
+        let mut slot = self.0.lock().expect("auth-ack slot poisoned");
+        if *slot != AuthAck::Ok {
+            *slot = ack;
+        }
     }
 
     /// Read the observation.
@@ -689,5 +701,21 @@ mod tests {
                 .expect("raw is every protocol's header-dest mode");
             reject_vless_only_mode(&udp_ctx(None), kind).expect("no mode is not a mode error");
         }
+    }
+
+    /// The verdict the `cred` purge reads must not be downgraded by a later
+    /// close: a v2 `AnyTLS` session can send `cmdServerSettings` and only then
+    /// die, and that is still an accepted config (amendment D10).
+    #[test]
+    fn an_observed_ok_is_terminal_in_the_slot() {
+        let slot = AuthAckSlot::new(AuthAck::Unknown);
+        slot.set(AuthAck::Ok);
+        slot.set(AuthAck::Failed);
+        assert_eq!(slot.get(), AuthAck::Ok);
+
+        // Before the acceptance, a failure still lands.
+        let slot = AuthAckSlot::new(AuthAck::Unknown);
+        slot.set(AuthAck::Failed);
+        assert_eq!(slot.get(), AuthAck::Failed);
     }
 }

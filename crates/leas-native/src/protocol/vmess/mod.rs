@@ -90,12 +90,20 @@ async fn handshake(
             &session.response_body_key,
             &session.response_body_iv,
         );
-        return Ok(VmessClientStream::new_legacy(Box::new(reader), session));
+        return Ok(VmessClientStream::with_ack_slot_legacy(
+            Box::new(reader),
+            session,
+            ctx.ack.clone(),
+        ));
     }
     let request = encode_request(&ck, &session, &ctx.target, command, ts, &mut entropy)?;
     // Header waits for the first payload (see `first_flight`).
     let framed: BoxStream = Box::new(HeaderFirst::new(stream, request));
-    Ok(VmessClientStream::new(framed, session))
+    Ok(VmessClientStream::with_ack_slot(
+        framed,
+        session,
+        ctx.ack.clone(),
+    ))
 }
 
 /// Connect through a `VMess` outbound over an already-secured stream.

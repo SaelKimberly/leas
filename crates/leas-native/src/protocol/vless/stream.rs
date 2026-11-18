@@ -27,22 +27,6 @@ enum PeelState {
     Done,
 }
 
-/// What the peel saw of the server's ack (spec D3).
-///
-/// The peel is where the ack is observable: a vless server's `[0,0]` response
-/// header IS the acceptance, and its absence is the rejection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum PeelAck {
-    /// The header was not read yet — the ack is possible but unobserved.
-    #[default]
-    Pending,
-    /// The header arrived: the server accepted this config.
-    Accepted,
-    /// The header was truncated (EOF before it completed): POSITIVE rejection
-    /// evidence — the server closed instead of accepting.
-    Rejected,
-}
-
 /// The VLESS response-header peel: `version(1B) | addon_len(1B) | addons`,
 /// consumed once from the tunnel before the first payload byte.
 ///
@@ -62,8 +46,6 @@ pub(crate) struct Peel {
     /// read, which happens during the probe's target-TLS handshake, long
     /// after the protocol phase returned).
     ack_slot: crate::protocol::AuthAckSlot,
-    /// What the peel saw of the server's ack (spec D3).
-    ack: PeelAck,
 }
 
 impl Peel {
@@ -75,7 +57,6 @@ impl Peel {
             addons_total: 0,
             state: PeelState::Head,
             ack_slot,
-            ack: PeelAck::Pending,
         }
     }
 
@@ -114,11 +95,10 @@ impl Peel {
                         let mut tmp = [0u8; 1];
                         let got = r.read(&mut tmp).await?;
                         if got == 0 {
-                            // The server closed instead of accepting: the
-                            // header was truncated. POSITIVE rejection
-                            // evidence (spec D3) — not an unobserved ack.
-                            self.ack = PeelAck::Rejected;
-                            self.ack_slot.set(crate::protocol::AuthAck::Failed);
+                            // The server closed instead of accepting. Not
+                            // credential evidence (D8): sing-box writes the
+                            // header lazily, so the same EOF is also a target
+                            // failure. The slot stays `Unknown`.
                             return Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 "vless response header truncated (EOF)",
@@ -131,9 +111,8 @@ impl Peel {
                             // protocol: Xray's DecodeResponseHeader refuses
                             // it, and passing the byte to the application
                             // would deliver a wrong endpoint's bytes as
-                            // payload instead of failing.
-                            self.ack = PeelAck::Rejected;
-                            self.ack_slot.set(crate::protocol::AuthAck::Failed);
+                            // payload instead of failing. Not credential
+                            // evidence: the peer is not a VLESS server.
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!(
@@ -148,9 +127,7 @@ impl Peel {
                     let got = r.read(&mut tmp).await?;
                     if got == 0 {
                         // The header was truncated after its version byte:
-                        // the same positive rejection evidence.
-                        self.ack = PeelAck::Rejected;
-                        self.ack_slot.set(crate::protocol::AuthAck::Failed);
+                        // the same ambiguous close as above — stays `Unknown`.
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "vless response header truncated (EOF)",
@@ -165,7 +142,6 @@ impl Peel {
                     } else {
                         // A zero-length addon section: the header is complete,
                         // so the server accepted this config.
-                        self.ack = PeelAck::Accepted;
                         self.ack_slot.set(crate::protocol::AuthAck::Ok);
                         PeelState::Done
                     };
@@ -178,9 +154,8 @@ impl Peel {
                     let got = r.read(&mut tmp[..need]).await?;
                     if got == 0 {
                         // The addons were truncated: the header never
-                        // completed, so the server did not accept.
-                        self.ack = PeelAck::Rejected;
-                        self.ack_slot.set(crate::protocol::AuthAck::Failed);
+                        // completed. Ambiguous like the other closes — no slot
+                        // write.
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "vless response addons truncated (EOF)",
@@ -191,7 +166,6 @@ impl Peel {
                     self.state = if filled == total {
                         // The header completed: the server ACCEPTED this
                         // config (the header IS the acceptance).
-                        self.ack = PeelAck::Accepted;
                         self.ack_slot.set(crate::protocol::AuthAck::Ok);
                         PeelState::Done
                     } else {
@@ -299,8 +273,10 @@ mod tests {
 
     /// The peel reports the ack into the slot it was built with (spec D3):
     /// a server's `[0,0]` header IS the acceptance, so the slot reads `Ok`
-    /// after the header is peeled — and `Failed` when the server closes
-    /// instead (the positive-rejection case), never `Unknown` for either.
+    /// after the header is peeled. A truncated header and a wrong first byte
+    /// leave it `Unknown` — under D8 a close is NOT credential evidence
+    /// (sing-box writes the header lazily, so the same EOF is also a target
+    /// failure), and a non-VLESS first byte says nothing about the secret.
     #[tokio::test]
     async fn the_peel_reports_the_ack_into_its_slot() {
         // ── the accepted case ──
@@ -330,8 +306,8 @@ mod tests {
         );
         assert_eq!(
             slot.get(),
-            crate::protocol::AuthAck::Failed,
-            "an EOF during the peel is POSITIVE rejection evidence, never Unknown"
+            crate::protocol::AuthAck::Unknown,
+            "an EOF during the peel is ambiguous (lazy sing-box header + target failure), never Failed"
         );
 
         // ── the wrong-protocol case: a non-vless first byte ──
@@ -350,8 +326,8 @@ mod tests {
         );
         assert_eq!(
             slot.get(),
-            crate::protocol::AuthAck::Failed,
-            "a wrong version is positive rejection evidence"
+            crate::protocol::AuthAck::Unknown,
+            "a wrong version says the peer is not VLESS, not that the secret failed"
         );
     }
 

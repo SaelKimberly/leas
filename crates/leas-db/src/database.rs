@@ -103,7 +103,11 @@ use rapidhash::{HashMapExt as _, RapidHashMap};
 // 20 = `routing_rules.ruleset` (country ruleset, spec
 // `2026-11-11-country-rulesets-design` D3): nullable, so a pre-ruleset row
 // stays readable and is treated as custom under every country.
-pub const SCHEMA_VERSION: i64 = 20;
+//
+// 21 = `PurgeReason::CredentialRejected`: SQLite cannot widen a CHECK in
+// place, so the step rebuilds `profile_stats` (spec `2026-09-17-purge-reason`
+// amendment, D8/D9).
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
 /// geo step wrote (`None` until it does).
@@ -826,6 +830,7 @@ const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static
         PurgeReason::ConfigInvalid => "config_invalid",
         PurgeReason::TransportRejected => "transport_rejected",
         PurgeReason::OriginUnreachable => "origin_unreachable",
+        PurgeReason::CredentialRejected => "credential_rejected",
     }
 }
 

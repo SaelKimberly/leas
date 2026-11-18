@@ -305,11 +305,15 @@ async fn read_loop(
     ack: AuthAckSlot,
 ) {
     let mut header = [0u8; HEADER_LEN];
+    // Frames the SERVER sent. Zero at the end means it closed before it said
+    // anything — the one shape a wrong password produces (amendment D9).
+    let mut frames = 0usize;
     loop {
         if read_half.read_exact(&mut header).await.is_err() {
             break;
         }
         let header = Header::parse(header);
+        frames += 1;
         let mut payload = vec![0u8; usize::from(header.len)];
         if header.len > 0 && read_half.read_exact(&mut payload).await.is_err() {
             break;
@@ -360,6 +364,14 @@ async fn read_loop(
             _ => {}
         }
     }
+    // A close before ANY server frame rejected the 32-byte auth: AnyTLS reads
+    // the secret first, so no target-dependent failure can produce this shape
+    // (amendment D9). `dead` excludes our own teardown — a probe that gave up
+    // must not be recorded as a rejection. Written before `shutdown`, because
+    // that is what ends the probe's read with an error.
+    if frames == 0 && !inner.dead.load(Ordering::Relaxed) {
+        ack.set(AuthAck::Failed);
+    }
     inner.shutdown();
 }
 
@@ -395,7 +407,12 @@ async fn write_loop(
             break;
         }
     }
-    inner.shutdown();
+    // No `shutdown` here on purpose: the READ loop owns the teardown, so a
+    // credential verdict it observes is written into the ack slot BEFORE the
+    // streams are ended (the probe reads the slot once its read fails; a
+    // writer-side shutdown would race it and lose the verdict).
+    // A client-initiated close already shut the session down before aborting
+    // both tasks.
 }
 
 /// One padded write: split `data` per the packet's row and trailing
@@ -842,5 +859,62 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1], "each stream gets its own id");
         assert!(!session.is_idle(), "streams are still open");
+    }
+
+    /// Wait until the read loop has run its exit path — that path is where the
+    /// verdict is written — bounded so a hang fails the test, not the suite.
+    async fn wait_dead(session: &Session) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !session.is_dead() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the read loop never ended"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A server that closes before ANY frame rejected the 32-byte auth: that is
+    /// the only shape a wrong password produces (`fallback` + close), because
+    /// nothing target-dependent precedes it (amendment D9).
+    #[tokio::test]
+    async fn a_close_before_any_frame_is_credential_evidence() {
+        let (client, server) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            let mut server = server;
+            consume_auth(&mut server).await;
+            drop(server);
+        });
+        let slot = AuthAckSlot::new(AuthAck::Unknown);
+        let session = Session::start(Box::new(client), "wrong", padding(), slot.clone(), 1)
+            .await
+            .expect("session");
+        peer.await.expect("peer task");
+        wait_dead(&session).await;
+        assert_eq!(slot.get(), AuthAck::Failed);
+    }
+
+    /// `cmdServerSettings` is the acceptance, and the close after it must not
+    /// downgrade the verdict (amendment D10) — a later session error is not
+    /// credential evidence.
+    #[tokio::test]
+    async fn server_settings_report_ok_and_stay_terminal() {
+        let (client, server) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            let mut server = server;
+            consume_auth(&mut server).await;
+            server
+                .write_all(&frame::frame(CMD_SERVER_SETTINGS, 0, b"v=2\nclient=x"))
+                .await
+                .expect("settings");
+            drop(server);
+        });
+        let slot = AuthAckSlot::new(AuthAck::Unknown);
+        let session = Session::start(Box::new(client), "secret", padding(), slot.clone(), 1)
+            .await
+            .expect("session");
+        peer.await.expect("peer task");
+        wait_dead(&session).await;
+        assert_eq!(slot.get(), AuthAck::Ok);
     }
 }

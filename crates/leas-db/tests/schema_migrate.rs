@@ -19,6 +19,16 @@ fn first_i64(rows: &[Value]) -> Option<i64> {
     })
 }
 
+fn first_string(rows: &[Value]) -> Option<String> {
+    rows.first().and_then(|v| match v {
+        Value::Record(fields) => fields.first().and_then(|f| match f {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
 /// A FRESH file is created at the current version and gets the raw DDL (the
 /// `endpoint_rank` columns and indexes toasty cannot express).
 #[tokio::test]
@@ -690,4 +700,130 @@ async fn reopening_a_migrated_file_does_not_re_run_the_non_idempotent_step() {
         .expect("table_info");
         assert_eq!(first_i64(&rows), Some(0), "the discriminator stays dropped");
     }
+}
+
+/// Migration 21 (spec `2026-09-17-purge-reason`, amendment D8/D9): the CHECK
+/// cannot be widened in place, so the step rebuilds `profile_stats`. The
+/// fixture is a genuine v20 table — the current CREATE with the new value
+/// removed — because SQLite can only be given the old shape by writing it.
+#[tokio::test]
+async fn migration_21_widens_the_purge_reason_check_and_keeps_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v20-cred.db");
+
+    {
+        let db = Database::open(&path).await.expect("fresh open");
+        let mut conn = db.connection().await.expect("conn");
+        let rows = toasty::sql::query("SELECT sql FROM sqlite_master WHERE name = 'profile_stats'")
+            .exec(&mut conn)
+            .await
+            .expect("ddl");
+        let current = first_string(&rows).expect("profile_stats exists");
+        let v20 =
+            current
+                .replace(", 'credential_rejected'", "")
+                .replacen("profile_stats", "ps_v20", 1);
+        assert!(
+            v20.contains("'origin_unreachable')"),
+            "the fixture must carry the v20 CHECK"
+        );
+        let fixture: Vec<String> = vec![
+            v20,
+            "INSERT INTO ps_v20 SELECT * FROM profile_stats".to_owned(),
+            "DROP TABLE profile_stats".to_owned(),
+            "ALTER TABLE ps_v20 RENAME TO profile_stats".to_owned(),
+            "CREATE INDEX \"index_profile_stats_by_endpoint_id\" ON \"profile_stats\" (\"endpoint_id\")".to_owned(),
+            "CREATE INDEX \"index_profile_stats_by_last_seen_at\" ON \"profile_stats\" (\"last_seen_at\")".to_owned(),
+            // One purged link and one live link.
+            "INSERT INTO profile_stats (\"protocol_id\", \"endpoint_id\", \"last_seen_at\", \"stab_mask\", \"stab_len\", \"traffic_today_up\", \"traffic_today_down\", \"traffic_total_up\", \"traffic_total_down\", \"created_at\", \"updated_at\", \"version\", \"purge_reason\") VALUES (1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 'not_tls')".to_owned(),
+            "INSERT INTO profile_stats (\"protocol_id\", \"endpoint_id\", \"last_seen_at\", \"stab_mask\", \"stab_len\", \"traffic_today_up\", \"traffic_today_down\", \"traffic_total_up\", \"traffic_total_down\", \"created_at\", \"updated_at\", \"version\") VALUES (1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)".to_owned(),
+        ];
+        for sql in fixture {
+            toasty::sql::statement(sql)
+                .exec(&mut conn)
+                .await
+                .expect("v20 fixture");
+        }
+        toasty::sql::query("PRAGMA user_version = 20")
+            .exec(&mut conn)
+            .await
+            .expect("downgrade cursor");
+    }
+
+    let db = Database::open(&path).await.expect("migrating open");
+    let mut conn = db.connection().await.expect("conn");
+
+    let rows = toasty::sql::query("PRAGMA user_version")
+        .exec(&mut conn)
+        .await
+        .expect("version");
+    assert_eq!(first_i64(&rows), Some(SCHEMA_VERSION));
+
+    let rows = toasty::sql::query("SELECT COUNT(*) FROM profile_stats")
+        .exec(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(first_i64(&rows), Some(2), "the rebuild copies every row");
+    let rows = toasty::sql::query("SELECT purge_reason FROM profile_stats WHERE endpoint_id = 1")
+        .exec(&mut conn)
+        .await
+        .expect("reason");
+    assert_eq!(
+        first_string(&rows).as_deref(),
+        Some("not_tls"),
+        "an existing verdict survives the copy"
+    );
+
+    toasty::sql::statement(
+        "UPDATE profile_stats SET purge_reason = 'credential_rejected' WHERE endpoint_id = 2",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("the widened CHECK accepts the new reason");
+    let unknown = toasty::sql::statement(
+        "UPDATE profile_stats SET purge_reason = 'bogus' WHERE endpoint_id = 2",
+    )
+    .exec(&mut conn)
+    .await;
+    assert!(unknown.is_err(), "the CHECK still guards the vocabulary");
+
+    let rows = toasty::sql::query(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN \
+         ('index_profile_stats_by_endpoint_id', 'index_profile_stats_by_last_seen_at')",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("indexes");
+    assert_eq!(first_i64(&rows), Some(2), "both secondary indexes are back");
+
+    // The rebuilt table must have push_schema's columns — name, type,
+    // nullability and PK position — in its order. The stored SQL TEXT is not
+    // compared: a migration's `CREATE` is a historical spelling, and SQLite
+    // preserves it verbatim (quoting included), while the shape is what the
+    // typed layer reads.
+    let migrated = column_shape(&mut conn).await;
+    drop(conn);
+    drop(db);
+
+    let fresh = Database::open(dir.path().join("fresh-v21.db"))
+        .await
+        .expect("fresh v21");
+    let mut conn = fresh.connection().await.expect("conn");
+    let expected = column_shape(&mut conn).await;
+    assert_eq!(
+        migrated, expected,
+        "the rebuilt profile_stats must match the model's column shape"
+    );
+}
+
+/// `name:type:notnull:pk` per column, in table order.
+async fn column_shape(conn: &mut toasty::Connection) -> String {
+    let rows = toasty::sql::query(
+        "SELECT group_concat(shape, '|') FROM (SELECT name || ':' || type || ':' || \"notnull\" \
+         || ':' || pk AS shape FROM pragma_table_info('profile_stats') ORDER BY cid)",
+    )
+    .exec(conn)
+    .await
+    .expect("table_info");
+    first_string(&rows).expect("profile_stats has columns")
 }

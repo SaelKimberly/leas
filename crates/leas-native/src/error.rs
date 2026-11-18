@@ -37,6 +37,14 @@ pub enum NativeError {
     /// `detail` is the message the [`Self::Transport`] arm carries.
     #[error("transport error: {detail}")]
     TransportRejected { detail: String, status: u16 },
+    /// The peer's OWN authentication answer rejected this config's credentials.
+    ///
+    /// The only `NativeError` that proves a wrong secret: hysteria2's h3 auth
+    /// status (`AuthResponse` ≠ `233`). A close, a timeout or a framing error
+    /// stays untagged — those do not name the secret (spec 2026-09-17 §6,
+    /// amendment 2026-11-18 D8/D9).
+    #[error("authentication rejected: {detail}")]
+    AuthRejected { detail: String },
     #[error("protocol {kind} error: {detail}")]
     Protocol { kind: ProtocolKind, detail: String },
     /// The stream UNDER a later phase ended before it answered.
@@ -82,6 +90,14 @@ pub enum FailureEvidence {
     ConfigDefect,
     /// The peer's own answer to our handshake, when it is an HTTP status.
     HttpRejected(u16),
+    /// The peer's authentication answer rejected this config's secret.
+    ///
+    /// The one class that earns `[cred]` (spec 2026-09-17 §7, amendment
+    /// 2026-11-18 D8/D9). Produced two ways: [`NativeError::AuthRejected`]
+    /// (an explicit status), and the probe's mapping of `AuthAck::Failed`, which
+    /// only the families whose server reads the secret before any
+    /// target-dependent work may set.
+    CredentialsRejected,
 }
 
 impl NativeError {
@@ -101,6 +117,7 @@ impl NativeError {
             Self::CertExpired(_) => Some(FailureEvidence::CertExpired),
             Self::CleartextPeer(_) => Some(FailureEvidence::CleartextPeer),
             Self::TransportRejected { status, .. } => Some(FailureEvidence::HttpRejected(*status)),
+            Self::AuthRejected { .. } => Some(FailureEvidence::CredentialsRejected),
             Self::Dial(_)
             | Self::Tls(_)
             | Self::Transport(_)
@@ -151,6 +168,12 @@ mod tests {
                 },
                 Some(FailureEvidence::HttpRejected(403)),
             ),
+            (
+                NativeError::AuthRejected {
+                    detail: "authentication failed, status code: 404 Not Found".into(),
+                },
+                Some(FailureEvidence::CredentialsRejected),
+            ),
             (NativeError::Dial("refused".into()), None),
             (NativeError::Tls("alert 2 40".into()), None),
             (
@@ -197,6 +220,13 @@ mod tests {
             }
             .to_string(),
             "transport error: v2rayhttp: expected 200, got 404 Not Found"
+        );
+        assert_eq!(
+            NativeError::AuthRejected {
+                detail: "authentication failed, status code: 404 Not Found".into(),
+            }
+            .to_string(),
+            "authentication rejected: authentication failed, status code: 404 Not Found"
         );
     }
 }

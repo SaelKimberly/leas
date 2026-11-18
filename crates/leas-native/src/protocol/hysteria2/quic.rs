@@ -255,8 +255,7 @@ async fn runtime_auth(
 
     let status = resp.status();
     if status != http::StatusCode::from_u16(233).expect("233 is a valid status") {
-        return Err(NativeError::Protocol {
-            kind: leas_proto::proto_spec::ProtocolKind::Hysteria2,
+        return Err(NativeError::AuthRejected {
             detail: format!("authentication failed, status code: {status}"),
         });
     }

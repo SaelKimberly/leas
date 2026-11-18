@@ -436,3 +436,38 @@ variant, no CHECK change, no schema bump, no wipe** — every change is inside
 
 `reason_for` is no longer `const`: the check goes through a non-`const` predicate, and
 re-implementing it inline would duplicate the single decision point.
+
+## Amendment — 2026-11-18: the credential purge (`cred`)
+
+Source: the 2026-11-18 grilling, decisions A/A/A/A (strict evidence, one-meaning `Failed`,
+fingerprint veto kept, CHECK widened). **This amendment DOES bump the schema (20 → 21) and
+rebuilds `profile_stats`** — unlike the 2026-09-22 one, which stayed inside `reason_for`.
+
+- **D8 — `Failed` has one meaning.** `AuthAck::Failed` ≡ credential-grade evidence ≡ the purge
+  trigger. There is no display-only rejection state: a failure that is not credential evidence
+  leaves the ack `Unknown`. The VLESS peel's EOF / non-zero-version / truncated-addon arms stop
+  writing `Failed` (they no longer prove anything about the secret) and `PeelAck` is retired.
+- **D9 — the evidence set is ordering-based, because no pinned server emits an explicit
+  credential rejection.**
+  - AnyTLS: a close, or a fallback answer, **before the first session frame**; `cmdAlert` also
+    counts. The 32-byte auth is the first thing the server reads, so nothing target-dependent
+    precedes a close there (`anytls-go/cmd/server/inbound_tcp.go:40-44` — bad hash → `fallback`
+    → close, no alert).
+  - Hysteria2: the h3 auth status is not `233`. A bad hash is answered by the masquerade handler
+    (`hysteria/core/server/server.go:230-232`), so the verdict also fires for a non-hysteria
+    endpoint — accepted: the row is unusable either way.
+  - Rejected: VMess and SS2022 (their response header follows target-dependent work — xray
+    `vmess/inbound.go:273-317`, shadowsocks-rust `server/tcprelay.rs:263-343`), and VLESS (xray
+    writes the header before dispatch, but sing-box writes it lazily on the first uplink —
+    `sing-vmess/vless/service.go:114-139` — so the same EOF is also a target failure; the probe
+    cannot know which server it faced).
+- **D10 — `Ok` is terminal.** Once observed, a later session close/alert never downgrades it.
+- **D11 — D7's approximation rule still applies.** An approximated `security_fp` earns no verdict,
+  credential evidence included: an untried TLS shape is a live alternative explanation for a
+  server-side refusal.
+- **Storage.** New `PurgeReason::CredentialRejected` (`credential_rejected`, label `cred`). The
+  column's CHECK stays enforced, so the v21 step rebuilds `profile_stats` (copy rows, drop old,
+  rename, recreate the two secondary indexes, widen the CHECK to 8 values). Export/import gains
+  the string; an older build rejects it. `docs/reference/database.md` cursor 20 → 21.
+- **Out of scope.** The Hysteria2 stage-2 probe path (`protocol::connect` → `not_impl` after the
+  QUIC dial), pooled/mux carriers, and speed-test failures.

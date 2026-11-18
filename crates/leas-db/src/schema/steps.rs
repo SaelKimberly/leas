@@ -65,6 +65,10 @@ pub const STEPS: &[Step] = &[
         version: 20,
         kind: StepKind::Sql(crate::schema::ddl::V20_ROUTING_RULESET),
     },
+    Step {
+        version: 21,
+        kind: StepKind::Sql(crate::schema::ddl::V21_CREDENTIAL_PURGE),
+    },
 ];
 
 /// The steps a cursor at `cursor` must apply, in order.
@@ -118,19 +122,35 @@ mod tests {
 
     #[test]
     fn a_cursor_below_the_first_step_gets_it() {
-        let steps = steps_after(18).expect("the v19 and v20 steps");
-        assert_eq!(steps.len(), 2);
+        let steps = steps_after(18).expect("the v19, v20 and v21 steps");
+        assert_eq!(steps.len(), 3);
         assert_eq!(steps[0].version, 19);
         assert_eq!(steps[1].version, 20);
+        assert_eq!(steps[2].version, 21);
     }
 
-    /// The migration this change depends on: a v19 database gets exactly the
-    /// ruleset column, and nothing else.
+    /// The migration this change depends on: a v20 database gets exactly the
+    /// credential-purge rebuild, and nothing else.
     #[test]
-    fn a_v19_cursor_gets_only_the_ruleset_step() {
-        let steps = steps_after(19).expect("the v20 step");
+    fn a_v20_cursor_gets_only_the_credential_purge_step() {
+        let steps = steps_after(20).expect("the v21 step");
         assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].version, 21);
+        assert!(matches!(
+            steps[0].kind,
+            StepKind::Sql(statements)
+                if statements.iter().any(|s| s.contains("credential_rejected"))
+                    && statements.iter().any(|s| s.contains("INSERT INTO profile_stats_v21"))
+        ));
+    }
+
+    /// A v19 database gets the ruleset ALTER first, then the purge rebuild.
+    #[test]
+    fn a_v19_cursor_gets_the_ruleset_and_purge_steps() {
+        let steps = steps_after(19).expect("the v20 and v21 steps");
+        assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].version, 20);
+        assert_eq!(steps[1].version, 21);
         assert!(matches!(
             steps[0].kind,
             StepKind::Sql(statements) if statements.iter().any(|s| s.contains("ruleset"))
@@ -147,8 +167,9 @@ mod tests {
 
     #[test]
     fn the_version_after_a_step_is_that_step() {
-        assert_eq!(version_after(18), 20);
-        assert_eq!(version_after(19), 20);
-        assert_eq!(version_after(20), 20);
+        assert_eq!(version_after(18), 21);
+        assert_eq!(version_after(19), 21);
+        assert_eq!(version_after(20), 21);
+        assert_eq!(version_after(21), 21);
     }
 }

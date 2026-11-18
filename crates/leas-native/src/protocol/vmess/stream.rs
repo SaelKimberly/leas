@@ -34,6 +34,7 @@ use crate::BoxStream;
 use crate::protocol::vmess::header::{SECURITY_AES128_GCM, SECURITY_CHACHA20_POLY1305, Session};
 use crate::protocol::vmess::keys;
 use crate::protocol::vmess::pad::{PADDING_MAX, ShakeSizeParser};
+use crate::protocol::{AuthAck, AuthAckSlot};
 use crate::rand;
 
 /// Peel salt paths (Go `aead.KDFSaltConstAEADRespHeader*`), as byte slices for
@@ -162,19 +163,22 @@ struct VmessRead {
     /// Legacy peel: four plaintext bytes (`echo`, `option`, `0`, `0`) instead
     /// of the AEAD response header.
     legacy_peel: bool,
+    /// The ack slot: the peeled response header IS the acceptance, and it is
+    /// reported at read time because the header arrives lazily (spec D3).
+    ack_slot: AuthAckSlot,
 }
 
 impl VmessRead {
-    fn new(session: Session) -> Self {
-        Self::with_mode(session, true, false)
+    fn new(session: Session, ack_slot: AuthAckSlot) -> Self {
+        Self::with_mode(session, true, false, ack_slot)
     }
 
     /// Legacy (`alterId > 0`) wire: plain size field, four-byte response peel.
-    fn new_legacy(session: Session) -> Self {
-        Self::with_mode(session, false, true)
+    fn new_legacy(session: Session, ack_slot: AuthAckSlot) -> Self {
+        Self::with_mode(session, false, true, ack_slot)
     }
 
-    fn with_mode(session: Session, masked: bool, legacy_peel: bool) -> Self {
+    fn with_mode(session: Session, masked: bool, legacy_peel: bool, ack_slot: AuthAckSlot) -> Self {
         let mut resp_nonce = [0u8; 12];
         resp_nonce.copy_from_slice(&session.response_body_iv[..12]);
         let resp_cipher = Cipher::new(session.security, &session.response_body_key);
@@ -193,6 +197,7 @@ impl VmessRead {
             resp_size,
             masked,
             legacy_peel,
+            ack_slot,
         }
     }
 
@@ -268,6 +273,9 @@ impl VmessRead {
                                 "vmess legacy response header has a non-zero reserved byte",
                             )));
                         }
+                        // The header is complete and echoes our request: the
+                        // server accepted this config.
+                        self.ack_slot.set(AuthAck::Ok);
                         self.read_state = ReadState::RecordLen { filled: 0 };
                         continue;
                     }
@@ -357,6 +365,9 @@ impl VmessRead {
                             "vmess response header echo mismatch",
                         )));
                     }
+                    // The header decrypted and echoes our request byte: the
+                    // server accepted this config.
+                    self.ack_slot.set(AuthAck::Ok);
                     self.read_state = ReadState::RecordLen { filled: 0 };
                 }
                 ReadState::RecordLen { filled } => {
@@ -731,12 +742,22 @@ pub struct VmessClientStream<S = BoxStream> {
 impl<S> VmessClientStream<S> {
     /// Wrap `inner` with a `VMess` session: peels the response header on the
     /// first read, then codes AEAD records.
+    ///
+    /// The ack slot defaults to `NotApplicable`; the live path uses
+    /// [`Self::with_ack_slot`] so the probe sees the acceptance.
     #[must_use]
     pub fn new(inner: S, session: Session) -> Self {
+        Self::with_ack_slot(inner, session, AuthAckSlot::default())
+    }
+
+    /// [`Self::new`] reporting the peeled response header into `ack_slot`
+    /// (the probe's channel, spec D3).
+    #[must_use]
+    pub fn with_ack_slot(inner: S, session: Session, ack_slot: AuthAckSlot) -> Self {
         // The write direction only needs the request key material; the
         // response-header peel needs the session itself, so it takes it.
         let write = VmessWrite::new(&session);
-        let read = VmessRead::new(session);
+        let read = VmessRead::new(session, ack_slot);
         Self { inner, read, write }
     }
 
@@ -746,8 +767,14 @@ impl<S> VmessClientStream<S> {
     /// is encrypted as a whole on that wire.
     #[must_use]
     pub fn new_legacy(inner: S, session: Session) -> Self {
+        Self::with_ack_slot_legacy(inner, session, AuthAckSlot::default())
+    }
+
+    /// [`Self::new_legacy`] reporting the four-byte peel into `ack_slot`.
+    #[must_use]
+    pub fn with_ack_slot_legacy(inner: S, session: Session, ack_slot: AuthAckSlot) -> Self {
         let write = VmessWrite::with_mode(&session, false);
-        let read = VmessRead::new_legacy(session);
+        let read = VmessRead::new_legacy(session, ack_slot);
         Self { inner, read, write }
     }
 
@@ -1032,10 +1059,17 @@ mod tests {
             server_side.write_all(&wire).await.unwrap();
             drop(server_side); // EOF after the data — read_to_end can finish
 
-            let mut tunnel = VmessClientStream::new(Box::new(client_side), session);
+            let slot = crate::protocol::AuthAckSlot::new(crate::protocol::AuthAck::Unknown);
+            let mut tunnel =
+                VmessClientStream::with_ack_slot(Box::new(client_side), session, slot.clone());
             let mut got = Vec::new();
             tunnel.read_to_end(&mut got).await.unwrap();
             assert_eq!(got.as_slice(), payload);
+            assert_eq!(
+                slot.get(),
+                crate::protocol::AuthAck::Ok,
+                "the peeled response header IS the acceptance"
+            );
         });
     }
 
@@ -1103,7 +1137,9 @@ mod tests {
             server_side.write_all(&wire).await.unwrap();
             drop(server_side);
 
-            let mut tunnel = VmessClientStream::new(Box::new(client_side), session);
+            let slot = crate::protocol::AuthAckSlot::new(crate::protocol::AuthAck::Unknown);
+            let mut tunnel =
+                VmessClientStream::with_ack_slot(Box::new(client_side), session, slot.clone());
             let mut got = Vec::new();
             let res = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -1113,6 +1149,11 @@ mod tests {
             assert!(
                 res.is_err() || res.unwrap().is_err(),
                 "must fail, got {got:?}"
+            );
+            assert_eq!(
+                slot.get(),
+                crate::protocol::AuthAck::Unknown,
+                "a wrong echo is not credential evidence"
             );
         });
     }

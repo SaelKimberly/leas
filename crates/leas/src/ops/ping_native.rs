@@ -149,7 +149,9 @@ impl ProbeFailure {
             // phase, so the class is the protocol exchange that never completed
             // — not `Tls`, which is what the engine's `TlsError::Io` wrap used
             // to produce.
-            NativeError::Protocol { .. } | NativeError::TunnelClosed { .. } => ProbeClass::Protocol,
+            NativeError::Protocol { .. }
+            | NativeError::TunnelClosed { .. }
+            | NativeError::AuthRejected { .. } => ProbeClass::Protocol,
             NativeError::Io(_) => ProbeClass::Io,
             NativeError::Timeout { .. } => ProbeClass::Timeout,
         };
@@ -216,6 +218,18 @@ fn is_transport_failure(err: &NativeError) -> bool {
         ),
         _ => false,
     }
+}
+
+/// The ack→verdict bridge (spec amendment D8): a `Failed` ack on a FAILED
+/// attempt is credential-grade evidence. It lives here, not in the engine,
+/// because `AnyTLS` observes it inside its read task after the error was made —
+/// the ack slot is the only channel that carries it out.
+///
+/// `Ok`/`Unknown`/`NotApplicable` prove nothing: a lazy response header, a
+/// timeout and a family with no ack all look like those, and none names the
+/// secret.
+fn credential_evidence(ack: leas_native::protocol::AuthAck) -> Option<FailureEvidence> {
+    (ack == leas_native::protocol::AuthAck::Failed).then_some(FailureEvidence::CredentialsRejected)
 }
 
 /// Parameters for one native real ping.
@@ -488,6 +502,9 @@ async fn probe_attempts(
                     let mut failure = ProbeFailure::from_engine(e.error());
                     failure.transport_ms = e.transport_span.map(|s| s.as_millis() as u64);
                     failure.auth_ack = e.auth_ack;
+                    // The ack overrides only when it IS credential evidence;
+                    // otherwise the engine's typed evidence stands.
+                    failure.evidence = credential_evidence(e.auth_ack).or(failure.evidence);
                     failure
                 })
         });
@@ -729,8 +746,8 @@ async fn fetch_ip_info_once(
 #[cfg(test)]
 mod tests {
     use super::{
-        IP_INFO_ATTEMPTS, IpInfoOutcome, IpInfoStep, ProbeClass, ProbeFailure, next_step,
-        parse_probe_url, refusal_reason,
+        IP_INFO_ATTEMPTS, IpInfoOutcome, IpInfoStep, ProbeClass, ProbeFailure, credential_evidence,
+        next_step, parse_probe_url, refusal_reason,
     };
     use rstest::rstest;
 
@@ -809,6 +826,41 @@ mod tests {
         assert!(
             !tls.transport_failed,
             "a TLS failure is a CONFIG failure — the transport was up"
+        );
+    }
+
+    /// A credential rejection is the PROXY's answer: a protocol-stage failure
+    /// carrying the one evidence class that purges, and NOT a transport failure
+    /// (which would write the `[fast]` "server unreachable" marker over a live
+    /// server).
+    #[test]
+    fn a_credential_rejection_is_a_protocol_answer_with_credential_evidence() {
+        use leas_native::error::{FailureEvidence, NativeError};
+        let failure = ProbeFailure::from_engine(&NativeError::AuthRejected {
+            detail: "authentication failed, status code: 404 Not Found".into(),
+        });
+        assert_eq!(failure.class, ProbeClass::Protocol);
+        assert_eq!(failure.evidence, Some(FailureEvidence::CredentialsRejected));
+        assert!(
+            !failure.transport_failed,
+            "the server answered; the transport was up"
+        );
+    }
+
+    /// The ack→verdict bridge (D8): only `Failed` becomes credential
+    /// evidence. `Ok` is an acceptance, `Unknown` is a possible-but-unobserved
+    /// ack (a lazy sing-box header, a timeout) and `n-a` is a family with no
+    /// ack — none of them names the secret.
+    #[test]
+    fn only_a_failed_ack_is_credential_evidence() {
+        use leas_native::error::FailureEvidence;
+        use leas_native::protocol::AuthAck;
+        for ack in [AuthAck::Ok, AuthAck::Unknown, AuthAck::NotApplicable] {
+            assert_eq!(credential_evidence(ack), None, "{ack:?} proves nothing");
+        }
+        assert_eq!(
+            credential_evidence(AuthAck::Failed),
+            Some(FailureEvidence::CredentialsRejected)
         );
     }
 

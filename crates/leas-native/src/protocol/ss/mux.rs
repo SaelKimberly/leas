@@ -95,7 +95,16 @@ impl SsMux {
         match self.method.family() {
             SsFamily::Classic => stream::connect_to(target, stream, &self.cfg, self.method).await,
             SsFamily::Blake3_2022 => {
-                stream2022::connect_to(target, stream, &self.cfg, self.method).await
+                // The plugin-mux carrier has no AUTH consumer: a per-session
+                // codec's header is this session's, not the row's verdict.
+                stream2022::connect_to(
+                    target,
+                    stream,
+                    &self.cfg,
+                    self.method,
+                    crate::protocol::AuthAckSlot::default(),
+                )
+                .await
             }
             SsFamily::Stream => {
                 crate::protocol::ss::stream_legacy::connect_to(

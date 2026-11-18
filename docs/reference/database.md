@@ -41,7 +41,7 @@ for the tables, and `schema/ddl.rs` owns everything toasty cannot express.
 | --- | --- |
 | Modelled tables | 11 |
 | Raw tables | 2 (`rank_weight_meta`, `__toasty_migrations`) |
-| Schema cursor | `PRAGMA user_version`; current value 20 (`SCHEMA_VERSION` 20, `schema::LATEST` = `SCHEMA_VERSION`) |
+| Schema cursor | `PRAGMA user_version`; current value 21 (`SCHEMA_VERSION` 21, `schema::LATEST` = `SCHEMA_VERSION`) |
 | References | none: toasty emits no SQL `REFERENCES`, so the arrows in the entity map are ownership, not constraints |
 
 ## Table inventory
@@ -118,7 +118,7 @@ erDiagram
         BOOLEAN error "failure marker flag"
         TEXT error_kind "real|fast|name"
         TEXT error_text
-        TEXT purge_reason "reality_fallback|certificate_mismatch|..., NULL = live (ADR 0006)"
+        TEXT purge_reason "reality_fallback|certificate_mismatch|...|credential_rejected, NULL = live (ADR 0006; schema 21 adds the last)"
         BIGINT stab_mask "stability ring: last 16 outcomes, bit i = i-th OLDEST, 1 = success"
         BIGINT stab_len "live samples in the ring, 0..=16"
         BIGINT traffic_today_up
@@ -249,6 +249,12 @@ a test measures, everything traffic counts, and the one durable verdict
 swept by `error_ttl_hours`, `purge_reason` moves only when a real probe earns one
 or a data-carrying success clears one, and it is written by its own column group
 so no other writer can rewrite it from a stale snapshot.
+
+`credential_rejected` (schema 21) is the one reason derived from the AUTH
+column's `Failed`: the peer's own authentication answer rejected the secret
+(AnyTLS closed/alerted before any session frame, hysteria2's status was not
+`233`). A silent close is never `Failed` — sing-box writes the VLESS response
+header lazily, so the same EOF is also a target failure.
 
 The `latency` embed is a struct with two independent delays and no
 discriminator (schema 19). Before that it was an enum with a shared

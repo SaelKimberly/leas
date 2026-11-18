@@ -43,6 +43,10 @@ pub fn reason_for(evidence: FailureEvidence, fp: Option<&str>) -> Option<PurgeRe
         FailureEvidence::CleartextPeer => Some(PurgeReason::NotTls),
         // The stored config cannot dial as written: no retry will change that.
         FailureEvidence::ConfigDefect => Some(PurgeReason::ConfigInvalid),
+        // The peer's own authentication answer rejected the secret (spec
+        // 2026-09-17, amendment 2026-11-18 D8): the only class that earns
+        // `cred`. The approximation veto above still applies (D11).
+        FailureEvidence::CredentialsRejected => Some(PurgeReason::CredentialRejected),
         FailureEvidence::HttpRejected(status) => match status {
             // The CDN could not reach the origin: the config's backend is gone.
             521 | 522 | 526 | 530 => Some(PurgeReason::OriginUnreachable),
@@ -84,6 +88,10 @@ mod tests {
                 FailureEvidence::ConfigDefect,
                 Some(PurgeReason::ConfigInvalid),
             ),
+            (
+                FailureEvidence::CredentialsRejected,
+                Some(PurgeReason::CredentialRejected),
+            ),
         ];
         for (evidence, expected) in cases {
             assert_eq!(reason_for(evidence, HONOURED), expected, "for {evidence:?}");
@@ -104,6 +112,7 @@ mod tests {
                 FailureEvidence::CertExpired,
                 FailureEvidence::CleartextPeer,
                 FailureEvidence::ConfigDefect,
+                FailureEvidence::CredentialsRejected,
                 FailureEvidence::HttpRejected(404),
                 FailureEvidence::HttpRejected(521),
             ] {

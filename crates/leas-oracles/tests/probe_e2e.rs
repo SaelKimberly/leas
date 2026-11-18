@@ -16,6 +16,11 @@ use std::time::Duration;
 use leas_native::addr::TargetAddr;
 use leas_native::context::NativeConnectParams;
 use leas_native::probe::{self, ProbeMethod, ProbeRequest};
+use leas_oracles::e2e::config;
+use leas_oracles::e2e::{
+    CaseSpec, Certs, CoreKind, CoreUnderTest, E2eCase, SINGBOX_VERSION, ServerEnv, generate_certs,
+    spawn_core,
+};
 use leas_proto::proto_spec::common::TransportConfig;
 use leas_proto::proto_spec::endpoint::EndpointEssentials;
 use leas_proto::proto_spec::{HostKind, ProtocolConfig, SecurityConfig, VlessConfig};
@@ -179,4 +184,192 @@ async fn probe_through_real_xray_vless_server() {
     let _ = std::fs::remove_file(config_path);
     let _ = std::fs::remove_file(log_path);
     target.abort();
+}
+
+/// The pinned sing-box, when present (the ignored rows below only run with it).
+fn singbox_binary() -> Option<CoreUnderTest> {
+    match CoreUnderTest::resolve(CoreKind::SingBox, SINGBOX_VERSION) {
+        Ok(core) => Some(core),
+        Err(e) => {
+            eprintln!("SKIP: {e}");
+            None
+        }
+    }
+}
+
+/// The cert/key files a sing-box TLS inbound references, plus the env its
+/// config builder takes. The echo addresses are irrelevant to a probe row (the
+/// probe carries its own HTTP request), so both point at the target.
+fn stage_singbox_server<'a>(
+    dir: &'a std::path::Path,
+    certs: &'a Certs,
+    port: u16,
+    target: std::net::SocketAddr,
+) -> ServerEnv<'a> {
+    std::fs::write(dir.join("server.crt"), &certs.cert_pem).expect("cert");
+    std::fs::write(dir.join("server.key"), &certs.key_pem).expect("key");
+    ServerEnv {
+        port,
+        certs,
+        tmp: dir,
+        echo: target,
+        tls_echo: target,
+        inner_tls_echo: None,
+        udp_echo: None,
+    }
+}
+
+/// One plain HTTP request through the tunnel to the local target.
+fn probe_request(target_port: u16) -> ProbeRequest<'static> {
+    ProbeRequest {
+        host: "127.0.0.1",
+        port: target_port,
+        https: false,
+        method: ProbeMethod::Get,
+        path: "/",
+        timeout: Duration::from_secs(5),
+        transport_timeout: Duration::from_secs(5),
+    }
+}
+
+/// AnyTLS (spec amendment D8/D9, sing-box): the credential verdict is
+/// observed on the wire, and a target failure does NOT look like one.
+///
+/// - right password → `cmdServerSettings` → `Ok`;
+/// - wrong password → the server closes before any session frame → `Failed`
+///   (the one shape a rejected secret produces: auth is the first 32 bytes);
+/// - right password + a refusing target → `cmdServerSettings` still arrived,
+///   so the secret is ACCEPTED (`Ok`); the failure is the target's and no
+///   `[cred]` verdict can come from it.
+#[tokio::test]
+#[ignore = "needs the pinned sing-box (build.rs fetch or LEAS_CORE_BIN_DIR)"]
+async fn anytls_probe_reports_the_credential_verdict() {
+    let Some(bin) = singbox_binary() else {
+        panic!("no sing-box binary found");
+    };
+    let certs = generate_certs();
+    let case = CaseSpec::anytls();
+    case.client_trust(&certs);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (target_port, _target) = spawn_http_target();
+    let target = std::net::SocketAddr::from(([127, 0, 0, 1], target_port));
+    let port = free_port();
+    let env = stage_singbox_server(dir.path(), &certs, port, target);
+    let config_path = dir.path().join("anytls.json");
+    std::fs::write(
+        &config_path,
+        config::anytls_inbound(CoreKind::SingBox, &env),
+    )
+    .expect("anytls config");
+    let _core = spawn_core(&bin.bin, CoreKind::SingBox, &config_path, port, false);
+
+    let params = config::client_params_anytls(port, target);
+    let ok = probe::fetch(params, &probe_request(target_port))
+        .await
+        .expect("probe through a correct anytls password");
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.auth_ack, leas_native::protocol::AuthAck::Ok);
+
+    let mut params = config::client_params_anytls(port, target);
+    if let ProtocolConfig::AnyTls(cfg) = &mut params.protocol {
+        cfg.password = Some("definitely-not-the-password".into());
+    }
+    let err = probe::fetch(params, &probe_request(target_port))
+        .await
+        .expect_err("a wrong password must fail");
+    assert_eq!(
+        err.auth_ack,
+        leas_native::protocol::AuthAck::Failed,
+        "a close before any session frame is the credential verdict"
+    );
+
+    let refused = free_port();
+    let params = config::client_params_anytls(port, target);
+    let err = probe::fetch(params, &probe_request(refused))
+        .await
+        .expect_err("a refusing target must fail");
+    assert_eq!(
+        err.auth_ack,
+        leas_native::protocol::AuthAck::Ok,
+        "the server had already accepted the secret; the target failed afterwards"
+    );
+}
+
+/// Hysteria2 (D9, sing-box): the h3 auth answer is a TYPED rejection —
+/// the one family whose refusal is a value, not a close.
+#[tokio::test]
+#[ignore = "needs the pinned sing-box (build.rs fetch or LEAS_CORE_BIN_DIR)"]
+async fn hysteria2_probe_auth_failure_carries_credential_evidence() {
+    let Some(bin) = singbox_binary() else {
+        panic!("no sing-box binary found");
+    };
+    let certs = generate_certs();
+    CaseSpec::hysteria2(None).client_trust(&certs);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (target_port, _target) = spawn_http_target();
+    let target = std::net::SocketAddr::from(([127, 0, 0, 1], target_port));
+    let port = free_port();
+    let env = stage_singbox_server(dir.path(), &certs, port, target);
+    let config_path = dir.path().join("hysteria2.json");
+    std::fs::write(&config_path, config::hysteria2_inbound(&env, None)).expect("hysteria2 config");
+    let _core = spawn_core(&bin.bin, CoreKind::SingBox, &config_path, port, true);
+
+    let mut params = config::client_params_hysteria2(port, target, None);
+    if let ProtocolConfig::Hysteria2(cfg) = &mut params.protocol {
+        cfg.auth = "definitely-not-the-password".into();
+    }
+    let err = probe::fetch(params, &probe_request(target_port))
+        .await
+        .expect_err("a wrong hysteria2 auth must fail");
+    assert_eq!(
+        err.error.evidence(),
+        Some(leas_native::error::FailureEvidence::CredentialsRejected),
+        "the h3 status is the peer's own answer"
+    );
+}
+
+/// VLESS on sing-box (D8): the response header is written lazily on the first
+/// uplink, so a close before it is ALSO a target failure. It must never be
+/// `Failed` — a wrong UUID on a working target stays `Unknown`.
+#[tokio::test]
+#[ignore = "needs the pinned sing-box (build.rs fetch or LEAS_CORE_BIN_DIR)"]
+async fn vless_singbox_silent_close_is_not_credential_evidence() {
+    let Some(bin) = singbox_binary() else {
+        panic!("no sing-box binary found");
+    };
+    let certs = generate_certs();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (target_port, _target) = spawn_http_target();
+    let target = std::net::SocketAddr::from(([127, 0, 0, 1], target_port));
+    let port = free_port();
+    let case = CaseSpec::vless();
+    case.client_trust(&certs);
+    let env = stage_singbox_server(dir.path(), &certs, port, target);
+    let config_path = dir.path().join("vless.json");
+    std::fs::write(&config_path, case.server_config(CoreKind::SingBox, &env))
+        .expect("vless config");
+    let _core = spawn_core(&bin.bin, CoreKind::SingBox, &config_path, port, false);
+
+    let params = case.client_params(port, target);
+    let ok = probe::fetch(params, &probe_request(target_port))
+        .await
+        .expect("probe through a correct VLESS UUID");
+    assert_eq!(
+        ok.auth_ack,
+        leas_native::protocol::AuthAck::Ok,
+        "the peeled response header is the acceptance"
+    );
+
+    let mut params = case.client_params(port, target);
+    if let ProtocolConfig::Vless(cfg) = &mut params.protocol {
+        cfg.uuid = "1c1c1c1c-1c1c-1c1c-1c1c-1c1c1c1c1c1c".into();
+    }
+    let err = probe::fetch(params, &probe_request(target_port))
+        .await
+        .expect_err("a wrong UUID must fail");
+    assert_eq!(
+        err.auth_ack,
+        leas_native::protocol::AuthAck::Unknown,
+        "a lazy header close is ambiguous: no credential verdict"
+    );
 }
