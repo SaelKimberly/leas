@@ -11,11 +11,11 @@
 
 mod common;
 
-use common::{Cores, certs, cores, echo, fp, pick, tls_echo};
+use common::{Cores, certs, cores, echo, fp, pick, tls_echo, trojan_go_core};
 use leas_native::PacketMode;
 use leas_oracles::e2e::AppKind;
 use leas_oracles::e2e::{
-    CaseSpec, Certs, CoreKind, E2eCase, EchoServer, TlsEchoServer, run_against,
+    CaseSpec, Certs, CoreKind, CoreUnderTest, E2eCase, EchoServer, TlsEchoServer, run_against,
 };
 use rstest::rstest;
 
@@ -49,6 +49,36 @@ async fn trojan_against_cores(
 ) {
     let label = case.label();
     run_against(&case, pick(cores, core), certs, &echo, &tls_echo)
+        .await
+        .unwrap_or_else(|e| panic!("{label}: e2e failed: {e}"));
+}
+
+// ── Trojan-Go's extra shadowsocks layer (the only reference for it) ────────
+
+fn trojan_go(method: &'static str, net: &'static str) -> CaseSpec {
+    CaseSpec::trojan()
+        .with_network(net)
+        .with_trojan_encryption(method, "inner-ss-password")
+}
+
+/// All three ciphers Trojan-Go's link parser accepts, across both transports
+/// its stack composes with the layer (`transport → tls → websocket → ss →
+/// trojan`). Red here means our bare-AEAD framing (salt, chunk seals, nonce
+/// order, no SS address header) disagrees with the reference.
+#[rstest]
+#[case::ss_aes128_gcm_tcp(trojan_go("aes-128-gcm", "tcp"))]
+#[case::ss_aes256_gcm_ws(trojan_go("aes-256-gcm", "ws"))]
+#[case::ss_chacha20_ietf_poly1305_tcp(trojan_go("chacha20-ietf-poly1305", "tcp"))]
+#[tokio::test]
+async fn trojan_go_against_reference(
+    #[case] case: CaseSpec,
+    trojan_go_core: &CoreUnderTest,
+    certs: &Certs,
+    echo: EchoServer,
+    tls_echo: TlsEchoServer,
+) {
+    let label = case.label();
+    run_against(&case, trojan_go_core, certs, &echo, &tls_echo)
         .await
         .unwrap_or_else(|e| panic!("{label}: e2e failed: {e}"));
 }

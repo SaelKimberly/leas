@@ -85,6 +85,7 @@ impl ShadowTlsConfig {
         }
 
         let query = utils::parse_query(raw.query);
+        utils::reject_foreign_encryption(&query)?;
         let remarks = utils::decode_fragment(raw)?;
 
         let password = utils::query_get(&query, "password").map(str::to_string);

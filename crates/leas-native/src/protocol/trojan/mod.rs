@@ -20,7 +20,7 @@ use sha2::{Digest, Sha224};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
-use leas_proto::proto_spec::TrojanConfig;
+use leas_proto::proto_spec::{TrojanConfig, TrojanEncryption};
 
 use crate::BoxStream;
 use crate::addr::{
@@ -30,6 +30,25 @@ use crate::addr::{
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
 use crate::protocol::first_flight::HeaderFirst;
+use crate::protocol::ss::method::SsMethod;
+use crate::protocol::ss::stream::wrap_bare;
+
+/// Apply Trojan-Go's extra shadowsocks layer when the row carries one.
+///
+/// The layer is a bare AEAD stream over the already-secured/transported
+/// carrier; the Trojan header is written through it.
+fn wrap_encryption(stream: BoxStream, cfg: &TrojanConfig) -> Result<BoxStream, NativeError> {
+    let Some(TrojanEncryption::Ss { method, password }) = &cfg.encryption else {
+        return Ok(stream);
+    };
+    let Some(ss_method) = SsMethod::from_method(method.as_str()) else {
+        return Err(NativeError::Config(format!(
+            "trojan-go encryption method `{}` is not implemented",
+            method.as_str()
+        )));
+    };
+    wrap_bare(stream, ss_method, password)
+}
 
 /// TCP command byte (`protocol.go` `commandTCP`).
 const COMMAND_TCP: u8 = 1;
@@ -91,6 +110,7 @@ pub async fn connect(
     stream: BoxStream,
     cfg: &TrojanConfig,
 ) -> Result<BoxStream, NativeError> {
+    let stream = wrap_encryption(stream, cfg)?;
     let request = encode_request(&auth_key(&cfg.password), &ctx.target)?;
     // The header leaves with the first payload instead of as its own small
     // record; see `first_flight`.
@@ -540,7 +560,7 @@ pub async fn connect_udp(
 ) -> Result<PacketConn<BoxStream>, NativeError> {
     let request = encode_udp_request(&auth_key(&cfg.password), &ctx.target)?;
     let timeout = timeouts::PROTOCOL;
-    let mut stream = stream;
+    let mut stream = wrap_encryption(stream, cfg)?;
     tokio::time::timeout(timeout, stream.write_all(&request))
         .await
         .map_err(|_| NativeError::Timeout {
@@ -703,6 +723,95 @@ mod tests {
         let big = vec![0u8; MAX_UDP_PAYLOAD + 1];
         let err = conn.send(None, &big).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    fn layered_ctx_and_cfg() -> (
+        crate::context::LinkContext,
+        leas_proto::proto_spec::TrojanConfig,
+    ) {
+        let cfg: leas_proto::proto_spec::TrojanConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Trojan",
+            "password": "pw",
+            "transport": { "type": "tcp" },
+            "encryption": { "ss": { "method": "aes-128-gcm", "password": "inner" } }
+        }))
+        .expect("trojan config parses");
+        let target = TargetAddr::new(Host::Domain("example.com".into()), 443);
+        let params = crate::context::NativeConnectParams::new(
+            leas_proto::proto_spec::ProtocolConfig::Trojan(cfg.clone()),
+            leas_proto::proto_spec::endpoint::EndpointEssentials::new("1.2.3.4", 443),
+            target.clone(),
+        );
+        (crate::context::LinkContext::new(params, target), cfg)
+    }
+
+    /// Decrypt the first shadowsocks chunk of a client write: `salt ‖ length
+    /// seal ‖ body seal`. The caller asserts on the plaintext, so an address
+    /// header (which Trojan-Go does not send) would show up as leading bytes.
+    fn open_first_chunk(wire: &[u8], method: &str, password: &str) -> Vec<u8> {
+        use crate::protocol::ss::method::{SsMethod, password_key, stream_subkey};
+        let method = SsMethod::from_method(method).expect("method");
+        let master = password_key(method, password).expect("key");
+        let aead = method.cipher.aead().expect("aead");
+        let salt_len = aead.salt_len();
+        let subkey = stream_subkey(method, &master, &wire[..salt_len]);
+        let mut nonce = [0u8; 12];
+        let len = aead
+            .open(&subkey, &nonce, b"", &wire[salt_len..salt_len + 2 + 16])
+            .expect("length seal");
+        let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
+        nonce[0] = 1;
+        aead.open(
+            &subkey,
+            &nonce,
+            b"",
+            &wire[salt_len + 18..salt_len + 18 + len + 16],
+        )
+        .expect("body seal")
+    }
+
+    #[tokio::test]
+    async fn encryption_layer_is_a_bare_aead_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (ctx, cfg) = layered_ctx_and_cfg();
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut conn = connect(&ctx, Box::new(client), &cfg)
+            .await
+            .expect("connect");
+        conn.write_all(b"GET / HTTP/1.1\r\n\r\n")
+            .await
+            .expect("write");
+        conn.flush().await.expect("flush");
+        let mut wire = vec![0u8; 4096];
+        let n = server.read(&mut wire).await.expect("read");
+        let plain = open_first_chunk(&wire[..n], "aes-128-gcm", "inner");
+
+        let hash = auth_key("pw");
+        assert_eq!(
+            &plain[..hash.len()],
+            hash.as_slice(),
+            "the first plaintext bytes ARE the trojan hash — no SS address header"
+        );
+        assert_eq!(&plain[hash.len()..hash.len() + 2], &CRLF);
+        assert_eq!(plain[hash.len() + 2], COMMAND_TCP);
+    }
+
+    #[tokio::test]
+    async fn encryption_layer_wraps_the_udp_header() {
+        use tokio::io::AsyncReadExt;
+        let (ctx, cfg) = layered_ctx_and_cfg();
+        let (client, mut server) = tokio::io::duplex(4096);
+        let conn = connect_udp(&ctx, Box::new(client), &cfg)
+            .await
+            .expect("udp connect");
+        drop(conn);
+        let mut wire = vec![0u8; 4096];
+        let n = server.read(&mut wire).await.expect("read");
+        let plain = open_first_chunk(&wire[..n], "aes-128-gcm", "inner");
+
+        let hash = auth_key("pw");
+        assert_eq!(&plain[..hash.len()], hash.as_slice());
+        assert_eq!(plain[hash.len() + 2], COMMAND_UDP);
     }
 
     #[tokio::test]

@@ -37,6 +37,9 @@ mod tuic;
 mod vless;
 mod vmess;
 pub mod weight;
+/// One share-link parser's entry point, used by the fallback chain.
+type ProtoParser = for<'a> fn(&RawUrlX<'a>) -> Result<ParsedProto, ParseError>;
+
 mod wireguard;
 pub use anytls::AnyTlsConfig;
 pub use common::{
@@ -59,9 +62,12 @@ pub use ssh::SshConfig;
 pub use ssr::SsrConfig;
 pub use tailscale::TailscaleConfig;
 pub use tor::TorConfig;
-pub use trojan::TrojanConfig;
+pub use trojan::{TrojanConfig, TrojanEncryption, TrojanSsMethod};
 pub use tuic::TuicConfig;
-pub use vless::{MlkemEncryption, MlkemMode, VlessConfig, parse_mlkem_encryption};
+pub use vless::{
+    MlkemEncryption, MlkemKey, MlkemMode, VlessConfig, normalize_vless_encryption,
+    parse_mlkem_encryption, parse_padding_spec,
+};
 pub use vless::{MuxWire, VlessMux};
 pub use vmess::VmessConfig;
 pub use wireguard::WireguardConfig;
@@ -215,7 +221,7 @@ impl ProtocolConfig {
         // + protocol essentials).
         let r = match raw.schema {
             SchemeX::Vless => VlessConfig::try_parse_proto(raw),
-            SchemeX::Trojan => TrojanConfig::try_parse_proto(raw),
+            SchemeX::Trojan | SchemeX::TrojanGo => TrojanConfig::try_parse_proto(raw),
             SchemeX::Vmess => VmessConfig::try_parse_proto(raw),
             SchemeX::Hysteria => Hysteria1Config::try_parse_proto(raw),
             SchemeX::Hysteria2 => Hysteria2Config::try_parse_proto(raw),
@@ -249,14 +255,28 @@ impl ProtocolConfig {
             ) => e,
             unrecoverable @ Err(_) => return Err(unrecoverable.unwrap_err()),
         };
-        SsConfig::try_parse_proto(raw)
-            .or_else(|_| SsrConfig::try_parse_proto(raw))
-            .or_else(|_| VmessConfig::try_parse_proto(raw))
-            .or_else(|_| VlessConfig::try_parse_proto(raw))
-            .or_else(|_| TrojanConfig::try_parse_proto(raw))
-            .or_else(|_| Hysteria2Config::try_parse_proto(raw))
-            .or_else(|_| Hysteria1Config::try_parse_proto(raw))
-            .or(Err(original_err))
+        // Structural failures mean "the body is not mine — try the next
+        // parser"; a config-invalid result means "the body is mine and broken",
+        // so it ends the chain. Without this, a VLESS/Trojan-family invalid
+        // body would be reinterpreted by a later permissive parser (Trojan and
+        // Hysteria accept any userinfo as a credential).
+        let candidates: [ProtoParser; 7] = [
+            SsConfig::try_parse_proto,
+            SsrConfig::try_parse_proto,
+            VmessConfig::try_parse_proto,
+            VlessConfig::try_parse_proto,
+            TrojanConfig::try_parse_proto,
+            Hysteria2Config::try_parse_proto,
+            Hysteria1Config::try_parse_proto,
+        ];
+        for candidate in candidates {
+            match candidate(raw) {
+                Ok(parsed) => return Ok(parsed),
+                Err(error @ ParseError::InvalidConf(..)) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Err(original_err)
     }
 
     /// Reconstruct the share URL for this config given its endpoint.
@@ -753,6 +773,53 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    #[test]
+    fn trojan_go_scheme_dispatches_through_the_boundary() {
+        let raw = RawUrlX::from(
+            "trojan-go://pw@127.0.0.1:443?security=tls&encryption=ss%3Baes-128-gcm%3Ainner",
+        );
+        assert_eq!(raw.schema, crate::urlx::SchemeX::TrojanGo);
+        let parsed = ProtocolConfig::try_parse_proto(&raw).expect("trojan-go dispatches to Trojan");
+        assert!(matches!(parsed.protocol.config, ProtocolConfig::Trojan(_)));
+    }
+
+    #[test]
+    fn foreign_encryption_is_invalid_and_ends_the_chain() {
+        for url in [
+            "hy2://pw@127.0.0.1:443?encryption=none",
+            "hysteria://pw@127.0.0.1:443?encryption=none",
+            "anytls://pw@127.0.0.1:443?encryption=none",
+            "shadowtls://pw@127.0.0.1:443?encryption=none",
+            "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:pw@127.0.0.1:443?encryption=none",
+            "ss://YWVzLTEyOC1nY206cHc@127.0.0.1:443?encryption=none",
+            "http://u:p@127.0.0.1:443?encryption=none",
+            "wireguard://cHJpdmF0ZQ@127.0.0.1:443?encryption=none",
+        ] {
+            let error = ProtocolConfig::try_parse_proto(&RawUrlX::from(url))
+                .expect_err("foreign encryption must be rejected");
+            assert!(
+                matches!(error, ParseError::InvalidConf(..)),
+                "{url}: {error:?}"
+            );
+        }
+
+        // The stored row's real source: a `vmess://` URI body with a VMess
+        // cipher in the `encryption` slot. It used to heal into VLESS; now the
+        // chain stops at VLESS's config-invalid verdict.
+        let aes = "vmess://5c040f1d-45db-43bd-8d46-e4950e433735@141.95.65.9:1234?allowInsecure=1&encryption=aes-128-gcm&security=tls&sni=supervpn.super.com&type=tcp#[341ms test]";
+        let error = ProtocolConfig::try_parse_proto(&RawUrlX::from(aes))
+            .expect_err("the aes body must not heal");
+        assert!(matches!(error, ParseError::InvalidConf(..)), "{error:?}");
+
+        // A structurally mis-schemed body still heals: the ss parser cannot
+        // read a UUID userinfo, so the chain reaches VLESS.
+        let healed = ProtocolConfig::try_parse_proto(&RawUrlX::from(
+            "ss://6202b230-417c-4d8e-b624-0f71afa9c75d@127.0.0.1:443?security=tls",
+        ))
+        .expect("heals to vless");
+        assert!(matches!(healed.protocol.config, ProtocolConfig::Vless(_)));
+    }
 
     #[test]
     fn placeholder_try_parse_proto_emits_endpointless_parsed_proto() {

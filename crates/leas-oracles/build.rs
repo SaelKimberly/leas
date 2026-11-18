@@ -52,7 +52,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
-    for core in [pins::Core::Xray, pins::Core::SingBox, pins::Core::Mihomo] {
+    for core in [
+        pins::Core::Xray,
+        pins::Core::SingBox,
+        pins::Core::Mihomo,
+        pins::Core::TrojanGo,
+    ] {
         let asset = pins::asset_name(core, os, arch).unwrap_or_else(|| {
             panic!(
                 "leas-oracles: no pinned {core:?} asset for {os}/{arch}; \
@@ -117,6 +122,7 @@ fn bin_file(core: pins::Core) -> String {
         pins::Core::Xray => "xray",
         pins::Core::SingBox => "sing-box",
         pins::Core::Mihomo => "mihomo",
+        pins::Core::TrojanGo => "trojan-go",
     };
     format!("{base}{}", env::consts::EXE_SUFFIX)
 }

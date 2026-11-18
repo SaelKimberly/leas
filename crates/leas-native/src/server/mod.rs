@@ -308,6 +308,7 @@ mod tests {
             password: "pw".into(),
             security: SecurityConfig::default(),
             transport: TransportConfig::Tcp,
+            encryption: None,
             path: None,
             remarks: None,
         });

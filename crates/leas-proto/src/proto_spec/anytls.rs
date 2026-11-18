@@ -90,6 +90,7 @@ impl AnyTlsConfig {
         }
 
         let query = utils::parse_query(raw.query);
+        utils::reject_foreign_encryption(&query)?;
 
         // Password from query: password or auth alias
         let password = utils::query_get_multi(&query, &["password", "auth"]).map(str::to_string);

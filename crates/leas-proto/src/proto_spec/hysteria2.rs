@@ -132,6 +132,7 @@ impl Hysteria2Config {
         }
 
         let query = utils::parse_query(raw.query);
+        utils::reject_foreign_encryption(&query)?;
 
         // obfs: obfuscation type (e.g., "salamander")
         let obfs = utils::query_get(&query, "obfs").map(TinyText::from);

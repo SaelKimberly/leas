@@ -114,6 +114,7 @@ impl Hysteria1Config {
         endpoint.host_type = host_kind_for(&parsed_host);
 
         let query = utils::parse_query(raw.query);
+        utils::reject_foreign_encryption(&query)?;
 
         // protocol: "protocol" or "type" (udp, wechat-video, faketcp)
         let protocol = utils::query_get_multi(&query, &["protocol", "type"]).map(TinyText::from);

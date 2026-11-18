@@ -76,8 +76,108 @@ pub struct TrojanConfig {
     #[serde(default, skip_serializing_if = "SecurityConfig::is_empty")]
     pub security: SecurityConfig,
     pub transport: TransportConfig,
+    /// Trojan-Go's extra shadowsocks layer (`encryption=ss;<method>:<password>`).
+    /// Absent for a plain Trojan row; `None` serialises nothing, so existing
+    /// identities are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<TrojanEncryption>,
     pub path: Option<TinyText>,
     pub remarks: Option<TinyText>,
+}
+
+/// A Trojan-Go extra encryption layer.
+///
+/// Trojan-Go wraps the carrier with a **bare** shadowsocks AEAD stream
+/// (`core.Cipher.StreamConn`) before its own protocol header; there is no SS
+/// target-address frame. Only the methods its share-link parser accepts exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrojanEncryption {
+    Ss {
+        method: TrojanSsMethod,
+        password: String,
+    },
+}
+
+/// The three shadowsocks methods Trojan-Go's link parser accepts
+/// (`url/share_link.go:26-30`), spelled exactly as on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrojanSsMethod {
+    #[serde(rename = "aes-128-gcm")]
+    Aes128Gcm,
+    #[serde(rename = "aes-256-gcm")]
+    Aes256Gcm,
+    #[serde(rename = "chacha20-ietf-poly1305")]
+    Chacha20IetfPoly1305,
+}
+
+impl TrojanSsMethod {
+    /// The lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Aes128Gcm => "aes-128-gcm",
+            Self::Aes256Gcm => "aes-256-gcm",
+            Self::Chacha20IetfPoly1305 => "chacha20-ietf-poly1305",
+        }
+    }
+
+    /// Parse a method name (ASCII case-insensitive; the reference is
+    /// strict-lowercase, permissive parsing is the contract).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "aes-128-gcm" => Some(Self::Aes128Gcm),
+            "aes-256-gcm" => Some(Self::Aes256Gcm),
+            "chacha20-ietf-poly1305" => Some(Self::Chacha20IetfPoly1305),
+            _ => None,
+        }
+    }
+}
+
+/// Parse Trojan-Go's `encryption` query key.
+///
+/// Grammar (`url/share_link.go:143-185`): absent → no layer; `none` (with or
+/// without ignored parameters) → no layer; `ss;<method>:<password>` → the
+/// layer. A repeated key, an unknown provider/method, a missing `:` or an
+/// empty password is invalid. The password may contain `:` (only the first
+/// one separates it from the method).
+fn parse_trojan_encryption(
+    params: &[(String, String)],
+) -> Result<Option<TrojanEncryption>, ParseError> {
+    let invalid = |what: &str, value: &str| {
+        ParseError::InvalidConf("encryption".into(), format!("{what}: {value}").into())
+    };
+    let mut values = params
+        .iter()
+        .filter(|(key, _)| key == "encryption")
+        .map(|(_, value)| value.as_str());
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid("multiple encryption fields", value));
+    }
+    let (provider, rest) = value.split_once(';').unwrap_or((value, ""));
+    if provider.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    if !provider.eq_ignore_ascii_case("ss") {
+        return Err(invalid("unsupported encryption provider", value));
+    }
+    let Some((method, password)) = rest.split_once(':') else {
+        return Err(invalid("missing ss password", value));
+    };
+    let Some(method) = TrojanSsMethod::parse(method) else {
+        return Err(invalid("unsupported ss method", value));
+    };
+    if password.is_empty() {
+        return Err(invalid("empty ss password", value));
+    }
+    Ok(Some(TrojanEncryption::Ss {
+        method,
+        password: password.to_string(),
+    }))
 }
 
 impl TrojanConfig {
@@ -113,6 +213,17 @@ impl TrojanConfig {
         }
 
         let query = utils::parse_query(raw.query);
+
+        let encryption = parse_trojan_encryption(&query)?;
+        // Trojan-Go's transport-plugin surface (`plugin=v2ray-plugin;…`) is
+        // unimplemented; ignoring it would dial a different wire, so it is
+        // invalid rather than a no-op.
+        if let Some((_, plugin)) = query.iter().find(|(key, _)| key == "plugin") {
+            return Err(ParseError::InvalidConf(
+                "plugin".into(),
+                plugin.clone().into(),
+            ));
+        }
 
         // Security mode: tls (default), none, or reality
         let security = match utils::query_get(&query, "security") {
@@ -193,6 +304,7 @@ impl TrojanConfig {
             password: username.to_string(),
             transport,
             security,
+            encryption,
             path,
             remarks,
         };
@@ -312,6 +424,10 @@ impl TrojanConfig {
             if let Some(path) = &self.path {
                 parts.push(format!("path={}", urlencoding::encode(path)));
             }
+            if let Some(TrojanEncryption::Ss { method, password }) = &self.encryption {
+                let value = format!("ss;{}:{password}", method.as_str());
+                parts.push(format!("encryption={}", urlencoding::encode(&value)));
+            }
             if parts.is_empty() {
                 String::new()
             } else {
@@ -324,8 +440,15 @@ impl TrojanConfig {
             .as_ref()
             .map_or_default(|f| format!("#{}", urlencoding::encode(f)));
 
+        // Trojan-Go's own parser accepts `trojan-go://` only, so a layered row
+        // round-trips under that scheme; a plain row keeps the classic one.
+        let scheme = if self.encryption.is_some() {
+            "trojan-go"
+        } else {
+            "trojan"
+        };
         Ok(format!(
-            "trojan://{password}@{hostport}{query_string}{fragment}",
+            "{scheme}://{password}@{hostport}{query_string}{fragment}",
             password = self.password,
         ))
     }
@@ -339,6 +462,9 @@ impl TrojanConfig {
         &self,
         endpoint: &EndpointEssentials,
     ) -> Result<ClashProxy, ProtoSpecError> {
+        if self.encryption.is_some() {
+            return Err(ProtoSpecError::Unsupported("trojan-go encryption".into()));
+        }
         let name = self.remarks.as_deref().unwrap_or("").to_string();
         let server = endpoint.host.clone();
         let (tls, servername, skip_cert_verify, alpn_str, fingerprint) =
@@ -412,6 +538,9 @@ impl TrojanConfig {
                     password: c.password.clone(),
                     security,
                     transport,
+                    // Clash has no trojan-go encryption field; the layer is not
+                    // representable here (export refuses instead of dropping it).
+                    encryption: None,
                     path,
                     remarks: match c.name.as_str() {
                         "" => None,
@@ -516,6 +645,8 @@ impl ProtoSpec for TrojanConfig {
     }
 }
 
+const ID_SS_METHOD: u8 = 0x50;
+
 impl ProtoIdentity for TrojanConfig {
     /// Identity fields: everything a builder or the native client reads.
     ///
@@ -530,6 +661,10 @@ impl ProtoIdentity for TrojanConfig {
         w.kind("trojan");
         super::common::write_security(w, &self.security);
         super::common::write_transport(w, &self.transport);
+        if let Some(TrojanEncryption::Ss { method, password }) = &self.encryption {
+            w.nonempty_str(ID_SS_METHOD, Some(method.as_str()));
+            w.cred("trojan_ss_password", password);
+        }
         w.cred("password", &self.password);
     }
 }
@@ -542,6 +677,15 @@ impl InjectToCoreConf for TrojanConfig {
         endpoint: Option<&EndpointEssentials>,
         opts: InjectOptions,
     ) -> Result<(), SupportError> {
+        if self.encryption.is_some() {
+            let core = match core_type {
+                CoreTarget::Xray => "xray-core",
+                CoreTarget::SingBox => "sing-box",
+            };
+            return Err(SupportError::Config(format!(
+                "trojan-go shadowsocks encryption is not supported by {core}"
+            )));
+        }
         match core_type {
             CoreTarget::Xray => self.inject_xray(core_conf, endpoint, opts),
             CoreTarget::SingBox => self.inject_singbox(core_conf, endpoint, opts),
@@ -648,6 +792,116 @@ mod tests {
             ProtocolConfig::Trojan(c) => c,
             other => panic!("expected TrojanConfig, got {other:?}"),
         }
+    }
+
+    fn go_url(query: &str) -> String {
+        format!("trojan-go://pw@h.example:443?security=tls{query}")
+    }
+
+    #[test]
+    fn trojan_go_encryption_parses_and_round_trips() {
+        let url = go_url("&type=original&encryption=ss%3Baes-256-gcm%3Ainner");
+        let parsed = parse(&url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed);
+        assert_eq!(cfg.transport, TransportConfig::Tcp, "original → tcp");
+        assert_eq!(
+            cfg.encryption,
+            Some(super::TrojanEncryption::Ss {
+                method: super::TrojanSsMethod::Aes256Gcm,
+                password: "inner".into(),
+            })
+        );
+        let out = cfg.reconstruct_proto(&endpoint).expect("reconstruct");
+        assert!(out.starts_with("trojan-go://"), "{out}");
+        assert!(out.contains("encryption=ss%3Baes-256-gcm%3Ainner"), "{out}");
+        assert_eq!(config(parse(&out)).encryption, cfg.encryption);
+    }
+
+    #[test]
+    fn trojan_go_encryption_none_and_rejections() {
+        for query in ["", "&encryption=none", "&encryption=none%3Bx%3Ay"] {
+            assert_eq!(config(parse(&go_url(query))).encryption, None, "{query}");
+        }
+        for bad in [
+            "&encryption=aes-128-gcm",
+            "&encryption=ss%3Bbogus%3Apw",
+            "&encryption=ss%3Baes-256-gcm",
+            "&encryption=ss%3Baes-256-gcm%3A",
+            "&encryption=",
+            "&encryption=ss%3Baes-256-gcm%3Aa&encryption=none",
+            "&plugin=v2ray-plugin",
+        ] {
+            let url = go_url(bad);
+            assert!(
+                TrojanConfig::try_parse_proto(&RawUrlX::from(url.as_str())).is_err(),
+                "`{bad}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn trojan_go_encryption_is_in_the_identity() {
+        let plain = parse(&go_url(""));
+        let method_only = parse(&go_url("&encryption=ss%3Baes-128-gcm%3Apw"));
+        let other_method = parse(&go_url("&encryption=ss%3Baes-256-gcm%3Apw"));
+        let other_password = parse(&go_url("&encryption=ss%3Baes-128-gcm%3Aother"));
+
+        assert_ne!(plain.uid(), method_only.uid(), "layer changes the uid");
+        assert_ne!(
+            method_only.sig(),
+            other_method.sig(),
+            "method is a non-credential field"
+        );
+        assert_eq!(
+            method_only.sig(),
+            other_password.sig(),
+            "password is not a non-credential field"
+        );
+        assert_ne!(
+            method_only.cred_hash(),
+            other_password.cred_hash(),
+            "password is a credential"
+        );
+    }
+
+    #[test]
+    fn builders_refuse_a_layered_row() {
+        use super::super::{InjectOptions, InjectToCoreConf, ProtoSpecError};
+
+        let endpoint = parse(&go_url("")).endpoints[0].clone();
+        let layered = config(parse(&go_url("&encryption=ss%3Baes-128-gcm%3Apw")));
+
+        for core in [CoreTarget::Xray, CoreTarget::SingBox] {
+            let mut conf = serde_json::json!({});
+            let error = layered
+                .inject_to(&mut conf, core, Some(&endpoint), InjectOptions::default())
+                .expect_err("layered row must be refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("trojan-go shadowsocks encryption"),
+                "{error}"
+            );
+        }
+        assert!(matches!(
+            layered.to_clash_proto(&endpoint),
+            Err(ProtoSpecError::Unsupported(_))
+        ));
+
+        let plain = config(parse(&go_url("")));
+        assert!(
+            plain
+                .inject_to(
+                    &mut serde_json::json!({}),
+                    CoreTarget::Xray,
+                    Some(&endpoint),
+                    InjectOptions::default(),
+                )
+                .is_ok(),
+            "a plain row still injects"
+        );
+        assert!(plain.to_clash_proto(&endpoint).is_ok());
     }
 
     /// The identity payload must be endpoint-free: no top-level `host`/`port`

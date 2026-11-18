@@ -466,6 +466,11 @@ pub fn spawn_core(
             c.args(["-f", p]);
             c
         }
+        CoreKind::TrojanGo => {
+            let mut c = Command::new(bin);
+            c.args(["-config", p]);
+            c
+        }
     };
     if std::env::var("LEAS_CORE_LOG").is_ok() {
         cmd.stdout(std::process::Stdio::inherit())

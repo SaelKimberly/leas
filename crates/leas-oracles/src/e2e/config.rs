@@ -157,6 +157,7 @@ pub fn mlkem_enc_pair() -> (String, String) {
 fn set_flow(json: &mut serde_json::Value, core: CoreKind, flow: Flow) {
     match core {
         CoreKind::Mihomo => mihomo_unsupported("flow"),
+        CoreKind::TrojanGo => panic!("flow rows do not run on trojan-go"),
         CoreKind::Xray => {
             json["inbounds"][0]["settings"]["clients"][0]["flow"] =
                 serde_json::json!(flow.server_str());
@@ -204,6 +205,7 @@ pub fn vmess_inbound(
     };
     let json = match core {
         CoreKind::Mihomo => mihomo_unsupported("vmess"),
+        CoreKind::TrojanGo => panic!("vmess rows do not run on trojan-go"),
         CoreKind::Xray => {
             let mut stream = serde_json::json!({
                 "network": network,
@@ -442,6 +444,7 @@ pub fn vless_inbound(
     }
     let json = match core {
         CoreKind::Mihomo => unreachable!("mihomo's vless listener is built above"),
+        CoreKind::TrojanGo => panic!("vless rows do not run on trojan-go"),
         CoreKind::Xray => {
             // `NoTls` (the kcp_plain row) emits streamSettings WITHOUT
             // tlsSettings — genuinely no security layer, not cert TLS.
@@ -593,6 +596,7 @@ fn reality_stream(
 ) -> serde_json::Value {
     match core {
         CoreKind::Mihomo => mihomo_unsupported("vless/reality"),
+        CoreKind::TrojanGo => panic!("reality rows do not run on trojan-go"),
         CoreKind::Xray => serde_json::json!({
             "network": "tcp", "security": "reality",
             "realitySettings": {
@@ -664,6 +668,7 @@ fn vless_reality_inbound(
     }
     let json = match core {
         CoreKind::Mihomo => mihomo_unsupported("vless/reality"),
+        CoreKind::TrojanGo => panic!("vless reality rows do not run on trojan-go"),
         CoreKind::Xray => serde_json::json!({
             "inbounds": [{
                 "listen": "127.0.0.1", "port": env.port, "protocol": "vless",
@@ -741,6 +746,7 @@ fn vmess_reality_inbound(
     }
     let json = match core {
         CoreKind::Mihomo => mihomo_unsupported("vmess/reality"),
+        CoreKind::TrojanGo => panic!("vmess reality rows do not run on trojan-go"),
         CoreKind::Xray => serde_json::json!({
             "inbounds": [{
                 "listen": "127.0.0.1", "port": env.port, "protocol": "vmess",
@@ -1003,6 +1009,47 @@ pub const HYSTERIA2_AUTH: &str = "hy2-test-auth-token";
 /// The salamander obfuscation PSK (≥4 bytes) for the obfs row.
 pub const HYSTERIA2_OBFS_PSK: &str = "obfs-shared-secret";
 
+/// Trojan-Go server JSON (the fourth oracle): its own `run_type: server`
+/// schema, TLS cert/key from the harness, optional ws transport, and the
+/// extra shadowsocks layer at the root.
+///
+/// `enc` is `(method, password)` for a layered row; `None` is plain Trojan.
+/// The keys come from `config.FromContext`'s merged config registrations:
+/// `local_addr`/`local_port` (transport), `remote_addr`/`remote_port`
+/// (tunnel + shadowsocks), `password` (statistic, an array), `ssl`
+/// (tunnel/tls), `websocket` (tunnel/websocket), `shadowsocks`
+/// (tunnel/shadowsocks).
+#[must_use]
+pub fn trojan_go_server(env: &ServerEnv, network: &str, enc: Option<(&str, &str)>) -> String {
+    let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
+    let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
+    let mut server = serde_json::json!({
+        "run_type": "server",
+        "local_addr": "127.0.0.1",
+        "local_port": env.port,
+        "remote_addr": env.echo.ip().to_string(),
+        "remote_port": env.echo.port(),
+        "password": [TROJAN_PASSWORD],
+        "ssl": { "cert": cert_path, "key": key_path },
+        "log_level": 0,
+    });
+    if network == "ws" {
+        server["websocket"] = serde_json::json!({
+            "enabled": true,
+            "host": "localhost",
+            "path": "/ws",
+        });
+    }
+    if let Some((method, password)) = enc {
+        server["shadowsocks"] = serde_json::json!({
+            "enabled": true,
+            "method": method,
+            "password": password,
+        });
+    }
+    server.to_string()
+}
+
 /// Trojan inbound JSON for `core` (`protocol`/`type` "trojan", password
 /// `clients[0]`/`users[0]`, `tls`/`streamSettings` per dialect).
 #[must_use]
@@ -1015,6 +1062,7 @@ pub fn trojan_inbound(core: CoreKind, env: &ServerEnv, network: &str) -> String 
     };
     let json = match core {
         CoreKind::Mihomo => mihomo_unsupported("trojan"),
+        CoreKind::TrojanGo => unreachable!("trojan-go rows use trojan_go_server"),
         CoreKind::Xray => {
             let mut stream = serde_json::json!({
                 "network": network,
@@ -1089,6 +1137,7 @@ pub fn client_params_trojan(
     target: SocketAddr,
     tls: &dyn TlsVariant,
     network: &str,
+    trojan_enc: Option<(&'static str, &'static str)>,
 ) -> NativeConnectParams {
     let transport = match network {
         "ws" => serde_json::json!({ "type": "ws", "path": "/ws" }),
@@ -1105,6 +1154,11 @@ pub fn client_params_trojan(
     });
     if tls.tls_enabled() {
         protocol_value["security"] = client_security(tls, network);
+    }
+    if let Some((method, password)) = trojan_enc {
+        protocol_value["encryption"] = serde_json::json!({
+            "ss": { "method": method, "password": password }
+        });
     }
     let protocol: ProtocolConfig =
         serde_json::from_value(protocol_value).expect("trojan client config parses");
@@ -1210,6 +1264,7 @@ pub fn ss_inbound(
     // and to fail loudly if that early return is ever dropped.
     let json = match core {
         CoreKind::Mihomo => unreachable!("mihomo's shadowsocks listener is built above"),
+        CoreKind::TrojanGo => panic!("shadowsocks rows do not run on trojan-go"),
         CoreKind::Xray => {
             let mut stream = serde_json::json!({ "network": network });
             if tls.tls_enabled() {
@@ -1658,6 +1713,7 @@ mod tests {
                 CoreKind::Xray => flow,
                 CoreKind::SingBox => flow_sing,
                 CoreKind::Mihomo => unreachable!("the loop covers the two JSON cores"),
+                CoreKind::TrojanGo => unreachable!("flow rows never run on trojan-go"),
             };
             assert_eq!(emitted, "xtls-rprx-vision");
         }
@@ -1951,6 +2007,7 @@ pub fn anytls_inbound(core: CoreKind, env: &ServerEnv) -> String {
         CoreKind::Xray => {
             panic!("xray-core has no anytls inbound — keep the row on sing-box/mihomo")
         }
+        CoreKind::TrojanGo => panic!("anytls rows do not run on trojan-go"),
     }
 }
 

@@ -17,6 +17,7 @@ pub enum SchemeX {
     SS,
     SSR,
     Trojan,
+    TrojanGo,
     TUIC,
     Warp,
     AnyTLS,
@@ -47,6 +48,7 @@ impl SchemeX {
             Self::Hysteria2 => "hy2",
             Self::Hysteria => "hy",
             Self::Trojan => "trojan",
+            Self::TrojanGo => "trojan-go",
             Self::TUIC => "tuic",
             Self::Warp => "warp",
             Self::AnyTLS => "anytls",
@@ -82,6 +84,7 @@ impl SchemeX {
                 .build([
                     "vless://",
                     "vmess://",
+                    "trojan-go://",
                     "trojan://",
                     "hhysteria2://",
                     "hhysteria://",
@@ -194,6 +197,7 @@ impl std::str::FromStr for SchemeX {
             Vless => "vless";
             Vmess => "vmess";
             Trojan => "trojan";
+            TrojanGo => "trojan-go";
             SS => "shadowsocks", "ss";
             SSR => "shadowsocksr", "ssr";
             TUIC => "tuic";

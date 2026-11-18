@@ -19,6 +19,7 @@ pub enum Core {
     Xray,
     SingBox,
     Mihomo,
+    TrojanGo,
 }
 
 /// Pinned Xray-core release.
@@ -34,10 +35,17 @@ pub const SINGBOX_VERSION: &str = "1.15.0-alpha.13";
 /// ciphers, and the reference implementation our Clash/mihomo config surface is
 /// checked against.
 pub const MIHOMO_VERSION: &str = "1.19.33";
+/// Pinned Trojan-Go release.
+///
+/// The fourth oracle, and the only implementation of the Trojan-Go
+/// `encryption=ss;<method>:<password>` layer. Upstream's newest release tag;
+/// the project has not shipped since 2023 but the wire is frozen.
+pub const TROJAN_GO_VERSION: &str = "0.10.6";
 
 const XRAY_REPO: &str = "https://github.com/XTLS/Xray-core/releases/download";
 const SINGBOX_REPO: &str = "https://github.com/SagerNet/sing-box/releases/download";
 const MIHOMO_REPO: &str = "https://github.com/MetaCubeX/mihomo/releases/download";
+const TROJAN_GO_REPO: &str = "https://github.com/p4gefau1t/trojan-go/releases/download";
 
 /// The upstream release asset filename for `(core, os, arch)`.
 ///
@@ -83,6 +91,11 @@ pub fn asset_name(core: Core, os: &str, arch: &str) -> Option<String> {
         (Core::Mihomo, "windows", "aarch64") => {
             format!("mihomo-windows-arm64-v{MIHOMO_VERSION}.zip")
         }
+        // Trojan-Go's 64-bit ARM linux build is spelled `armv8`.
+        (Core::TrojanGo, "linux", "x86_64") => "trojan-go-linux-amd64.zip".to_string(),
+        (Core::TrojanGo, "linux", "aarch64") => "trojan-go-linux-armv8.zip".to_string(),
+        (Core::TrojanGo, "windows", "x86_64") => "trojan-go-windows-amd64.zip".to_string(),
+        (Core::TrojanGo, "windows", "aarch64") => "trojan-go-windows-arm64.zip".to_string(),
         _ => return None,
     };
     Some(name)
@@ -95,6 +108,7 @@ pub const fn version(core: Core) -> &'static str {
         Core::Xray => XRAY_VERSION,
         Core::SingBox => SINGBOX_VERSION,
         Core::Mihomo => MIHOMO_VERSION,
+        Core::TrojanGo => TROJAN_GO_VERSION,
     }
 }
 
@@ -140,6 +154,20 @@ pub fn sha256(core: Core, os: &str, arch: &str) -> Option<&'static str> {
         (Core::Mihomo, "windows", "aarch64") => {
             Some("a2a26869a14634c49f3fbcecc593b498ed8591fbdd7616b24475b3d60b148da3")
         }
+        // Computed from the v0.10.6 release assets on 2026-11-18: GitHub's
+        // release API publishes no digest for this tag.
+        (Core::TrojanGo, "linux", "x86_64") => {
+            Some("764480722783a6d76ed8401f6d2f1d87d8df7e60bf261f69c67eb94b77e732af")
+        }
+        (Core::TrojanGo, "linux", "aarch64") => {
+            Some("42e98b97bd0715ee4c5771a953e96c829cfbf81792547ce1d67cc40eb9f35618")
+        }
+        (Core::TrojanGo, "windows", "x86_64") => {
+            Some("c4eb4b6a44395271089bb0848daea9bc6d47552c7f2c2555dfecc14c6ea6c733")
+        }
+        (Core::TrojanGo, "windows", "aarch64") => {
+            Some("a2a1ae44221e57acca35d9cc9b122e905af36dc90a68c545318922f756faf2d3")
+        }
         _ => None,
     }
 }
@@ -151,6 +179,7 @@ pub fn url(core: Core, os: &str, arch: &str) -> Option<String> {
         Core::Xray => XRAY_REPO,
         Core::SingBox => SINGBOX_REPO,
         Core::Mihomo => MIHOMO_REPO,
+        Core::TrojanGo => TROJAN_GO_REPO,
     };
     let name = asset_name(core, os, arch)?;
     Some(format!("{repo}/v{}/{name}", version(core)))

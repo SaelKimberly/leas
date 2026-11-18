@@ -322,10 +322,13 @@ impl VlessConfig {
             .unwrap_or("tcp")
             .to_string();
         let path = utils::query_get(&query, "path").map(TinyText::from);
-        // encryption: typically "none" (VLESS relies on TLS, not payload encryption)
+        // encryption: typically "none" (VLESS relies on TLS, not payload
+        // encryption). The normaliser restores generator noise and validates
+        // the mlkem grammar, so an invalid value never reaches the model.
         let encryption = utils::query_get(&query, "encryption")
-            .filter(|v| *v != "none")
-            .map(TinyText::from);
+            .map(normalize_vless_encryption)
+            .transpose()?
+            .flatten();
         // flow: xtls-rprx-vision for XTLS direct transmission (TLS 1.3 required)
         let flow = utils::query_get(&query, "flow").map(TinyText::from);
         // splice: boolean splice mode flag
@@ -790,7 +793,12 @@ impl VlessConfig {
                     uuid_origin: None,
                     security,
                     transport,
-                    encryption: c.encryption.clone().map(TinyText::from),
+                    encryption: c
+                        .encryption
+                        .as_deref()
+                        .map(normalize_vless_encryption)
+                        .transpose()?
+                        .flatten(),
                     flow: c.flow.clone().map(TinyText::from),
                     // Clash states mux as a BOOL (`mux: true`); a true row asks
                     // for the default cap.
@@ -1084,6 +1092,26 @@ impl MlkemMode {
     }
 }
 
+/// One decoded server key segment: an X25519 public key (32 bytes) or an
+/// ML-KEM-768 encapsulation key (1184 bytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MlkemKey {
+    X25519([u8; 32]),
+    Mlkem(Vec<u8>),
+}
+
+impl MlkemKey {
+    /// The key's bytes on the wire.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::X25519(k) => k,
+            Self::Mlkem(k) => k,
+        }
+    }
+}
+
 /// Parsed `mlkem768x25519plus` VLESS account `encryption` value
 /// (xray `infra/conf/vless.go` outbound parser → `vless.Account`).
 ///
@@ -1102,6 +1130,81 @@ pub struct MlkemEncryption {
     pub padding: String,
     /// The remaining key material segments (base64url, dot-joined).
     pub keys: String,
+    /// Decoded padding length blocks (`probability-min-max` triples).
+    pub padding_lens: Vec<[usize; 3]>,
+    /// Decoded padding delay blocks, alternating with `padding_lens`.
+    pub padding_gaps: Vec<[usize; 3]>,
+    /// Decoded server keys, in link order (the relay chain order).
+    pub decoded_keys: Vec<MlkemKey>,
+}
+
+/// One `probability-min-max` padding block (xray `[3]int`).
+pub type PaddingSpec = [usize; 3];
+
+/// Alternating length and delay blocks, as `(lengths, gaps)`.
+pub type ParsedPadding = (Vec<PaddingSpec>, Vec<PaddingSpec>);
+
+/// Parse the padding spec (xray `ParsePadding`): dot-separated
+/// `probability-min-max` triples, alternating length and delay blocks starting
+/// with a length block.
+///
+/// The first block requires `probability >= 100` and both bounds `>= 35`; the
+/// total maximum padding is 65553.
+///
+/// Public because the native handshake tests build a config from a padding
+/// string without re-encoding a key.
+///
+/// # Errors
+///
+/// A non-numeric triple, a missing part, a first block below the bounds, or an
+/// over-large total.
+pub fn parse_padding_spec(padding: &str) -> Result<ParsedPadding, ParseError> {
+    let invalid = |what: &str, detail: &str| {
+        ParseError::InvalidConf(
+            "mlkem768x25519plus padding".into(),
+            format!("{detail}: {what}").into(),
+        )
+    };
+    let mut lens = Vec::new();
+    let mut gaps = Vec::new();
+    if padding.is_empty() {
+        return Ok((lens, gaps));
+    }
+    let mut max_len = 0usize;
+    for (i, segment) in padding.split('.').enumerate() {
+        let parts: Vec<&str> = segment.split('-').collect();
+        if parts.len() < 3 || parts.iter().any(|part| part.is_empty()) {
+            return Err(invalid(segment, "invalid padding segment"));
+        }
+        let mut y = [0usize; 3];
+        for (slot, part) in y.iter_mut().zip(parts) {
+            *slot = part
+                .parse()
+                .map_err(|_| invalid(segment, "non-numeric padding segment"))?;
+        }
+        if i == 0 && (y[0] < 100 || y[1] < 18 + 17 || y[2] < 18 + 17) {
+            return Err(invalid(
+                segment,
+                "first padding length must not be smaller than 35 and its probability not below 100",
+            ));
+        }
+        if i % 2 == 0 {
+            // `saturating_add`, not `+`: each part is a parsed `usize`, and a
+            // crafted pair (`usize::MAX` then `1`) would wrap the total below
+            // the bound — or panic in an overflow-checked build.
+            max_len = max_len.saturating_add(y[1].max(y[2]));
+            lens.push(y);
+        } else {
+            gaps.push(y);
+        }
+    }
+    if max_len > 18 + 65_535 {
+        return Err(invalid(
+            padding,
+            "total padding length must not be larger than 65553",
+        ));
+    }
+    Ok((lens, gaps))
 }
 
 /// Parse an mlkem768x25519plus `encryption` value, mirroring xray's
@@ -1144,6 +1247,7 @@ pub fn parse_mlkem_encryption(value: &str) -> Result<Option<MlkemEncryption>, Pa
     // material and must decode to 32 or 1184 bytes (xray checks the decoded
     // length only — a failed decode yields length 0, also rejected).
     let mut padding = 0usize;
+    let mut decoded_keys = Vec::new();
     for r in &s[3..] {
         if r.len() < 20 {
             padding += r.len() + 1;
@@ -1152,9 +1256,18 @@ pub fn parse_mlkem_encryption(value: &str) -> Result<Option<MlkemEncryption>, Pa
         let decoded = base64::prelude::BASE64_URL_SAFE_NO_PAD
             .decode(r)
             .map_err(|_| invalid("invalid base64url key segment"))?;
-        if decoded.len() != 32 && decoded.len() != 1184 {
-            return Err(invalid("key segment must be 32 or 1184 bytes"));
+        match decoded.len() {
+            32 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&decoded);
+                decoded_keys.push(MlkemKey::X25519(key));
+            }
+            1184 => decoded_keys.push(MlkemKey::Mlkem(decoded)),
+            _ => return Err(invalid("key segment must be 32 or 1184 bytes")),
         }
+    }
+    if decoded_keys.is_empty() {
+        return Err(invalid("no server keys"));
     }
     // The remainder after the (27 + window) strip carries the padding
     // segments then the keys, still dot-separated.
@@ -1170,12 +1283,85 @@ pub fn parse_mlkem_encryption(value: &str) -> Result<Option<MlkemEncryption>, Pa
     } else {
         ("", rest)
     };
+    let (padding_lens, padding_gaps) = parse_padding_spec(padding_str)?;
     Ok(Some(MlkemEncryption {
         mode,
         seconds,
         padding: padding_str.to_string(),
         keys: keys.to_string(),
+        padding_lens,
+        padding_gaps,
+        decoded_keys,
     }))
+}
+
+/// Restore what a share-link generator meant, then validate the VLESS
+/// `encryption` value.
+///
+/// Restored to *absent* (the value VLESS actually means by `none`):
+/// - `none` and `auto`, ASCII case-insensitive (a `VMess` `scy` leak: `auto`
+///   requests no concrete cipher, and VLESS's only concrete non-mlkem answer is
+///   `none`);
+/// - `none` followed by a garbage suffix (`none=/@Telegram…`, the glued-remark
+///   shape), recognised by a suffix starting with `= / @ # ? & ; ,` or
+///   whitespace — the same healing class as `recover_transport_type`.
+///
+/// Anything else must be a fully valid `mlkem768x25519plus` value. Empty,
+/// unknown and malformed values are `InvalidConf` (the row is not imported).
+///
+/// # Errors
+///
+/// Empty, non-mlkem, or malformed mlkem values.
+pub fn normalize_vless_encryption(raw: &str) -> Result<Option<TinyText>, ParseError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(ParseError::InvalidConf(
+            "encryption".into(),
+            "<empty>".into(),
+        ));
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower == "none" || lower == "auto" {
+        return Ok(None);
+    }
+    if let Some(rest) = lower.strip_prefix("none")
+        && (rest.starts_with(['=', '/', '@', '#', '?', '&', ';', ','])
+            || rest.starts_with(char::is_whitespace))
+    {
+        return Ok(None);
+    }
+    match parse_mlkem_encryption(value)? {
+        Some(_) => Ok(Some(TinyText::from(value))),
+        None => Err(ParseError::InvalidConf(
+            "encryption".into(),
+            value.to_string().into(),
+        )),
+    }
+}
+
+impl VlessConfig {
+    /// Re-run the encryption rule on a stored/deserialised config.
+    ///
+    /// The parser already rejects invalid values; this is the backstop for
+    /// rows written by an older build or by a direct JSON import. The reason
+    /// names the value and is the persisted `[ n-a]` marker text.
+    ///
+    /// # Errors
+    ///
+    /// A non-empty `encryption` that is neither a restore case nor valid
+    /// mlkem.
+    pub fn validate(&self) -> Result<(), SupportError> {
+        let Some(value) = self.encryption.as_deref() else {
+            return Ok(());
+        };
+        normalize_vless_encryption(value)
+            .map(|_| ())
+            .map_err(|error| {
+                SupportError::Config(format!(
+                    "vless encryption `{value}` is not a VLESS encryption value: {error}"
+                ))
+            })
+    }
 }
 
 #[cfg(test)]
@@ -2216,6 +2402,101 @@ mod tests {
             parse_mlkem_encryption("mlkem768x25519plus.native.1rtt.!!!!invalid-base64-segment!!!")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn vless_encryption_restores_and_rejects() {
+        for enc in ["none", "auto", "AUTO", "none=/@Telegram-|-@x"] {
+            let url = format!("vless://{UUID}@h.example:443?security=tls&encryption={enc}");
+            let cfg = config(parse(&url));
+            assert_eq!(cfg.encryption, None, "`{enc}` must restore to none");
+        }
+
+        let key = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let mlkem = format!("mlkem768x25519plus.native.1rtt.{key}");
+        let url = format!("vless://{UUID}@h.example:443?security=tls&encryption={mlkem}");
+        let cfg = config(parse(&url));
+        assert_eq!(cfg.encryption.as_deref(), Some(mlkem.as_str()));
+
+        for bad in ["aes-128-gcm", "nonefoo", ""] {
+            let url = format!("vless://{UUID}@h.example:443?security=tls&encryption={bad}");
+            assert!(
+                VlessConfig::try_parse_proto(&RawUrlX::from(url.as_str())).is_err(),
+                "`{bad}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn clash_vless_encryption_uses_the_same_normaliser() {
+        use crate::clash::ClashProxy;
+        let proxy = |enc: &str| -> ClashProxy {
+            serde_json::from_value(serde_json::json!({
+                "type": "vless",
+                "name": "t",
+                "server": "h.example",
+                "port": 443,
+                "uuid": UUID,
+                "encryption": enc,
+            }))
+            .expect("clash proxy")
+        };
+        for enc in ["none", "auto"] {
+            let parsed = VlessConfig::try_from_clash_proto(&proxy(enc)).expect("clash parse");
+            let ProtocolConfig::Vless(cfg) = parsed.protocol.config else {
+                panic!("expected vless");
+            };
+            assert_eq!(cfg.encryption, None, "`{enc}` must restore through Clash");
+        }
+        assert!(VlessConfig::try_from_clash_proto(&proxy("aes-128-gcm")).is_err());
+    }
+
+    #[test]
+    fn validate_names_the_bad_value() {
+        use crate::urlx::TinyText;
+        let mut cfg = config(parse(&format!("vless://{UUID}@h.example:443?security=tls")));
+        cfg.encryption = Some(TinyText::from("aes-128-gcm"));
+        let reason = cfg.validate().expect_err("bad value").to_string();
+        assert!(
+            reason.contains("aes-128-gcm"),
+            "reason names the value: {reason}"
+        );
+
+        for ok in ["none", "auto", "AUTO"] {
+            cfg.encryption = Some(TinyText::from(ok));
+            assert!(cfg.validate().is_ok(), "`{ok}` is valid");
+        }
+    }
+
+    #[test]
+    fn mlkem_rejects_padding_violating_xray_rules() {
+        // Every segment here is shorter than 20 chars, so the parser treats it
+        // as a padding block; the codec rules the parser must enforce are the
+        // first block `prob >= 100 && min >= 35`, numeric triples, and a total
+        // max padding of 65553.
+        for pad in [
+            "1-2-3",
+            "100-20-40",
+            "100-40-20",
+            "a-b-c",
+            "100-70000-70000",
+        ] {
+            let value = format!("mlkem768x25519plus.native.1rtt.{pad}.{}", key32());
+            assert!(
+                parse_mlkem_encryption(&value).is_err(),
+                "padding block `{pad}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn mlkem_padding_sum_cannot_wrap() {
+        use super::parse_padding_spec;
+        // Two length blocks whose max values overflow a `usize` if summed
+        // naively: the wrap would land below the 65553 bound and accept the
+        // spec (then the handshake would allocate from a wrapped total).
+        let huge = "100-18446744073709551615-18446744073709551615.0-0-1.100-1-1";
+        assert!(parse_padding_spec(huge).is_err());
     }
 
     #[test]

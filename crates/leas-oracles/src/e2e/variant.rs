@@ -405,6 +405,7 @@ impl SecurityVariant for Aes128GcmVariant {
             // mihomo's vmess listener takes the method in its own config
             // dialect; no JSON `security` field to mirror.
             CoreKind::SingBox | CoreKind::Mihomo => None,
+            CoreKind::TrojanGo => None,
         }
     }
     fn client_security(&self) -> &'static str {
@@ -426,6 +427,7 @@ impl SecurityVariant for Chacha20Poly1305Variant {
         match core {
             CoreKind::Xray => Some("chacha20-poly1305"),
             CoreKind::SingBox | CoreKind::Mihomo => None,
+            CoreKind::TrojanGo => None,
         }
     }
     fn client_security(&self) -> &'static str {

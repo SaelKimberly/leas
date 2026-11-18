@@ -11,4 +11,4 @@ mod mlkem;
 #[cfg(test)]
 pub(crate) use b3::derive_key_bytes;
 
-pub use mlkem::{CommonConn, EncryptionConfig, ServerKey, handshake};
+pub use mlkem::{CommonConn, handshake};

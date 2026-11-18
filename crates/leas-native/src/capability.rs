@@ -7,9 +7,9 @@
 //! reason it returns doubles as the user-visible `[real]` marker text. A row
 //! native serves *worse* than a subprocess is refused so Auto resolution falls
 //! back to the subprocess. VLESS `mlkem768x25519plus` account encryption was
-//! such a row until 2026-09-23; it is now supported and gated on the connect
-//! path's own parser (`mlkem_encryption_supported`), which refuses only a
-//! value that is not that scheme or that the codec would reject at dial time.
+//! such a row until 2026-09-23; it is now supported, and validity is the
+//! proto-owned rule (`VlessConfig::validate`, the same normaliser the parser
+//! runs), so a stored invalid value is refused by name and never dialed.
 //!
 //! The predicate mirrors the native dispatch arms, not xray's feature set:
 //! [`crate::protocol`], [`crate::transport`], and [`crate::security`]. A
@@ -40,7 +40,6 @@ use leas_proto::proto_spec::{
 
 use crate::protocol::ss::method::{SsFamily, password_key};
 use crate::protocol::ss::resolve_method;
-use crate::protocol::vless::encryption::EncryptionConfig;
 
 /// The protocols with a native implementation, in canonical order.
 ///
@@ -241,11 +240,10 @@ fn kcp_reason(cfg: &KcpConfig, _path: Option<&str>) -> Option<&'static str> {
 
 /// VLESS row: implemented account encryption and flow, implemented transport.
 ///
-/// Account encryption: any non-empty `encryption` other than `"none"` must be
-/// an `mlkem768x25519plus` value the CONNECT PATH can actually dial
-/// ([`mlkem_encryption_supported`] runs the codec's own parser, so the gate
-/// cannot drift from it) — anything else is refused as `"vless account
-/// encryption is not implemented"`. Flows are limited to the vision pair native
+/// Account encryption: [`VlessConfig::validate`] is the same rule the parser
+/// applies (restore `none`/`auto`/junk suffix, then require valid mlkem), so a
+/// stored row written by an older build cannot be dialed with an invalid value.
+/// Its reason names the value. Flows are limited to the vision pair native
 /// encodes (`connect_vision`); any other non-empty flow is a `NotImplemented`
 /// guard, refused as `"vless flow is not implemented"`. A transport refusal
 /// appends the [`transport_reason`] string.
@@ -257,12 +255,12 @@ fn kcp_reason(cfg: &KcpConfig, _path: Option<&str>) -> Option<&'static str> {
 /// deferring it would trade a live fast path for a UDP leg that is dead on
 /// both sides of the decision.
 fn vless_reason(cfg: &VlessConfig) -> Option<Cow<'static, str>> {
-    if let Some(enc) = cfg.encryption.as_deref()
-        && !enc.is_empty()
-        && enc != "none"
-        && !mlkem_encryption_supported(enc)
-    {
-        return Some(Cow::Borrowed("vless account encryption is not implemented"));
+    if let Err(error) = cfg.validate() {
+        let reason = match error {
+            leas_proto::proto_spec::SupportError::Config(reason) => reason,
+            other => other.to_string(),
+        };
+        return Some(Cow::Owned(reason));
     }
     if let Some(flow) = cfg.flow.as_deref()
         && !(flow.is_empty() || flow == "xtls-rprx-vision" || flow == "xtls-rprx-vision-udp443")
@@ -312,24 +310,6 @@ fn vless_reason(cfg: &VlessConfig) -> Option<Cow<'static, str>> {
         )));
     }
     transport_reason(&cfg.transport, cfg.path.as_deref()).map(Cow::Borrowed)
-}
-
-/// Whether a non-`none` VLESS `encryption` value is one native can serve.
-///
-/// `mlkem768x25519plus` IS implemented (`protocol/vless/encryption`), so the
-/// only refusal left is a value that is not that scheme at all. The check runs
-/// the CONNECT PATH'S OWN PARSER (`parse_mlkem_encryption` then
-/// [`EncryptionConfig::try_from_parsed`]) rather than a string test, so the
-/// gate and the codec cannot drift: anything the codec would reject at dial
-/// time (a malformed base64 key segment, an out-of-range padding spec, an
-/// unknown mode/window) is refused here, and anything it accepts is offered to
-/// the fast path. Fails closed — a lowercased or otherwise unrecognised scheme
-/// yields `Ok(None)` and is refused.
-fn mlkem_encryption_supported(enc: &str) -> bool {
-    leas_proto::proto_spec::parse_mlkem_encryption(enc)
-        .ok()
-        .flatten()
-        .is_some_and(|parsed| EncryptionConfig::try_from_parsed(&parsed).is_ok())
 }
 
 /// `VMess` row: modern AEAD payload security only, implemented transport.
@@ -630,6 +610,7 @@ mod tests {
             password: "secret".into(),
             security: SecurityConfig::default(),
             transport: TransportConfig::Tcp,
+            encryption: None,
             path: None,
             remarks: None,
         }
@@ -885,6 +866,25 @@ mod tests {
         let mut cfg = vless_cfg();
         cfg.encryption = Some(TinyText::from("some-future-scheme"));
         assert!(!supported(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg)));
+    }
+
+    /// A stored row (older build or direct JSON) can still carry a value the
+    /// parser would now reject. The capability backstop names it; it must not
+    /// claim the value is merely "not implemented", and it must never dial.
+    #[test]
+    fn stored_invalid_vless_encryption_is_refused_by_name() {
+        let mut cfg = vless_cfg();
+        cfg.encryption = Some(TinyText::from("aes-128-gcm"));
+        let reason = support_reason(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg))
+            .expect("must be refused")
+            .into_owned();
+        assert!(reason.contains("aes-128-gcm"), "{reason}");
+        assert!(!reason.contains("not implemented"), "{reason}");
+
+        // A stored restore case is accepted: it means plain VLESS.
+        let mut cfg = vless_cfg();
+        cfg.encryption = Some(TinyText::from("auto"));
+        assert!(supported(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg)));
     }
 
     #[test]

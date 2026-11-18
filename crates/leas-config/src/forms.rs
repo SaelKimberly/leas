@@ -1882,6 +1882,9 @@ fn trojan_from_form(
             enc: None,
         },
         transport: TransportConfig::Tcp,
+        // The add-server form has no trojan-go encryption field; layered rows
+        // enter through a share link.
+        encryption: None,
         path: None,
         remarks: None,
     })

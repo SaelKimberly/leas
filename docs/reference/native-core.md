@@ -188,7 +188,7 @@ Matrix notes:
 
 | Capability | Detail |
 |------------|--------|
-| Encryption | None by default: identity is a UUID, with optional `xtls-rprx-vision` flow control. Account encryption `mlkem768x25519plus` is implemented: `mlkem768x25519plus.<native\|xorpub\|random>.<seconds>[s].<padding>`, the parser mirrors xray `infra/conf/vless.go`, ML-KEM-768 plus X25519 PFS wraps the session before the request header, and the sealed-record tunnel lives in `protocol/vless/encryption/`. The client always seals ChaCha20-Poly1305; the server may answer with either cipher. 0-RTT ticket resume is omitted. `encryption` composes with `flow`: vision sits on top of the sealed layer and its Direct handoff targets the encryption conn (`CanSpliceCopy = 3`, xray `proxy/vless/outbound/outbound.go:262-267`), so the outer TLS is never peeled |
+| Encryption | None by default: identity is a UUID, with optional `xtls-rprx-vision` flow control. Account encryption `mlkem768x25519plus` is implemented: `mlkem768x25519plus.<native\|xorpub\|random>.<1rtt\|0rtt>.<padding>.<keys>`. Validity is owned by `leas-proto::parse_mlkem_encryption` (grammar, decoded keys, padding bounds); the native handshake consumes the validated value. Generator noise is restored before validation: `none`, `auto`, and `none`+a junk suffix become absent. ML-KEM-768 plus X25519 PFS wraps the session before the request header, and the sealed-record tunnel lives in `protocol/vless/encryption/`. The client always seals ChaCha20-Poly1305; the server may answer with either cipher. 0-RTT ticket resume is omitted. `encryption` composes with `flow`: vision sits on top of the sealed layer and its Direct handoff targets the encryption conn (`CanSpliceCopy = 3`, xray `proxy/vless/outbound/outbound.go:262-267`), so the outer TLS is never peeled |
 | Auth | UUID, carried as the command bytes in the request header |
 | Obfuscation | None at protocol level; REALITY supplies traffic camouflage |
 | Transports | TCP, WS, gRPC, HTTPUpgrade, XHTTP (h1, h2, h3), h2 via the v2rayhttp transport, and mKCP. KCP is xray-only because sing-box has no kcp. Vision requires raw TCP: the Direct handoff needs the socket, so ws, grpc and xhttp framing are incompatible |
@@ -212,13 +212,13 @@ Matrix notes:
 
 | Capability | Detail |
 |------------|--------|
-| Encryption | None: plaintext after TLS; the TLS layer is the security |
+| Encryption | Plain after TLS by default; the TLS layer is the security. Trojan-Go's `encryption=ss;<method>:<password>` layer is implemented for `aes-128-gcm`, `aes-256-gcm` and `chacha20-ietf-poly1305` as a **bare** classic-AEAD stream (`protocol/ss/stream.rs::wrap_bare`, `first: None`): salt then sealed chunks, no SS target-address header. It wraps the carrier between the transport/security and the Trojan request header, and the UDP command-3 header goes through it too. `trojan-go://` is accepted as a scheme and emitted on export when the layer is present; `type=original` restores to tcp; `plugin=` is refused. xray/sing-box/Clash builders refuse a layered row by name |
 | Auth | `auth_key` (`protocol/trojan/mod.rs`): 56 lowercase hex characters of `sha224(password)`, mirroring xray `hexSha224` |
 | Obfuscation | None; REALITY can carry it through the engine |
 | Transports | TCP, WS, gRPC and HTTPUpgrade ride the uniform pipeline |
 | Wire | Request `key(56) || CRLF || command(1) || ATYP+addr+port-BE2 || CRLF`, with the port last (trojan's `NewAddressParser` has no `PortFirst`, and sing-box's `SocksaddrSerializer` is port-last too). There is no server response header; both cores relay raw after the request |
 | UDP | Command 3: per-datagram `ATYP\|addr\|port \|\| 2B len \|\| CRLF \|\| payload` (`connect_udp`), with the per-packet address defaulting to the session target. Send payloads are capped at 8192 (xray `maxLength`); reads follow the permissive peer and accept the full u16. A domain-addressed reply frame is delivered with no per-packet address instead of failing the session |
-| Status | Complete, `{tcp, ws, grpc} × {standard, chrome-fingerprint} × both cores` plus the UDP row |
+| Status | Complete, `{tcp, ws, grpc} × {standard, chrome-fingerprint} × both cores` plus the UDP row. The Trojan-Go layer is proven against the pinned `trojan-go v0.10.6` server: `aes-128-gcm/tcp`, `aes-256-gcm/ws`, `chacha20-ietf-poly1305/tcp` |
 
 **Shadowsocks and Shadowsocks-2022**: native implementation, `crates/leas-native/src/protocol/ss/`
 

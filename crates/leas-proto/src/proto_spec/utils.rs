@@ -142,6 +142,26 @@ pub fn query_get_multi<'a>(params: &'a [(String, String)], keys: &[&str]) -> Opt
     keys.iter().find_map(|key| query_get(params, key))
 }
 
+/// Refuse a protocol parser that does not own the `encryption` parameter.
+///
+/// The key belongs to VLESS (account encryption) and Trojan (Trojan-Go's SS
+/// layer). On every other share-link parser its presence means the body is not
+/// that protocol — or the generator leaked a `VMess` `scy` value — so it is a
+/// config-invalid result, never a silent no-op.
+///
+/// # Errors
+///
+/// Any `encryption` pair, including `none` and an empty value.
+pub fn reject_foreign_encryption(params: &[(String, String)]) -> Result<(), ParseError> {
+    if let Some((_, value)) = params.iter().find(|(key, _)| key == "encryption") {
+        return Err(ParseError::InvalidConf(
+            "encryption".into(),
+            value.clone().into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Decode fragment (remarks) from raw URL
 ///
 /// # Errors

@@ -251,7 +251,7 @@ memtrace-compare a b='' force='':
 # into `crates/leas-oracles/src/pins.rs`. Print-only: no source is rewritten.
 # `curl` needs to reach api.github.com; on a workstation whose proxy breaks
 # TLS or has no DNS, set ALL_PROXY=socks5h://<host>:<port> (the proxy resolves).
-oracles-pins xray singbox mihomo:
+oracles-pins xray singbox mihomo trojan-go:
     #!/usr/bin/env bash
     set -euo pipefail
     # mihomo publishes a dozen amd64 microarchitecture variants, so its asset
@@ -271,6 +271,19 @@ oracles-pins xray singbox mihomo:
             /^[[:space:]]*"digest":/ { d=$0; sub(/.*"digest": "sha256:/,"",d); sub(/".*/,"",d); print n, d }
         ' \
         | grep -E "$pat"
+    done
+    # Trojan-Go v{{trojan-go}} predates the release API's `digest` field, so its
+    # hashes are computed from the assets (the only honest fallback).
+    echo "== p4gefau1t/trojan-go v{{trojan-go}}"
+    for asset in trojan-go-linux-amd64.zip trojan-go-linux-armv8.zip \
+                 trojan-go-windows-amd64.zip trojan-go-windows-arm64.zip; do
+        tmp="$(mktemp)"
+        curl -fsSL --ssl-no-revoke \
+            "https://github.com/p4gefau1t/trojan-go/releases/download/v{{trojan-go}}/$asset" \
+            -o "$tmp"
+        printf '%s ' "$asset"
+        sha256sum "$tmp" | cut -d' ' -f1
+        rm -f "$tmp"
     done
 
 # ─── Tier-3b test oracle: pinned SIP003 plugin binaries ────────────

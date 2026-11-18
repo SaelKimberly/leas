@@ -85,6 +85,8 @@ impl TransportConfig {
             "httpupgrade",
             "splithttp",
             "websocket",
+            // Trojan-Go's name for plain TCP (`url/share_link.go`).
+            "original",
             "https",
             "xhttp",
             "grpc",
@@ -124,7 +126,7 @@ impl TransportConfig {
             // "auto"/"none" on `net` field are common mistakes from share link
             // generators confusing `net` (transport) with `scy` (security) or
             // `type` (header type). Default to TCP like mihomo does.
-            Some("tcp" | "raw" | "auto" | "none") => Ok(Some(Self::Tcp)),
+            Some("tcp" | "raw" | "original" | "auto" | "none") => Ok(Some(Self::Tcp)),
             Some("ws" | "websocket") => Ok(Some(Self::Ws(WebSocketConfig {
                 path: path.map(TinyText::from),
                 ..WebSocketConfig::default()

@@ -104,6 +104,7 @@ impl HttpClientConfig {
         endpoint.host_type = host_kind_for(&parsed_host);
 
         let query = utils::parse_query(raw.query);
+        utils::reject_foreign_encryption(&query)?;
 
         // Security mode: tls (HTTPS) or none (default plain HTTP)
         let security = match utils::query_get(&query, "security") {

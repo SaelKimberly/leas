@@ -106,7 +106,7 @@ xray-core, sing-box, Clash and native all build. Native transport support is the
 | `uuid` | userinfo | `String` | - | Required |
 | `uuid_origin` | userinfo | `Option<TinyText>` | `None` | Non-UUID userinfo, mapped to a v5 UUID |
 | `security` | `security` | `SecurityConfig` | `none` | `none`, `tls`, `reality` |
-| `encryption` | `encryption` | `Option<TinyText>` | `None` | Stored unless empty; also the ML-KEM form, see below |
+| `encryption` | `encryption` | `Option<TinyText>` | `None` | `none`/`auto`/a `none`+junk suffix restore to absent; a valid ML-KEM form is stored; anything else is a parse error (see below) |
 | `flow` | `flow` | `Option<TinyText>` | `None` | `xtls-rprx-vision`, `xtls-rprx-vision-udp443` |
 | `transport` | `type` | `TransportConfig` | `tcp` | |
 | `path` | `path` | `Option<TinyText>` | `None` | Mirrored from the transport |
@@ -122,7 +122,9 @@ The `encryption` value may be an xray `mlkem768x25519plus` string:
 mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<padding>.<keys>
 ```
 
-`parse_mlkem_encryption` returns `None` for any other prefix, and errors on an unknown mode, unknown RTT token, bad base64url, or a key segment that is not 32 or 1184 bytes.
+`parse_mlkem_encryption` returns `None` for any other prefix. It owns the whole validity rule now: an unknown mode, unknown RTT token, bad base64url, a key segment that is not 32 or 1184 bytes, an empty key list, and the padding rules (numeric triples, first block probability ≥100 with both bounds ≥35, total ≤65553) are all parse errors. `VlessConfig::validate` re-runs the same normaliser on a stored config; `capability` refuses it by name.
+
+`encryption` is one shared normaliser, applied by the URL parser, the Clash conversion, and stored-row validation: `none` and `auto` (ASCII case-insensitive) and `none` followed by a junk suffix (`none=/@Telegram…`, first suffix byte one of `= / @ # ? & ; ,` or whitespace) restore to absent; a valid ML-KEM value is kept; empty, unknown and malformed values are `InvalidConf`, so the row is not imported. The fallback chain stops on `InvalidConf`, so a mis-schemed body is never reinterpreted as Trojan or Hysteria (which accept any userinfo as a credential).
 
 ### Parser quirks
 
@@ -139,7 +141,8 @@ xray-core, sing-box, Clash, native.
 
 ## 4. Trojan
 
-- **Scheme**: `trojan://<password>@<host>:<port>?<query>#<remarks>`.
+- **Schemes**: `trojan://<password>@<host>:<port>?<query>#<remarks>` and
+  `trojan-go://…` (Trojan-Go's own scheme; required for its extra encryption).
 - **Source**: `crates/leas-proto/src/proto_spec/trojan.rs`: `TrojanConfig`.
 - **Example**: `trojan://humanity@172.64.152.23:443?security=tls&type=ws&path=/assignment&sni=www.creationlong.org`
 
@@ -149,17 +152,40 @@ xray-core, sing-box, Clash, native.
 |---|---|---|---|---|
 | `password` | userinfo | `String` | - | Required; `#` in a password is handled by the splitter |
 | `security` | `security` | `SecurityConfig` | `tls` | `tls`, `none`, `reality` |
-| `transport` | `type` | `TransportConfig` | `tcp` | |
+| `transport` | `type` | `TransportConfig` | `tcp` | `original` (Trojan-Go's name for plain TCP) restores to `tcp` |
+| `encryption` | `encryption` | `Option<TrojanEncryption>` | `None` | Trojan-Go's `ss;<method>:<password>` layer, see below |
 | `path` | `path` | `Option<TinyText>` | `None` | Mirrored from the transport |
 | `remarks` | `#` | `Option<TinyText>` | `None` | |
 
 TLS keys match VLESS. REALITY accepts `pbk`, `sid`, `spx`, `pqv`.
 
+### Trojan-Go `encryption`
+
+`encryption=ss;<method>:<password>` with exactly `aes-128-gcm`, `aes-256-gcm` or
+`chacha20-ietf-poly1305`; the password may contain `:` (only the first one splits
+it). `none` (with or without ignored parameters) and an absent key are plain
+Trojan. A repeated key, an unknown provider/method, a missing `:` or an empty
+password is `InvalidConf`. `plugin=…` is also `InvalidConf`: transport plugins
+are unimplemented and ignoring the key would dial a different wire.
+
+On the wire the layer is a **bare shadowsocks AEAD stream** (Trojan-Go
+`core.Cipher.StreamConn`): salt first, then sealed chunks, with **no SS
+target-address header** — the Trojan header inside it carries the destination.
+It sits between the transport/TLS carrier and the Trojan request header (the
+Trojan-Go stack is `transport → tls → websocket → ss → trojan`), and the UDP
+associate header is wrapped the same way. The method is part of the signature
+identity and the password is a credential. Reconstruction emits
+`trojan-go://…encryption=ss%3B<method>%3A<password>` when the layer is present
+and `trojan://` otherwise.
+
+xray-core, sing-box and Clash cannot express the layer: their builders refuse
+the row by name rather than emitting a config that would dial plain Trojan.
+
 ### Parser quirks
 
 - `security` absent means `tls`; `security=none` must be explicit.
 - The parser reads `sni` only. Export defaults fill an absent SNI with the resolved host (`set_export_defaults`); the config stores only explicit values. The module header mentions a `peer` fallback, but no code reads a `peer` key.
-- Only `type` and `path` are read; the module header's `ws=1` + `wspath=` legacy form is not implemented.
+- `type` and `path` are read; the module header's `ws=1` + `wspath=` legacy form is not implemented.
 
 ### Backend coverage
 

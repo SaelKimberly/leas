@@ -39,6 +39,7 @@ use crate::pins;
 pub const SINGBOX_VERSION: &str = pins::SINGBOX_VERSION;
 pub const MIHOMO_VERSION: &str = pins::MIHOMO_VERSION;
 pub const XRAY_VERSION: &str = pins::XRAY_VERSION;
+pub const TROJAN_GO_VERSION: &str = pins::TROJAN_GO_VERSION;
 
 /// Environment handed to an [`E2eCase`]'s `server_config` builder.
 pub struct ServerEnv<'a> {

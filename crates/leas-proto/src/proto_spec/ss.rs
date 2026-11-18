@@ -156,6 +156,7 @@ impl SsConfig {
         let remarks = utils::decode_fragment(raw)?;
 
         let query = utils::parse_query(raw.query);
+        utils::reject_foreign_encryption(&query)?;
         // The single constructor: glued name+options, a separate `plugin_opts`,
         // and the base64-JSON spelling all resolve here (spec §3.2), and it
         // never refuses — a row we cannot serve still stores, so it can be

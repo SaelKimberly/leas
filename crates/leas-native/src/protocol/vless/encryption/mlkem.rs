@@ -32,7 +32,6 @@
 
 use super::b3;
 
-use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, AeadInOut};
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use ring::rand::SecureRandom;
@@ -48,6 +47,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use zeroize::Zeroizing;
 
 use leas_proto::proto_spec::MlkemEncryption;
+use leas_proto::proto_spec::MlkemKey;
 use leas_proto::proto_spec::MlkemMode;
 use leas_tls::crypto::X25519KeyPair;
 use leas_tls::crypto::mlkem::{Ciphertext, Mlkem768, PublicKey};
@@ -304,122 +304,6 @@ fn rand_between(lo: usize, hi: usize, rng: &ring::rand::SystemRandom) -> usize {
 
 // ── config ─────────────────────────────────────────────────────────────────
 
-/// A configured server authentication key: X25519 (32 bytes) or ML-KEM-768
-/// encapsulation key (1184 bytes).
-#[derive(Debug, Clone)]
-pub enum ServerKey {
-    X25519([u8; X25519_LEN]),
-    Mlkem(Vec<u8>),
-}
-
-impl ServerKey {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Self::X25519(k) => k.as_slice(),
-            Self::Mlkem(k) => k,
-        }
-    }
-}
-
-/// Ready-to-use encryption parameters (parsed string + decoded keys +
-/// parsed padding).
-#[derive(Debug, Clone)]
-pub struct EncryptionConfig {
-    pub mode: MlkemMode,
-    /// xray `account.Seconds` — `1` for `0rtt` accounts. Ticket-based
-    /// resume is not implemented (deviation); every dial runs the full
-    /// handshake.
-    pub seconds: u32,
-    pub padding_lens: Vec<[usize; 3]>,
-    pub padding_gaps: Vec<[usize; 3]>,
-    pub keys: Vec<ServerKey>,
-}
-
-impl EncryptionConfig {
-    /// Build from the proto-parsed value: decodes the base64url key
-    /// segments and parses the padding spec (xray `ParsePadding` rules).
-    pub fn try_from_parsed(parsed: &MlkemEncryption) -> Result<Self, NativeError> {
-        let invalid = |what: String| NativeError::Config(format!("vless mlkem encryption: {what}"));
-        let mut keys = Vec::new();
-        for seg in parsed.keys.split('.') {
-            if seg.is_empty() {
-                return Err(invalid("empty key segment".into()));
-            }
-            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(seg)
-                .map_err(|_| invalid("invalid base64url key segment".into()))?;
-            match decoded.len() {
-                32 => {
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(&decoded);
-                    keys.push(ServerKey::X25519(k));
-                }
-                1184 => keys.push(ServerKey::Mlkem(decoded)),
-                other => {
-                    return Err(invalid(format!(
-                        "key segment must be 32 or 1184 bytes, got {other}"
-                    )));
-                }
-            }
-        }
-        if keys.is_empty() {
-            return Err(invalid("no server keys".into()));
-        }
-        let (padding_lens, padding_gaps) = parse_padding(&parsed.padding)?;
-        Ok(Self {
-            mode: parsed.mode,
-            seconds: parsed.seconds,
-            padding_lens,
-            padding_gaps,
-            keys,
-        })
-    }
-}
-
-/// Parse the padding spec (xray `ParsePadding`): dot-separated
-/// `probability-min-max` triples, alternating length/delay blocks starting
-/// with a length block. The first block requires probability ≥100 and
-/// min ≥35; total max padding ≤65553.
-/// One `probability-min-max` padding block (xray `[3]int`).
-type PaddingSpec = [usize; 3];
-
-fn parse_padding(padding: &str) -> Result<(Vec<PaddingSpec>, Vec<PaddingSpec>), NativeError> {
-    let invalid = |s: &str| NativeError::Config(format!("vless mlkem padding parameter: {s}"));
-    let mut lens = Vec::new();
-    let mut gaps = Vec::new();
-    if padding.is_empty() {
-        return Ok((lens, gaps));
-    }
-    let mut max_len = 0usize;
-    for (i, s) in padding.split('.').enumerate() {
-        let x: Vec<&str> = s.split('-').collect();
-        if x.len() < 3 || x.iter().any(|p| p.is_empty()) {
-            return Err(invalid(s));
-        }
-        let mut y = [0usize; 3];
-        for (slot, part) in y.iter_mut().zip(x) {
-            *slot = part.parse().map_err(|_| invalid(s))?;
-        }
-        if i == 0 && (y[0] < 100 || y[1] < 18 + 17 || y[2] < 18 + 17) {
-            return Err(NativeError::Config(
-                "vless mlkem padding: first padding length must not be smaller than 35".into(),
-            ));
-        }
-        if i % 2 == 0 {
-            max_len += y[1].max(y[2]);
-            lens.push(y);
-        } else {
-            gaps.push(y);
-        }
-    }
-    if max_len > 18 + 65_535 {
-        return Err(NativeError::Config(
-            "vless mlkem padding: total padding length must not be larger than 65553".into(),
-        ));
-    }
-    Ok((lens, gaps))
-}
-
 /// Draw one padded fragment plan (xray `CreatPadding`): each block fires
 /// with its probability, producing a length/gap in `[min, max]`; empty
 /// specs fall back to the documented defaults.
@@ -459,18 +343,18 @@ const LENGTH_LEN: usize = 18;
 /// header is written through the returned connection.
 pub async fn handshake(
     stream: BoxStream,
-    cfg: &EncryptionConfig,
+    cfg: &MlkemEncryption,
 ) -> Result<CommonConn, NativeError> {
     let mut stream = stream;
     let rng = ring::rand::SystemRandom::new();
 
     // Relay blocks: one per server key, chained by hash32 + CTR streams.
     let relays_len: usize = cfg
-        .keys
+        .decoded_keys
         .iter()
         .map(|k| match k {
-            ServerKey::X25519(_) => 32 + 32,
-            ServerKey::Mlkem(_) => MLKEM_CT_LEN + 32,
+            MlkemKey::X25519(_) => 32 + 32,
+            MlkemKey::Mlkem(_) => MLKEM_CT_LEN + 32,
         })
         .sum::<usize>()
         - 32;
@@ -489,9 +373,9 @@ pub async fn handshake(
     let mut nfs_key = Zeroizing::new(Vec::new());
     let mut last_ctr: Option<Ctr128BE<Aes256>> = None;
     let mut off = IV_LEN;
-    for (j, key) in cfg.keys.iter().enumerate() {
+    for (j, key) in cfg.decoded_keys.iter().enumerate() {
         let index = match key {
-            ServerKey::X25519(pk) => {
+            MlkemKey::X25519(pk) => {
                 let eph =
                     X25519KeyPair::generate(&rng).map_err(|e| NativeError::Tls(e.to_string()))?;
                 hello[off..off + X25519_LEN].copy_from_slice(&eph.public_key());
@@ -502,7 +386,7 @@ pub async fn handshake(
                 );
                 X25519_LEN
             }
-            ServerKey::Mlkem(ek) => {
+            MlkemKey::Mlkem(ek) => {
                 let pk = PublicKey::from_bytes(ek).map_err(|e| NativeError::Tls(e.to_string()))?;
                 // Encapsulate straight into the hello relay slot and a
                 // stack secret — no `Ciphertext`/`Vec` temps.
@@ -529,13 +413,13 @@ pub async fn handshake(
             // hash32 check region.
             c.apply_keystream(&mut hello[off..off + 32]);
         }
-        if j == cfg.keys.len() - 1 {
+        if j == cfg.decoded_keys.len() - 1 {
             break;
         }
         // Chain to the next key: write blake3(next server key) masked by a
         // CTR stream keyed by THIS hop's shared secret.
         let mut c = new_ctr(&nfs_key, &iv);
-        let hash = b3::hash32(cfg.keys[j + 1].bytes());
+        let hash = b3::hash32(cfg.decoded_keys[j + 1].bytes());
         hello[off + index..off + index + 32].copy_from_slice(&hash);
         c.apply_keystream(&mut hello[off + index..off + index + 32]);
         last_ctr = Some(c);
@@ -1016,7 +900,7 @@ mod tests {
     /// on a record boundary — the shape the clean-EOF test needs.
     async fn fake_server_bounded(
         conn: DuplexStream,
-        keys: Vec<ServerKey>,
+        keys: Vec<MlkemKey>,
         x25519_sk: std::sync::Arc<X25519KeyPair>,
         mlkem_sk: leas_tls::crypto::mlkem::SecretKey,
     ) -> std::io::Result<usize> {
@@ -1030,7 +914,7 @@ mod tests {
     /// back until the client disconnects.
     async fn fake_server(
         conn: DuplexStream,
-        keys: Vec<ServerKey>,
+        keys: Vec<MlkemKey>,
         x25519_sk: std::sync::Arc<X25519KeyPair>,
         mlkem_sk: leas_tls::crypto::mlkem::SecretKey,
         mode: MlkemMode,
@@ -1041,7 +925,7 @@ mod tests {
     /// The shared body of [`fake_server`]/[`fake_server_bounded`].
     async fn fake_server_limited(
         mut conn: DuplexStream,
-        keys: Vec<ServerKey>,
+        keys: Vec<MlkemKey>,
         x25519_sk: std::sync::Arc<X25519KeyPair>,
         mlkem_sk: leas_tls::crypto::mlkem::SecretKey,
         mode: MlkemMode,
@@ -1050,8 +934,8 @@ mod tests {
         let relays_len: usize = keys
             .iter()
             .map(|k| match k {
-                ServerKey::X25519(_) => 64,
-                ServerKey::Mlkem(_) => MLKEM_CT_LEN + 32,
+                MlkemKey::X25519(_) => 64,
+                MlkemKey::Mlkem(_) => MLKEM_CT_LEN + 32,
             })
             .sum::<usize>()
             - 32;
@@ -1069,19 +953,19 @@ mod tests {
                 c.apply_keystream(&mut relays[off..off + 32]); // recover this relay
             }
             let index = match key {
-                ServerKey::X25519(_) => X25519_LEN,
-                ServerKey::Mlkem(_) => MLKEM_CT_LEN,
+                MlkemKey::X25519(_) => X25519_LEN,
+                MlkemKey::Mlkem(_) => MLKEM_CT_LEN,
             };
             if mode != MlkemMode::Native {
                 new_ctr(key.bytes(), &iv).apply_keystream(&mut relays[off..off + index]);
             }
             match key {
-                ServerKey::X25519(_) => {
+                MlkemKey::X25519(_) => {
                     let mut peer = [0u8; X25519_LEN];
                     peer.copy_from_slice(&relays[off..off + X25519_LEN]);
                     nfs_key = x25519_sk.agree(&peer).expect("agree").to_vec();
                 }
-                ServerKey::Mlkem(_) => {
+                MlkemKey::Mlkem(_) => {
                     let ct = leas_tls::crypto::mlkem::Ciphertext::from_bytes(
                         &relays[off..off + MLKEM_CT_LEN],
                     )
@@ -1196,7 +1080,7 @@ mod tests {
     }
 
     fn test_keys() -> (
-        Vec<ServerKey>,
+        Vec<MlkemKey>,
         std::sync::Arc<X25519KeyPair>,
         leas_tls::crypto::mlkem::SecretKey,
     ) {
@@ -1204,8 +1088,8 @@ mod tests {
         let (pk, sk) = Mlkem768::generate_keypair();
         (
             vec![
-                ServerKey::X25519(x.public_key()),
-                ServerKey::Mlkem(pk.as_bytes().to_vec()),
+                MlkemKey::X25519(x.public_key()),
+                MlkemKey::Mlkem(pk.as_bytes().to_vec()),
             ],
             std::sync::Arc::new(x),
             sk,
@@ -1217,12 +1101,16 @@ mod tests {
     /// randomised per connection).
     async fn roundtrip(mode: MlkemMode, padding: &str, payload_len: usize, seconds: u32) -> usize {
         let (keys, x_sk, mlkem_sk) = test_keys();
-        let cfg = EncryptionConfig {
+        let (padding_lens, padding_gaps) =
+            leas_proto::proto_spec::parse_padding_spec(padding).expect("padding");
+        let cfg = MlkemEncryption {
             mode,
             seconds,
-            padding_lens: parse_padding(padding).expect("padding").0,
-            padding_gaps: parse_padding(padding).expect("padding").1,
-            keys: keys.clone(),
+            padding: padding.to_string(),
+            keys: String::new(),
+            padding_lens,
+            padding_gaps,
+            decoded_keys: keys.clone(),
         };
         let (client_side, server_side) = tokio::io::duplex(1 << 16);
         let server = tokio::spawn(async move {
@@ -1305,12 +1193,14 @@ mod tests {
     #[tokio::test]
     async fn eof_at_a_record_boundary_is_clean() {
         let (keys, x_sk, mlkem_sk) = test_keys();
-        let cfg = EncryptionConfig {
+        let cfg = MlkemEncryption {
             mode: MlkemMode::Native,
             seconds: 0,
+            padding: String::new(),
+            keys: String::new(),
             padding_lens: Vec::new(),
             padding_gaps: Vec::new(),
-            keys: keys.clone(),
+            decoded_keys: keys.clone(),
         };
         let (client_side, server_side) = tokio::io::duplex(1 << 16);
         // The stock fake server loops until the CLIENT closes. This variant
@@ -1607,21 +1497,20 @@ mod tests {
         }
     }
 
-    /// The config builder decodes base64url keys and rejects bad segments.
+    /// The proto parser decodes base64url keys and validates padding.
     #[test]
     fn config_from_parsed_string() {
         use base64::Engine as _;
         let x = X25519KeyPair::generate(&ring::rand::SystemRandom::new()).expect("x");
         let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x.public_key());
         let value = format!("mlkem768x25519plus.native.1rtt.100-35-70.0-0-0.{key_b64}");
-        let parsed = leas_proto::proto_spec::parse_mlkem_encryption(&value)
+        let cfg = leas_proto::proto_spec::parse_mlkem_encryption(&value)
             .expect("parse")
             .expect("is mlkem");
-        let cfg = EncryptionConfig::try_from_parsed(&parsed).expect("config");
         assert_eq!(cfg.mode, MlkemMode::Native);
         assert_eq!(cfg.seconds, 0); // 1rtt → xray Seconds=0 (no 0-RTT resume)
-        assert_eq!(cfg.keys.len(), 1);
-        assert_eq!(cfg.keys[0].bytes(), x.public_key().as_slice());
+        assert_eq!(cfg.decoded_keys.len(), 1);
+        assert_eq!(cfg.decoded_keys[0].bytes(), x.public_key().as_slice());
 
         // A malformed key segment is rejected at parse time.
         let bad = format!("mlkem768x25519plus.native.0rtt.{key_b64}!!!");
@@ -1631,11 +1520,12 @@ mod tests {
     /// Padding validation mirrors xray `ParsePadding` bounds.
     #[test]
     fn padding_validation() {
-        assert!(parse_padding("100-35-70.0-0-0").is_ok());
-        assert!(parse_padding("50-35-70").is_err()); // first probability < 100
-        assert!(parse_padding("100-34-70").is_err()); // first min < 35
-        assert!(parse_padding("100-35-70.0-0").is_err()); // missing slot
+        use leas_proto::proto_spec::parse_padding_spec;
+        assert!(parse_padding_spec("100-35-70.0-0-0").is_ok());
+        assert!(parse_padding_spec("50-35-70").is_err()); // first probability < 100
+        assert!(parse_padding_spec("100-34-70").is_err()); // first min < 35
+        assert!(parse_padding_spec("100-35-70.0-0").is_err()); // missing slot
         let big = "100-35-65535.".repeat(3);
-        assert!(parse_padding(big.trim_end_matches('.')).is_err()); // total > 65553
+        assert!(parse_padding_spec(big.trim_end_matches('.')).is_err()); // total > 65553
     }
 }

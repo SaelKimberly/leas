@@ -109,6 +109,7 @@ impl WireguardConfig {
         }
 
         let query = utils::parse_query(raw.query);
+        utils::reject_foreign_encryption(&query)?;
 
         // address: interface address in CIDR notation (required)
         let address = utils::query_get(&query, "address")

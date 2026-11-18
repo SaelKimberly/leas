@@ -159,6 +159,9 @@ pub struct CaseSpec {
     /// Shadowsocks cipher method (`None` for every other protocol); selects
     /// the codec family and the server config's method/password.
     ss_method: Option<&'static str>,
+    /// Trojan-Go's extra SS layer `(method, password)`; `None` for a plain
+    /// Trojan row. Only the TrojanGo oracle serves it.
+    trojan_enc: Option<(&'static str, &'static str)>,
 }
 
 impl CaseSpec {
@@ -182,6 +185,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: None,
+            trojan_enc: None,
         }
     }
 
@@ -205,6 +209,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: None,
+            trojan_enc: None,
         }
     }
 
@@ -230,6 +235,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: None,
+            trojan_enc: None,
         }
     }
 
@@ -255,6 +261,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: Some(CoreKind::SingBox),
             ss_method: None,
+            trojan_enc: None,
         }
     }
 
@@ -281,6 +288,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: None,
+            trojan_enc: None,
         }
     }
 
@@ -312,6 +320,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: Some(method),
+            trojan_enc: None,
         }
     }
 
@@ -417,6 +426,19 @@ impl CaseSpec {
         self
     }
 
+    /// Trojan-Go's extra shadowsocks layer `(method, password)`. Only the
+    /// TrojanGo oracle implements it, so such a row belongs in the single-core
+    /// test.
+    #[must_use]
+    pub const fn with_trojan_encryption(
+        mut self,
+        method: &'static str,
+        password: &'static str,
+    ) -> Self {
+        self.trojan_enc = Some((method, password));
+        self
+    }
+
     /// The app-side probe kind.
     #[must_use]
     pub const fn app(&self) -> AppKind {
@@ -495,6 +517,7 @@ impl CaseSpec {
                 CoreKind::Xray => &[CoreKind::Xray],
                 CoreKind::SingBox => &[CoreKind::SingBox],
                 CoreKind::Mihomo => &[CoreKind::Mihomo],
+                CoreKind::TrojanGo => &[CoreKind::TrojanGo],
             };
         }
         if self.vless_enc.is_some() {
@@ -592,7 +615,14 @@ impl E2eCase for CaseSpec {
                 let security = self.security.as_ref().and_then(|s| s.server_security(core));
                 config::vmess_inbound(core, env, security, self.tls(), self.network)
             }
-            ProtocolKind::Trojan => config::trojan_inbound(core, env, self.network),
+            ProtocolKind::Trojan => match (core, self.trojan_enc) {
+                (CoreKind::TrojanGo, enc) => config::trojan_go_server(env, self.network, enc),
+                (_, Some(_)) => panic!(
+                    "{}: trojan-go encryption needs CoreKind::TrojanGo",
+                    self.label()
+                ),
+                (_, None) => config::trojan_inbound(core, env, self.network),
+            },
             ProtocolKind::Hysteria2 => config::hysteria2_inbound(env, self.obfs),
             ProtocolKind::Shadowsocks => config::ss_inbound(
                 core,
@@ -637,9 +667,13 @@ impl E2eCase for CaseSpec {
                     self.xhttp_mode,
                 )
             }
-            ProtocolKind::Trojan => {
-                config::client_params_trojan(port, target, self.tls(), self.network)
-            }
+            ProtocolKind::Trojan => config::client_params_trojan(
+                port,
+                target,
+                self.tls(),
+                self.network,
+                self.trojan_enc,
+            ),
             ProtocolKind::Hysteria2 => config::client_params_hysteria2(port, target, self.obfs),
             ProtocolKind::Shadowsocks => config::client_params_ss(
                 port,

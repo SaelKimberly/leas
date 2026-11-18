@@ -8,6 +8,7 @@ pub enum CoreKind {
     Xray,
     SingBox,
     Mihomo,
+    TrojanGo,
 }
 
 impl CoreKind {
@@ -18,6 +19,7 @@ impl CoreKind {
             Self::Xray => "xray",
             Self::SingBox => "sing-box",
             Self::Mihomo => "mihomo",
+            Self::TrojanGo => "trojan-go",
         };
         format!("{base}{}", std::env::consts::EXE_SUFFIX)
     }
@@ -84,6 +86,9 @@ fn probe_version(bin: &std::path::Path, kind: CoreKind) -> Result<String, String
         CoreKind::Xray => "-version",
         CoreKind::SingBox => "version",
         CoreKind::Mihomo => "-v",
+        // Trojan-Go prints `Trojan-Go <version> (<go>, <os>/<arch>)` and may
+        // exit non-zero after; only stdout matters here.
+        CoreKind::TrojanGo => "-version",
     };
     // `Command::output()` can hang; run it on a std thread and bound the wait.
     let (tx, rx) = std::sync::mpsc::channel();

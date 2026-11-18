@@ -475,6 +475,39 @@ impl<S: AsyncRead + Unpin> AsyncRead for SsStream<S> {
     }
 }
 
+/// Wrap `stream` in a **bare** classic-AEAD Shadowsocks stream — the
+/// Trojan-Go `encryption=ss;<method>:<password>` layer.
+///
+/// Unlike [`connect_to`], no target-address chunk is written: the request
+/// direction starts with its salt and the first sealed chunk is the caller's
+/// bytes (the Trojan request header). Trojan-Go wraps its carrier with
+/// `core.Cipher.StreamConn` (`tunnel/shadowsocks/client.go`), which is exactly
+/// this shape; sending an SS address first would be a different protocol.
+///
+/// # Errors
+///
+/// A non-classic or non-AEAD method, or a password the cipher cannot key.
+pub(crate) fn wrap_bare(
+    stream: BoxStream,
+    method: SsMethod,
+    password: &str,
+) -> Result<BoxStream, NativeError> {
+    if method.family() != SsFamily::Classic {
+        return Err(NativeError::Config(format!(
+            "trojan-go encryption requires a classic AEAD method, got {method:?}"
+        )));
+    }
+    let Some(aead) = method.cipher.aead() else {
+        return Err(NativeError::Config(
+            "trojan-go encryption requires an AEAD method".into(),
+        ));
+    };
+    let key = password_key(method, password)?;
+    let mut salt = Zeroizing::new(vec![0u8; aead.salt_len()]);
+    crate::rand::fill_nonsecret(&mut salt);
+    Ok(Box::new(SsStream::new(stream, method, key, &salt, None)))
+}
+
 /// Connect through a classic-AEAD Shadowsocks server: write the target
 /// address as the first chunk (`salt ‖ length seal ‖ payload seal`, one pass)
 /// and hand back the framing tunnel.

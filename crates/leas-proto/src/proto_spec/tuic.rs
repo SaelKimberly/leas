@@ -114,6 +114,7 @@ impl TuicConfig {
         }
 
         let query = utils::parse_query(raw.query);
+        utils::reject_foreign_encryption(&query)?;
 
         // congestion_control: cubic/bbr/new_reno/bbr3. Defaults to bbr.
         let congestion_control = utils::query_get(&query, "congestion_control").map(TinyText::from);

@@ -47,9 +47,18 @@ pub async fn connect(
 ) -> Result<BoxStream, NativeError> {
     // `mlkem768x25519plus` account encryption wraps the whole session (xray
     // outbound.go): the PQ handshake runs on the secured stream first, then
-    // the request header goes through it sealed.
+    // the request header goes through it sealed. The stored value goes through
+    // the parser's normaliser here too: a row written by an older build (or a
+    // direct JSON import) may still carry `none`/`auto`, which mean plain.
     if let Some(enc) = cfg.encryption.as_deref().filter(|e| !e.is_empty()) {
-        return connect_encrypted(ctx, stream, cfg, enc).await;
+        let normalized = leas_proto::proto_spec::normalize_vless_encryption(enc).map_err(|e| {
+            NativeError::Config(format!(
+                "vless encryption `{enc}` is not a VLESS encryption value: {e}"
+            ))
+        })?;
+        if let Some(value) = normalized {
+            return connect_encrypted(ctx, stream, cfg, value.as_str()).await;
+        }
     }
     let uuid = header::uuid_bytes(&cfg.uuid)?;
     match cfg.flow.as_deref() {
@@ -83,8 +92,7 @@ async fn connect_encrypted(
         .map_err(|e| invalid(e.to_string()))?
         .ok_or_else(|| invalid(format!("unsupported encryption value {enc}")))?;
     let uuid = header::uuid_bytes(&cfg.uuid)?;
-    let ecfg = encryption::EncryptionConfig::try_from_parsed(&parsed)?;
-    let conn = encryption::handshake(stream, &ecfg).await?;
+    let conn = encryption::handshake(stream, &parsed).await?;
     match cfg.flow.as_deref() {
         None | Some("") => {}
         Some(FLOW_XTLS_RPRX_VISION | FLOW_XTLS_RPRX_VISION_UDP443) => {

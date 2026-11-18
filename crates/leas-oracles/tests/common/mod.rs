@@ -3,8 +3,8 @@
 use leas_oracles::e2e::{
     Certs, CoreKind, CoreUnderTest, EchoServer, FingerprintTls, MIHOMO_VERSION, NoTls,
     PlainServerRealityClientTls, PqTls, RealityServerPlainClientTls, RealityTls,
-    RealityWrongPbkTls, RealityWrongSidTls, SINGBOX_VERSION, TlsEchoServer, TlsVariant,
-    XRAY_VERSION, generate_certs, spawn_echo, spawn_tls_echo,
+    RealityWrongPbkTls, RealityWrongSidTls, SINGBOX_VERSION, TROJAN_GO_VERSION, TlsEchoServer,
+    TlsVariant, XRAY_VERSION, generate_certs, spawn_echo, spawn_tls_echo,
 };
 use rstest::fixture;
 
@@ -25,6 +25,15 @@ pub fn cores() -> Cores {
             .expect("resolve sing-box"),
         mihomo: CoreUnderTest::resolve(CoreKind::Mihomo, MIHOMO_VERSION).expect("resolve mihomo"),
     }
+}
+
+/// Trojan-Go is resolved only by the rows that use it: a `LEAS_CORE_BIN_DIR`
+/// built before the fourth pin must not fail every unrelated e2e test.
+#[fixture]
+#[once]
+pub fn trojan_go_core() -> CoreUnderTest {
+    CoreUnderTest::resolve(CoreKind::TrojanGo, TROJAN_GO_VERSION)
+        .unwrap_or_else(|e| panic!("resolve trojan-go: {e}"))
 }
 
 /// Harness CA (cert/key), generated once per test binary.
@@ -54,6 +63,9 @@ pub const fn pick(cores: &Cores, kind: CoreKind) -> &CoreUnderTest {
         CoreKind::Xray => &cores.xray,
         CoreKind::SingBox => &cores.singbox,
         CoreKind::Mihomo => &cores.mihomo,
+        CoreKind::TrojanGo => {
+            panic!("trojan-go rows resolve the dedicated `trojan_go_core` fixture")
+        }
     }
 }
 

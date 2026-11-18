@@ -126,6 +126,8 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             // Identity re-key (IDENTITY_VERSION 4): marker-guarded DATA step,
             // never a cursor bump.
             rekey::rekey_once(conn).await?;
+            // One-time VLESS encryption normalisation (spec D15 = A).
+            rekey::normalize_encryption_once(conn).await?;
             Ok(())
         }
         0 => {
@@ -162,6 +164,7 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
                 .exec(conn)
                 .await?;
             rekey::stamp(conn).await?;
+            rekey::stamp_encryption_normalized(conn).await?;
             Ok(())
         }
         other => {
@@ -178,6 +181,7 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
                 if let Some(steps) = steps {
                     apply_steps(conn, steps).await?;
                     rekey::rekey_once(conn).await?;
+                    rekey::normalize_encryption_once(conn).await?;
                     return Ok(());
                 }
             }

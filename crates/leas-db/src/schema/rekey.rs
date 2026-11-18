@@ -10,6 +10,7 @@
 //! atomically renamed; only provably duplicate identities (same recomputed
 //! uid) merge, using the same link-collision evidence law as `merge.rs`.
 
+use toasty::Json;
 use toasty::stmt::Value;
 use toasty_core::driver::operation::TransactionMode;
 
@@ -19,6 +20,70 @@ use crate::models_toasty::{AppMeta, ProtocolId};
 use leas_proto::proto_spec::IDENTITY_VERSION;
 
 const MARKER: &str = "identity_version";
+
+/// Marker for the one-time VLESS `encryption` normalisation (spec D15 = A).
+const ENCRYPTION_MARKER: &str = "vless_encryption_normalized";
+
+/// Rewrite the stored VLESS `encryption` values the parser would now restore
+/// (`auto`, `none` + a glued suffix) to *absent*, then re-key the identities
+/// they touch. A marker-guarded DATA step: no DDL, no cursor bump.
+///
+/// Invalid values (e.g. `aes-128-gcm`) are left in place — `capability`
+/// refuses them by name and they are never dialed (spec D9).
+pub(super) async fn normalize_encryption_once(conn: &mut toasty::Connection) -> Result<()> {
+    if marker_value(conn, ENCRYPTION_MARKER).await? >= 1 {
+        return Ok(());
+    }
+    let mut tx = conn
+        .transaction_builder()
+        .mode(TransactionMode::Immediate)
+        .begin()
+        .await?;
+    match normalize_encryption_in(&mut tx).await {
+        Ok(()) => {
+            tx.commit().await?;
+            tracing::info!(target: "leas_db",
+                "protocols: normalised stored VLESS encryption values");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Stamp a freshly created database (no rows to normalise).
+pub(super) async fn stamp_encryption_normalized(conn: &mut toasty::Connection) -> Result<()> {
+    if marker_value(conn, ENCRYPTION_MARKER).await? >= 1 {
+        return Ok(());
+    }
+    stamp_marker(conn, ENCRYPTION_MARKER, 1).await
+}
+
+async fn normalize_encryption_in(tx: &mut impl toasty::Executor) -> Result<()> {
+    for (id, _kind, config) in read_protocols(tx).await? {
+        let leas_proto::proto_spec::ProtocolConfig::Vless(mut vless) = config else {
+            continue;
+        };
+        let Some(value) = vless.encryption.as_deref() else {
+            continue;
+        };
+        let Ok(normalized) = leas_proto::proto_spec::normalize_vless_encryption(value) else {
+            // Invalid rows stay: the capability backstop names them and
+            // refuses the dial (D9).
+            continue;
+        };
+        if normalized.as_ref().is_some_and(|v| v.as_str() == value) {
+            continue;
+        }
+        vless.encryption = normalized;
+        crate::models_toasty::Protocol::filter_by_id(ProtocolId::new(id))
+            .update()
+            .config(Json(leas_proto::proto_spec::ProtocolConfig::Vless(vless)))
+            .exec(&mut *tx)
+            .await?;
+    }
+    rebuild_identities(tx).await?;
+    stamp_marker(tx, ENCRYPTION_MARKER, 1).await
+}
 
 /// Re-key once, stamped in the same transaction. A no-op when the marker
 /// already equals [`IDENTITY_VERSION`].
@@ -58,7 +123,11 @@ pub(super) async fn stamp(conn: &mut toasty::Connection) -> Result<()> {
 }
 
 async fn marker(conn: &mut impl toasty::Executor) -> Result<i64> {
-    let Some(row) = AppMeta::filter_by_key(MARKER.to_owned())
+    marker_value(conn, MARKER).await
+}
+
+async fn marker_value(conn: &mut impl toasty::Executor, key: &str) -> Result<i64> {
+    let Some(row) = AppMeta::filter_by_key(key.to_owned())
         .first()
         .exec(conn)
         .await?
@@ -68,7 +137,7 @@ async fn marker(conn: &mut impl toasty::Executor) -> Result<i64> {
     Ok(row.value.parse().unwrap_or(0))
 }
 
-async fn rekey_in(tx: &mut impl toasty::Executor) -> Result<()> {
+async fn rebuild_identities(tx: &mut impl toasty::Executor) -> Result<()> {
     // (old id, new id, new sig)
     let mut rekeyed: Vec<(i64, i64, i64)> = Vec::new();
     for (old, kind, config) in read_protocols(tx).await? {
@@ -130,9 +199,18 @@ async fn rekey_in(tx: &mut impl toasty::Executor) -> Result<()> {
     for sql in ["DELETE FROM endpoint_rank", "DELETE FROM rank_weight_meta"] {
         let _ = toasty::sql::query(sql).exec(&mut *tx).await;
     }
+    Ok(())
+}
 
+async fn rekey_in(tx: &mut impl toasty::Executor) -> Result<()> {
+    rebuild_identities(tx).await?;
+    stamp_marker(tx, MARKER, i64::from(IDENTITY_VERSION)).await
+}
+
+/// Stamp an `app_meta` marker in the caller's transaction.
+async fn stamp_marker(tx: &mut impl toasty::Executor, key: &str, value: i64) -> Result<()> {
     toasty::sql::query(format!(
-        "INSERT INTO app_meta (key, value) VALUES ('{MARKER}', '{IDENTITY_VERSION}') \
+        "INSERT INTO app_meta (key, value) VALUES ('{key}', '{value}') \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value"
     ))
     .exec(&mut *tx)
@@ -608,5 +686,160 @@ mod tests {
             .expect("ids");
         let again: Vec<i64> = rows.iter().filter_map(|r| i64_at(r, 0)).collect();
         assert_eq!(again, ids);
+    }
+
+    fn vless_config(uuid: &str, encryption: Option<&str>) -> ProtocolConfig {
+        let mut value = serde_json::json!({
+            "schema": "Vless",
+            "uuid": uuid,
+            "transport": { "type": "tcp" },
+        });
+        if let Some(encryption) = encryption {
+            value["encryption"] = serde_json::json!(encryption);
+        }
+        serde_json::from_value(value).expect("vless config")
+    }
+
+    fn vless_row(id: i64, sig: i64, config: ProtocolConfig) -> Protocol {
+        Protocol {
+            id: ProtocolId::new(id),
+            sig,
+            proto_kind: ProtocolKind::Vless,
+            transport: Transport {
+                r#type: TransportType::Tcp,
+            },
+            security: Security {
+                r#type: SecurityType::None,
+                sni: None,
+                fp: None,
+                insecure: None,
+            },
+            config: Deferred::from(Json(config)),
+            created_at: 0,
+            links: Deferred::default(),
+        }
+    }
+
+    fn vless_id(config: &ProtocolConfig) -> (i64, i64) {
+        let parsed = ParsedProto {
+            endpoints: Vec::new(),
+            protocol: ProtocolEssentials {
+                proto_kind: ProtocolKind::Vless,
+                config: config.clone(),
+            },
+        };
+        (parsed.uid(), parsed.sig())
+    }
+
+    /// D15 = A: stored `auto`/`none=<junk>` rows are rewritten to absent,
+    /// re-keyed, and merged with an already-canonical duplicate; a second open
+    /// is a marker no-op.
+    #[tokio::test]
+    async fn encryption_normalization_rewrites_rekeys_and_merges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("encryption.db");
+
+        let auto = vless_config("11111111-1111-4111-8111-111111111111", Some("auto"));
+        let glued = vless_config(
+            "22222222-2222-4222-8222-222222222222",
+            Some("none=/@Telegram-|-@x"),
+        );
+        let canonical = vless_config("33333333-3333-4333-8333-333333333333", None);
+        let auto_normalized = vless_config("11111111-1111-4111-8111-111111111111", None);
+        let (auto_uid, auto_sig) = vless_id(&auto_normalized);
+        let (glued_uid, _) = vless_id(&vless_config("22222222-2222-4222-8222-222222222222", None));
+        let (canonical_uid, _) = vless_id(&canonical);
+
+        {
+            let db = Database::open(&path).await.expect("open");
+            let mut conn = db.connection().await.expect("connection");
+            // Force the DATA step on the next open: a fresh database is
+            // stamped with nothing to do.
+            toasty::sql::query("DELETE FROM app_meta WHERE key = 'vless_encryption_normalized'")
+                .exec(&mut conn)
+                .await
+                .expect("clear marker");
+            crate::upsert_protocols_bulk(
+                &mut conn,
+                &[
+                    vless_row(100, 1, auto),
+                    vless_row(101, 2, glued),
+                    vless_row(102, 3, canonical),
+                    // Already canonical, at the uid the rewrite produces:
+                    // the merge path must collapse it with row 100.
+                    vless_row(auto_uid, auto_sig, auto_normalized),
+                ],
+            )
+            .await
+            .expect("protocols");
+            crate::upsert_links_bulk(
+                &mut conn,
+                &[
+                    link(100, 1, Latency::fast(200), 1),
+                    link(auto_uid, 1, Latency::real(42), 9),
+                ],
+            )
+            .await
+            .expect("links");
+        }
+
+        let db = Database::open(&path).await.expect("reopen");
+        let mut conn = db.connection().await.expect("connection");
+        let rows = toasty::sql::query("SELECT id, config FROM protocols")
+            .exec(&mut conn)
+            .await
+            .expect("protocols");
+        let mut got: Vec<(i64, ProtocolConfig)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    i64_at(row, 0).expect("id"),
+                    serde_json::from_str(&text_at(row, 1).expect("config")).expect("config json"),
+                )
+            })
+            .collect();
+        got.sort_by_key(|(id, _)| *id);
+
+        let mut want = vec![auto_uid, glued_uid, canonical_uid];
+        want.sort_unstable();
+        assert_eq!(
+            got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            want,
+            "all three rows are re-keyed to their normalised identity"
+        );
+        for (_, config) in &got {
+            let ProtocolConfig::Vless(vless) = config else {
+                panic!("expected a vless config");
+            };
+            assert_eq!(vless.encryption, None, "restored to absent");
+        }
+
+        let merged = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(auto_uid),
+            EndpointId::new(1),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("merged link")
+        .expect("survivor row");
+        assert_eq!(
+            merged.latency.real_delay,
+            Some(42),
+            "measured evidence wins the merge"
+        );
+        drop(conn);
+        drop(db);
+
+        // Marker no-op: a second open changes nothing.
+        let db = Database::open(&path).await.expect("second reopen");
+        let mut conn = db.connection().await.expect("connection");
+        let rows = toasty::sql::query("SELECT id FROM protocols")
+            .exec(&mut conn)
+            .await
+            .expect("ids");
+        let mut again: Vec<i64> = rows.iter().filter_map(|r| i64_at(r, 0)).collect();
+        again.sort_unstable();
+        assert_eq!(again, want);
     }
 }
