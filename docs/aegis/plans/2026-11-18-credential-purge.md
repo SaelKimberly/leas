@@ -1,7 +1,7 @@
 # Credential purge (`cred`) from the auth ack — implementation plan
 
 Date: `2026-11-18`
-Status: `draft — awaiting execution`
+Status: `executed 2026-11-18 (T1–T10; gate 3/3, real-core probe rows 4/4)`
 Spec: `specs/2026-09-17-purge-reason-design.md` (amended 2026-11-18, D8–D11)
 Source: grilling session of 2026-11-18 (decisions: strict evidence set, one-meaning `Failed`, fp veto kept, CHECK widened)
 
