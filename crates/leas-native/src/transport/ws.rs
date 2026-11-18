@@ -144,16 +144,25 @@ impl AsyncRead for EarlyDataDial {
         let this = &mut *self;
         // Reads cannot precede the upgrade: drive it first.
         if this.ws.is_none() {
-            if let Some(fut) = this.upgrading.as_mut() {
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(ws)) => this.ws = Some(WsStream::new(ws)),
-                    Poll::Ready(Err(e)) => {
-                        return Poll::Ready(Err(io::Error::other(e.to_string())));
-                    }
-                    Poll::Pending => return Poll::Pending,
+            let Some(fut) = this.upgrading.as_mut() else {
+                // No first write yet, and a read cannot start the upgrade:
+                // the early bytes come from that write.
+                return Poll::Pending;
+            };
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(ws)) => {
+                    this.ws = Some(WsStream::new(ws));
+                    this.upgrading = None;
                 }
+                Poll::Ready(Err(e)) => {
+                    // A finished future left in the slot is polled again by
+                    // the next read (or the relay's half-close): resuming a
+                    // completed `async fn` panics.
+                    this.upgrading = None;
+                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            return Poll::Pending;
         }
         let ws = this.ws.as_mut().expect("checked above");
         Pin::new(ws).poll_read(cx, buf)
@@ -192,6 +201,9 @@ impl AsyncWrite for EarlyDataDial {
                     this.upgrading = None;
                 }
                 Poll::Ready(Err(e)) => {
+                    // Finished: clearing the slot keeps a later flush or
+                    // shutdown from resuming the completed `async fn`.
+                    this.upgrading = None;
                     return Poll::Ready(Err(io::Error::other(e.to_string())));
                 }
                 Poll::Pending => return Poll::Pending,
@@ -385,6 +397,82 @@ mod early_data_tests {
             max_early_data: max,
             ..WebSocketConfig::default()
         }
+    }
+
+    /// A rejected upgrade leaves its future in the slot; the next poll — the
+    /// relay's half-close after the error — must not poll it a second time
+    /// (`async fn resumed after completion` at `upgrade_with`).
+    #[tokio::test]
+    async fn shutdown_after_a_rejected_upgrade_does_not_repoll_the_upgrade() {
+        use crate::protocol::first_flight::HeaderFirst;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut head = [0u8; 4096];
+            let _ = server.read(&mut head).await;
+            server
+                .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let dial = EarlyDataDial::new(cfg(Some(64)), "example.com".into(), Box::new(client), 64);
+        let mut stream = HeaderFirst::new(Box::new(dial), b"HEADER".to_vec());
+        stream.write_all(b"PAYLOAD").await.unwrap();
+        let err = stream.read(&mut [0u8; 1]).await.unwrap_err();
+        assert!(err.to_string().contains("400"), "{err}");
+        stream.shutdown().await.unwrap_err();
+        srv.await.unwrap();
+    }
+
+    /// Xray's hub echoes the requested subprotocol (`hub.go:55-59`), and
+    /// tungstenite's client refuses an upgrade that drops it.
+    #[allow(clippy::result_large_err, clippy::unnecessary_wraps)] // tungstenite's callback shape
+    fn echo_subprotocol(
+        req: &tokio_tungstenite::tungstenite::http::Request<()>,
+        mut resp: tokio_tungstenite::tungstenite::http::Response<()>,
+    ) -> Result<
+        tokio_tungstenite::tungstenite::http::Response<()>,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        if let Some(v) = req.headers().get("sec-websocket-protocol") {
+            resp.headers_mut()
+                .insert("sec-websocket-protocol", v.clone());
+        }
+        Ok(resp)
+    }
+
+    /// The read that finishes the upgrade must hand up the data it came for,
+    /// not park without a waker: the upgrade future is already gone from the
+    /// runtime's point of view, so nothing would poll the read again.
+    #[tokio::test]
+    async fn early_data_upgrade_completes_on_the_read_path() {
+        use crate::protocol::first_flight::HeaderFirst;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            use futures_sink::Sink;
+            let mut ws = tokio_tungstenite::accept_hdr_async(server, echo_subprotocol)
+                .await
+                .unwrap();
+            std::future::poll_fn(|cx| Pin::new(&mut ws).poll_ready(cx))
+                .await
+                .unwrap();
+            Pin::new(&mut ws)
+                .start_send(Message::Binary(Bytes::from_static(b"REPLY")))
+                .unwrap();
+            std::future::poll_fn(|cx| Pin::new(&mut ws).poll_flush(cx))
+                .await
+                .unwrap();
+        });
+        let dial = EarlyDataDial::new(cfg(Some(64)), "example.com".into(), Box::new(client), 64);
+        let mut stream = HeaderFirst::new(Box::new(dial), b"HEADER".to_vec());
+        stream.write_all(b"PAYLOAD").await.unwrap();
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"REPLY");
+        srv.await.unwrap();
     }
 
     /// Xray's rule: the header carries URL-safe base64 of the first bytes,
