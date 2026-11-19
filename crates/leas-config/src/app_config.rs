@@ -473,6 +473,11 @@ mod tests {
 pub struct SpeedTestConfig {
     #[serde(default = "default_ping_url")]
     pub ping_url: String,
+    /// The SECOND observation's target when the first failed at the
+    /// destination (spec `2026-11-19-probe-truth` S3): the Cloudflare trace,
+    /// which answers liveness and the exit IP in one request.
+    #[serde(default = "default_probe_fallback_url")]
+    pub probe_fallback_url: String,
     /// Exit-IP lookup endpoint, fetched through the probe's own tunnel. The
     /// family-agnostic providers are also the automatic fallback order: the
     /// exit IP does not depend on which one answers, so a rate-limited free
@@ -539,6 +544,10 @@ fn default_ping_url() -> String {
     "https://www.gstatic.com/generate_204".to_string()
 }
 
+fn default_probe_fallback_url() -> String {
+    "https://www.cloudflare.com/cdn-cgi/trace".to_string()
+}
+
 fn default_tcp_timeout_secs() -> crate::DurationOrSecs {
     crate::DurationOrSecs::from(std::time::Duration::from_secs(5))
 }
@@ -601,6 +610,7 @@ impl Default for SpeedTestConfig {
     fn default() -> Self {
         Self {
             ping_url: default_ping_url(),
+            probe_fallback_url: default_probe_fallback_url(),
             ip_provider: crate::IpProvider::default(),
             tcp_timeout_secs: default_tcp_timeout_secs(),
             real_ping_timeout_secs: default_real_ping_timeout_secs(),

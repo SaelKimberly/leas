@@ -601,6 +601,16 @@ fn compute_test_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) 
             // what the page query projects, so the label needs no config load.
             leas_native::security::fingerprint::resolve_fingerprint(p.security.fp.as_deref()).1
         });
+    // S7: "the server is up, the exit is not" — auth accepted, target stage
+    // failed. Read from the representative link so the label and the row's
+    // ordering tier describe one fact.
+    let dest = representative.is_some_and(|link| {
+        link.latency.auth == leas_db::models::AuthState::Ok.as_i64()
+            && link
+                .error
+                .as_ref()
+                .is_some_and(|e| e.stage == Some(leas_db::models::FailureStage::Target))
+    });
     let (mut text, style) = test_cell_content(
         &RealCellFacts {
             dns: DnsFacts {
@@ -610,6 +620,7 @@ fn compute_test_cell(row: &EndpointRow, resolved: bool, theme: &opaline::Theme) 
             untestable,
             purged,
             failure,
+            dest,
             active_delay: delay,
             // The TRANSPORT measurement: a DNS endpoint the probe REACHED is
             // reachable, so the `[name]` marker cannot stand beside it.
@@ -790,6 +801,10 @@ struct RealCellFacts<'a> {
     purged: Option<&'a str>,
     /// The persisted failure marker's class, when the row carries one.
     failure: Option<TestFailure>,
+    /// The server took the config and the DESTINATION did not answer (S7):
+    /// `latency_auth = ok` with a target-stage failure. Rendered `[dest]` —
+    /// a status, not a verdict, and not `[real]` (which says the config failed).
+    dest: bool,
     /// The real measurement, when the row has one.
     active_delay: Option<i32>,
     /// The TRANSPORT measurement — the probe's stage-1 span. A DNS endpoint
@@ -827,6 +842,7 @@ impl Default for RealCellFacts<'_> {
             untestable: false,
             purged: None,
             failure: None,
+            dest: false,
             active_delay: None,
             transport_measured: false,
         }
@@ -863,6 +879,14 @@ fn test_cell_content(facts: &RealCellFacts<'_>, theme: &opaline::Theme) -> (Stri
         // view does not load a purged link beside a live one), so this is the
         // Purgatory/All row: the verdict is what the row IS.
         return (format!("[{}]", center_cell(label, 4)), bad);
+    }
+    if facts.dest {
+        // The server accepted the config and the destination never answered
+        // (spec `2026-11-19-probe-truth` S7). `[real]` would claim the config
+        // failed, which the auth ack contradicts; the token is bracketed like
+        // every other STATUS marker, so it cannot be read as a verdict
+        // (`mitm`/`cert`/`cfg`/`http`/`cred` are bare).
+        return (format!("[{}]", center_cell("dest", 4)), bad);
     }
     // A failure marker outranks the link's OWN measurement. A failed real
     // probe keeps its fast latency in `profile_stats` (`apply_test_result`
@@ -2164,6 +2188,8 @@ mod tests {
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Real,
             text: "timeout".into(),
+            stage: None,
+            cause: None,
         });
 
         let (fast, _) = compute_fast_cell(&row, true, &theme);
@@ -2201,6 +2227,8 @@ mod tests {
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "timeout on probe transport (limit 5s)".into(),
+            stage: None,
+            cause: None,
         });
 
         let (fast, _) = compute_fast_cell(&row, true, &theme);
@@ -2495,6 +2523,8 @@ mod tests {
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Real,
             text: "timeout".into(),
+            stage: None,
+            cause: None,
         });
         row.links[1].latency = Latency::real_with_ip(40, None);
         // p102 stays untested.
@@ -2514,10 +2544,14 @@ mod tests {
         row.links[1].error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "timeout".into(),
+            stage: None,
+            cause: None,
         });
         row.links[2].error = Some(ErrorInfo {
             kind: ProfileErr::Real,
             text: "timeout".into(),
+            stage: None,
+            cause: None,
         });
         row.selected_protocol = 1;
         let (text, _) = compute_test_cell(&row, true, &theme);
@@ -2541,6 +2575,8 @@ mod tests {
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Real,
             text: "timeout".into(),
+            stage: None,
+            cause: None,
         });
         row.links[1].latency = Latency::real(20);
 
@@ -2574,6 +2610,8 @@ mod tests {
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "timeout".into(),
+            stage: None,
+            cause: None,
         });
         let (text, _style) = compute_test_cell(&row, true, &theme);
         assert_eq!(text, "[fast]", "the marker must win over a stale delay");
@@ -3111,6 +3149,36 @@ mod tests {
         assert_eq!(t, "[name]", "nothing was measured, so the marker stands");
     }
 
+    /// S7: the server accepted the config and the destination did not answer.
+    /// The label is `[dest]` — a status beside the auth glyph — and must NOT be
+    /// `[real]`, which would claim the config failed while the ack says
+    /// otherwise. A real failure at any OTHER stage keeps `[real]`.
+    #[test]
+    fn test_cell_shows_dest_only_for_a_target_stage_failure_after_an_ok_ack() {
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let facts = |dest: bool, failure: Option<TestFailure>| RealCellFacts {
+            dns: DnsFacts {
+                is_dns: false,
+                resolved: true,
+            },
+            untestable: false,
+            purged: None,
+            failure,
+            dest,
+            active_delay: None,
+            transport_measured: true,
+        };
+
+        let (t, _) = test_cell_content(&facts(true, Some(TestFailure::Real)), &theme);
+        assert_eq!(t, "[dest]", "auth ok + target stage is the egress status");
+
+        let (t, _) = test_cell_content(&facts(false, Some(TestFailure::Real)), &theme);
+        assert_eq!(t, "[real]", "no target-stage evidence keeps the marker");
+
+        let (t, _) = test_cell_content(&facts(true, None), &theme);
+        assert_eq!(t, "[dest]", "the status stands even without a marker class");
+    }
+
     /// The purge verdict outranks the delay the link still carries from phase 1
     /// — the row is retired, and its only reachable position is Purgatory/All.
     #[test]
@@ -3127,6 +3195,7 @@ mod tests {
                 failure: None,
                 active_delay: Some(12),
                 transport_measured: false,
+                dest: false,
             },
             &theme,
         );
@@ -3144,6 +3213,7 @@ mod tests {
                 failure: None,
                 active_delay: Some(12),
                 transport_measured: false,
+                dest: false,
             },
             &theme,
         );
@@ -3237,6 +3307,7 @@ mod tests {
                 failure: Some(TestFailure::Real),
                 active_delay: Some(12),
                 transport_measured: false,
+                dest: false,
             },
             &theme,
         );
@@ -3252,6 +3323,7 @@ mod tests {
                 failure: Some(TestFailure::Fast),
                 active_delay: Some(12),
                 transport_measured: false,
+                dest: false,
             },
             &theme,
         );
@@ -3270,6 +3342,7 @@ mod tests {
                 failure: Some(TestFailure::Real),
                 active_delay: None,
                 transport_measured: false,
+                dest: false,
             },
             &theme,
         );
@@ -3287,6 +3360,7 @@ mod tests {
                 failure: Some(TestFailure::Fast),
                 active_delay: None,
                 transport_measured: false,
+                dest: false,
             },
             &theme,
         );
@@ -3333,6 +3407,7 @@ mod tests {
                 failure: Some(TestFailure::Real),
                 active_delay: Some(12),
                 transport_measured: false,
+                dest: false,
             },
             &theme,
         );
@@ -3479,6 +3554,8 @@ mod tests {
         row.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Real,
             text: "probe failed".into(),
+            stage: None,
+            cause: None,
         });
         let (text, _) = compute_streak_cell(&row, true, &state, &theme);
         assert_eq!(text, "", "a real error has no streak");

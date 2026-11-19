@@ -166,6 +166,11 @@ pub(crate) fn apply_test_result(
     // batch's merged probe. `None` = no protocol phase ran (a TCP handshake)
     // or the caller has none — the flag is left exactly as it was.
     auth_ack: Option<leas_native::protocol::AuthAck>,
+    // The persisted `(stage, cause)` pair (spec `2026-11-19-probe-truth` S1).
+    // `None` = this path has no typed failure (a success, a synthetic result,
+    // or a path that never reached the probe) — the row keeps NULL, which is
+    // "class unknown", never a guess.
+    failure: Option<(leas_db::models::FailureStage, leas_db::models::FailureCause)>,
 ) -> Option<LinkGroups> {
     if let Some(err) = error {
         if err == "Cancelled" {
@@ -222,6 +227,8 @@ pub(crate) fn apply_test_result(
         row.error = Some(ErrorInfo {
             kind,
             text: cap_error_text(err),
+            stage: failure.map(|(stage, _)| stage),
+            cause: failure.map(|(_, cause)| cause),
         });
         // Only a real probe carries evidence; a fast result can never set a
         // verdict (a TCP handshake proves nothing about the config).
@@ -762,6 +769,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 purge,
                 marker_kind,
                 auth_ack,
+                failure,
             } => {
                 // The test result mutates link latency/speed/error and the
                 // testing_details map — the profiles display cache must
@@ -830,6 +838,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                     purge,
                                     marker_kind,
                                     auth_ack,
+                                    failure,
                                 )
                             };
                             if let Some(groups) = verdict {
@@ -1054,6 +1063,32 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // Refresh whitelist features for every endpoint (never
                 // persisted — cached entries must track the current files).
                 crate::ops::enrich::spawn_whitelist_pass(state);
+            }
+            CoreEvent::NamesResolved { endpoint_ids } => {
+                // A resolved host is a retry state, not a verdict: clear the
+                // name-class markers and refresh the ordering keys so the link
+                // lands in bin 12 ("not tested") instead of staying sunk below
+                // every untested row (spec `2026-11-19-probe-truth` S4).
+                let ids: Vec<leas_db::models::EndpointId> = endpoint_ids
+                    .iter()
+                    .map(|id| leas_db::models::EndpointId::new(*id))
+                    .collect();
+                let db = state.db.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = db.clear_name_markers(&ids).await {
+                        tracing::warn!(target: "tui::ops::events", "clear name markers: {e}");
+                        return;
+                    }
+                    if let Err(e) = db.refresh_endpoint_ranks(&ids).await {
+                        tracing::warn!(target: "tui::ops::events", "refresh ranks: {e}");
+                    }
+                });
+                state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
+                // The loaded rows still carry the marker: the display cache is
+                // derived from them, so drop it and let the page re-read the
+                // cleared rows from the DB (S4). Without this, the cell keeps
+                // `[name]` until an unrelated invalidation.
+                state.filter_cache_valid.set(false);
             }
             CoreEvent::EndpointInfoUpdated { endpoint_id, info } => {
                 // The merge mutates endpoint_info (resolved IPs, country,
@@ -1405,8 +1440,53 @@ mod tests {
             &leas_db::models::ErrorInfo {
                 kind: leas_db::models::ProfileErr::Real,
                 text: capped,
+                stage: None,
+                cause: None,
             }
         ));
+    }
+
+    /// S1: the stage × cause pair is persisted with the marker and cleared by
+    /// the success that supersedes it. A row that carries NULL means "class
+    /// unknown", never "typed as something else".
+    #[test]
+    fn the_failure_pair_is_persisted_and_a_success_clears_it() {
+        use leas_db::models::{FailureCause, FailureStage};
+
+        let mut link = fake_row(1, "h.example", 1).links.remove(0);
+        apply_test_result(
+            &mut link,
+            TestType::RealPing,
+            None,
+            Some(28),
+            None,
+            None,
+            Some("timeout on probe attempt (limit 5s)"),
+            None,
+            None,
+            None,
+            Some((FailureStage::Target, FailureCause::Timeout)),
+        )
+        .expect("a failure changes the row");
+        let marker = link.error.as_ref().expect("marker written");
+        assert_eq!(marker.stage, Some(FailureStage::Target));
+        assert_eq!(marker.cause, Some(FailureCause::Timeout));
+
+        apply_test_result(
+            &mut link,
+            TestType::RealPing,
+            Some(120),
+            Some(28),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a success changes the row");
+        assert!(link.error.is_none(), "the success clears the marker");
     }
 
     /// The verdict rule, which is the whole point of the PURGE group: only a
@@ -1430,6 +1510,7 @@ mod tests {
             Some(PurgeReason::TransportRejected),
             None,
             None,
+            None,
         )
         .expect("changed");
         assert_eq!(
@@ -1451,6 +1532,7 @@ mod tests {
             Some(PurgeReason::RealityFallback),
             None,
             None,
+            None,
         )
         .expect("changed");
         assert!(groups.contains(LinkGroups::PURGE), "the verdict moved");
@@ -1468,6 +1550,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("changed");
         assert!(!groups.contains(LinkGroups::PURGE));
@@ -1478,6 +1561,7 @@ mod tests {
             &mut link,
             TestType::TcpPing,
             Some(42),
+            None,
             None,
             None,
             None,
@@ -1500,6 +1584,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("changed");
         assert!(groups.contains(LinkGroups::PURGE), "the verdict moved back");
@@ -1516,6 +1601,7 @@ mod tests {
                 None,
                 None,
                 Some("Cancelled"),
+                None,
                 None,
                 None,
                 None,
@@ -1562,6 +1648,7 @@ mod tests {
                 None,
                 None,
                 Some(ack),
+                None,
             );
             assert_eq!(
                 link.latency.auth,
@@ -1578,6 +1665,7 @@ mod tests {
             TestType::TcpPing,
             Some(42),
             Some(42),
+            None,
             None,
             None,
             None,
@@ -1631,6 +1719,7 @@ mod tests {
             None,
             Some(ProfileErr::Fast),
             None,
+            None,
         );
         assert_eq!(
             link.latency.fast_delay, None,
@@ -1660,6 +1749,7 @@ mod tests {
             Some("timeout on probe attempt (limit 5s)"),
             None,
             Some(ProfileErr::Real),
+            None,
             None,
         );
         assert_eq!(
@@ -1694,6 +1784,7 @@ mod tests {
             // No `marker_kind`: the kind comes from the test type.
             None,
             None,
+            None,
         );
         assert_eq!(
             link.error.as_ref().map(|e| e.kind),
@@ -1722,6 +1813,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("changed");
         assert!(groups.contains(LinkGroups::PURGE));
@@ -1735,6 +1827,7 @@ mod tests {
             None,
             None,
             Some("Connection refused"),
+            None,
             None,
             None,
             None,
@@ -1772,6 +1865,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -1993,6 +2087,7 @@ mod tests {
                 purge: None,
                 marker_kind: None,
                 auth_ack: None,
+                failure: None,
             })
             .expect("result");
             let _ = state.poll_core_events().await;
@@ -2162,6 +2257,7 @@ mod tests {
                 purge: None,
                 marker_kind: None,
                 auth_ack: None,
+                failure: None,
             })
             .await
             .expect("send");
@@ -2561,6 +2657,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -2606,6 +2703,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -2644,6 +2742,8 @@ mod tests {
         row.links[0].error = Some(leas_db::models::ErrorInfo {
             kind: leas_db::models::ProfileErr::Real,
             text: "timeout".into(),
+            stage: None,
+            cause: None,
         });
         row.links[0].last_seen_at = crate::ops::profiles::test_support::ts(200);
         row.links[1].latency = Latency::real(90);
@@ -2664,6 +2764,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -2712,6 +2813,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -2757,6 +2859,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -2798,6 +2901,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -2835,6 +2939,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -2889,6 +2994,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -2927,6 +3033,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -3021,6 +3128,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();
@@ -3045,6 +3153,7 @@ mod tests {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         })
         .await
         .unwrap();

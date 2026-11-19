@@ -126,7 +126,7 @@ async fn marker(conn: &mut impl toasty::Executor) -> Result<i64> {
     marker_value(conn, MARKER).await
 }
 
-async fn marker_value(conn: &mut impl toasty::Executor, key: &str) -> Result<i64> {
+pub(crate) async fn marker_value(conn: &mut impl toasty::Executor, key: &str) -> Result<i64> {
     let Some(row) = AppMeta::filter_by_key(key.to_owned())
         .first()
         .exec(conn)
@@ -208,7 +208,11 @@ async fn rekey_in(tx: &mut impl toasty::Executor) -> Result<()> {
 }
 
 /// Stamp an `app_meta` marker in the caller's transaction.
-async fn stamp_marker(tx: &mut impl toasty::Executor, key: &str, value: i64) -> Result<()> {
+pub(crate) async fn stamp_marker(
+    tx: &mut impl toasty::Executor,
+    key: &str,
+    value: i64,
+) -> Result<()> {
     toasty::sql::query(format!(
         "INSERT INTO app_meta (key, value) VALUES ('{key}', '{value}') \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value"

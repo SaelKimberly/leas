@@ -191,3 +191,38 @@ pub const V21_CREDENTIAL_PURGE: &[&str] = &[
     "CREATE INDEX \"index_profile_stats_by_endpoint_id\" ON \"profile_stats\" (\"endpoint_id\")",
     "CREATE INDEX \"index_profile_stats_by_last_seen_at\" ON \"profile_stats\" (\"last_seen_at\")",
 ];
+
+/// v22: the failure stage × cause pair (spec `2026-11-19-probe-truth-and-ingest-boundary`,
+/// S1).
+///
+/// SQLite cannot add a CHECK in place, so the table is rebuilt exactly as v21
+/// rebuilt it: explicit column copy, indexes recreated under the names
+/// `push_schema` emits. The two new columns sit AFTER `error_text` (the embed's
+/// own order) and are nullable TOGETHER (the pair CHECK), so every pre-22 row
+/// migrates as "class unknown" instead of a guess.
+///
+/// The non-idempotence is safe because the cursor gates the step.
+pub const V22_STAGE_CAUSE: &[&str] = &[
+    "CREATE TABLE profile_stats_v22 (\"protocol_id\" BIGINT NOT NULL, \"endpoint_id\" BIGINT NOT NULL, \"last_used_at\" BIGINT, \"last_seen_at\" BIGINT NOT NULL, \"latency_real_delay\" INTEGER, \"latency_fast_delay\" INTEGER, \"latency_ip\" TEXT, \"latency_auth\" BIGINT, \"speed_bps\" BIGINT, \"error\" BOOLEAN, \"error_kind\" TEXT CHECK (\"error_kind\" IN ('real', 'fast', 'name')), \"error_text\" TEXT, \"error_stage\" TEXT, \"error_cause\" TEXT, \"purge_reason\" TEXT CHECK (\"purge_reason\" IN ('reality_fallback', 'certificate_mismatch', 'certificate_expired', 'not_tls', 'config_invalid', 'transport_rejected', 'origin_unreachable', 'credential_rejected')), \"stab_mask\" BIGINT NOT NULL, \"stab_len\" BIGINT NOT NULL, \"traffic_today_up\" BIGINT NOT NULL, \"traffic_today_down\" BIGINT NOT NULL, \"traffic_total_up\" BIGINT NOT NULL, \"traffic_total_down\" BIGINT NOT NULL, \"created_at\" BIGINT NOT NULL, \"updated_at\" BIGINT NOT NULL, \"version\" INTEGER NOT NULL, PRIMARY KEY (\"protocol_id\", \"endpoint_id\"), CHECK ((\"error_stage\" IS NULL) = (\"error_cause\" IS NULL)))",
+    "INSERT INTO profile_stats_v22 (\"protocol_id\", \"endpoint_id\", \"last_used_at\", \"last_seen_at\", \"latency_real_delay\", \"latency_fast_delay\", \"latency_ip\", \"latency_auth\", \"speed_bps\", \"error\", \"error_kind\", \"error_text\", \"error_stage\", \"error_cause\", \"purge_reason\", \"stab_mask\", \"stab_len\", \"traffic_today_up\", \"traffic_today_down\", \"traffic_total_up\", \"traffic_total_down\", \"created_at\", \"updated_at\", \"version\") SELECT \"protocol_id\", \"endpoint_id\", \"last_used_at\", \"last_seen_at\", \"latency_real_delay\", \"latency_fast_delay\", \"latency_ip\", \"latency_auth\", \"speed_bps\", \"error\", \"error_kind\", \"error_text\", NULL, NULL, \"purge_reason\", \"stab_mask\", \"stab_len\", \"traffic_today_up\", \"traffic_today_down\", \"traffic_total_up\", \"traffic_total_down\", \"created_at\", \"updated_at\", \"version\" FROM profile_stats",
+    "DROP TABLE profile_stats",
+    "ALTER TABLE profile_stats_v22 RENAME TO profile_stats",
+    "CREATE INDEX \"index_profile_stats_by_endpoint_id\" ON \"profile_stats\" (\"endpoint_id\")",
+    "CREATE INDEX \"index_profile_stats_by_last_seen_at\" ON \"profile_stats\" (\"last_seen_at\")",
+];
+
+/// The stage × cause pair invariant for a FRESH database.
+///
+/// A migrated file gets it from [`V22_STAGE_CAUSE`]'s table CHECK; `push_schema`
+/// emits only what the model declares and the model cannot declare a table
+/// constraint, so a fresh install would otherwise accept a half pair at the
+/// same `SCHEMA_VERSION`. Two triggers, idempotent, run by `ensure_raw_ddl`
+/// on every open — a file that already has the CHECK pays one no-op each.
+pub const PAIR_GUARD: &[&str] = &[
+    "CREATE TRIGGER IF NOT EXISTS profile_stats_pair_ins BEFORE INSERT ON profile_stats \
+     WHEN (NEW.error_stage IS NULL) <> (NEW.error_cause IS NULL) \
+     BEGIN SELECT RAISE(ABORT, 'error_stage and error_cause must be set together'); END",
+    "CREATE TRIGGER IF NOT EXISTS profile_stats_pair_upd BEFORE UPDATE ON profile_stats \
+     WHEN (NEW.error_stage IS NULL) <> (NEW.error_cause IS NULL) \
+     BEGIN SELECT RAISE(ABORT, 'error_stage and error_cause must be set together'); END",
+];

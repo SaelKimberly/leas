@@ -588,6 +588,26 @@ pub fn spawn_dns_resolve_host(
                 scheduler.mark_dns_failure(endpoint);
             }
         }
+        // A name that resolves now is no longer "not resolvable": the endpoints
+        // that were waiting drop their name-class marker and fall back to "not
+        // tested" (spec `2026-11-19-probe-truth` S4). One event, not one per
+        // link: the state handler owns the write and the rank refresh.
+        if resolved_ok
+            && !waiters.is_empty()
+            && let Some(t) = tx.as_ref()
+            && t.try_send(crate::types::CoreEvent::NamesResolved {
+                endpoint_ids: waiters.iter().copied().collect(),
+            })
+            .is_err()
+        {
+            // Dropped under channel pressure: the marker is a status, not a
+            // measurement, so the next batch re-derives it — but say so,
+            // because a silently dropped clear looks like a stuck `[name]`.
+            tracing::warn!(
+                target: "tui::ops::enrich",
+                "NamesResolved dropped: the event channel was full"
+            );
+        }
 
         let mut info = EndpointInfo {
             resolved_ips: ips,

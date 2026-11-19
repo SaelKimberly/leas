@@ -22,8 +22,9 @@ use std::net::IpAddr;
 use crate::Database;
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    Endpoint, EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr, ProfileStats, Protocol,
-    ProtocolId, PurgatoryView, PurgeReason, Security, TrafficStats, Transport,
+    Endpoint, EndpointId, EndpointRow, ErrorInfo, FailureCause, FailureStage, Latency, ProfileErr,
+    ProfileStats, Protocol, ProtocolId, PurgatoryView, PurgeReason, Security, TrafficStats,
+    Transport,
 };
 use leas_proto::proto_spec::{ProtocolKind, SecurityType, TransportType};
 use rapidhash::{HashMapExt as _, RapidHashMap};
@@ -187,6 +188,10 @@ pub struct AggregateCounts {
     /// Not proven and in no other bucket — measured but with no real success
     /// in the ring (e.g. a fast-only-ok endpoint).
     pub other: u64,
+    /// Distinct exit IPs across the whole store (S6): servers, not links.
+    /// Not part of the per-endpoint partition above — set by the caller's
+    /// separate query, and 0 when it has not run.
+    pub exit_ips: u64,
 }
 
 impl AggregateCounts {
@@ -212,6 +217,7 @@ impl AggregateCounts {
             untested: field(5)?,
             failed: field(6)?,
             other: field(7)?,
+            exit_ips: 0,
         })
     }
 }
@@ -918,7 +924,7 @@ const PAGE_PROJECTION: &[&str] = &[
     "(SELECT group_concat(hex(ip_key), ',') FROM endpoint_ip ip WHERE ip.endpoint_id = e.id)",
     "e.resolved_at",
     "e.created_at",
-    // profile_stats (26)
+    // profile_stats (24)
     "ps.protocol_id",
     "ps.endpoint_id",
     "ps.last_used_at",
@@ -931,6 +937,9 @@ const PAGE_PROJECTION: &[&str] = &[
     "ps.error",
     "ps.error_kind",
     "ps.error_text",
+    // Schema 22: the stage × cause pair (always both or neither).
+    "ps.error_stage",
+    "ps.error_cause",
     "ps.purge_reason",
     "ps.stab_mask",
     "ps.stab_len",
@@ -1125,7 +1134,7 @@ fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<(Endpoint, Vec<Ip
     ))
 }
 
-/// `profile_stats` (25 columns, in [`PAGE_PROJECTION`] order). The three
+/// `profile_stats` (24 columns, in [`PAGE_PROJECTION`] order). The three
 /// multi-column embeds (`latency`, `error`, `traffic`) are flattened in the
 /// table, so they are reassembled by hand — the parity test against
 /// [`Database::load_page_rows`] pins every one of them.
@@ -1142,6 +1151,8 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
     let error_flag = p.next_opt_bool()?;
     let error_kind: Option<ProfileErr> = p.next()?;
     let error_text: Option<String> = p.next()?;
+    let failure_stage: Option<FailureStage> = p.next()?;
+    let failure_cause: Option<FailureCause> = p.next()?;
     // Only the Active view's panel hides purged links; the page decides which
     // links it asked for, so this column is always decoded.
     let purge_reason: Option<PurgeReason> = p.next()?;
@@ -1169,6 +1180,8 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
         (Some(true), Some(kind)) => Some(ErrorInfo {
             kind,
             text: error_text.unwrap_or_default(),
+            stage: failure_stage,
+            cause: failure_cause,
         }),
         (Some(true), None) => {
             return Err(DatabaseError::Generic(

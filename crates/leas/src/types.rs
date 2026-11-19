@@ -693,6 +693,17 @@ pub enum CoreEvent {
         /// handshake never reaches a protocol phase, and the single Real
         /// Test's event carries the flag through its own field).
         auth_ack: Option<leas_native::protocol::AuthAck>,
+        /// The typed `(stage, cause)` pair this failure earned (spec
+        /// `2026-11-19-probe-truth` S1). `None` for a success and for the
+        /// synthetic failures that never reached a probe; a real-probe failure
+        /// carries what the engine classified.
+        failure: Option<(leas_db::models::FailureStage, leas_db::models::FailureCause)>,
+    },
+    /// A host resolved: every endpoint in the list had its name-class marker
+    /// cleared by the resolver (spec `2026-11-19-probe-truth` S4). The state
+    /// handler refreshes the derived ordering keys and repaints.
+    NamesResolved {
+        endpoint_ids: Vec<i64>,
     },
     /// Update the displayed test type for a profile without triggering cleanup.
     /// Used by `batch_then_real_ping` to switch from TcpPing→RealPing emoji.

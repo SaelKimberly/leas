@@ -356,6 +356,8 @@ mod tests {
         link.error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "previous failure".to_string(),
+            stage: None,
+            cause: None,
         });
         let traffic_before = link.traffic;
         // Persist rows: the connect task's `load_protocol_with_config` reads

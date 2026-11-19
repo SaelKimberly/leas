@@ -159,6 +159,15 @@ pub fn validate_ss_config(parsed: &ParsedProto) -> Result<()> {
         return Ok(());
     };
     let method = cfg.method.as_str();
+    // A method no shipped codec can resolve is not an unsupported cipher — it
+    // is not a cipher. Broken feeds emit placeholders (`null`, the channel's
+    // own name) that would otherwise be stored, probed and re-probed forever
+    // (ADR 0018 D-C, report `2026-11-19-real-test-funnel` §3.2 row 3).
+    if !leas_proto::proto_spec::ss_method_support::native_supports_ss_method(method) {
+        return Err(ImportError::Validation(format!(
+            "shadowsocks method `{method}` is not a cipher this client can resolve"
+        )));
+    }
     if !leas_proto::proto_spec::ss2022_password_usable(method, &cfg.password) {
         return Err(ImportError::Validation(format!(
             "shadowsocks-2022 key for method `{method}` is malformed: it is neither base64 \
@@ -197,6 +206,38 @@ fn ss_row_has_tls_layer(cfg: &leas_proto::proto_spec::SsConfig) -> bool {
     security_is_tls || plugin_tls
 }
 
+/// Refuse a VLESS row whose `flow` has no layer to run over.
+///
+/// XTLS is defined only over TLS/REALITY ("XTLS is available only with
+/// TCP+TLS/REALITY", `xtls.github.io`): a stored `flow` with an empty
+/// `security` is a shape no core can dial — the legacy core refuses it at dial
+/// (`failed to use xtls-rprx-direct, maybe "security" is not "xtls"`), the
+/// current one at config load. Such rows are broken feeds, not variants: the
+/// 2026-11-19 corpus held 85 of them, none of which ever worked (ADR 0018 D-C;
+/// report §3.4).
+///
+/// # Errors
+///
+/// [`ImportError::Validation`] naming the flow when the row carries one without
+/// a TLS/REALITY layer.
+pub fn validate_vless_shape(parsed: &ParsedProto) -> Result<()> {
+    let ProtocolConfig::Vless(cfg) = &parsed.protocol.config else {
+        return Ok(());
+    };
+    let Some(flow) = cfg.flow.as_deref().filter(|f| !f.is_empty()) else {
+        return Ok(());
+    };
+    let layered = cfg.security.type_str().is_some_and(|kind| {
+        kind.eq_ignore_ascii_case("tls") || kind.eq_ignore_ascii_case("reality")
+    });
+    if layered {
+        return Ok(());
+    }
+    Err(ImportError::Validation(format!(
+        "vless flow `{flow}` requires a TLS or REALITY layer; the row carries neither, so no          core can dial it"
+    )))
+}
+
 /// Parse a share URL into a typed [`ParsedProfile`].
 ///
 /// Splits the URL first (shape gate — garbage without a `://` gets a clean
@@ -222,6 +263,7 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Parse
     // A config no shipped stack can dial is a hard drop, not a `validation`
     // note; the row must never reach the store.
     validate_ss_config(&parsed)?;
+    validate_vless_shape(&parsed)?;
 
     let validation = validate_required_fields(&parsed);
 
@@ -1363,7 +1405,7 @@ mod tests {
     #[rstest]
     #[case::vless("vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?type=tcp")]
     #[case::trojan("trojan://pass@example.com:443?security=none")]
-    #[case::shadowsocks("ss://Y2xlb2Y6cGFzc3dvcmQ@example.com:443#my-server")]
+    #[case::shadowsocks("ss://YWVzLTI1Ni1jZmI6cGFzc3dvcmQ=@example.com:443#my-server")]
     #[case::shadowsocksr(
         "ssr://ZXhhbXBsZS5jb206NDQzOm9yaWdpbjpyYzQtbWQ1OnBsYWluOmNHRnpjM2R2Y21RLz9ncm91cD1WR1Z6ZEVkeWIzVncmcmVtYXJrcz1WR1Z6ZEZObGNuWmxjZw"
     )]
@@ -1628,7 +1670,43 @@ mod ss_import_gate_tests {
         "ss://none:pw@example.com:8388?plugin=obfs-local%3Bobfs%3Dtls",
         false
     )]
+    // ADR 0018 D-C: a "method" that is not a cipher is a broken feed, not an
+    // unsupported variant. `null:null` is the base64 of a panel's unset field
+    // (report §3.2 row 3); the channel-name spelling is the same defect.
+    #[case::null_method_placeholder("ss://null:null@example.com:443", false)]
+    #[case::channel_name_as_method("ss://telegram-id-ArV2ray:pw@example.com:443", false)]
+    #[case::legacy_stream_cipher_still_imports("ss://aes-256-cfb:pw@example.com:443", true)]
     fn only_undialable_rows_are_dropped(#[case] url: &str, #[case] imports: bool) {
+        let got = parse_share_url(url, &settings()).is_ok();
+        assert_eq!(got, imports, "{url}");
+    }
+
+    /// A `flow` has nothing to run over without a TLS/REALITY layer, so the
+    /// shape is refused at ingestion (ADR 0018 D-C; report §3.4: 85 such rows,
+    /// none ever worked, both cores refuse the config).
+    #[rstest]
+    #[case::flow_without_a_layer(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=xtls-rprx-direct",
+        false
+    )]
+    #[case::flow_over_tls(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=xtls-rprx-direct&security=tls&sni=example.com",
+        true
+    )]
+    #[case::flow_over_reality(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=xtls-rprx-vision&security=reality&sni=example.com&pbk=e2RLf57Li_-MDZGE9ss1BWPgP54mqRb5PfXhW2jcVVg&sid=c39cc7310a",
+        true
+    )]
+    #[case::no_flow_without_a_layer(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp",
+        true
+    )]
+    // `flow=none` is the alias for absent: it is a plain row, not a flow row.
+    #[case::flow_none_is_plain(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=none",
+        true
+    )]
+    fn vless_flow_requires_a_tls_layer(#[case] url: &str, #[case] imports: bool) {
         let got = parse_share_url(url, &settings()).is_ok();
         assert_eq!(got, imports, "{url}");
     }

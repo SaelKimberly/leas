@@ -466,8 +466,10 @@ impl AppState {
             .profiles_aggregate(&req, true)
             .await
             .unwrap_or_default();
+        let exit_ips = self.db.distinct_exit_ips().await.unwrap_or(0);
         self.aggregates = Some(AggregateCache {
             counts: AggregateCounts {
+                exit_ips,
                 total: view.total,
                 alive: global.alive,
                 active: global.active,

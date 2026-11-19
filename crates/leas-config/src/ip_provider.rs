@@ -61,6 +61,13 @@ pub enum IpProvider {
     #[serde(rename = "ipapi-is")]
     #[strum(serialize = "ipapi-is")]
     IpApiIs,
+    /// `www.cloudflare.com/cdn-cgi/trace`: a plain-text `key=value` body whose
+    /// `ip=`/`loc=` are the exit and its country. It doubles as the probe's
+    /// fallback target, so a link that succeeded on it already has this answer
+    /// and needs no second tunnel (spec `2026-11-19-probe-truth` S3).
+    #[serde(rename = "cloudflare-trace")]
+    #[strum(serialize = "cloudflare-trace")]
+    CloudflareTrace,
 }
 
 /// The `Select:` cell the Settings form renders for this setting, in
@@ -69,7 +76,25 @@ pub enum IpProvider {
 /// It lives beside the enum so a new variant cannot be invisible to the form
 /// without a failing test
 /// ([`tests::the_select_cell_offers_every_variant`]).
-pub const SELECT_CELL: &str = "Select:ip-api,ip-sb,ip-sb-ipv4,ip-sb-ipv6,ipapi-is";
+pub const SELECT_CELL: &str = "Select:ip-api,ip-sb,ip-sb-ipv4,ip-sb-ipv6,ipapi-is,cloudflare-trace";
+
+/// `"<ip> | <loc>"` from a Cloudflare `cdn-cgi/trace` text body (`key=value`
+/// lines). `None` when the body is not that shape, so a 200 from something else
+/// never invents an exit address.
+fn parse_trace(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut ip = None;
+    let mut loc = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("ip=") {
+            ip = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("loc=") {
+            loc = Some(value.trim());
+        }
+    }
+    let ip = ip.filter(|value| !value.is_empty())?;
+    Some(format!("{ip} | {}", loc.unwrap_or("-")))
+}
 
 impl IpProvider {
     /// The provider's endpoint.
@@ -81,6 +106,7 @@ impl IpProvider {
             Self::IpSbIpv4 => "https://api-ipv4.ip.sb/geoip",
             Self::IpSbIpv6 => "https://api-ipv6.ip.sb/geoip",
             Self::IpApiIs => "https://api.ipapi.is/",
+            Self::CloudflareTrace => "https://www.cloudflare.com/cdn-cgi/trace",
         }
     }
 
@@ -112,10 +138,14 @@ impl IpProvider {
     /// `query`, every other endpoint as `ip`. The country is the provider's
     /// spelling — the persisted flag comes from the mmdb, never from here.
     pub fn parse(self, body: &[u8]) -> Option<String> {
+        if self == Self::CloudflareTrace {
+            return parse_trace(body);
+        }
         let json: serde_json::Value = serde_json::from_slice(body).ok()?;
         let (addr_field, country_field) = match self {
             Self::IpApi => ("query", "country"),
             Self::IpSb | Self::IpSbIpv4 | Self::IpSbIpv6 | Self::IpApiIs => ("ip", "country"),
+            Self::CloudflareTrace => unreachable!("handled above"),
         };
         let ip = json.get(addr_field)?.as_str()?;
         let country = json
@@ -130,6 +160,30 @@ impl IpProvider {
 mod tests {
     use super::IpProvider;
     use strum::IntoEnumIterator;
+
+    /// The trace body is text, not the JSON the other providers answer; a
+    /// non-trace 200 must yield nothing rather than an invented address.
+    #[test]
+    fn the_trace_provider_reads_its_text_body() {
+        let body = b"fl=1\nh=www.cloudflare.com\nip=203.0.113.7\nts=1\nloc=NL\n";
+        assert_eq!(
+            IpProvider::CloudflareTrace.parse(body).as_deref(),
+            Some("203.0.113.7 | NL")
+        );
+        assert_eq!(
+            IpProvider::CloudflareTrace
+                .parse(b"ip=203.0.113.7\r\n")
+                .as_deref(),
+            Some("203.0.113.7 | -")
+        );
+        assert!(
+            IpProvider::CloudflareTrace
+                .parse(b"<html>403</html>")
+                .is_none()
+        );
+        // The JSON providers must not accept a trace body either.
+        assert!(IpProvider::IpSb.parse(body).is_none());
+    }
 
     /// The settings form writes `Display` into a `Select:` cell and reads it
     /// back with `FromStr`, and `config.json` round-trips through serde — three
@@ -263,7 +317,12 @@ mod tests {
         // The generic providers are the whole chain, in declaration order.
         assert_eq!(
             IpProvider::IpApi.fallback_chain().collect::<Vec<_>>(),
-            vec![IpProvider::IpApi, IpProvider::IpSb, IpProvider::IpApiIs]
+            vec![
+                IpProvider::IpApi,
+                IpProvider::IpSb,
+                IpProvider::IpApiIs,
+                IpProvider::CloudflareTrace
+            ]
         );
         // A family-forced choice leads its own chain and still falls back.
         assert_eq!(
@@ -272,7 +331,8 @@ mod tests {
                 IpProvider::IpSbIpv4,
                 IpProvider::IpApi,
                 IpProvider::IpSb,
-                IpProvider::IpApiIs
+                IpProvider::IpApiIs,
+                IpProvider::CloudflareTrace
             ]
         );
     }

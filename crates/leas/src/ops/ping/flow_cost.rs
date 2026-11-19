@@ -210,6 +210,7 @@ fn batch_params(
         real_timeout: Duration::from_secs(2),
         real_retries: 1,
         ping_url: "http://127.0.0.1/".to_owned(),
+        fallback_url: String::new(),
         ip_provider: IpProvider::IpApi,
         defer_delay: Duration::from_millis(50),
         real_concurrency: 64,
@@ -271,6 +272,8 @@ async fn flow_cost_report() {
         link.error = Some(leas_db::models::ErrorInfo {
             kind: ProfileErr::Fast,
             text: "Connection refused by the remote proxy host".to_owned(),
+            stage: None,
+            cause: None,
         });
         link
     };
@@ -355,6 +358,8 @@ async fn flow_cost_report() {
         evidence: None,
         transport_ms: None,
         transport_failed: true,
+        confirmed: false,
+        pair: None,
     };
     let stage_result_acc = bench_sync(4096, || {
         let link = &links_all[black_box(0)];
@@ -401,6 +406,8 @@ async fn flow_cost_report() {
             evidence: None,
             transport_ms: None,
             transport_failed: true,
+            confirmed: false,
+            pair: None,
         },
     ))
     .fold(HashMap::new(), |mut m, (h, p, o)| {
@@ -552,6 +559,8 @@ async fn flow_cost_report() {
     err_link.error = Some(leas_db::models::ErrorInfo {
         kind: ProfileErr::Real,
         text: "connection timed out after 5000 ms".to_owned(),
+        stage: None,
+        cause: None,
     });
     let err_clone_acc = bench_sync(200_000, || {
         black_box(err_link.clone());
@@ -1460,6 +1469,7 @@ async fn flow_cost_network() {
     let sample_started = Instant::now();
     let req = NativeProbeReq {
         ping_url: PING_URL,
+        fallback_url: None,
         ip_provider: IpProvider::IpApi,
         timeout: budget,
         transport_timeout: budget,
@@ -1659,6 +1669,7 @@ async fn flow_cost_transport_control() {
 
     let req = NativeProbeReq {
         ping_url: PING_URL,
+        fallback_url: None,
         ip_provider: IpProvider::IpApi,
         timeout: budget,
         transport_timeout: budget,
@@ -1739,6 +1750,7 @@ async fn hit_miss_rows(hit: bool) -> Vec<TableRow> {
             purge: None,
             marker_kind: None,
             auth_ack: None,
+            failure: None,
         });
     }
     while state.poll_core_events().await {}

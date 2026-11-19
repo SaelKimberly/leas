@@ -174,11 +174,58 @@ pub enum ConvertTarget {
     Clash,
 }
 
+/// Which stage of the four-stage probe died (spec `2026-11-19-probe-truth`,
+/// S1). The stage and the cause are stored together and always both present or
+/// both absent: a cause without a stage says nothing.
+///
+/// `Target` is the stage after the tunnel formed — the destination handshake —
+/// and is what the cell renders `[dest]` for when the server already accepted
+/// the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum FailureStage {
+    /// Reaching the server: name resolution, socket open, connect.
+    Dial,
+    /// The transport layer over TCP: TLS/REALITY, ws/gRPC/XHTTP upgrade.
+    Transport,
+    /// The proxy protocol handshake (VLESS/VMess/Trojan/SS/…).
+    Protocol,
+    /// The destination through a live tunnel.
+    Target,
+}
+
+/// The nature of the failure, independent of its stage.
+///
+/// `Io` is the honest bucket for a socket error that is neither a refusal nor
+/// a route problem; it exists so the stage is not forced to lie about a cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum FailureCause {
+    Timeout,
+    Refused,
+    NoRoute,
+    /// The name does not resolve (`EAI_NONAME`-class answer).
+    Nxdomain,
+    /// A TLS alert (the peer or a middlebox refused the handshake).
+    Alert,
+    /// An HTTP status answered the request (proxy front or target).
+    Status,
+    /// Framing bytes that do not parse as the protocol the row claims.
+    Framing,
+    /// The row cannot dial as configured.
+    Config,
+    /// Any other socket/I/O failure.
+    Io,
+}
+
 /// Error info attached to a failed test.
 #[derive(Debug, Clone, PartialEq, Eq, toasty::Embed)]
 pub struct ErrorInfo {
     pub kind: ProfileErr,
     pub text: String,
+    /// The stage the probe died at, and the cause within it (S1). Nullable as
+    /// a pair: rows written before schema 22, and rows the native engine
+    /// refused before dialling (an untestable marker), carry neither.
+    pub stage: Option<FailureStage>,
+    pub cause: Option<FailureCause>,
 }
 
 /// Why a link was moved to Purgatory permanently (spec
@@ -1076,6 +1123,8 @@ mod tests {
 
     fn err(kind: ProfileErr) -> ErrorInfo {
         ErrorInfo {
+            stage: None,
+            cause: None,
             kind,
             text: "boom".to_string(),
         }
@@ -1506,6 +1555,8 @@ mod tests {
             },
             kind: TaskKind::UdpTest,
             err: Some(ErrorInfo {
+                stage: None,
+                cause: None,
                 kind: ProfileErr::Real,
                 text: "timeout".to_string(),
             }),
@@ -1523,6 +1574,8 @@ mod tests {
         assert_eq!(
             read.err,
             Some(ErrorInfo {
+                stage: None,
+                cause: None,
                 kind: ProfileErr::Real,
                 text: "timeout".to_string(),
             })

@@ -1864,6 +1864,8 @@ mod tests {
         let mut row = link_row(1);
         row.latency = Latency::fast(42);
         row.error = Some(crate::models_toasty::ErrorInfo {
+            stage: None,
+            cause: None,
             kind: ProfileErr::Fast,
             text: "boom".to_owned(),
         });

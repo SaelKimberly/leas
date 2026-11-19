@@ -419,6 +419,7 @@ fn render_aggregates(frame: &mut Frame, area: Rect, state: &AppState, theme: &op
     let mut alive_buf = FmtBuf::<24>::default();
     let mut active_buf = FmtBuf::<24>::default();
     let mut reliable_buf = FmtBuf::<24>::default();
+    let mut exit_ips_buf = FmtBuf::<24>::default();
     let total = total_buf.put(format_args!("{}", c.total));
     let proven = proven_buf.put(format_args!("{}", c.proven));
     let untested = untested_buf.put(format_args!("{}", c.untested));
@@ -427,6 +428,7 @@ fn render_aggregates(frame: &mut Frame, area: Rect, state: &AppState, theme: &op
     let alive = alive_buf.put(format_args!("{}", c.alive));
     let active = active_buf.put(format_args!("{}", c.active));
     let reliable = reliable_buf.put(format_args!("{}", c.reliable));
+    let exit_ips = exit_ips_buf.put(format_args!("{}", c.exit_ips));
 
     lines.push(Line::from(vec![
         Span::styled("DB ", ThemeStyles::container_title(theme)),
@@ -447,6 +449,9 @@ fn render_aggregates(frame: &mut Frame, area: Rect, state: &AppState, theme: &op
     lines.push(field("alive", alive, theme));
     lines.push(field("active", active, theme));
     lines.push(field("reliable", reliable, theme));
+    // Servers, not links: one exit IP per working server, however many ports
+    // and endpoints it appears under (spec `2026-11-19-probe-truth` S6).
+    lines.push(field("exit IPs", exit_ips, theme));
 
     lines.push(Line::raw(""));
     // The view label owns its `String` (it may append the search query).

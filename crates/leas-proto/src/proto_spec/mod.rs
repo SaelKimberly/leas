@@ -11,6 +11,35 @@ pub mod common;
 pub mod endpoint;
 pub(crate) mod identity;
 pub mod ss_method_support;
+
+/// A shape NO shipped codec can dial, decided by the same predicates the
+/// config-owned writers use (spec `2026-11-19-probe-truth` S5; ADR 0018 D-C).
+///
+/// Two owners, one rule. The ingest gate (`leas-config`) refuses these rows
+/// before they are stored; the database's one-time step gives the rows that
+/// arrived earlier the `config_invalid` verdict. Both call THIS function, so a
+/// row cannot be "invalid" for one and acceptable to the other.
+///
+/// What it is NOT: a deprecation list. A variant some pinned oracle still
+/// serves (non-vision flows over TLS, legacy SS stream ciphers, the `quic`
+/// transport) is never "undialable" — the flow gate below only fires when the
+/// row has no layer for XTLS to run over, which no core accepts.
+#[must_use]
+pub fn is_undialable_shape(config: &ProtocolConfig) -> bool {
+    match config {
+        ProtocolConfig::Vless(cfg) => {
+            let flow = cfg.flow.as_deref().filter(|f| !f.is_empty());
+            let layered = cfg.security.type_str().is_some_and(|kind| {
+                kind.eq_ignore_ascii_case("tls") || kind.eq_ignore_ascii_case("reality")
+            });
+            flow.is_some() && !layered
+        }
+        ProtocolConfig::Ss(cfg) => {
+            !ss_method_support::native_supports_ss_method(cfg.method.as_str())
+        }
+        _ => false,
+    }
+}
 pub use identity::IDENTITY_VERSION;
 pub mod utils;
 

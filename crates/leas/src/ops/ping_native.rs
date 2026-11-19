@@ -67,6 +67,69 @@ pub enum ProbeClass {
     Other,
 }
 
+/// The persisted `(stage, cause)` pair for one failure (spec
+/// `2026-11-19-probe-truth-and-ingest-boundary` S1).
+///
+/// Stage = where the probe died; cause = what it met there. `transport_failed`
+/// is the disambiguator the engine cannot give through `ProbeClass` alone: the
+/// stage-1 deadline and a protocol-stage hang are both `Timeout`.
+///
+/// A real/name error keeps this pure — no text parsing — which is the point of
+/// the pair: reports group by two closed columns instead of regexing prose.
+#[must_use]
+pub const fn failure_pair(
+    class: ProbeClass,
+    evidence: Option<leas_native::error::FailureEvidence>,
+    transport_failed: bool,
+) -> (leas_db::models::FailureStage, leas_db::models::FailureCause) {
+    use leas_db::models::{FailureCause as C, FailureStage as S};
+    use leas_native::error::FailureEvidence as E;
+    match class {
+        ProbeClass::Dns => (S::Dial, C::Nxdomain),
+        ProbeClass::Refused => (S::Dial, C::Refused),
+        ProbeClass::NoRoute | ProbeClass::Unreachable => (S::Dial, C::NoRoute),
+        ProbeClass::Dial => (S::Dial, C::Io),
+        ProbeClass::Timeout => {
+            if transport_failed {
+                (S::Dial, C::Timeout)
+            } else {
+                (S::Target, C::Timeout)
+            }
+        }
+        ProbeClass::Tls => (S::Transport, C::Alert),
+        ProbeClass::Reality => (S::Transport, C::Config),
+        ProbeClass::Transport => {
+            if matches!(evidence, Some(E::HttpRejected(_))) {
+                (S::Transport, C::Status)
+            } else {
+                (S::Transport, C::Framing)
+            }
+        }
+        // The protocol stage carries two different statements: the origin
+        // rejecting the SECRET (or the config being undialable) is a config
+        // fact, while bytes that do not parse are a framing fact.
+        ProbeClass::Protocol => {
+            if matches!(evidence, Some(E::CredentialsRejected | E::ConfigDefect)) {
+                (S::Protocol, C::Config)
+            } else {
+                (S::Protocol, C::Framing)
+            }
+        }
+        ProbeClass::Http => (S::Target, C::Status),
+        ProbeClass::Config => (S::Protocol, C::Config),
+        // A local I/O failure that never got past the dial is a DIAL failure;
+        // the engine's `transport_failed` is the only signal that separates it
+        // from a destination that hung.
+        ProbeClass::Io | ProbeClass::Other => {
+            if transport_failed {
+                (S::Dial, C::Io)
+            } else {
+                (S::Target, C::Io)
+            }
+        }
+    }
+}
+
 impl ProbeClass {
     /// The label the batch summary prints. Short: the line carries every class.
     #[must_use]
@@ -125,6 +188,10 @@ pub struct ProbeFailure {
     /// stage ran. `NotApplicable` for a transport-stage failure (no protocol
     /// phase ever ran) and for a failure this module raised itself.
     pub auth_ack: leas_native::protocol::AuthAck,
+    /// Whether a SECOND observation agreed with this failure (spec S2).
+    /// Only a confirmed failure may sample the stability ring: one ambiguous
+    /// deadline never demotes a link.
+    pub confirmed: bool,
 }
 
 impl ProbeFailure {
@@ -162,6 +229,7 @@ impl ProbeFailure {
             transport_ms: None,
             transport_failed: is_transport_failure(err),
             auth_ack: leas_native::protocol::AuthAck::NotApplicable,
+            confirmed: false,
         }
     }
 
@@ -178,6 +246,7 @@ impl ProbeFailure {
             transport_ms: None,
             transport_failed: false,
             auth_ack: leas_native::protocol::AuthAck::NotApplicable,
+            confirmed: false,
         }
     }
 }
@@ -248,8 +317,15 @@ pub struct NativeProbeReq<'a> {
     /// the measurement that says "the server is alive", so it must never be
     /// truncated by the protocol stage's budget.
     pub transport_timeout: Duration,
-    /// Concurrent attempts; the fastest 2xx wins.
+    /// Attempts per observation. The first failure buys ONE confirm
+    /// observation (spec `2026-11-19-probe-truth` S2): the value is the total
+    /// observation count, never a parallel fan-out.
     pub retries: u32,
+    /// The fallback target (Cloudflare trace). It is the second observation's
+    /// target ONLY when the first failure died at the destination — a dial or
+    /// transport failure is re-observed on the same target (one extra dial,
+    /// chosen by stage).
+    pub fallback_url: Option<&'a str>,
 }
 
 /// A successful native real ping.
@@ -264,6 +340,10 @@ pub struct NativeProbeResult {
     pub transport_ms: Option<u64>,
     /// What the PROTOCOL stage saw of the server's ack (spec D3).
     pub auth_ack: leas_native::protocol::AuthAck,
+    /// `"<ip> | <country>"` when the winning observation was the fallback
+    /// target and its body carried the trace fields — the exit IP costs no
+    /// second tunnel in that case (spec S3).
+    pub ip_info: Option<String>,
 }
 
 /// One parsed probe URL: the pieces `probe::fetch` needs.
@@ -319,13 +399,15 @@ pub async fn real_ping(
 ) -> Result<NativeProbeResult, ProbeFailure> {
     let target =
         parse_probe_url(req.ping_url).map_err(|e| ProbeFailure::local(ProbeClass::Config, e))?;
-    let params = probe_params(endpoint, addresses, config, &target);
+    let fallback = req.fallback_url.and_then(|url| parse_probe_url(url).ok());
 
-    let (latency_ms, transport_ms, auth_ack) = probe_attempts(&params, &target, req).await?;
+    let (latency_ms, transport_ms, auth_ack, ip_info) =
+        probe_attempts(target, fallback.as_ref(), endpoint, addresses, config, req).await?;
     Ok(NativeProbeResult {
         latency_ms,
         transport_ms,
         auth_ack,
+        ip_info,
     })
 }
 
@@ -451,129 +533,215 @@ pub async fn fetch_exit_ip(params: &NativeConnectParams, provider: IpProvider) -
     fetch_ip_info(params, provider).await
 }
 
-/// Fan out `retries` attempts and return the fastest 2xx latency in ms, plus
-/// the TRANSPORT span the winning attempt measured.
-///
-/// Spawned tasks (not one polling loop): each attempt runs the engine's TLS /
-/// REALITY handshake, which is CPU-bound, and the attempts must not serialize
-/// on one worker thread.
-///
-/// The transport span is reported even when the attempt FAILED after the
-/// dial — that is the whole point of measuring it separately (spec D12): a
-/// row that reached the server but failed the config says "the transport was
-/// alive, the config was not".
-async fn probe_attempts(
-    params: &NativeConnectParams,
-    target: &ProbeUrl,
-    req: &NativeProbeReq<'_>,
-) -> Result<(u64, Option<u64>, leas_native::protocol::AuthAck), ProbeFailure> {
-    let attempts = req.retries.max(1);
-    let mut set = tokio::task::JoinSet::new();
-    for _ in 0..attempts {
-        let params = params.clone();
-        let host = target.host.clone();
-        let path = target.path.clone();
-        let (port, https, timeout) = (target.port, target.https, req.timeout);
-        let transport_timeout = req.transport_timeout;
-        set.spawn(async move {
-            let request = ProbeRequest {
-                host: &host,
-                port,
-                https,
-                method: ProbeMethod::Head,
-                path: &path,
-                timeout,
-                transport_timeout,
-            };
-            probe::fetch(params, &request)
-                .await
-                .map(|r| {
-                    (
-                        r.status,
-                        r.elapsed.as_millis() as u64,
-                        r.transport_span.map(|s| s.as_millis() as u64),
-                        r.auth_ack,
-                    )
-                })
-                .map_err(|e| {
-                    // The transport span and the ack ride along with the
-                    // failure: the transport was alive and the protocol stage
-                    // SAW something (spec D12, D3).
-                    let mut failure = ProbeFailure::from_engine(e.error());
-                    failure.transport_ms = e.transport_span.map(|s| s.as_millis() as u64);
-                    failure.auth_ack = e.auth_ack;
-                    // The ack overrides only when it IS credential evidence;
-                    // otherwise the engine's typed evidence stands.
-                    failure.evidence = credential_evidence(e.auth_ack).or(failure.evidence);
-                    failure
-                })
-        });
+/// The severity ladder for choosing which of two failed observations to
+/// persist (spec `2026-11-19-probe-truth` S2). Higher is more informative: a
+/// config/credential answer outranks a certificate verdict, which outranks a
+/// front's status, a framing break, a TLS alert, a deadline, and finally a
+/// dial error. Ties keep the EARLIER observation.
+const fn failure_severity(failure: &ProbeFailure) -> u8 {
+    use leas_native::error::FailureEvidence as E;
+    match failure.evidence {
+        Some(E::ConfigDefect) => 9,
+        Some(E::CredentialsRejected) => 8,
+        Some(E::RealityFallback | E::CertNotValidForName | E::CertExpired | E::CleartextPeer) => 7,
+        Some(E::HttpRejected(_)) => 6,
+        None => match failure.class {
+            ProbeClass::Protocol | ProbeClass::Transport => 5,
+            ProbeClass::Tls => 4,
+            ProbeClass::Http => 6,
+            ProbeClass::Timeout => 2,
+            ProbeClass::Config => 9,
+            ProbeClass::Dns
+            | ProbeClass::Refused
+            | ProbeClass::NoRoute
+            | ProbeClass::Unreachable
+            | ProbeClass::Dial => 1,
+            ProbeClass::Reality => 7,
+            ProbeClass::Io | ProbeClass::Other => 0,
+        },
     }
+}
 
-    let mut best: Option<u64> = None;
-    // The transport span of the FASTEST successful attempt, and — when every
-    // attempt failed — the transport span of the last failure (the transport
-    // was alive even though the config was not).
-    let mut best_transport: Option<u64> = None;
-    let mut best_ack: Option<leas_native::protocol::AuthAck> = None;
-    let mut last_error: Option<ProbeFailure> = None;
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok((status, ms, transport, ack))) if (200..300).contains(&status) => {
-                best = Some(best.map_or(ms, |b| b.min(ms)));
-                if best == Some(ms) {
-                    best_transport = transport;
-                    best_ack = Some(ack);
-                }
-            }
-            Ok(Ok((status, _, transport, ack))) => {
-                // A non-2xx answer: the transport was alive (the probe reached
-                // the target), so the span is kept on the failure. The ack is
-                // the tunnel's own observation — the protocol stage SAW
-                // something, and a non-2xx from the TARGET says nothing about
-                // the config, so the flag still reports it.
-                let mut failure =
-                    ProbeFailure::local(ProbeClass::Http, format!("unexpected status {status}"));
-                failure.transport_ms = transport;
-                failure.auth_ack = ack;
-                last_error = Some(failure);
-            }
-            Ok(Err(e)) => {
-                // The engine's failure already carries its transport span —
-                // `probe::fetch` reports the span it measured before the
-                // failure (spec D12). Keeping it here is what makes the
-                // "the server is up, the config is not" row possible.
-                last_error = Some(e);
-            }
-            Err(e) => {
-                last_error = Some(ProbeFailure::local(
-                    ProbeClass::Io,
-                    format!("probe task failed: {e}"),
-                ));
-            }
+/// True when the failure is the origin's own answer, so a second observation
+/// would only repeat it (spec S2's "positive evidence stops here").
+const fn is_positive(failure: &ProbeFailure) -> bool {
+    matches!(
+        failure.evidence,
+        Some(
+            leas_native::error::FailureEvidence::ConfigDefect
+                | leas_native::error::FailureEvidence::CredentialsRejected
+                | leas_native::error::FailureEvidence::RealityFallback
+                | leas_native::error::FailureEvidence::CertNotValidForName
+                | leas_native::error::FailureEvidence::CertExpired
+                | leas_native::error::FailureEvidence::CleartextPeer
+                | leas_native::error::FailureEvidence::HttpRejected(_)
+        )
+    )
+}
+
+/// `"<ip> | <loc>"` from a Cloudflare `cdn-cgi/trace` body, or `None` for any
+/// other body. Shape: `key=value` lines, one per line (verified 2026-11-19:
+/// 200, 221 B, `ip=`, `loc=`, `ts=`).
+fn parse_trace_body(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut ip = None;
+    let mut loc = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("ip=") {
+            ip = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("loc=") {
+            loc = Some(value.trim());
         }
     }
+    let ip = ip.filter(|v| !v.is_empty())?;
+    let loc = loc.unwrap_or("-");
+    Some(format!("{ip} | {loc}"))
+}
 
-    if let Some(ms) = best {
-        return Ok((
-            ms,
-            best_transport,
-            best_ack.unwrap_or(leas_native::protocol::AuthAck::NotApplicable),
-        ));
+/// One observation: a single request on the given target, retried zero times.
+async fn probe_once(
+    params: &NativeConnectParams,
+    target: &ProbeUrl,
+    method: ProbeMethod,
+    req: &NativeProbeReq<'_>,
+) -> Result<
+    (
+        u64,
+        Option<u64>,
+        leas_native::protocol::AuthAck,
+        Option<String>,
+    ),
+    ProbeFailure,
+> {
+    let request = ProbeRequest {
+        host: &target.host,
+        port: target.port,
+        https: target.https,
+        method,
+        path: &target.path,
+        timeout: req.timeout,
+        transport_timeout: req.transport_timeout,
+    };
+    match probe::fetch(params.clone(), &request).await {
+        Ok(r) => {
+            if !(200..300).contains(&r.status) {
+                // A non-2xx answer: the transport was alive (the probe reached
+                // the target), so the span is kept on the failure. The ack is
+                // the tunnel's own observation, and a non-2xx from the TARGET
+                // says nothing about the config, so the flag still reports it.
+                let mut failure = ProbeFailure::local(
+                    ProbeClass::Http,
+                    format!("unexpected status {}", r.status),
+                );
+                failure.transport_ms = r.transport_span.map(|s| s.as_millis() as u64);
+                failure.auth_ack = r.auth_ack;
+                return Err(failure);
+            }
+            let trace = parse_trace_body(&r.body);
+            Ok((
+                r.elapsed.as_millis() as u64,
+                r.transport_span.map(|s| s.as_millis() as u64),
+                r.auth_ack,
+                trace,
+            ))
+        }
+        Err(e) => {
+            // The transport span and the ack ride along with the failure: the
+            // transport was alive and the protocol stage SAW something
+            // (spec D12, D3).
+            let mut failure = ProbeFailure::from_engine(e.error());
+            failure.transport_ms = e.transport_span.map(|s| s.as_millis() as u64);
+            failure.auth_ack = e.auth_ack;
+            // The ack overrides only when it IS credential evidence; otherwise
+            // the engine's typed evidence stands.
+            failure.evidence = credential_evidence(e.auth_ack).or(failure.evidence);
+            Err(failure)
+        }
     }
-    // The failure carries the transport span when the transport stage
-    // completed: the row then says "the server is up, the config is
-    // not" (spec D12) instead of only "timeout".
-    //
-    // The span is read FROM the failure, not from a separate accumulator: the
-    // engine-failure arm (the only arm a real timeout, a TLS error or a
-    // refusal reaches) stores it on the failure itself, and a separate
-    // accumulator would be set only by the non-2xx arm — silently dropping
-    // the span on every real failure.
-    let failure = last_error.unwrap_or_else(|| {
-        ProbeFailure::local(ProbeClass::Other, "all attempts failed".to_string())
-    });
-    Err(failure)
+}
+
+/// Observe the link once, and — only when the first failure is not the
+/// origin's own answer — exactly once more, on the target its stage selects
+/// (spec `2026-11-19-probe-truth` S2/S3).
+///
+/// One extra dial, never a fan-out: a destination-stage failure is re-observed
+/// on the fallback target (it both confirms and tests the exit), a dial or
+/// transport failure on the same target. The persisted failure is the more
+/// informative of the two, by the severity ladder.
+async fn probe_attempts(
+    target: ProbeUrl,
+    fallback: Option<&ProbeUrl>,
+    endpoint: &Endpoint,
+    addresses: &[std::net::IpAddr],
+    config: &ProtocolConfig,
+    req: &NativeProbeReq<'_>,
+) -> Result<
+    (
+        u64,
+        Option<u64>,
+        leas_native::protocol::AuthAck,
+        Option<String>,
+    ),
+    ProbeFailure,
+> {
+    let params = probe_params(endpoint, addresses, config, &target);
+    // The primary observation is a HEAD (a 204 needs no body); the fallback is
+    // a GET because its whole point is the trace BODY (spec S3).
+    let first = probe_once(&params, &target, ProbeMethod::Head, req).await;
+    let first_failure = match first {
+        Ok(ok) => return Ok(ok),
+        Err(failure) => failure,
+    };
+    // Positive evidence is the origin's answer: repeating it spends a dial to
+    // learn nothing (spec S2).
+    // `retries` is the observation budget: one attempt is the minimum, and a
+    // configured 1 means "no confirm observation" (spec S2's default is 2).
+    if req.retries.max(1) < 2 {
+        return Err(first_failure);
+    }
+    if is_positive(&first_failure) {
+        // The origin answered, so a second dial learns nothing — but one
+        // observation is still ONE observation: it must not sample the ring
+        // (spec S2: "a single failure never samples 0, whatever its stage").
+        return Err(first_failure);
+    }
+    // The stage decides the second observation's target. The pair is the same
+    // function the persisted row uses, so the choice cannot drift from the
+    // classification.
+    let (stage, _) = failure_pair(
+        first_failure.class,
+        first_failure.evidence,
+        first_failure.transport_failed,
+    );
+    let second_target = if stage == leas_db::models::FailureStage::Target {
+        fallback.unwrap_or(&target)
+    } else {
+        &target
+    };
+    let second_params = probe_params(endpoint, addresses, config, second_target);
+    // Only the trace fallback needs a body; re-observing the primary target
+    // stays a HEAD.
+    let second_method = if stage == leas_db::models::FailureStage::Target && fallback.is_some() {
+        ProbeMethod::Get
+    } else {
+        ProbeMethod::Head
+    };
+    match probe_once(&second_params, second_target, second_method, req).await {
+        Ok(ok) => Ok(ok),
+        Err(second_failure) => {
+            // The more informative failure is persisted; a tie keeps the
+            // earlier one (it was observed first and is not worse evidence).
+            // Two observations: whichever is persisted is confirmed.
+            let mut worse = if failure_severity(&second_failure) > failure_severity(&first_failure)
+            {
+                second_failure
+            } else {
+                first_failure
+            };
+            worse.confirmed = true;
+            Err(worse)
+        }
+    }
 }
 
 /// Attempts at the exit-IP fetch. The fetch rides a SECOND tunnel through the
@@ -747,9 +915,62 @@ async fn fetch_ip_info_once(
 mod tests {
     use super::{
         IP_INFO_ATTEMPTS, IpInfoOutcome, IpInfoStep, ProbeClass, ProbeFailure, credential_evidence,
-        next_step, parse_probe_url, refusal_reason,
+        failure_pair, next_step, parse_probe_url, parse_trace_body, refusal_reason,
     };
+    use leas_db::models::{FailureCause as C, FailureStage as S};
+    use leas_native::error::FailureEvidence as E;
     use rstest::rstest;
+
+    /// The fallback target answers liveness AND the exit IP in one body; any
+    /// other body must not be mistaken for one (spec S3).
+    #[rstest]
+    #[case::trace(b"fl=1\nh=www.cloudflare.com\nip=203.0.113.7\nts=1\nloc=NL\n", Some("203.0.113.7 | NL".to_string()))]
+    #[case::crlf(b"ip=203.0.113.7\r\nloc=NL\r\n", Some("203.0.113.7 | NL".to_string()))]
+    #[case::missing_loc(b"ip=203.0.113.7\n", Some("203.0.113.7 | -".to_string()))]
+    #[case::no_ip(b"loc=NL\n", None)]
+    #[case::empty(b"", None)]
+    #[case::junk(b"<html>403</html>", None)]
+    fn the_trace_body_yields_the_exit_and_country(
+        #[case] body: &[u8],
+        #[case] want: Option<String>,
+    ) {
+        assert_eq!(parse_trace_body(body), want);
+    }
+
+    /// The persisted pair is computed from the class the engine reported plus
+    /// the transport flag — never from prose. The timeout row is the reason the
+    /// pair exists: the engine cannot say whether the deadline hit the dial or
+    /// the destination, and only `transport_failed` separates them.
+    #[rstest]
+    #[case::dns(ProbeClass::Dns, None, false, (S::Dial, C::Nxdomain))]
+    #[case::refused(ProbeClass::Refused, None, false, (S::Dial, C::Refused))]
+    #[case::no_route(ProbeClass::NoRoute, None, false, (S::Dial, C::NoRoute))]
+    #[case::unreachable(ProbeClass::Unreachable, None, false, (S::Dial, C::NoRoute))]
+    #[case::dial_io(ProbeClass::Dial, None, false, (S::Dial, C::Io))]
+    #[case::dial_timeout(ProbeClass::Timeout, None, true, (S::Dial, C::Timeout))]
+    #[case::target_timeout(ProbeClass::Timeout, None, false, (S::Target, C::Timeout))]
+    #[case::tls_alert(ProbeClass::Tls, Some(E::CertExpired), false, (S::Transport, C::Alert))]
+    #[case::reality_wrong_keys(ProbeClass::Reality, Some(E::RealityFallback), false, (S::Transport, C::Config))]
+    #[case::front_refused_the_upgrade(ProbeClass::Transport, Some(E::HttpRejected(403)), false, (S::Transport, C::Status))]
+    #[case::upgrade_framing(ProbeClass::Transport, None, false, (S::Transport, C::Framing))]
+    #[case::protocol_framing(ProbeClass::Protocol, None, false, (S::Protocol, C::Framing))]
+    // The origin rejected the SECRET: a config fact, not a framing one.
+    #[case::protocol_credentials(ProbeClass::Protocol, Some(E::CredentialsRejected), false, (S::Protocol, C::Config))]
+    #[case::protocol_config_defect(ProbeClass::Protocol, Some(E::ConfigDefect), false, (S::Protocol, C::Config))]
+    // A local I/O failure that never got past the dial is a DIAL failure.
+    #[case::io_dial(ProbeClass::Io, None, true, (S::Dial, C::Io))]
+    #[case::io_target(ProbeClass::Io, None, false, (S::Target, C::Io))]
+    #[case::target_http(ProbeClass::Http, None, false, (S::Target, C::Status))]
+    #[case::config(ProbeClass::Config, Some(E::ConfigDefect), false, (S::Protocol, C::Config))]
+    #[case::io(ProbeClass::Io, None, false, (S::Target, C::Io))]
+    fn failure_pair_is_class_plus_transport_flag(
+        #[case] class: ProbeClass,
+        #[case] evidence: Option<E>,
+        #[case] transport_failed: bool,
+        #[case] want: (S, C),
+    ) {
+        assert_eq!(failure_pair(class, evidence, transport_failed), want);
+    }
 
     /// T6: the class names the STAGE that failed. A tunnel that ended under a
     /// later phase is a protocol-stage failure, and the engine now says so with

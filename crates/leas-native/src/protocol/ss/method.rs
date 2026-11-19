@@ -304,6 +304,24 @@ mod tests {
     use super::*;
     use crate::crypto::aead::SsAead;
 
+    /// The ingestion roster (`leas_proto::proto_spec::NATIVE_SS_METHODS`) and the
+    /// codec's own resolver are one set: the config gate refuses what this
+    /// resolver cannot dial, so the two must not drift (ADR 0018 D-C).
+    #[test]
+    fn resolver_matches_the_ingestion_roster_exactly() {
+        use leas_proto::proto_spec::ss_method_support::NATIVE_SS_METHODS;
+        for method in NATIVE_SS_METHODS {
+            assert!(
+                SsMethod::from_method(method).is_some(),
+                "{method} is in the ingestion roster but the codec cannot resolve it"
+            );
+        }
+        // The junk a feed emits must stay out of both sets.
+        for junk in ["null", "", "telegram-id-ArV2ray", "aes-256"] {
+            assert!(SsMethod::from_method(junk).is_none(), "{junk:?} resolved");
+        }
+    }
+
     #[test]
     fn method_table_covers_the_native_set_including_aliases() {
         let cases: &[(&str, SsAead, SsFamily)] = &[

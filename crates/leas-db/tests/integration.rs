@@ -1337,6 +1337,8 @@ async fn clear_all_stats_zeroes_traffic_and_clears_results() {
         })
         .speed_bps(Some(5_000))
         .error(Some(ErrorInfo {
+            stage: None,
+            cause: None,
             kind: ProfileErr::Fast,
             text: "boom".to_string(),
         }))
@@ -1898,6 +1900,8 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
     result_row.latency = Latency::real_with_ip(42, Some("203.0.113.5".to_string()));
     result_row.speed_bps = Some(9_000_000);
     result_row.error = Some(ErrorInfo {
+        stage: None,
+        cause: None,
         kind: ProfileErr::Fast,
         text: "boom".to_string(),
     });
@@ -2157,6 +2161,8 @@ async fn apply_link_patches_isolates_column_groups() {
     row.latency = Latency::real_with_ip(7, None);
     row.speed_bps = Some(1_000);
     row.error = Some(ErrorInfo {
+        stage: None,
+        cause: None,
         kind: ProfileErr::Real,
         text: "old".to_string(),
     });

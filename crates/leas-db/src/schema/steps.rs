@@ -69,6 +69,10 @@ pub const STEPS: &[Step] = &[
         version: 21,
         kind: StepKind::Sql(crate::schema::ddl::V21_CREDENTIAL_PURGE),
     },
+    Step {
+        version: 22,
+        kind: StepKind::Sql(crate::schema::ddl::V22_STAGE_CAUSE),
+    },
 ];
 
 /// The steps a cursor at `cursor` must apply, in order.
@@ -122,20 +126,22 @@ mod tests {
 
     #[test]
     fn a_cursor_below_the_first_step_gets_it() {
-        let steps = steps_after(18).expect("the v19, v20 and v21 steps");
-        assert_eq!(steps.len(), 3);
+        let steps = steps_after(18).expect("the v19..v22 steps");
+        assert_eq!(steps.len(), 4);
         assert_eq!(steps[0].version, 19);
         assert_eq!(steps[1].version, 20);
         assert_eq!(steps[2].version, 21);
+        assert_eq!(steps[3].version, 22);
     }
 
     /// The migration this change depends on: a v20 database gets exactly the
     /// credential-purge rebuild, and nothing else.
     #[test]
-    fn a_v20_cursor_gets_only_the_credential_purge_step() {
-        let steps = steps_after(20).expect("the v21 step");
-        assert_eq!(steps.len(), 1);
+    fn a_v20_cursor_gets_the_credential_purge_then_the_pair() {
+        let steps = steps_after(20).expect("the v21 and v22 steps");
+        assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].version, 21);
+        assert_eq!(steps[1].version, 22);
         assert!(matches!(
             steps[0].kind,
             StepKind::Sql(statements)
@@ -147,10 +153,11 @@ mod tests {
     /// A v19 database gets the ruleset ALTER first, then the purge rebuild.
     #[test]
     fn a_v19_cursor_gets_the_ruleset_and_purge_steps() {
-        let steps = steps_after(19).expect("the v20 and v21 steps");
-        assert_eq!(steps.len(), 2);
+        let steps = steps_after(19).expect("the v20, v21 and v22 steps");
+        assert_eq!(steps.len(), 3);
         assert_eq!(steps[0].version, 20);
         assert_eq!(steps[1].version, 21);
+        assert_eq!(steps[2].version, 22);
         assert!(matches!(
             steps[0].kind,
             StepKind::Sql(statements) if statements.iter().any(|s| s.contains("ruleset"))
@@ -167,9 +174,26 @@ mod tests {
 
     #[test]
     fn the_version_after_a_step_is_that_step() {
-        assert_eq!(version_after(18), 21);
-        assert_eq!(version_after(19), 21);
-        assert_eq!(version_after(20), 21);
-        assert_eq!(version_after(21), 21);
+        assert_eq!(version_after(18), 22);
+        assert_eq!(version_after(19), 22);
+        assert_eq!(version_after(20), 22);
+        assert_eq!(version_after(21), 22);
+        assert_eq!(version_after(22), 22);
+    }
+
+    /// The pair's migration: a v21 database gets exactly the stage/cause
+    /// rebuild — two nullable columns, the pair CHECK, and no other table.
+    #[test]
+    fn a_v21_cursor_gets_only_the_stage_cause_step() {
+        let steps = steps_after(21).expect("the v22 step");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].version, 22);
+        assert!(matches!(
+            steps[0].kind,
+            StepKind::Sql(statements)
+                if statements.iter().any(|s| s.contains("\"error_stage\" TEXT"))
+                    && statements.iter().any(|s| s.contains("error_stage\" IS NULL"))
+                    && statements.iter().any(|s| s.contains("INSERT INTO profile_stats_v22"))
+        ));
     }
 }

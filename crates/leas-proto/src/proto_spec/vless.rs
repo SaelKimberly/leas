@@ -273,6 +273,17 @@ impl VlessMux {
     }
 }
 
+/// Normalise a VLESS `flow` value: `None` and the empty string are the "no
+/// flow" spelling, `none` (any case) is the alias some panels emit for it, and
+/// everything else is kept verbatim for the capability gate to judge.
+fn normalize_flow(raw: &str) -> Option<TinyText> {
+    let value = raw.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    Some(TinyText::from(value))
+}
+
 impl VlessConfig {
     /// Parse a VLESS URL into the parse boundary: [`ParsedProto`] with the
     /// endpoint essentials (host/port) split out and the identity payload
@@ -329,8 +340,11 @@ impl VlessConfig {
             .map(normalize_vless_encryption)
             .transpose()?
             .flatten();
-        // flow: xtls-rprx-vision for XTLS direct transmission (TLS 1.3 required)
-        let flow = utils::query_get(&query, "flow").map(TinyText::from);
+        // flow: xtls-rprx-vision for XTLS direct transmission (TLS 1.3 required).
+        // `flow=none` (and an empty value) is the alias for ABSENT, not a flow:
+        // xray's docs list "no flow or empty" as plain TLS proxying, and some
+        // panels write the literal `none`.
+        let flow = utils::query_get(&query, "flow").and_then(normalize_flow);
         // splice: boolean splice mode flag
         let splice = utils::query_get(&query, "splice").and_then(|v| match v {
             "1" | "true" | "yes" => Some(true),

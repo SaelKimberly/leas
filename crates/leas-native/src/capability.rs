@@ -74,6 +74,11 @@ pub const fn kind_supported(kind: ProtocolKind) -> bool {
             | ProtocolKind::Shadowsocks
             | ProtocolKind::Shadowsocks2022
             | ProtocolKind::AnyTls
+            // The SOCKS5 client shipped with the kind excluded; the oracle row
+            // `socks5_client_oracle` proved the wire end to end before this
+            // flip (spec `2026-11-19-probe-truth` S8). TCP CONNECT only: the
+            // proxy UDP leg is not implemented, as the module docs say.
+            | ProtocolKind::Socks
     )
 }
 
@@ -143,6 +148,10 @@ pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow
         (ProtocolKind::AnyTls, ProtocolConfig::AnyTls(cfg)) => {
             anytls_reason(cfg).map(Cow::Borrowed)
         }
+        // The SOCKS5 client dials TCP CONNECT only; nothing in the config can
+        // make the row undialable (spec `2026-11-19-probe-truth` S8 — the
+        // oracle row proves the wire before the gate admits the kind).
+        (ProtocolKind::Socks, ProtocolConfig::Socks(_)) => None,
         _ => Some(Cow::Borrowed("protocol kind and config type do not match")),
     }
 }
@@ -1212,10 +1221,26 @@ mod tests {
         );
     }
 
+    /// S8: the gate admits the kind AND the config arm, or every SOCKS5 row is
+    /// refused with a mismatch before a dial.
+    #[test]
+    fn a_socks5_row_passes_the_config_gate() {
+        let config = ProtocolConfig::Socks(leas_proto::proto_spec::Socks5Config {
+            username: None,
+            password: None,
+            security: leas_proto::proto_spec::SecurityConfig::default(),
+            remarks: None,
+        });
+        assert_eq!(
+            support_reason(ProtocolKind::Socks, &config).map(std::borrow::Cow::into_owned),
+            None,
+            "the SOCKS5 client must reach the dial path"
+        );
+    }
+
     #[test]
     fn non_native_kinds_unsupported() {
         let non_native = [
-            ProtocolKind::Socks,
             ProtocolKind::Http,
             ProtocolKind::WireGuard,
             ProtocolKind::DokodemoDoor,
@@ -1236,7 +1261,7 @@ mod tests {
             ProtocolKind::TProxy,
             ProtocolKind::Mixed,
         ];
-        assert_eq!(non_native.len(), 20);
+        assert_eq!(non_native.len(), 19);
         let fallback = ProtocolConfig::Vless(vless_cfg());
         for kind in non_native {
             assert!(!kind_supported(kind), "{kind:?}");

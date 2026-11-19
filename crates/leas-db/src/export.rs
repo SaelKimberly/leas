@@ -7,7 +7,8 @@ use turso::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    EndpointId, ErrorInfo, Latency, ProfileErr, ProfileStats, ProtocolId, PurgeReason, TrafficStats,
+    EndpointId, ErrorInfo, FailureCause, FailureStage, Latency, ProfileErr, ProfileStats,
+    ProtocolId, PurgeReason, TrafficStats,
 };
 use crate::{Database, endpoint_ip};
 
@@ -230,7 +231,7 @@ fn projection_sql(scope: ExportScope) -> String {
          CASE WHEN e.domain = '' AND EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id) THEN 1 \
               WHEN EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id) THEN 0 \
               ELSE 2 END AS address_rank, \
-         ps.stab_mask, ps.stab_len \
+         ps.stab_mask, ps.stab_len, ps.error_stage, ps.error_cause \
          FROM profile_stats ps \
          JOIN endpoints e ON e.id = ps.endpoint_id \
          JOIN protocols pr ON pr.id = ps.protocol_id \
@@ -270,6 +271,14 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
         (Some(true), Some(kind)) => Some(ErrorInfo {
             kind: profile_err(&kind)?,
             text: optional_text(row, 19)?.unwrap_or_default(),
+            stage: optional_text(row, 32)?
+                .as_deref()
+                .map(failure_stage)
+                .transpose()?,
+            cause: optional_text(row, 33)?
+                .as_deref()
+                .map(failure_cause)
+                .transpose()?,
         }),
         (Some(true), None) => {
             return Err(DatabaseError::Generic(
@@ -391,6 +400,35 @@ fn optional_blob(row: &turso::Row, index: usize) -> Result<Option<Vec<u8>>> {
         ))),
     }
 }
+fn failure_stage(value: &str) -> Result<FailureStage> {
+    match value {
+        "dial" => Ok(FailureStage::Dial),
+        "transport" => Ok(FailureStage::Transport),
+        "protocol" => Ok(FailureStage::Protocol),
+        "target" => Ok(FailureStage::Target),
+        other => Err(DatabaseError::Generic(format!(
+            "unknown failure stage {other}"
+        ))),
+    }
+}
+
+fn failure_cause(value: &str) -> Result<FailureCause> {
+    match value {
+        "timeout" => Ok(FailureCause::Timeout),
+        "refused" => Ok(FailureCause::Refused),
+        "no_route" => Ok(FailureCause::NoRoute),
+        "nxdomain" => Ok(FailureCause::Nxdomain),
+        "alert" => Ok(FailureCause::Alert),
+        "status" => Ok(FailureCause::Status),
+        "framing" => Ok(FailureCause::Framing),
+        "config" => Ok(FailureCause::Config),
+        "io" => Ok(FailureCause::Io),
+        other => Err(DatabaseError::Generic(format!(
+            "unknown failure cause {other}"
+        ))),
+    }
+}
+
 fn profile_err(value: &str) -> Result<ProfileErr> {
     match value {
         "real" => Ok(ProfileErr::Real),
@@ -582,6 +620,8 @@ mod tests {
             &["3.3.3.3".parse().unwrap()],
             Latency::real_with_ip(10, None),
             Some(ErrorInfo {
+                stage: None,
+                cause: None,
                 kind: crate::models_toasty::ProfileErr::Fast,
                 text: "later failure".into(),
             }),

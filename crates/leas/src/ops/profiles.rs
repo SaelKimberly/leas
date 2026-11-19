@@ -700,6 +700,9 @@ pub fn fields_to_parsed(
     // Same hard gate the URL funnel applies: a form-built row no stack can
     // dial (malformed 2022 key, cleartext `none`, `mode=quic`) never stores.
     leas_config::import_export::validate_ss_config(&parsed).map_err(|e| e.to_string())?;
+    // The form can build the same undialable VLESS shape a share URL can (a
+    // `flow` with no TLS/REALITY layer), so it runs the same rule (S5).
+    leas_config::import_export::validate_vless_shape(&parsed).map_err(|e| e.to_string())?;
     Ok(parsed)
 }
 
@@ -2066,6 +2069,8 @@ mod ttl_tests {
         link.error = Some(ErrorInfo {
             kind,
             text: "boom".to_string(),
+            stage: None,
+            cause: None,
         });
     }
 

@@ -41,7 +41,7 @@ for the tables, and `schema/ddl.rs` owns everything toasty cannot express.
 | --- | --- |
 | Modelled tables | 11 |
 | Raw tables | 2 (`rank_weight_meta`, `__toasty_migrations`) |
-| Schema cursor | `PRAGMA user_version`; current value 21 (`SCHEMA_VERSION` 21, `schema::LATEST` = `SCHEMA_VERSION`) |
+| Schema cursor | `PRAGMA user_version`; current value 22 (`SCHEMA_VERSION` 22, `schema::LATEST` = `SCHEMA_VERSION`) |
 | References | none: toasty emits no SQL `REFERENCES`, so the arrows in the entity map are ownership, not constraints |
 
 ## Table inventory
@@ -119,6 +119,8 @@ erDiagram
         TEXT error_kind "real|fast|name"
         TEXT error_text
         TEXT purge_reason "reality_fallback|certificate_mismatch|...|credential_rejected, NULL = live (ADR 0006; schema 21 adds the last)"
+        TEXT error_stage "dial|transport|protocol|target, NULL = unknown (schema 22)"
+        TEXT error_cause "timeout|refused|no_route|nxdomain|alert|status|framing|config|io, NULL = unknown (schema 22)"
         BIGINT stab_mask "stability ring: last 16 outcomes, bit i = i-th OLDEST, 1 = success"
         BIGINT stab_len "live samples in the ring, 0..=16"
         BIGINT traffic_today_up
@@ -216,6 +218,14 @@ non-empty `domain` is a DNS name whose addresses live in `endpoint_ip`; an empty
 `endpoint_ip` row. `Endpoint::derive_domain` and `Endpoint::derive_name` are the
 derivation; `is_dns()` reads `domain`. `ports` carries a multi-port spec (JSON
 array, empty when the single `port` is the whole spec).
+
+**The failure pair (schema 22)**: `error_stage` × `error_cause` live beside
+`error_kind`/`error_text` inside the same embed and are nullable TOGETHER (a
+table CHECK rejects a half pair). Every real-probe failure writes both; a
+success clears them; a row that predates the schema — or one the native engine
+refused before dialling — carries NULL, which means "class unknown", never a
+guess. The classifier is `ops::ping_native::failure_pair` (engine class +
+`transport_failed` + evidence, never prose).
 
 **`endpoint_ip`**: a DNS endpoint's resolved addresses, one row per address
 (ADR 0005). `country` is the address's ISO-3166 alpha-2 code (`country.iso_code`

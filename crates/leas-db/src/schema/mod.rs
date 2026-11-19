@@ -34,7 +34,7 @@ use crate::error::DatabaseError;
 use crate::models_toasty::AppMeta;
 
 pub mod ddl;
-mod rekey;
+pub mod rekey;
 pub mod steps;
 
 /// The version this crate's schema is at. Distinct from
@@ -87,6 +87,10 @@ async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<()> {
         }
     }
     for statement in ddl::V18_AFTER_ALTERS {
+        toasty::sql::query(*statement).exec(conn).await?;
+    }
+    // The pair invariant on a fresh `push_schema` file (schema 22).
+    for statement in ddl::PAIR_GUARD {
         toasty::sql::query(*statement).exec(conn).await?;
     }
     Ok(())

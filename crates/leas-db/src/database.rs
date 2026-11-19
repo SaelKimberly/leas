@@ -107,7 +107,7 @@ use rapidhash::{HashMapExt as _, RapidHashMap};
 // 21 = `PurgeReason::CredentialRejected`: SQLite cannot widen a CHECK in
 // place, so the step rebuilds `profile_stats` (spec `2026-09-17-purge-reason`
 // amendment, D8/D9).
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
 /// geo step wrote (`None` until it does).
@@ -420,14 +420,97 @@ impl Database {
                 None
             }
         };
-        Ok(Self {
+        let db = Self {
             db,
             concurrent_writes,
             path: Some(PathBuf::from(path_str)),
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
             direct,
             dirty_ranks: Arc::new(dashmap::DashSet::new()),
-        })
+        };
+        // One-time: retire the stored shapes no codec can dial (S5). A failure
+        // here must not block the open — the next open retries, and the marker
+        // only advances when the work committed.
+        if std::env::var("LEAS_SKIP_INVALID_PURGE").is_err()
+            && let Err(e) = db.purge_invalid_shapes_once().await
+        {
+            tracing::warn!(target: "leas_db", "invalid-shape purge: {e}");
+        }
+        Ok(db)
+    }
+
+    /// One-time retirement of the stored rows the ingest gate now refuses
+    /// (spec `2026-11-19-probe-truth-and-ingest-boundary` S5).
+    ///
+    /// A shape no shipped codec can dial — a `flow` with no TLS/REALITY layer,
+    /// or an `ss` "method" that is not a cipher — is not a deprecated variant
+    /// (ADR 0018 D-C): it is an invalid config. New imports are refused before
+    /// they reach the store; this step gives the rows that arrived earlier the
+    /// verdict their shape earns (`config_invalid`), so Purgatory's TTL retires
+    /// them instead of the probe budget testing them forever.
+    ///
+    /// Marker-gated (`app_meta.invalid_shapes_purged`): the scan runs once per
+    /// database, never on a normal open. Rows are classified with the SAME
+    /// validators the ingest gate uses, never by a second JSON reading here.
+    async fn purge_invalid_shapes_once(&self) -> Result<()> {
+        const MARKER: &str = "invalid_shapes_purged";
+        let mut conn = self.conn().await?;
+        if crate::schema::rekey::marker_value(&mut conn, MARKER).await? >= 1 {
+            return Ok(());
+        }
+        let rows = toasty::sql::query(
+            "SELECT ps.endpoint_id, ps.protocol_id, p.config FROM profile_stats ps \
+             JOIN protocols p ON p.id = ps.protocol_id WHERE ps.purge_reason IS NULL",
+        )
+        .exec(&mut conn)
+        .await?;
+        let mut hits: Vec<(i64, i64)> = Vec::new();
+        for row in &rows {
+            let toasty_core::stmt::Value::Record(fields) = row else {
+                continue;
+            };
+            let (
+                Some(toasty_core::stmt::Value::I64(endpoint)),
+                Some(toasty_core::stmt::Value::I64(protocol)),
+                Some(toasty_core::stmt::Value::String(config)),
+            ) = (fields.first(), fields.get(1), fields.get(2))
+            else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<leas_proto::proto_spec::ProtocolConfig>(config)
+            else {
+                continue;
+            };
+            if !leas_proto::proto_spec::is_undialable_shape(&parsed) {
+                continue;
+            }
+            hits.push((*protocol, *endpoint));
+        }
+        if hits.is_empty() {
+            crate::schema::rekey::stamp_marker(&mut conn, MARKER, 1).await?;
+            return Ok(());
+        }
+        let mut endpoints: Vec<EndpointId> = Vec::new();
+        for chunk in hits.chunks(400) {
+            let list = chunk
+                .iter()
+                .map(|(p, e)| format!("({p},{e})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            toasty::sql::query(format!(
+                "UPDATE profile_stats SET purge_reason = 'config_invalid', updated_at = {} \
+                 WHERE (protocol_id, endpoint_id) IN ({list})",
+                crate::models_toasty::now_epoch()
+            ))
+            .exec(&mut conn)
+            .await?;
+            endpoints.extend(chunk.iter().map(|(_, e)| EndpointId::new(*e)));
+        }
+        drop(conn);
+        let _ = self.refresh_endpoint_ranks(&endpoints).await;
+        let mut conn = self.conn().await?;
+        crate::schema::rekey::stamp_marker(&mut conn, MARKER, 1).await?;
+        Ok(())
     }
 
     /// True when this handle reads the page through the long-lived direct
@@ -1918,6 +2001,79 @@ impl Database {
     /// refresh the ordering keys, and decoding every link row to keep one
     /// integer cost 25.9 ms against 9.0 ms for this at 74k rows / 14.8k swept
     /// links (`docs/research/2026-11-16-turso-0.9-delta.md` §7).
+    /// How many DISTINCT exit IPs the stored successes name (spec
+    /// `2026-11-19-probe-truth` S6).
+    ///
+    /// The corpus is links, not servers: one endpoint's several links share a
+    /// host, and one server's several ports share an exit. The page's own
+    /// aggregates count endpoints, so this is the only number that says "how
+    /// many servers actually work".
+    ///
+    /// Raw SQL cause (`docs/reference/database-manual-sql.md`): `COUNT(DISTINCT
+    /// latency_ip)` is an aggregate over a column no typed projection exposes,
+    /// and the page's aggregate is per-endpoint (it joins `endpoint_rank`), so
+    /// the question cannot be asked of it.
+    pub async fn distinct_exit_ips(&self) -> Result<u64> {
+        let mut conn = self.conn().await?;
+        let rows = toasty::sql::query(
+            "SELECT COUNT(DISTINCT latency_ip) FROM profile_stats \
+             WHERE latency_ip IS NOT NULL AND latency_ip <> ''",
+        )
+        .exec(&mut conn)
+        .await?;
+        Ok(rows
+            .first()
+            .and_then(|row| match row {
+                toasty_core::stmt::Value::Record(record) => record.fields.first(),
+                _ => None,
+            })
+            .and_then(|value| match value {
+                toasty_core::stmt::Value::I64(n) => u64::try_from(*n).ok(),
+                _ => None,
+            })
+            .unwrap_or(0))
+    }
+
+    /// Clear the DNS-derived failure marker on every link of `endpoint_ids`
+    /// (spec `2026-11-19-probe-truth-and-ingest-boundary` S4).
+    ///
+    /// A resolved host is a *retry state*, not a verdict: the marker it carried
+    /// ("the name does not resolve") is stale the moment an address exists, so
+    /// the link must fall back to "not tested" (bin 12) rather than stay sunk
+    /// below every untested row.
+    ///
+    /// Raw SQL cause (`docs/reference/database-manual-sql.md`): the marker is
+    /// an EMBED (`error_kind`/`error_text`/`error_stage`/`error_cause`), and
+    /// toasty exposes no filter over an embed's field, so "kind = name" cannot
+    /// be written through the typed path. The UPDATE is endpoint-scoped and
+    /// touches ONLY the name class: a real marker, a measurement and a purge
+    /// verdict are left exactly as they were.
+    ///
+    /// The caller owes a `refresh_endpoint_ranks` for the same ids — the page
+    /// reads the derived keys, not this table.
+    pub async fn clear_name_markers(&self, endpoint_ids: &[EndpointId]) -> Result<()> {
+        if endpoint_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn().await?;
+        let now = crate::models_toasty::now_epoch();
+        for chunk in endpoint_ids.chunks(500) {
+            let list = chunk
+                .iter()
+                .map(|id| id.get().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            toasty::sql::query(format!(
+                "UPDATE profile_stats SET error = NULL, error_kind = NULL, error_text = NULL, \
+                 error_stage = NULL, error_cause = NULL, updated_at = {now} \
+                 WHERE error_kind = 'name' AND endpoint_id IN ({list})"
+            ))
+            .exec(&mut conn)
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn endpoint_ids_with_errors_before(&self, cutoff: i64) -> Result<Vec<EndpointId>> {
         let mut conn = self.conn().await?;
         let rows = toasty::sql::query(format!(
@@ -3183,6 +3339,262 @@ mod tests {
         .expect("create link");
     }
 
+    /// S6: the page counts endpoints; this counts SERVERS. Two links behind
+    /// one exit IP are one server, and a blank IP is not a server at all.
+    #[tokio::test]
+    async fn distinct_exit_ips_counts_servers_not_links() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        let now = crate::models_toasty::now_epoch();
+        for (ep, pid, ip) in [
+            (1, 1001, "203.0.113.7"),
+            (2, 1002, "203.0.113.7"),
+            (3, 1003, "198.51.100.9"),
+            (4, 1004, ""),
+        ] {
+            seed_endpoint(
+                &mut conn,
+                ep,
+                pid,
+                &format!("10.0.1.{ep}"),
+                HostType::Ipv4,
+                443,
+                now,
+            )
+            .await;
+            toasty::sql::query(format!(
+                "UPDATE profile_stats SET latency_ip = '{ip}' WHERE endpoint_id = {ep}"
+            ))
+            .exec(&mut conn)
+            .await
+            .expect("seed exit ip");
+        }
+        assert_eq!(
+            db.distinct_exit_ips().await.expect("count"),
+            2,
+            "two distinct addresses, however many links name them"
+        );
+    }
+
+    /// S5: the stored shapes no codec can dial get `config_invalid` exactly
+    /// once, through the same predicate the ingest gate uses, and a valid row
+    /// keeps its NULL verdict.
+    #[tokio::test]
+    async fn invalid_shapes_are_retired_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shapes.db");
+        let now = crate::models_toasty::now_epoch();
+        {
+            let db = Database::open(&path).await.expect("fresh open");
+            let mut conn = db.connection().await.expect("connection");
+            for (ep, pid, config) in [
+                // VLESS flow with no TLS/REALITY layer: undialable.
+                (
+                    1,
+                    1001,
+                    serde_json::json!({"schema": "Vless", "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d", "transport": {"type": "tcp"}, "flow": "xtls-rprx-direct"}),
+                ),
+                // `ss` "method" that is not a cipher: undialable.
+                (
+                    2,
+                    2001,
+                    serde_json::json!({"schema": "Ss", "method": "null", "password": "null"}),
+                ),
+                // Plain VLESS: valid, must stay live.
+                (
+                    3,
+                    3001,
+                    serde_json::json!({"schema": "Vless", "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d", "transport": {"type": "tcp"}}),
+                ),
+            ] {
+                // The endpoint only: this fixture owns the protocol row (it
+                // carries the shape under test), so `seed_endpoint` would
+                // create a second protocol with the same id.
+                toasty::create!(Endpoint {
+                    created_at: 0,
+                    id: EndpointId::new(ep),
+                    domain: Endpoint::derive_domain(&format!("10.0.2.{ep}"), HostType::Ipv4).0,
+                    sub_domain: Endpoint::derive_domain(&format!("10.0.2.{ep}"), HostType::Ipv4).1,
+                    port: 443,
+                    ports: Vec::<u16>::new(),
+                })
+                .exec(&mut conn)
+                .await
+                .expect("create endpoint");
+                toasty::create!(Protocol {
+                    created_at: 0,
+                    id: ProtocolId::new(pid),
+                    sig: pid,
+                    proto_kind: if config["schema"] == "Ss" {
+                        ProtocolKind::Shadowsocks
+                    } else {
+                        ProtocolKind::Vless
+                    },
+                    transport: tcp_transport(),
+                    security: no_security(),
+                    config: Deferred::from(Json(serde_json::from_value(config).expect("config"))),
+                })
+                .exec(&mut conn)
+                .await
+                .expect("create protocol");
+                toasty::create!(ProfileStats {
+                    created_at: 0,
+                    updated_at: 0,
+                    protocol_id: ProtocolId::new(pid),
+                    endpoint_id: EndpointId::new(ep),
+                    last_seen_at: ts(now),
+                    stab_mask: 0,
+                    stab_len: 0,
+                    traffic: zero_traffic(),
+                    latency: Latency::default(),
+                })
+                .exec(&mut conn)
+                .await
+                .expect("create link");
+            }
+        }
+
+        // Model "rows imported before this build": the first open stamped the
+        // step (no rows existed yet), so clear the marker and reopen.
+        {
+            let db = Database::open(&path).await.expect("seed-state open");
+            let mut conn = db.connection().await.expect("connection");
+            toasty::sql::query("DELETE FROM app_meta WHERE key = 'invalid_shapes_purged'")
+                .exec(&mut conn)
+                .await
+                .expect("clear marker");
+        }
+
+        // Reopen: the one-time step runs and stamps.
+        let db = Database::open(&path).await.expect("migrating reopen");
+        let mut conn = db.connection().await.expect("connection");
+        for (ep, want) in [
+            (1, Some("config_invalid")),
+            (2, Some("config_invalid")),
+            (3, None),
+        ] {
+            let rows = toasty::sql::query(
+                "SELECT endpoint_id, purge_reason FROM profile_stats ORDER BY endpoint_id",
+            )
+            .exec(&mut conn)
+            .await
+            .expect("read verdicts");
+            let mut got: Option<String> = None;
+            for row in &rows {
+                let toasty_core::stmt::Value::Record(f) = row else {
+                    continue;
+                };
+                if let (Some(toasty_core::stmt::Value::I64(id)), kind) = (f.first(), f.get(1))
+                    && *id == ep
+                {
+                    got = match kind {
+                        Some(toasty_core::stmt::Value::String(s)) => Some(s.clone()),
+                        _ => None,
+                    };
+                }
+            }
+            assert_eq!(
+                got.as_deref(),
+                want,
+                "endpoint {ep}: the invalid-shape verdict"
+            );
+        }
+        drop(conn);
+
+        // Second open: the marker makes it a no-op (re-stamp, no rewrite).
+        let db = Database::open(&path).await.expect("second reopen");
+        let mut conn = db.connection().await.expect("connection");
+        let rows =
+            toasty::sql::query("SELECT value FROM app_meta WHERE key = 'invalid_shapes_purged'")
+                .exec(&mut conn)
+                .await
+                .expect("marker");
+        assert!(!rows.is_empty(), "the step stamps its marker");
+    }
+
+    /// S4: a resolved host drops its name-class marker, and ONLY that. A real
+    /// marker and a purge verdict are statements about the config, not about
+    /// DNS, so they stay exactly as they were.
+    #[tokio::test]
+    async fn clearing_name_markers_leaves_real_markers_and_purges_alone() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        let now = crate::models_toasty::now_epoch();
+        for (ep, pid) in [(1, 1001), (2, 1002), (3, 1003)] {
+            seed_endpoint(
+                &mut conn,
+                ep,
+                pid,
+                &format!("10.0.0.{ep}"),
+                HostType::Ipv4,
+                443,
+                now,
+            )
+            .await;
+        }
+        // One name marker, one real marker, one name marker on a purged row.
+        for (ep, kind, purge) in [
+            (1, "name", None),
+            (2, "real", None),
+            (3, "name", Some("config_invalid")),
+        ] {
+            toasty::sql::query(format!(
+                "UPDATE profile_stats SET error = 1, error_kind = '{kind}', \
+                 error_text = 'marker', purge_reason = {} WHERE endpoint_id = {ep}",
+                purge.map_or_else(|| "NULL".to_string(), |r| format!("'{r}'"))
+            ))
+            .exec(&mut conn)
+            .await
+            .expect("seed marker");
+        }
+
+        let ids = [EndpointId::new(1), EndpointId::new(2), EndpointId::new(3)];
+        db.clear_name_markers(&ids).await.expect("clear");
+
+        // A purged row's name marker is cleared too: the marker is a DNS
+        // statement, the verdict is the retirement. What must survive on row 3
+        // is `purge_reason`, asserted below.
+        for (ep, want_kind) in [(1, None), (2, Some("real")), (3, None)] {
+            let rows = toasty::sql::query(format!(
+                "SELECT error_kind FROM profile_stats WHERE endpoint_id = {ep}"
+            ))
+            .exec(&mut conn)
+            .await
+            .expect("read back");
+            let got = rows.first().and_then(|v| match v {
+                toasty_core::stmt::Value::Record(record) => record.fields.first(),
+                _ => None,
+            });
+            match want_kind {
+                None => assert!(
+                    matches!(got, Some(toasty_core::stmt::Value::Null) | None),
+                    "endpoint {ep}: a resolved name must clear the marker"
+                ),
+                Some(kind) => assert_eq!(
+                    got,
+                    Some(&toasty_core::stmt::Value::String(kind.to_string())),
+                    "endpoint {ep}: the {kind} marker must stay"
+                ),
+            }
+        }
+        // The purged row keeps its verdict.
+        let rows =
+            toasty::sql::query("SELECT purge_reason FROM profile_stats WHERE endpoint_id = 3")
+                .exec(&mut conn)
+                .await
+                .expect("read purge");
+        assert!(
+            matches!(
+                rows.first().and_then(|v| match v {
+                    toasty_core::stmt::Value::Record(record) => record.fields.first(),
+                    _ => None,
+                }),
+                Some(toasty_core::stmt::Value::String(reason)) if reason == "config_invalid"
+            ),
+            "a verdict is not DNS-derived and must survive the clear"
+        );
+    }
+
     #[tokio::test]
     async fn active_and_stale_windows() {
         let db = Database::in_memory().await.expect("in-memory db");
@@ -3918,6 +4330,8 @@ mod tests {
         let mut probed = link_struct(1001, 1, 100);
         probed.latency = Latency::fast(42);
         probed.error = Some(crate::models_toasty::ErrorInfo {
+            stage: None,
+            cause: None,
             kind: crate::models_toasty::ProfileErr::Real,
             text: "timeout on tcp dial".to_string(),
         });

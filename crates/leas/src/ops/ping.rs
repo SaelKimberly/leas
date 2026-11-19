@@ -242,6 +242,7 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 purge: None,
                 marker_kind: None,
                 auth_ack: None,
+                failure: None,
             },
             "tcp_ping_result",
         );
@@ -291,6 +292,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
     let db = state.db.clone();
 
     let ping_url = state.config.speed_test.ping_url.clone();
+    let fallback_url = state.config.speed_test.probe_fallback_url.clone();
     let ip_provider = state.config.speed_test.ip_provider;
     let timeout = *state.config.speed_test.real_ping_timeout_secs;
     let retries = state.config.speed_test.real_ping_retries;
@@ -324,6 +326,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         purge: None,
                         marker_kind: None,
                         auth_ack: None,
+                        failure: None,
                     },
                     "real_ping_protocol_missing",
                 );
@@ -344,6 +347,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         purge: None,
                         marker_kind: None,
                         auth_ack: None,
+                        failure: None,
                     },
                     "real_ping_protocol_load",
                 );
@@ -369,6 +373,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                     purge: None,
                     marker_kind: None,
                     auth_ack: None,
+                    failure: None,
                 },
                 "real_ping_untestable",
             );
@@ -385,6 +390,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 timeout,
                 transport_timeout: timeout,
                 retries,
+                fallback_url: Some(&fallback_url),
             },
         )
         .await;
@@ -396,38 +402,54 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
         // and it survives a failure — a row whose transport answered but whose
         // config did not says "the server is up, the config is not" (spec
         // D12).
-        let (latency_ms, transport_ms, error, purge, marker_kind, auth_ack) = match result {
-            Ok(r) => (
-                Some(r.latency_ms),
-                r.transport_ms,
-                None,
-                None,
-                None,
-                Some(r.auth_ack),
-            ),
-            Err(e) => (
-                None,
-                e.transport_ms,
-                Some(e.text),
-                // The `security_fp` COLUMN from this site's own `Protocol` row
-                // — the same input every other path reads.
-                e.evidence.and_then(|ev| {
-                    crate::ops::purge::reason_for(ev, protocol.security.fp.as_deref())
-                }),
-                // A TRANSPORT-stage failure is the `[fast]` marker even though
-                // this was a real probe (spec D1's "not measurable" outcome):
-                // the transport never came up, so the row is a transport
-                // failure, not a config verdict.
-                e.transport_failed
-                    .then_some(leas_db::models::ProfileErr::Fast),
-                Some(e.auth_ack),
-            ),
-        };
+        let (latency_ms, transport_ms, error, purge, marker_kind, auth_ack, failure, probe_ip) =
+            match result {
+                Ok(r) => (
+                    Some(r.latency_ms),
+                    r.transport_ms,
+                    None,
+                    None,
+                    None,
+                    Some(r.auth_ack),
+                    None,
+                    r.ip_info,
+                ),
+                Err(e) => (
+                    None,
+                    e.transport_ms,
+                    Some(e.text),
+                    // The `security_fp` COLUMN from this site's own `Protocol` row
+                    // — the same input every other path reads.
+                    e.evidence.and_then(|ev| {
+                        crate::ops::purge::reason_for(ev, protocol.security.fp.as_deref())
+                    }),
+                    // A TRANSPORT-stage failure is the `[fast]` marker even though
+                    // this was a real probe (spec D1's "not measurable" outcome):
+                    // the transport never came up, so the row is a transport
+                    // failure, not a config verdict.
+                    e.transport_failed
+                        .then_some(leas_db::models::ProfileErr::Fast),
+                    Some(e.auth_ack),
+                    // The same mapping the batch uses: class + transport flag +
+                    // evidence, never prose.
+                    Some(ping_native::failure_pair(
+                        e.class,
+                        e.evidence,
+                        e.transport_failed,
+                    )),
+                    None,
+                ),
+            };
         // The exit IP is a SEPARATE phase (spec D10/D11): the probe's verdict
         // never depends on it, and it ages on its own. A failed probe does
         // NOT fetch one — there is no proof the config works, so a tunnel
         // built from it would report the WRONG exit.
-        let ip_info = if latency_ms.is_some() {
+        // The fallback target answers the exit IP itself, so a probe that
+        // succeeded on it needs no second tunnel (spec S3); every other
+        // success keeps the separate IP phase.
+        let ip_info = if let Some(ip) = probe_ip {
+            Some(ip)
+        } else if latency_ms.is_some() {
             match ping_native::parse_probe_url(&ping_url) {
                 Ok(target) => {
                     let params = ping_native::probe_params(&endpoint, &addresses, &config, &target);
@@ -453,6 +475,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 error,
                 purge,
                 marker_kind,
+                failure,
             },
             "real_ping_result",
         );
@@ -512,6 +535,7 @@ pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64
                 purge: None,
                 marker_kind: None,
                 auth_ack: None,
+                failure: None,
             },
             "speed_test_result",
         );
@@ -571,6 +595,7 @@ pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 purge: None,
                 marker_kind: None,
                 auth_ack: None,
+                failure: None,
             },
             "udp_test_result",
         );
@@ -746,6 +771,13 @@ enum ProbeOutcome {
         /// hung. The merged pipeline's "not measurable" outcome (spec D1)
         /// reads THIS.
         transport_failed: bool,
+        /// Whether a SECOND observation agreed (spec S2): only a confirmed
+        /// failure may sample the stability ring.
+        confirmed: bool,
+        /// The typed `(stage, cause)` pair, when an ENGINE observation
+        /// produced this failure. `None` for a soft failure (the engine was
+        /// never asked): S1 stores NULL rather than a fabricated `protocol/config`.
+        pair: Option<(leas_db::models::FailureStage, leas_db::models::FailureCause)>,
         /// What the PROTOCOL stage saw of the server's ack (spec D3). `None`
         /// for a fast-probe outcome (the TCP handshake never reaches a
         /// protocol phase) and for a failure this module raised itself.
@@ -769,6 +801,10 @@ impl ProbeOutcome {
             // A config-level refusal is not a transport failure: the config
             // never got as far as a connection.
             transport_failed: false,
+            // Never confirmed: the row was not observed, it was refused.
+            confirmed: false,
+            // No engine observation ⇒ no typed pair (S1 stores NULL).
+            pair: None,
             auth_ack: None,
         }
     }
@@ -959,6 +995,8 @@ impl BatchProbeRunner for EngineProbeRunner {
                         evidence: None,
                         transport_ms: None,
                         auth_ack: None,
+                        confirmed: false,
+                        pair: None,
                     }
                 }
             }
@@ -978,13 +1016,18 @@ impl BatchProbeRunner for EngineProbeRunner {
                     // The exit IP is a SEPARATE phase (spec D10/D11): it rides
                     // its own tunnel, it never affects the probe's verdict, and
                     // a failed probe does not fetch one.
-                    let ip_info = match ping_native::parse_probe_url(req.ping_url) {
-                        Ok(target) => {
-                            let params =
-                                ping_native::probe_params(endpoint, addresses, config, &target);
-                            ping_native::fetch_exit_ip(&params, req.ip_provider).await
-                        }
-                        Err(_) => None,
+                    // The fallback target carries the exit IP in its body, so
+                    // that success spends no second tunnel (spec S3).
+                    let ip_info = match result.ip_info {
+                        Some(ip) => Some(ip),
+                        None => match ping_native::parse_probe_url(req.ping_url) {
+                            Ok(target) => {
+                                let params =
+                                    ping_native::probe_params(endpoint, addresses, config, &target);
+                                ping_native::fetch_exit_ip(&params, req.ip_provider).await
+                            }
+                            Err(_) => None,
+                        },
                     };
                     ProbeOutcome::Ok {
                         latency_ms: Some(result.latency_ms),
@@ -1001,6 +1044,8 @@ impl BatchProbeRunner for EngineProbeRunner {
                     transport_ms: e.transport_ms,
                     transport_failed: e.transport_failed,
                     auth_ack: Some(e.auth_ack),
+                    confirmed: e.confirmed,
+                    pair: None,
                 },
             }
         })
@@ -1051,6 +1096,7 @@ pub(crate) struct BatchShared {
     transport_timeout: Duration,
     real_retries: u32,
     ping_url: String,
+    fallback_url: String,
     ip_provider: IpProvider,
     defer_delay: Duration,
     real_concurrency: usize,
@@ -1228,6 +1274,7 @@ pub(crate) struct BatchParams {
     transport_timeout: Duration,
     real_retries: u32,
     ping_url: String,
+    fallback_url: String,
     ip_provider: IpProvider,
     defer_delay: Duration,
     real_concurrency: usize,
@@ -1267,6 +1314,7 @@ impl BatchShared {
             transport_timeout: p.transport_timeout,
             real_retries: p.real_retries,
             ping_url: p.ping_url,
+            fallback_url: p.fallback_url,
             ip_provider: p.ip_provider,
             defer_delay: p.defer_delay,
             real_concurrency: p.real_concurrency,
@@ -2218,6 +2266,22 @@ impl BatchShared {
             self.emit_untestable_marker(link, &reason);
             return;
         }
+        // The CONFIG-aware gate, refreshed on every visited link (spec
+        // `2026-11-19-probe-truth` S10). The plan-time map above only knows
+        // `kind_supported`; the config-aware reason lived inside the real
+        // probe, which is dispatched only after a fast dial produced a
+        // transport — so a row whose fast dial fails kept whatever marker an
+        // older build wrote (490 rows in the 2026-11-19 snapshot still named a
+        // refusal the shipped binary cannot emit). The protocol config is
+        // memoized per `ProtocolId`, so this costs one load per protocol, not
+        // per link.
+        if let Ok(protocol) = self.protocol_config(link.protocol_id).await
+            && let Some(reason) = capability::support_reason(protocol.kind, &protocol.config)
+        {
+            self.counters.untestable.fetch_add(1, Ordering::Relaxed);
+            self.emit_untestable_marker(link, &untestable_marker_text(&reason));
+            return;
+        }
         // The fast level already proved this link's proxy unreachable (refused,
         // no route, unresolvable, dial timeout): the real probe would only spend
         // its whole timeout re-learning that. The row keeps its `[fast]` marker,
@@ -2239,18 +2303,14 @@ impl BatchShared {
                 self.retract_fast_marker(link);
             } else {
                 self.counters.unreachable.fetch_add(1, Ordering::Relaxed);
-                // The retirement stands in for the real probe it prevented — a
-                // hard-fast failure is evidence the link is unreachable NOW
-                // (spec §7.2). Gated on `real_phase`: a fast-ONLY pass must not
-                // fill rings with failures no real probe can offset.
+                // The fast retirement does NOT sample the ring (spec
+                // `2026-11-19-probe-truth` S2): one observation never demotes,
+                // and this is one TCP dial. The link keeps its last sample; a
+                // ring demotion needs the real phase's confirmed failure.
                 //
-                // It goes in THIS arm, with the verdict — never on
-                // `hard_fast.contains(key)`: the quic-plugin link above is
-                // reachable and does get real-probed, so a sample there would
-                // demote a working link.
-                if self.real_phase {
-                    self.sample_stability(link, false);
-                }
+                // Not on `hard_fast.contains(key)` either: the quic-plugin
+                // link above is reachable and does get real-probed, so a sample
+                // there would demote a working link.
                 return;
             }
         }
@@ -2348,14 +2408,16 @@ impl BatchShared {
         // protocol stage merely hung.
         if let ProbeOutcome::Failed {
             transport_failed: true,
+            confirmed,
             ..
         } = &outcome
         {
             self.counters.unreachable.fetch_add(1, Ordering::Relaxed);
-            // The retirement stands in for the probe it prevented — a
-            // transport failure is evidence the link is unreachable NOW
-            // (spec §7.2).
-            self.sample_stability(link, false);
+            // A transport failure demotes the ring only when the probe's
+            // second observation agreed (spec S2): one deadline is ambiguous.
+            if *confirmed {
+                self.sample_stability(link, false);
+            }
         }
         // A successful real ping records the endpoint so the sibling-dedup pass
         // skips its remaining links.
@@ -2681,6 +2743,7 @@ impl BatchShared {
                     timeout: self.real_timeout,
                     transport_timeout: self.transport_timeout,
                     retries: self.real_retries,
+                    fallback_url: Some(&self.fallback_url),
                 },
             )
             .await
@@ -2821,43 +2884,52 @@ impl BatchShared {
     /// import moves every endpoint's ordering keys) used to drop those results
     /// silently. Staging here is what makes "emitted == persisted" hold.
     fn stage_result(&self, link: &ProfileStats, test_type: TestType, outcome: &ProbeOutcome) {
-        let (latency_ms, transport_ms, ip_info, error, purge, marker_kind, auth_ack) = match outcome
-        {
-            ProbeOutcome::Ok {
-                latency_ms,
-                transport_ms,
-                ip_info,
-                auth_ack,
-            } => (
-                *latency_ms,
-                *transport_ms,
-                ip_info.as_deref(),
-                None,
-                None,
-                None,
-                *auth_ack,
-            ),
-            ProbeOutcome::Failed {
-                text,
-                evidence,
-                transport_ms,
-                transport_failed,
-                auth_ack,
-                ..
-            } => (
-                None,
-                *transport_ms,
-                None,
-                Some(text.as_str()),
-                evidence.and_then(|ev| self.purge_for(link, ev)),
-                // A TRANSPORT-stage failure is the `[fast]` marker even when
-                // the probe was a real one (spec D1's "not measurable"
-                // outcome): the transport never came up, so the row is not a
-                // config verdict.
-                transport_failed.then_some(leas_db::models::ProfileErr::Fast),
-                *auth_ack,
-            ),
-        };
+        let (latency_ms, transport_ms, ip_info, error, purge, marker_kind, auth_ack, failure) =
+            match outcome {
+                ProbeOutcome::Ok {
+                    latency_ms,
+                    transport_ms,
+                    ip_info,
+                    auth_ack,
+                } => (
+                    *latency_ms,
+                    *transport_ms,
+                    ip_info.as_deref(),
+                    None,
+                    None,
+                    None,
+                    *auth_ack,
+                    None,
+                ),
+                ProbeOutcome::Failed {
+                    text,
+                    class,
+                    evidence,
+                    transport_ms,
+                    transport_failed,
+                    auth_ack,
+                    ..
+                } => (
+                    None,
+                    *transport_ms,
+                    None,
+                    Some(text.as_str()),
+                    evidence.and_then(|ev| self.purge_for(link, ev)),
+                    // A TRANSPORT-stage failure is the `[fast]` marker even when
+                    // the probe was a real one (spec D1's "not measurable"
+                    // outcome): the transport never came up, so the row is not a
+                    // config verdict.
+                    transport_failed.then_some(leas_db::models::ProfileErr::Fast),
+                    *auth_ack,
+                    // The typed pair: stage × cause, from the engine's own class
+                    // plus the transport flag (spec `2026-11-19-probe-truth` S1).
+                    Some(ping_native::failure_pair(
+                        *class,
+                        *evidence,
+                        *transport_failed,
+                    )),
+                ),
+            };
         let mut row = link.clone();
         // The fast phase's own measurement, when one ran for this link. It is
         // the SAME class of fact as the probe's transport span (spec D2), so
@@ -2879,8 +2951,14 @@ impl BatchShared {
                 outcome,
                 ProbeOutcome::Failed { text, .. } if is_untestable_text(text)
             );
-            if !refused {
-                self.sample_stability(link, matches!(outcome, ProbeOutcome::Ok { .. }));
+            // A success is its own evidence; a failure samples only when the
+            // probe's second observation agreed (spec S2).
+            let sample = match outcome {
+                ProbeOutcome::Ok { .. } => Some(true),
+                ProbeOutcome::Failed { confirmed, .. } => confirmed.then_some(false),
+            };
+            if !refused && let Some(ok) = sample {
+                self.sample_stability(link, ok);
             }
         }
         // The mapping returns the groups to write: RESULT always, plus PURGE
@@ -2896,6 +2974,7 @@ impl BatchShared {
             purge,
             marker_kind,
             auth_ack,
+            failure,
         ) {
             self.writer.stage(&row, groups);
         }
@@ -3025,6 +3104,7 @@ impl BatchShared {
                 purge,
                 marker_kind,
                 auth_ack,
+                failure: None,
             },
             "batch_ping_result",
         );
@@ -3099,6 +3179,7 @@ impl BatchShared {
                 purge: None,
                 marker_kind: None,
                 auth_ack: Some(leas_native::protocol::AuthAck::NotApplicable),
+                failure: None,
             },
             "untestable_marker",
         );
@@ -3360,6 +3441,7 @@ async fn run_fill_exit_ips(params: FillExitIpsParams) {
                 purge: None,
                 marker_kind: None,
                 auth_ack: None,
+                failure: None,
             });
             // The link's exit IP was fetched.
             meters.ok.total.fetch_add(1, Ordering::Relaxed);
@@ -3442,6 +3524,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     let transport_timeout = *state.config.speed_test.tcp_timeout_secs;
     let real_retries = state.config.speed_test.real_ping_retries;
     let ping_url = state.config.speed_test.ping_url.clone();
+    let fallback_url = state.config.speed_test.probe_fallback_url.clone();
     let ip_provider = state.config.speed_test.ip_provider;
     let real_concurrency = state.config.speed_test.real_ping_concurrency.max(1);
     let error_ttl_hours = state.config.speed_test.error_ttl_hours;
@@ -3467,6 +3550,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
         transport_timeout,
         real_retries,
         ping_url,
+        fallback_url,
         ip_provider,
         defer_delay,
         real_concurrency,
@@ -3866,6 +3950,8 @@ mod tests {
         failed.links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "timeout".into(),
+            stage: None,
+            cause: None,
         });
 
         let h = harness(vec![successful, untested, failed]).await;
@@ -3929,6 +4015,8 @@ mod tests {
                 row.links[0].error = Some(ErrorInfo {
                     kind: ProfileErr::Fast,
                     text: "timeout".into(),
+                    stage: None,
+                    cause: None,
                 });
                 row
             })
@@ -4218,6 +4306,7 @@ mod tests {
             transport_timeout: Duration::from_secs(2),
             real_retries: 1,
             ping_url: "http://127.0.0.1/".to_string(),
+            fallback_url: String::new(),
             ip_provider: IpProvider::IpApi,
             defer_delay: Duration::from_millis(50),
             real_concurrency: 8,
@@ -4562,6 +4651,8 @@ mod tests {
                 evidence: None,
                 // A refused socket: the transport never came up.
                 transport_failed: true,
+                confirmed: false,
+                pair: None,
             },
             1 => ProbeOutcome::Failed {
                 auth_ack: None,
@@ -4572,6 +4663,8 @@ mod tests {
                 evidence: None,
                 // The transport was up (it measured 9 ms); the CONFIG failed.
                 transport_failed: false,
+                confirmed: false,
+                pair: None,
             },
             _ => ProbeOutcome::Ok {
                 auth_ack: None,
@@ -4694,6 +4787,8 @@ mod tests {
             // stage hung. This is NOT a transport failure, so the row is NOT
             // retired: the server is up and the config is what failed.
             transport_failed: false,
+            confirmed: false,
+            pair: None,
         };
 
         let plan = plan_from_rows(&rows);
@@ -4845,7 +4940,8 @@ mod tests {
             .expect("real success samples");
         assert_eq!((staged.link.stab_mask, staged.link.stab_len), (1, 1));
 
-        // A REAL failure appends one failure to the SAME ring (read-through).
+        // A REAL failure appends one failure to the SAME ring (read-through) —
+        // but only when a second observation agreed (spec S2).
         shared.stage_result(
             &link,
             TestType::RealPing,
@@ -4857,16 +4953,43 @@ mod tests {
                 transport_ms: None,
                 evidence: None,
                 transport_failed: false,
+                confirmed: false,
+                pair: None,
             },
         );
         let staged = shared
             .writer
             .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB))
-            .expect("real failure samples");
+            .expect("the earlier sample is still staged");
+        assert_eq!(
+            (staged.link.stab_mask, staged.link.stab_len),
+            (1, 1),
+            "an UNCONFIRMED failure must not append a sample"
+        );
+
+        shared.stage_result(
+            &link,
+            TestType::RealPing,
+            &ProbeOutcome::Failed {
+                auth_ack: None,
+                text: "timeout on probe attempt (limit 5s)".to_string(),
+                class: ProbeClass::Timeout,
+                hard: false,
+                transport_ms: None,
+                evidence: None,
+                transport_failed: false,
+                confirmed: true,
+                pair: None,
+            },
+        );
+        let staged = shared
+            .writer
+            .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB))
+            .expect("a confirmed real failure samples");
         assert_eq!(
             (staged.link.stab_mask, staged.link.stab_len),
             (0b01, 2),
-            "the failure appends to the ring the success opened"
+            "the confirmed failure appends to the ring the success opened"
         );
     }
 
@@ -4896,7 +5019,11 @@ mod tests {
     /// fast-only pass it would fill rings with failures no real probe can
     /// offset, silently demoting proven links.
     #[tokio::test]
-    async fn the_retirement_sample_is_gated_on_the_real_phase() {
+    async fn a_fast_retirement_never_samples_whatever_the_phase() {
+        // Spec `2026-11-19-probe-truth` S2: a retirement is ONE fast dial, and
+        // a single observation never demotes the ring. The old contract sampled
+        // it in a real-capable batch; that is exactly the "one deadline flips a
+        // working link" defect the change removes.
         for real_phase in [false, true] {
             let rows = vec![fake_row(1, "10.0.0.1", 1)];
             let h = harness(rows.clone()).await;
@@ -4908,22 +5035,13 @@ mod tests {
                 .lock()
                 .insert((link.protocol_id, link.endpoint_id));
             shared.after_fast_settle(&link).await;
-            let staged = shared
-                .writer
-                .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB));
-            if real_phase {
-                let staged = staged.expect("a real-capable batch samples the retirement");
-                assert_eq!(
-                    (staged.link.stab_mask, staged.link.stab_len),
-                    (0, 1),
-                    "the retirement appends one FAILURE"
-                );
-            } else {
-                assert!(
-                    staged.is_none(),
-                    "a fast-only pass must not sample a retirement"
-                );
-            }
+            assert!(
+                shared
+                    .writer
+                    .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB))
+                    .is_none(),
+                "real_phase={real_phase}: a fast retirement is one observation and must not sample"
+            );
         }
     }
 
@@ -5133,6 +5251,8 @@ mod tests {
         link.error = Some(ErrorInfo {
             kind: ProfileErr::Fast,
             text: "old failure".to_string(),
+            stage: None,
+            cause: None,
         });
         h.state.db.upsert_link(&link).await.expect("upsert link");
         let mut conn = h.state.db.connection().await.unwrap();
@@ -5231,6 +5351,8 @@ mod tests {
                 transport_ms: Some(12),
                 // The transport was alive; the protocol stage failed.
                 transport_failed: false,
+                confirmed: false,
+                pair: None,
             },
             _ => ProbeOutcome::Ok {
                 auth_ack: None,
@@ -5286,6 +5408,8 @@ mod tests {
         rows[0].links[0].error = Some(ErrorInfo {
             kind: ProfileErr::Real,
             text: "timeout on probe attempt (limit 5s)".into(),
+            stage: None,
+            cause: None,
         });
         rows[0].links[0].purge_reason = Some(PurgeReason::RealityFallback);
         // A real delay and an auth flag are already on the row: the fast
@@ -5502,6 +5626,8 @@ mod tests {
         link.error = Some(ErrorInfo {
             kind: ProfileErr::Real,
             text: untestable_marker_text("no native implementation for this protocol kind"),
+            stage: None,
+            cause: None,
         });
         assert!(
             !is_removable_failure(link),
@@ -5510,6 +5636,8 @@ mod tests {
         link.error = Some(ErrorInfo {
             kind: ProfileErr::Real,
             text: "timeout".to_string(),
+            stage: None,
+            cause: None,
         });
         assert!(is_removable_failure(link), "a real failure still counts");
         link.error = None;
@@ -5779,6 +5907,8 @@ mod tests {
                 evidence: None,
                 // A refused socket: the transport never came up.
                 transport_failed: true,
+                confirmed: false,
+                pair: None,
             },
         );
         let plan = plan_from_rows(&rows);
@@ -6012,6 +6142,8 @@ mod tests {
                 evidence: None,
                 transport_ms: None,
                 auth_ack: None,
+                confirmed: false,
+                pair: None,
             },
         );
 

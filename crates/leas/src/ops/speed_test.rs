@@ -397,6 +397,7 @@ fn settle(
             None,
             None,
             Some(auth_ack),
+            None,
         ) {
             writer.stage(&row, groups);
         }
@@ -421,6 +422,7 @@ fn settle(
             purge: None,
             marker_kind: None,
             auth_ack: Some(auth_ack),
+            failure: None,
         },
         "speed_test_result",
     );

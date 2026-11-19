@@ -211,6 +211,8 @@ fn link_value(
         latency: delay.map_or_default(Latency::real),
         speed_bps: None,
         error: error_kind.map(|kind| ErrorInfo {
+            stage: None,
+            cause: None,
             kind: match kind {
                 "real" => leas_db::models::ProfileErr::Real,
                 "fast" => leas_db::models::ProfileErr::Fast,
