@@ -304,15 +304,19 @@ hints for the current mode.
 ### DNS (pane 1)
 
 The resolver list with its last measurement, a pane-1 tab between Sniffer and
-Sources. Columns: `Protocol · Endpoint · Latency · Status · Checked`. A row is
-`untested` until a test runs; a failed probe stores the error class and a NULL
-latency. The live pool is the fastest enabled-and-ok rows (10 by default,
-Settings → DNS → Resolver Pool Size); before the first test every enabled row
-is used, so behaviour is unchanged out of the box.
+Sources. Rows are ordered fastest measured first, then never tested, then
+failures — the order is fixed, not a setting. `●` marks the resolvers the live
+pool currently holds. Columns: `Protocol · Endpoint · Latency · Status ·
+Checked`. A row is `untested` until a test runs; a failed probe stores the
+error class and a NULL latency. The live pool is the fastest enabled-and-ok
+rows (10 by default, Settings → DNS → Resolver Pool Size); before the first
+test every enabled row is used, so behaviour is unchanged out of the box.
 
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` | Navigate resolvers |
+| `PgUp` / `PgDn` | Move ten rows |
+| `Home` / `End` | First / last resolver |
 | `t` | Queue `Test DNS Resolvers` (measures every enabled row against `Resolver Test Domain`, 2 s each) |
 | `s` | Re-apply the pool after a manual edit |
 | `Space` | Enable/disable the selected resolver |

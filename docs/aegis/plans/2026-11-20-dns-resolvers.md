@@ -138,3 +138,12 @@ Critical. All fixed:
 Tests added for the review: hermetic UDP pool lookup (`leas-dns`), a late
 refresh for a deleted source, a changed endpoint keeping its measurement
 (`leas-db`), and the `DnsTest` job identity/terminal wiring.
+
+## Enhancement (2026-11-20)
+
+- The DNS tab's order is fixed: measured rows fastest-first, then untested,
+  then failures; sorted once in `ops::dns::reload` (`sort_resolvers`), never per
+  frame.
+- `●` marks the pool members: `rebuild` stores the parsed candidate stamps in
+  `AppState::dns_pool_stamps` after a successful `set_candidates`.
+- `PgUp`/`PgDn` move ten rows; `Home`/`End` jump to the edges.

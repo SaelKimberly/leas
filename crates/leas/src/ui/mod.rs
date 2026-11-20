@@ -1324,7 +1324,12 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 crate::ops::dns::toggle_resolver(state, &stamp).await;
             }
         }
-        KeyCode::Up | KeyCode::Down
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Home
+        | KeyCode::End
             if matches!(state.pane1_tab, crate::Pane1Tab::Dns)
                 && matches!(state.focused_pane, crate::FocusedPane::Pane1)
                 && matches!(state.mode, crate::AppMode::List) =>
@@ -2096,7 +2101,8 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("q / Ctrl+C", "Quit"),
                 ],
                 crate::Pane1Tab::Dns => vec![
-                    ("↑↓", "Navigate resolvers"),
+                    ("↑↓ / PgUp / PgDn", "Navigate resolvers"),
+                    ("Home / End", "First / last resolver"),
                     ("t", "Test every resolver"),
                     ("s", "Re-apply the fastest pool"),
                     ("Space", "Enable/disable the selected resolver"),

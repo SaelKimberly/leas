@@ -379,6 +379,8 @@ pub struct AppState {
     pub dns_resolvers: Vec<leas_db::models::DnsResolver>,
     /// DNS tab cursor.
     pub dns_selected: usize,
+    /// Stamps in the pool the resolver currently holds (the DNS tab's `●`).
+    pub dns_pool_stamps: std::collections::HashSet<String>,
     /// Profiles display-row cache (part-2 runtime bounds): rebuilt when a row
     /// input changed — structural `endpoints_gen`, selection/connection (in
     /// the key), or the dirty bits set by the async mutation sites
@@ -922,6 +924,7 @@ impl AppState {
             dns_sources: Vec::new(),
             dns_resolvers: Vec::new(),
             dns_selected: 0,
+            dns_pool_stamps: std::collections::HashSet::new(),
             display_rows_cache: RefCell::new(crate::ui::profiles::DisplayRowsCache::default()),
             grid_header_cache: RefCell::new(crate::ui::profiles::GridHeaderCache::default()),
         };

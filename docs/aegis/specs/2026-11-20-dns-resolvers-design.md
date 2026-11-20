@@ -122,12 +122,16 @@ user cannot see or exclude it. That is the defect this design removes.
   agent, interval), so one renderer serves both. `e`/`d`/`u` dispatch by kind;
   the tab keeps one selection over the union.
 - **D13 — DNS tab.** `Pane1Tab::Dns` between `Profiles` and `Sources`, label
-  `DNS`. Columns: Protocol, Endpoint, Latency, Status, Checked. (The draft's
+  `DNS`. Rows are ordered fastest measured first, then never tested, then
+  failures (sorted once in `reload`, not per frame). `●` marks the resolvers
+  the installed pool holds (`dns_pool_stamps`, set by `rebuild` from the
+  parsed candidates — a stored stamp the policy no longer accepts is not
+  marked). Columns: Protocol, Endpoint, Latency, Status, Checked. (The draft's
   Sources column is dropped in execution: the link table is a uniqueness
   device, and a per-row source name would add a third query to every reload
   for a fact the Sources tab already shows.) Keys:
-  `t` test all, `Space` enable/disable, `s` re-apply the pool, `↑↓`/`g`/`G` as
-  every table. Empty state names the next action (`u` in Sources refreshes a
+  `t` test all, `Space` enable/disable, `s` re-apply the pool, `↑↓` plus
+  `PgUp`/`PgDn` (ten rows) and `Home`/`End`. Empty state names the next action (`u` in Sources refreshes a
   source; `t` tests).
 - **D14 — Schema 22 → 23.** One `Step` (`V23_DNS_SOURCES`) creates the three
   tables with `IF NOT EXISTS` (a fixture or a half-applied open may already

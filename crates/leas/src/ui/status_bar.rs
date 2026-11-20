@@ -226,7 +226,7 @@ fn build_hints(state: &AppState) -> Cow<'static, str> {
                     " [↑↓] Scroll  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit ".into()
                 }
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Dns) => {
-                    " [t] Test  [s] Apply pool  [Space] Enable  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                    " [↑↓/PgUp/PgDn] Move  [t] Test  [s] Apply  [Space] Enable  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
                         .into()
                 }
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Sources) => {

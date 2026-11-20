@@ -76,7 +76,13 @@ pub async fn reload(state: &mut AppState) {
         ),
     }
     match state.db.list_dns_resolvers().await {
-        Ok(rows) => state.dns_resolvers = rows,
+        Ok(mut rows) => {
+            // One order everywhere: fastest, then never tested, then failed.
+            // Sorting here (not in the render path) keeps the frame cheap and
+            // the cursor stable between frames.
+            sort_resolvers(&mut rows);
+            state.dns_resolvers = rows;
+        }
         Err(e) => state.log_trace(
             "error",
             "tui::ops::dns",
@@ -84,6 +90,24 @@ pub async fn reload(state: &mut AppState) {
         ),
     }
     rebuild(state).await;
+}
+
+/// Orders the DNS tab: measured rows fastest-first, then never-tested rows,
+/// then failures, each group by stamp as a stable tie-break.
+fn sort_resolvers(rows: &mut [leas_db::models::DnsResolver]) {
+    const fn rank(status: leas_db::models::ResolverStatus) -> u8 {
+        match status {
+            leas_db::models::ResolverStatus::Ok => 0,
+            leas_db::models::ResolverStatus::Unchecked => 1,
+            leas_db::models::ResolverStatus::Error => 2,
+        }
+    }
+    rows.sort_by(|a, b| {
+        rank(a.status)
+            .cmp(&rank(b.status))
+            .then_with(|| a.latency_ms.cmp(&b.latency_ms))
+            .then_with(|| a.stamp.cmp(&b.stamp))
+    });
 }
 
 /// Installs the pool: the fastest measured rows, or — before the first test —
@@ -124,7 +148,14 @@ pub async fn rebuild(state: &mut AppState) {
             "tui::ops::dns",
             &format!("failed to build the DNS pool: {e}"),
         );
+        return;
     }
+    // The tab marks exactly what the resolver installed; a stored stamp that
+    // no longer parses is not in the pool and must not be marked.
+    state.dns_pool_stamps = candidates
+        .iter()
+        .map(|candidate| candidate.stamp.clone())
+        .collect();
 }
 
 /// Refreshes every enabled source that is empty or older than a week, without
@@ -578,4 +609,39 @@ pub fn refresh_all(state: &mut AppState) {
         }
         let _ = tx.send(CoreEvent::DnsChanged).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leas_db::models::{DnsResolver, ResolverStatus};
+
+    fn row(stamp: &str, status: ResolverStatus, latency: Option<i64>) -> DnsResolver {
+        DnsResolver {
+            stamp: stamp.to_string(),
+            protocol: "dnscrypt".to_string(),
+            host: "94.140.14.140".to_string(),
+            port: 5443,
+            latency_ms: latency,
+            status,
+            error: None,
+            checked_at: None,
+            enabled: true,
+        }
+    }
+
+    /// The tab's only order: fastest measured first, then never tested, then
+    /// failures. A failure is not "slowest" — it carries no latency at all.
+    #[test]
+    fn resolvers_sort_fastest_then_untested_then_error() {
+        let mut rows = vec![
+            row("err", ResolverStatus::Error, None),
+            row("slow", ResolverStatus::Ok, Some(80)),
+            row("untested", ResolverStatus::Unchecked, None),
+            row("fast", ResolverStatus::Ok, Some(5)),
+        ];
+        sort_resolvers(&mut rows);
+        let order: Vec<&str> = rows.iter().map(|r| r.stamp.as_str()).collect();
+        assert_eq!(order, ["fast", "slow", "untested", "err"]);
+    }
 }
