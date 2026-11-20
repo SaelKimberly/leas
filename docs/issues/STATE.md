@@ -2,7 +2,7 @@
 
 ```yaml
 loop:
-  iteration: 2
+  iteration: 3
   status: running
   noop_streak: 0
 coverage:
@@ -15,8 +15,9 @@ coverage:
     last_touched_iteration: 2
     issues: [004, 005, 006]
   - domain: native-protocol
-    status: unexplored
-    issues: []
+    status: in-progress
+    last_touched_iteration: 3
+    issues: [007, 008, 009]
   - domain: native-transport
     status: unexplored
     issues: []
@@ -81,3 +82,33 @@ blocked: []
   ignored the deliberate `Spill` skip). All three fixed; verdict after fixes was
   not re-run (wording/ref corrections only, no claim changed shape).
 - Next: pick `native-protocol` in iteration 3.
+
+### Iteration 3 — native-protocol
+- Pre-existing dirty worktree (user's in-flight DNS-resolvers work) left
+  untouched; only `docs/issues/` files written.
+- Prior-work check: `rg protocol/|first_flight|HeaderFirst|vision|trojan/|ss/|vmess/`
+  over `docs/issues/` hit only STATE's own reading list — no duplicate.
+- Scope note: `crates/leas-native/src/protocol/` is 22 886 lines; reviewed
+  `mod.rs`, `first_flight.rs`, `vless/{header,packet}`, `trojan/mod.rs`,
+  `hysteria2/udp.rs`, `ss/{mod,method}`, `vmess/header.rs` on the hot/datagram
+  and credential paths. `vision.rs` (2074), `stream2022.rs` (1486),
+  `ss/udp.rs` (2386), `vmess/stream.rs` (1350) not read line by line.
+- Findings: 007 (datagram receive copies payloads that already live in a
+  `Bytes` — hysteria2 + VLESS packetaddr), 008 (credential-bearing handshake
+  buffers are plain `Vec`s, never wiped, while `auth_key` is `Zeroizing`),
+  009 (hysteria2 defragger allocates `frag_count` slots from an unvalidated
+  peer byte).
+- Dead ends recorded: `vless/header.rs` is allocation-correct
+  (`encode_request_into` + `HEADER_RESERVE`); `HeaderFirst`'s
+  Pending-must-not-shrink rule is kept and tested; trojan/vmess datagram write
+  paths reuse scratch; `Trojan auth_key`/`uuid_bytes` recomputation per dial is
+  microsecond-scale and not filed.
+- Reviewer round 1: `needs-fix` (5 findings: STATE's coverage left
+  native-protocol's `issues` empty; 007 attributed the VLESS packetaddr copy to
+  the `Vec` seam when it is local to the frame arm; 008's wipe site ran after
+  `pending.clear()` and its `Drop` would break `into_inner` (E0509), with an
+  after-drop test that is a use-after-free; 007 said seven `to_bytes` call sites
+  (eight) and named `PacketWriter` among the readers; 008 called vmess's
+  `auth_id` HMAC-bound when it is an AES-128-ECB timestamp block). All five
+  fixed; second round not run — ref/causality corrections only.
+- Next: pick the next unexplored domain — `native-transport`.
