@@ -67,6 +67,7 @@ num-traits = { version = "0.2", features = ["i128"] }
 once_cell = { version = "1", features = ["critical-section"] }
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 percent-encoding = { version = "2" }
+poly1305 = { version = "0.9", default-features = false, features = ["zeroize"] }
 portable-atomic = { version = "1", features = ["std"] }
 potential_utf = { version = "0.1", default-features = false, features = ["alloc", "zerovec"] }
 quinn = { version = "0.11", default-features = false, features = ["futures-io", "log", "runtime-tokio", "rustls-ring"] }

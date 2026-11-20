@@ -28,7 +28,7 @@ leas (binary)
   ├── leas-route            routing engine primitives and codecs
   │     ├── leas-dns       optional, feature `dns`
   │     └── leas-geoip     optional, feature `geoip`
-  ├── leas-dns              DNSCrypt-stamp resolver
+  ├── leas-dns              DNSCrypt-stamp resolver (DNSCrypt/DoH/DoT/DoQ)
   ├── leas-geoip            geo data: GeoLite2, .dat, .srs
   ├── leas-host-features    SNI / exact-IP / CIDR whitelist membership
   └── leas-memtrace         optional, feature `mem-trace`: the process allocator +
@@ -139,7 +139,7 @@ Ring-only TLS client engine: TLS 1.3 with a TLS 1.2 ECDHE+AEAD client path reach
 
 These three are consumers of network data, not owners of state.
 
-- `leas-dns` resolves through DNSCrypt stamps (DoH, DoT, DoQ) with hickory-resolver. `DnsResolver` performs the lookup; caching and TTL policy belong to the caller (`ops/enrich.rs`, `dns_cache_ttl_secs`).
+- `leas-dns` resolves through DNSCrypt stamps (DNSCrypt, DoH, DoT, DoQ) with hickory-resolver. DoH/DoT/DoQ use hickory's own transports; DNSCrypt v2 server stamps are served by a custom `ConnectionProvider` (`src/dnscrypt.rs`), so one hickory pool rotates and fails over across all of them (hickory owns its answer cache; the caller's TTL cache is separate). The caller's own TTL cache and policy live in `ops/enrich.rs` (`dns_cache_ttl_secs`).
 - `leas-geoip` owns every geo artifact: country/city lookups from a GeoLite2-City database (`maxminddb`, small per-IP caches, sync `country_sync` for the router), the v2ray `.dat` reader (`geodata::dat`), the sing-box binary rule-set reader (`geodata::srs`), and the validated atomic downloader (`fetch_validated`).
 - `leas-host-features` answers SNI, exact-IP and CIDR whitelist membership with `fastbloom`, downloading the whitelist files when missing.
 

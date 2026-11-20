@@ -179,6 +179,7 @@
 ## Phase 10 — DNS & GeoIP
 
 - ✅ leas-dns + leas-geoip crates adopted — DNSCrypt-stamp DNS resolution (DOH/DOT/DOQ via hickory-resolver 0.26) and GeoLite2-City IP → country/city lookup (maxminddb 0.32 — 0.32 removed the `simdutf8` feature outright, so the manifest carries no feature list). Panic-free async init, per-instance cache dirs, workspace style clean (fmt/clippy/tests). Not yet wired into TUI.
+- ✅ DNSCrypt v2 server stamps — `crates/leas-dns/src/dnscrypt.rs` serves server stamps through a custom hickory `ConnectionProvider` in the same pool as DoH/DoT/DoQ: TXT certificate fetch + Ed25519 verify, X25519 with HSalsa20/HChaCha20, both secretbox suites, UDP with TCP fallback. Anonymized DNSCrypt relays and ODoH are not implemented.
 - ✅ Resolve actual IP addresses of DNS-based endpoints in TUI — background enrichment pipeline (`ops/enrich.rs`): `spawn_dns_resolve` (TTL-gated, `x` key forces), results shown in the expanded panel's `IPs:` line; DNS hosts get `[?]` + `🏁` until resolved. Hard deadlines: 10s DNSCrypt-list download timeout + 8s overall lookup timeout — failed lookups never hang and materialize TTL-gated entries so auto-retriggers don't re-run.
 - ✅ Location Info (country flags) — inbound country flag column (`🏴` unknown) from mmdb + outbound (egress) IP/country from real-ping `ip_info`, both in the single-line row; outbound also in the panel sub-table. DNS results persist across launches via `endpoints.resolved_as`/`resolved_at` columns.
 

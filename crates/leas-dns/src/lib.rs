@@ -6,14 +6,15 @@ use std::time::Duration;
 
 use dns_stamp_parser::{Addr, DnsStamp, Props};
 use hickory_resolver::{
-    Resolver, TokioResolver,
+    Resolver,
     config::{
         ConnectionConfig, NameServerConfig, ResolverConfig, ResolverOpts, ServerOrderingStrategy,
     },
-    net::runtime::TokioRuntimeProvider,
     system_conf,
 };
 use tokio::io::AsyncWriteExt;
+
+mod dnscrypt;
 
 const DNSCRYPT_RESOLVERS_URL: &str =
     "https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md";
@@ -129,9 +130,24 @@ fn sdns_to_nsc(url: &url::Url, allow_ipv6: bool) -> Option<NameServerConfig> {
     }
 }
 
+/// The two stamp families the parser separates: hickory's DoH/DoT/DoQ name
+/// server configs, and the `DNSCrypt` server endpoints the custom provider
+/// serves from the same hickory pool.
+#[derive(Default)]
+struct ResolverList {
+    hickory: ResolverConfig,
+    dnscrypt: Vec<dnscrypt::DnsCryptServer>,
+}
+
+impl ResolverList {
+    fn is_empty(&self) -> bool {
+        self.hickory.name_servers().is_empty() && self.dnscrypt.is_empty()
+    }
+}
+
 /// Parses `DNSCrypt` resolver list text (fetched markdown or cache file) into
-/// name server configs. Lines that are not `sdns://` stamps, or that do not
-/// decode to a usable resolver, are skipped.
+/// hickory name server configs and `DNSCrypt` servers. Lines that are not
+/// `sdns://` stamps, or that do not decode to a usable resolver, are skipped.
 ///
 /// Stamp addresses stay IPv4-only (`allow_ipv6 = false`): a stamp is the
 /// client-side transport to the DNS server itself, so an unreachable family
@@ -141,19 +157,27 @@ fn sdns_to_nsc(url: &url::Url, allow_ipv6: bool) -> Option<NameServerConfig> {
 /// than `lookup_ip(allow_ipv6)`: there the flag gates which ANSWER families a
 /// host's records may carry — a server the app dials is the lookup's subject,
 /// not its transport.
-fn parse_dnscrypt_lines(text: &str) -> Vec<NameServerConfig> {
-    text.lines()
-        .filter(|s| s.starts_with("sdns://"))
-        .filter_map(|s| s.parse::<url::Url>().ok())
-        .filter_map(|url| sdns_to_nsc(&url, false))
-        .collect()
+fn parse_dnscrypt_lines(text: &str) -> ResolverList {
+    let mut list = ResolverList::default();
+    for line in text.lines().filter(|s| s.starts_with("sdns://")) {
+        if let Some(server) = dnscrypt::parse_stamp(line) {
+            list.dnscrypt.push(server);
+            continue;
+        }
+        if let Ok(url) = line.parse::<url::Url>()
+            && let Some(name_server) = sdns_to_nsc(&url, false)
+        {
+            list.hickory.add_name_server(name_server);
+        }
+    }
+    list
 }
 
 /// Reads the cache file, returning the parsed name servers and whether the
 /// file is stale (mtime older than [`DNSCRYPT_CACHE_MAX_AGE`], or undatable).
 /// Missing, unreadable, or empty/corrupt caches yield `None` so they get
 /// re-downloaded instead of serving a 0-server config forever.
-async fn read_dnscrypt_cache(cache_file: &Path) -> (Option<Vec<NameServerConfig>>, bool) {
+async fn read_dnscrypt_cache(cache_file: &Path) -> (Option<ResolverList>, bool) {
     let Ok(metadata) = tokio::fs::metadata(cache_file).await else {
         return (None, false);
     };
@@ -246,7 +270,7 @@ async fn write_dnscrypt_cache(
     Ok(())
 }
 
-async fn get_dns_servers(cache_dir: &Path) -> anyhow::Result<ResolverConfig> {
+async fn get_dns_servers(cache_dir: &Path) -> anyhow::Result<ResolverList> {
     get_dns_servers_from(cache_dir, DNSCRYPT_RESOLVERS_URL).await
 }
 
@@ -255,7 +279,7 @@ async fn get_dns_servers(cache_dir: &Path) -> anyhow::Result<ResolverConfig> {
 async fn get_dns_servers_from(
     cache_dir: &Path,
     resolvers_url: &str,
-) -> anyhow::Result<ResolverConfig> {
+) -> anyhow::Result<ResolverList> {
     let cache_file = cache_dir.join(DNSCRYPT_RESOLVERS_CACHE);
     let (cached, cache_stale) = read_dnscrypt_cache(&cache_file).await;
 
@@ -284,22 +308,22 @@ async fn get_dns_servers_from(
         None
     };
 
-    if let Some(name_servers) = downloaded.or(cached) {
-        let mut config = ResolverConfig::default();
-        for ns in name_servers {
-            config.add_name_server(ns);
-        }
-        Ok(config)
+    if let Some(list) = downloaded.or(cached) {
+        Ok(list)
     } else {
         // Last resort: the OS-provided resolver configuration (e.g.
         // /etc/resolv.conf) so lookups still work without the DNSCrypt list.
-        Ok(system_conf::read_system_conf().map(|(cfg, _)| cfg)?)
+        let (hickory, _) = system_conf::read_system_conf()?;
+        Ok(ResolverList {
+            hickory,
+            dnscrypt: Vec::new(),
+        })
     }
 }
 
 pub struct DnsResolver {
     cache_dir: PathBuf,
-    resolver: tokio::sync::OnceCell<TokioResolver>,
+    resolver: tokio::sync::OnceCell<Resolver<dnscrypt::DnsCryptProvider>>,
 }
 
 impl DnsResolver {
@@ -331,14 +355,21 @@ impl DnsResolver {
         Ok(ips.into_boxed_slice())
     }
 
-    async fn init(&self) -> anyhow::Result<TokioResolver> {
-        let resolver_cfg = get_dns_servers(&self.cache_dir).await?;
-        let resolver_opt = DEFAULT_RESOLVER_OPTS.clone();
-        Ok(
-            Resolver::builder_with_config(resolver_cfg, TokioRuntimeProvider::default())
-                .with_options(resolver_opt)
-                .build()?,
-        )
+    async fn init(&self) -> anyhow::Result<Resolver<dnscrypt::DnsCryptProvider>> {
+        let list = get_dns_servers(&self.cache_dir).await?;
+        let mut config = list.hickory;
+        let mut seen = HashSet::new();
+        for server in &list.dnscrypt {
+            // The provider keys on the endpoint; two stamps for one endpoint
+            // would otherwise add the same name server twice.
+            if seen.insert((server.addr.ip(), server.addr.port())) {
+                config.add_name_server(dnscrypt::name_server_config(server));
+            }
+        }
+        let provider = dnscrypt::DnsCryptProvider::new(&list.dnscrypt);
+        Ok(Resolver::builder_with_config(config, provider)
+            .with_options(DEFAULT_RESOLVER_OPTS.clone())
+            .build()?)
     }
 }
 
@@ -381,10 +412,10 @@ mod tests {
     /// Asserts the result is either a non-empty config, or an error that is
     /// justified by the host having no OS-level resolver config to fall back
     /// to. Never tolerates a 0-server Ok config.
-    fn assert_usable(result: anyhow::Result<ResolverConfig>) {
+    fn assert_usable(result: anyhow::Result<ResolverList>) {
         match result {
-            Ok(cfg) => assert!(
-                !cfg.name_servers().is_empty(),
+            Ok(list) => assert!(
+                !list.is_empty(),
                 "resolver config must not have 0 name servers"
             ),
             Err(_) => assert!(
@@ -402,8 +433,28 @@ mod tests {
             "# DNSCrypt resolver list (markdown header)\n{STAMP_IPV4}\nnot a stamp\n{STAMP_IPV6}\n"
         );
         let parsed = parse_dnscrypt_lines(&text);
-        assert_eq!(parsed.len(), 1, "only the IPv4 stamp should parse");
-        assert!(parsed[0].ip.is_ipv4());
+        assert_eq!(
+            parsed.hickory.name_servers().len(),
+            1,
+            "only the IPv4 stamp should parse"
+        );
+        assert!(parsed.hickory.name_servers()[0].ip.is_ipv4());
+        assert!(parsed.dnscrypt.is_empty());
+    }
+
+    /// A `DNSCrypt` server stamp feeds the `DNSCrypt` engine, not hickory.
+    #[test]
+    fn dnscrypt_stamps_go_to_the_dnscrypt_engine() {
+        // AdGuard `2.dnscrypt.unfiltered.ns1.adguard.com`.
+        const STAMP: &str = "sdns://AQcAAAAAAAAAEjk0LjE0MC4xNC4xNDA6NTQ0MyC16ETWuDo-PhJo62gfvqcN48X6aNvWiBQdvy7AZrLa-iUyLmRuc2NyeXB0LnVuZmlsdGVyZWQubnMxLmFkZ3VhcmQuY29t";
+        let text = format!("# list\n{STAMP}\n{STAMP_IPV4}\n");
+        let parsed = parse_dnscrypt_lines(&text);
+        assert_eq!(parsed.dnscrypt.len(), 1);
+        assert_eq!(
+            parsed.dnscrypt[0].addr,
+            "94.140.14.140:5443".parse().unwrap()
+        );
+        assert_eq!(parsed.hickory.name_servers().len(), 1);
     }
 
     /// The stamp address policy must match the config layer's host policy:
@@ -480,7 +531,7 @@ mod tests {
             .await
             .expect("failed refresh must keep the stale cache");
         assert_eq!(
-            cfg.name_servers().len(),
+            cfg.hickory.name_servers().len(),
             1,
             "stale cache entry must be kept"
         );
@@ -540,7 +591,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let cache = dir.path().join(DNSCRYPT_RESOLVERS_CACHE);
         let cfg = get_dns_servers_from(dir.path(), &url).await?;
-        assert_eq!(cfg.name_servers().len(), 1);
+        assert_eq!(cfg.hickory.name_servers().len(), 1);
         let contents = tokio::fs::read_to_string(&cache).await?;
         assert_eq!(
             contents,
@@ -559,7 +610,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         tokio::fs::create_dir(dir.path().join(DNSCRYPT_RESOLVERS_CACHE)).await?;
         let cfg = get_dns_servers_from(dir.path(), &url).await?;
-        assert_eq!(cfg.name_servers().len(), 1);
+        assert_eq!(cfg.hickory.name_servers().len(), 1);
 
         let mut entries = tokio::fs::read_dir(dir.path()).await?;
         let mut count = 0;
@@ -570,6 +621,25 @@ mod tests {
             count, 1,
             "failed cache write must not leave temp files behind"
         );
+        Ok(())
+    }
+
+    /// The `DNSCrypt` transport end to end: a cache holding one published
+    /// server stamp, no hickory name server at all.
+    #[tokio::test]
+    #[ignore = "requires network (DNSCrypt resolver)"]
+    async fn live_dnscrypt_only_lookup() -> anyhow::Result<()> {
+        // AdGuard `2.dnscrypt.unfiltered.ns1.adguard.com`.
+        const STAMP: &str = "sdns://AQcAAAAAAAAAEjk0LjE0MC4xNC4xNDA6NTQ0MyC16ETWuDo-PhJo62gfvqcN48X6aNvWiBQdvy7AZrLa-iUyLmRuc2NyeXB0LnVuZmlsdGVyZWQubnMxLmFkZ3VhcmQuY29t";
+        let dir = tempfile::tempdir()?;
+        tokio::fs::write(
+            dir.path().join(DNSCRYPT_RESOLVERS_CACHE),
+            format!("{STAMP}\n"),
+        )
+        .await?;
+        let resolver = DnsResolver::new(dir.path());
+        let ips = resolver.lookup_ip("example.com", true).await?;
+        assert!(!ips.is_empty(), "DNSCrypt lookup returned no address");
         Ok(())
     }
 

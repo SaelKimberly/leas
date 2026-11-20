@@ -7,7 +7,7 @@ Terms as this project uses them. Each entry is one line; the owning document is 
 | **capability::supported / NATIVE_KINDS** | The connect-time native gate in `crates/leas-native/src/capability.rs`: `NATIVE_KINDS` is the seven kinds Auto may resolve onto native, `support_reason` the config-aware verdict whose text doubles as the `[real]` marker. Unknown values fail closed |
 | **Config type** | The proxy protocol of a profile: `ProtocolKind`, string form `vmess`, `ss`, `ss-2022`, `any-tls` and so on (`crates/leas-proto/src/proto_spec/kinds.rs`) |
 | **Counted\<S\>** | Byte-counting `AsyncRead`/`AsyncWrite` wrapper in `crates/leas-native/src/telemetry.rs` that feeds shared atomics as bytes move |
-| **DnsResolver** | Per-instance resolver in `leas-dns`: DNSCrypt public resolver list (DoH, DoT, DoQ), on-disk cache; IP literals short-circuit |
+| **DnsResolver** | Per-instance resolver in `leas-dns`: DNSCrypt public resolver list (DNSCrypt, DoH, DoT, DoQ), on-disk cache; IP literals short-circuit |
 | **EndpointInfo** | In-memory enrichment cache (`AppState.endpoint_info`): resolved IPs, inbound and outbound country, whitelist flags, exit IP |
 | **Fast Ping** | Transport-level latency test (TCP handshake, UDP datagram, QUIC handshake) dispatched by `FastPingManager` in `crates/leas-core/src/ping/adapters`; unsupported protocols fall through to the real probe |
 | **HostFeatures** | Whitelist membership from `leas-host-features`: `sni_whitelisted`, `ip_whitelisted`, `cidr_whitelisted`. IPv4-only whitelists, zero false positives |

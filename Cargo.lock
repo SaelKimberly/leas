@@ -3355,15 +3355,23 @@ name = "leas-dns"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
+ "chacha20",
  "dns-stamp-parser",
+ "futures-util",
  "hickory-resolver",
  "leas-hakari",
+ "poly1305",
  "reqwest",
+ "ring",
  "rustls",
+ "salsa20",
+ "subtle",
  "tempfile",
  "tokio",
  "tracing",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -3443,6 +3451,7 @@ dependencies = [
  "once_cell",
  "parking_lot 0.12.5",
  "percent-encoding",
+ "poly1305",
  "portable-atomic",
  "potential_utf",
  "quinn",
@@ -4971,6 +4980,7 @@ checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
 dependencies = [
  "cpufeatures 0.3.1",
  "universal-hash 0.6.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -6020,6 +6030,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "salsa20"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f874456e72520ff1375a06c588eaf074b0f01f9e9e1aada45bd9b7954a6e42c"
+dependencies = [
+ "cfg-if",
+ "cipher 0.5.2",
 ]
 
 [[package]]

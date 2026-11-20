@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Secure DNS resolution for leas via DNSCrypt stamps (DoH/DoT/DoQ)"
+description = "Secure DNS resolution for leas via DNSCrypt stamps (DNSCrypt/DoH/DoT/DoQ)"
 readme.workspace = true
 keywords = ["dns", "dnscrypt", "doh"]
 categories = ["network-programming"]
@@ -15,9 +15,19 @@ rust-version.workspace = true
 # ============ DNS ============
 hickory-resolver = { version = "0.26.3", features = ["tls-ring", "https-ring", "quic-ring", "webpki-roots"] }
 dns-stamp-parser = "3.0.1"
+# DNSCrypt v2 (crates/leas-dns/src/dnscrypt.rs). The AEAD is NaCl secretbox,
+# which no RustCrypto AEAD crate implements: `chacha20poly1305` follows RFC
+# 8439's Poly1305 input, DNSCrypt does not. See docs/reference/crypto-dependencies.md.
+chacha20 = { version = "0.10.2", features = ["xchacha", "zeroize"] }
+salsa20 = { version = "0.11.0", features = ["zeroize"] }
+poly1305 = { version = "0.9.1", features = ["zeroize"] }
+subtle = { version = "2.6.1", default-features = false }
+base64.workspace = true
+ring.workspace = true
+zeroize.workspace = true
 
 # ============ Async Runtime & I/O ============
-tokio = { workspace = true, features = ["sync", "fs", "io-util"] }
+tokio = { workspace = true, features = ["sync", "fs", "io-util", "net", "time", "macros", "rt"] }
 
 # ============ Networking ============
 reqwest.workspace = true
@@ -27,6 +37,7 @@ rustls = { workspace = true, features = ["ring"] }
 
 # ============ Error Handling ============
 anyhow.workspace = true
+futures-util.workspace = true
 
 # ============ Observability ============
 tracing.workspace = true
