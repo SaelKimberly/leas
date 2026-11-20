@@ -33,9 +33,14 @@ answer is its only answer":
    no socket (`:1280-1284`). So on a dual-stack host with IPv6 disabled — the
    `[::]:0` bind fails, `out_v6` stays `None` — a name whose first answer is
    `AAAA` sends **every** datagram to `self.drop_datagram` (`:1145-1150` on a
-   cache hit, `:1190-1198` in the spawned miss path), for the association's life, while the host's `A` record sits
-   discarded in the same `addrs` iterator. `cached_domain` also keys on
+   cache hit, `:1190-1198` in the spawned miss path), for the association's
+   life, while the host's `A` record sits discarded in the same `addrs`
+   iterator. `cached_domain` also keys on
    `(domain, port)`, so no later failure ever invalidates the pick.
+   Taking the first address is NOT itself the deviation — the crate's own dials
+   do the same (`context.rs:160-180` `server_socket`, `inbound/outbound.rs:139-145`
+   `dial_direct`) — but those dials have no cache, so the next attempt
+   re-resolves; here the pick is permanent.
 
 3. **No negative cache.** A lookup that times out or returns NXDOMAIN returns
    `None` without recording anything (`:1605-1608`, two `?`s after the
@@ -116,19 +121,23 @@ its address is exactly what DNS is for. Pinning the first answer:
 - turns an unresolvable name into an unbounded fan-out of blocking lookups
   rather than one failure and a drop.
 
-The privacy half (the leg uses the OS resolver while the profile may be
-configured for dnscrypt/DoH through `leas-dns`) is filed as cost/shape in
-**016**; here it is the input to a cache that never revisits it.
+The resolver is not the deviation: `tokio::net::lookup_host` is the crate's
+documented choice for its own dials (`context.rs:156-158` declares it for
+`server_socket`, and `dial_direct` follows the same shape), so a profile
+configured for dnscrypt/DoH is already bypassed by every tunnelled dial, not
+just this one. What this issue adds is that the answer those dials fetch is
+thrown away on the next attempt, while here it is kept forever — 016 counts
+the duplicate lookup as cost.
 
 ## Fix sketch
 
 Reuse the mechanism the process already has instead of a second one:
 
-1. Give the association cache the same input the engine's: resolve through the
-   pinned `DnsSink` (`Socks5InboundConfig` already holds the
-   `Arc<Engine>`, whose resolver is installed in production,
-   `ops/geodata.rs:481-494`), or at minimum through the same
-   `leas_dns::DnsResolver` the app is configured with.
+1. Nothing about the resolver has to change for the correctness bug: the
+   crate dials through `lookup_host` by convention (`context.rs:156-158`).
+   Routing the association through the engine's `DnsSink`
+   (`ops/geodata.rs:481-494`) is a separate, crate-wide decision — worth taking
+   only if the dial path moves with it.
 2. Store the address list plus a `stored_at` and honour
    `dns_cache_ttl_secs` — `ResolvedCache`'s shape (`leas-route/src/resolve.rs:27-83`)
    is the existing precedent, not a new one.
@@ -138,9 +147,9 @@ Reuse the mechanism the process already has instead of a second one:
    `proxy_retry_at`/`RETRY_BACKOFF` pattern at `:1276` is the local precedent),
    and cap in-flight resolve tasks per association.
 
-The minimal version that fixes the correctness bug without the resolver
-plumbing: keep the system resolver, but cache `Vec<SocketAddr>` + `stored_at`,
-try addresses in order, and drop the entry on the first send error.
+The minimal version: keep the system resolver, cache `Vec<SocketAddr>` +
+`stored_at`, try addresses in order, drop the entry on the first send error —
+lifetime is the bug, not the resolver.
 
 ## Related
 

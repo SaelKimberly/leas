@@ -838,3 +838,11 @@ blocked: []
   the reviewer independently re-checked the arithmetic (10.6 %/19.4 %), the
   2.4 MB slot figure and every cross-reference against HEAD e752ea5f.
 - Second round applied and closed; no third round (one P3 boundary).
+- Post-commit correction (docs only): 028's resolver framing narrowed after a
+  re-read of the crate's own dials — `server_socket`
+  (`leas-native/src/context.rs:156-180`, the `lookup_host` choice is documented
+  at :156-158) and `dial_direct` (`inbound/outbound.rs:139-145`) also resolve
+  through `tokio::net::lookup_host` and also take the first address, so neither
+  is an inbound deviation. 028 now states the invariant that *is* local: those
+  dials re-resolve on the next attempt, the association's cache never does.
+  No severity change; the lifetime claims are untouched.
