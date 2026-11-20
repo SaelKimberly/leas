@@ -109,7 +109,7 @@ erDiagram
         BIGINT protocol_id PK "FK protocols.id"
         BIGINT endpoint_id PK "FK endpoints.id"
         BIGINT last_used_at
-        BIGINT last_seen_at "staleness + retention"
+        BIGINT last_seen_at "staleness + retention (import stamp, or a data-carrying success)"
         INTEGER latency_real_delay "ms, the real probe's span (schema 19)"
         INTEGER latency_fast_delay "ms, the transport span (schema 19)"
         TEXT latency_ip "exit IP of a real ping"
@@ -286,8 +286,8 @@ rebuilt for another reason. `stab_mask` and
 oldest, `1` a success, with bits `[stab_len, 64)` always zero. `#[version]` makes
 typed single-row updates optimistic-concurrency safe; the bulk patch path bumps
 it manually. Writers are disjoint by column group (`LinkGroups::RESULT`,
-`PURGE`, `TRAFFIC`, `STAB`) so a ping result and the stats poller cannot clobber
-each other (decision 22).
+`PURGE`, `TRAFFIC`, `STAB`, `SEEN` — the last owns `last_seen_at`) so a ping
+result, the stats poller and the import cannot clobber each other (decision 22).
 
 ### Grouping
 
@@ -458,7 +458,8 @@ What the write-behind driver does when MVCC is on:
   fresh import refreshes in the transaction in both modes.
 - **Writer partitioning deferred.** The planned N-channel partitioned drain was
   not built: the probe measured zero conflicts at every batch size, and the
-  column-group split already keeps `last_seen_at` out of the RESULT patch.
+  column-group split gives `last_seen_at` its own `SEEN` group (the approval
+  stamp of a data-carrying success), so a RESULT patch cannot move it.
   `WriteBehind::run` remains the single flush loop.
 - **Failure path.** A failed window is re-staged from the patch
   (`CacheSpec::restage_patch`); the drained triple carries no duplicate

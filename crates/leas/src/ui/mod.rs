@@ -953,6 +953,17 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                             },
                         );
                     }
+                    "Real Test (Purgatory)" => {
+                        job_scheduler::enqueue(
+                            state,
+                            TaskSpec {
+                                kind: TaskKind::RealTestPurgatory,
+                                scope: PlanScope::All,
+                                endpoint: None,
+                                label: label.to_string(),
+                            },
+                        );
+                    }
                     "Speed Test (Successful)" => {
                         job_scheduler::enqueue(
                             state,
@@ -2124,6 +2135,7 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Real Test (New)"),
     SpeedTestMenuItem::Item("Real Test (Successful + New)"),
     SpeedTestMenuItem::Item("Real Test (Failed)"),
+    SpeedTestMenuItem::Item("Real Test (Purgatory)"),
     SpeedTestMenuItem::Item("Speed Test (Successful)"),
     SpeedTestMenuItem::Item("Fill Exit IPs (Successful)"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),

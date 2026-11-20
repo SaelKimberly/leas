@@ -686,6 +686,13 @@ pub async fn remove_failed_servers(state: &mut AppState) {
 enum PlanSource {
     /// Every link in the database, narrowed to a [`PlanScope`] of endpoints.
     Feed(PlanScope),
+    /// The Purgatory tab: band-2 endpoints, purged links INCLUDED.
+    ///
+    /// The one sweep the purge skip does not cover (ADR 0006 D8 is about
+    /// feed-wide runs): re-proving a verdict is the resurrection this entry
+    /// point exists for. `ttl_secs` is read at plan time so the walk's frozen
+    /// id list and its page bound cannot disagree.
+    Purgatory { ttl_secs: i64 },
     /// An explicit plan: the selected-endpoint entry points, and tests.
     Links(Vec<PlanLink>),
 }
@@ -1545,6 +1552,13 @@ enum PlanWalk {
         db: Arc<Database>,
         /// The plan scope: which endpoints the walk visits.
         scope: PlanScope,
+        /// The band predicate's view and bound — `All`/`0` for a scoped feed
+        /// walk, `Purgatory`/`now − ttl` for the resurrection sweep.
+        view: PurgatoryView,
+        active_threshold: i64,
+        /// Whether the page projection keeps purged links. `false` for a
+        /// feed-wide walk (ADR 0006 D8), `true` for the Purgatory sweep.
+        include_purged: bool,
         /// The frozen endpoint ids of a SCOPED walk, read once before any probe
         /// runs — the scope predicate is derived state this batch mutates, so
         /// offset paging over the live predicate would skip rows. `None` while
@@ -1566,6 +1580,25 @@ impl PlanWalk {
             PlanSource::Feed(scope) => Self::Feed {
                 db,
                 scope,
+                view: PurgatoryView::All,
+                active_threshold: 0,
+                include_purged: false,
+                frozen: None,
+                page_size,
+                offset: 0,
+                pages_done: 0,
+                pages_total: 0,
+                exhausted: false,
+            },
+            PlanSource::Purgatory { ttl_secs } => Self::Feed {
+                db,
+                // The band IS the scope: no second predicate narrows it.
+                scope: PlanScope::All,
+                view: PurgatoryView::Purgatory,
+                // Stamped once, at plan time: the frozen id list and the page
+                // bound are one decision, not two reads of the clock.
+                active_threshold: leas_db::models::now_epoch().saturating_sub(ttl_secs),
+                include_purged: true,
                 frozen: None,
                 page_size,
                 offset: 0,
@@ -1599,6 +1632,9 @@ impl PlanWalk {
             Self::Feed {
                 db,
                 scope,
+                view,
+                active_threshold,
+                include_purged,
                 page_size,
                 offset,
                 pages_done,
@@ -1628,8 +1664,8 @@ impl PlanWalk {
                 // of a page-at-a-time stream.
                 if frozen.is_none() {
                     let request = PageRequest {
-                        view: PurgatoryView::All,
-                        active_threshold: 0,
+                        view: *view,
+                        active_threshold: *active_threshold,
                         scope: *scope,
                         search: None,
                         group_id: None,
@@ -1657,10 +1693,11 @@ impl PlanWalk {
                 // Purged links are skipped by a feed-wide sweep: the real half
                 // is the long pole, and re-proving a link the classifier has
                 // already judged is the one thing the purge exists to stop.
-                // The selected-endpoint entry points read the loaded page
+                // The Purgatory sweep is the exception (`include_purged`), and
+                // the selected-endpoint entry points read the loaded page
                 // instead, so a real test on a Purgatory row still probes it
                 // (spec §8, D3).
-                let rows = db.load_page_projection(&ids, false).await?;
+                let rows = db.load_page_projection(&ids, *include_purged).await?;
                 Ok(Some(rows.iter().flat_map(plan_row_links).collect()))
             }
         }
@@ -3241,6 +3278,19 @@ pub fn start_batch_then_real_ping_scoped(state: &mut AppState, scope: PlanScope)
     start_batch(state, PlanSource::Feed(scope), true, dedup);
 }
 
+/// Fast-ping then real-ping the Purgatory tab: every band-2 link, **including**
+/// the ones the classifier purged.
+///
+/// This is the resurrection sweep — a passing real probe clears the verdict and
+/// restamps `last_seen_at`, so the row returns to Active on the next page load.
+/// The TTL is read once here: the walk's frozen id list and its page bound are
+/// one decision, and a reload mid-run must not move the target set.
+pub fn start_batch_then_real_ping_purgatory(state: &mut AppState) {
+    let dedup = !state.config.speed_test.real_ping_test_all_protocols;
+    let ttl_secs = state.purgatory_ttl_secs;
+    start_batch(state, PlanSource::Purgatory { ttl_secs }, true, dedup);
+}
+
 /// Fast-ping every link of the selected endpoint (collapsed multi-protocol rows).
 pub fn start_endpoint_batch_ping(state: &mut AppState) {
     let plan = plan_selected_endpoint(state);
@@ -3997,6 +4047,60 @@ mod tests {
             planned_hosts(PlanScope::All).await,
             vec!["10.0.0.1", "10.0.0.2", "10.0.0.3"],
             "the unscoped walk still covers the feed"
+        );
+    }
+
+    /// The Purgatory sweep is the ONE plan that reaches purged links. A
+    /// feed-wide walk still skips them (ADR 0006 D8) — the purge exists to stop
+    /// paying for links the classifier judged dead — and the resurrection
+    /// depends on this walk planning BOTH band-2 populations: the aged link no
+    /// feed re-listed, and the purged link the verdict retired.
+    #[tokio::test]
+    async fn the_purgatory_walk_plans_both_band_two_populations() {
+        use leas_db::models::PurgeReason;
+
+        // e1: aged, no verdict — the feed stopped re-listing it.
+        let aged = fake_row(1, "10.0.0.1", 1); // `last_seen_at` = epoch
+        // e2: purged, stamped FRESH — a verdict alone is band 2, because a
+        // purged link is not live and `rank_newest_seen` is live-only.
+        let mut purged = fake_row(2, "10.0.0.2", 1);
+        purged.links[0].purge_reason = Some(PurgeReason::NotTls);
+        purged.links[0].last_seen_at = leas_db::models::now_epoch();
+        // e3: fresh and confirmed — band 1, NOT Purgatory.
+        let mut fresh = fake_row(3, "10.0.0.3", 1);
+        fresh.links[0].last_seen_at = leas_db::models::now_epoch();
+
+        let h = harness(vec![aged, purged, fresh]).await;
+        let planned_hosts = |source| {
+            let db = h.state.db.clone();
+            async move {
+                let mut walk = PlanWalk::new(source, db, 100);
+                let mut hosts: Vec<String> = Vec::new();
+                while let Some(links) = walk.next_page().await.expect("walk page") {
+                    hosts.extend(
+                        links
+                            .iter()
+                            .map(|pl| dial_host(&pl.endpoint, &pl.addresses)),
+                    );
+                }
+                hosts.sort();
+                hosts.dedup();
+                hosts
+            }
+        };
+
+        assert_eq!(
+            planned_hosts(PlanSource::Purgatory {
+                ttl_secs: 7 * 86_400
+            })
+            .await,
+            vec!["10.0.0.1", "10.0.0.2"],
+            "aged and purged: the resurrection sweep must reach both"
+        );
+        assert_eq!(
+            planned_hosts(PlanSource::Feed(PlanScope::All)).await,
+            vec!["10.0.0.1", "10.0.0.3"],
+            "a feed-wide sweep still skips the purged link (ADR 0006 D8)"
         );
     }
 

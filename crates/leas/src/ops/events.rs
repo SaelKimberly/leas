@@ -294,11 +294,21 @@ pub(crate) fn apply_test_result(
     // real probe built the tunnel from this link's own config, a speed test
     // carried bytes over it. A TCP handshake proves neither, so `TcpPing` and
     // `UdpTest` leave the verdict alone.
+    //
+    // That same proof is an APPROVAL: `last_seen_at` is the one clock `band`
+    // (Active/Purgatory) and `purge_expired` read, so a passing probe restamps
+    // it — otherwise a config the feed stopped re-listing is demoted on day 8
+    // and deleted on day 31 with nothing having contradicted it.
+    let mut groups = LinkGroups::RESULT;
+    if config_evidence {
+        row.last_seen_at = leas_db::models::now_epoch();
+        groups = groups.union(LinkGroups::SEEN);
+    }
     if config_evidence && row.purge_reason.is_some() {
         row.purge_reason = None;
-        return Some(LinkGroups::RESULT.union(LinkGroups::PURGE));
+        groups = groups.union(LinkGroups::PURGE);
     }
-    Some(LinkGroups::RESULT)
+    Some(groups)
 }
 
 /// The exit IP out of a probe's `"<ip> | <country>"` answer.
@@ -1801,6 +1811,73 @@ mod tests {
             link.latency.fast_delay, None,
             "and it clears the stale transport measurement too: {link:?}"
         );
+    }
+
+    /// The approval stamp: a data-carrying success is the only thing that
+    /// refreshes `last_seen_at`, the clock `band` (Active/Purgatory) and
+    /// `purge_expired` read. Without it a config the feed stopped re-listing is
+    /// demoted on day 8 with nothing having contradicted it.
+    #[test]
+    fn a_data_carrying_success_stamps_the_approval() {
+        let mut link = fake_row(1, "h.example", 1).links.remove(0);
+
+        for test_type in [TestType::RealPing, TestType::SpeedTest] {
+            link.last_seen_at = 1_000;
+            let groups = apply_test_result(
+                &mut link,
+                test_type,
+                Some(40),
+                Some(20),
+                Some(1_000_000),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("a success changes the row");
+            assert!(
+                groups.contains(LinkGroups::SEEN),
+                "{test_type:?} approves and must stage the stamp"
+            );
+            assert!(
+                link.last_seen_at > 1_000,
+                "{test_type:?} restamps the clock: {}",
+                link.last_seen_at
+            );
+        }
+
+        // A transport handshake proves reachable, not working, and a failure is
+        // certainly no approval.
+        for (test_type, error) in [
+            (TestType::TcpPing, None),
+            (TestType::RealPing, Some("timeout after 5s")),
+        ] {
+            link.last_seen_at = 1_000;
+            let groups = apply_test_result(
+                &mut link,
+                test_type,
+                Some(40),
+                Some(20),
+                None,
+                None,
+                error,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("changed");
+            assert!(
+                !groups.contains(LinkGroups::SEEN),
+                "{test_type:?} proves nothing about the config"
+            );
+            assert_eq!(
+                link.last_seen_at, 1_000,
+                "{test_type:?} must leave the clock alone"
+            );
+        }
     }
 
     #[test]

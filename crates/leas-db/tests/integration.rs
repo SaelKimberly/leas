@@ -2378,6 +2378,70 @@ async fn apply_link_patches_isolates_column_groups() {
         (0b1011, 4),
         "a RESULT patch must not touch the ring its snapshot never sampled"
     );
+
+    // SEEN-only patch: the approval stamp moves FORWARD and nothing else does,
+    // and the write is MONOTONE — an older snapshot cannot pull it back, because
+    // the import writer owns the same column and both values mean "seen".
+    //
+    // Order matters: the NEWER stamp lands FIRST, so only a monotone write can
+    // hold it. Landing them older-then-newer would assert the same value under
+    // `MAX` and under a plain assignment, i.e. test nothing.
+    let stored_seen = after.last_seen_at;
+    let mut newer = stale.clone();
+    newer.last_seen_at = stored_seen + 5_000;
+    db.apply_link_patches(&[LinkPatch {
+        link: newer,
+        groups: LinkGroups::SEEN,
+    }])
+    .await
+    .expect("fresh seen patch");
+    let mut older = stale.clone();
+    older.last_seen_at = stored_seen.saturating_sub(1_000);
+    db.apply_link_patches(&[LinkPatch {
+        link: older,
+        groups: LinkGroups::SEEN,
+    }])
+    .await
+    .expect("stale seen patch");
+    let after = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(301),
+        EndpointId::new(3),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("reload")
+    .expect("row");
+    assert_eq!(
+        after.last_seen_at,
+        stored_seen + 5_000,
+        "the stamp is monotone: an older snapshot must not pull it backwards"
+    );
+    assert_eq!(
+        after.latency,
+        Latency::fast(99),
+        "a stamp is not a measurement"
+    );
+    assert_eq!(
+        after.traffic,
+        TrafficStats {
+            today_up: 10,
+            today_down: 20,
+            total_up: 30,
+            total_down: 40
+        },
+        "nor traffic"
+    );
+    assert_eq!(
+        after.purge_reason,
+        Some(PurgeReason::TransportRejected),
+        "nor the verdict"
+    );
+    assert_eq!(
+        (after.stab_mask, after.stab_len),
+        (0b1011, 4),
+        "nor the ring"
+    );
 }
 
 #[tokio::test]

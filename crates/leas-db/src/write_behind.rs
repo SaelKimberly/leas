@@ -839,6 +839,21 @@ pub struct LinkRow {
     pub groups: crate::LinkGroups,
 }
 
+/// The column groups, in fold order, for the loops that must apply EVERY group.
+///
+/// ONE list, because each fold site carried its own hand-copied four-flag array
+/// and a new group then existed at its producer and in the SQL while reaching
+/// the file from nowhere (2026-11-20: `SEEN` was staged by no one and written by
+/// nothing). [`merge_group`] still matches each group explicitly — this is the
+/// iteration order, not the dispatch.
+const GROUP_FLAGS: [crate::LinkGroups; 5] = [
+    crate::LinkGroups::RESULT,
+    crate::LinkGroups::PURGE,
+    crate::LinkGroups::TRAFFIC,
+    crate::LinkGroups::STAB,
+    crate::LinkGroups::SEEN,
+];
+
 /// Fold one staged column group onto `base`.
 ///
 /// The groups are disjoint by construction, so the order they are applied in
@@ -865,6 +880,8 @@ fn merge_group(
     } else if flag == LinkGroups::STAB {
         base.stab_mask = staged.stab_mask;
         base.stab_len = staged.stab_len;
+    } else if flag == LinkGroups::SEEN {
+        base.last_seen_at = staged.last_seen_at;
     }
 }
 
@@ -914,12 +931,7 @@ impl CacheSpec for LinkSpec {
         for row in rows {
             let link_key = (row.link.protocol_id, row.link.endpoint_id);
             if let Some((groups, base)) = merged.get_mut(&link_key) {
-                for flag in [
-                    LinkGroups::RESULT,
-                    LinkGroups::PURGE,
-                    LinkGroups::TRAFFIC,
-                    LinkGroups::STAB,
-                ] {
+                for flag in GROUP_FLAGS {
                     if row.groups.contains(flag) {
                         merge_group(base, flag, &row.link);
                     }
@@ -928,12 +940,7 @@ impl CacheSpec for LinkSpec {
                 continue;
             }
             let mut link = row.link.clone();
-            for flag in [
-                LinkGroups::RESULT,
-                LinkGroups::PURGE,
-                LinkGroups::TRAFFIC,
-                LinkGroups::STAB,
-            ] {
+            for flag in GROUP_FLAGS {
                 if row.groups.contains(flag) {
                     merge_group(&mut link, flag, &row.link);
                 }
@@ -951,23 +958,17 @@ impl CacheSpec for LinkSpec {
     }
 
     fn restage_patch(patch: &Self::Patch) -> Vec<(Self::Key, Self::Row)> {
-        use crate::LinkGroups;
-        [
-            LinkGroups::RESULT,
-            LinkGroups::PURGE,
-            LinkGroups::TRAFFIC,
-            LinkGroups::STAB,
-        ]
-        .into_iter()
-        .filter(|flag| patch.groups.contains(*flag))
-        .map(|flag| {
-            let single = LinkRow {
-                link: patch.link.clone(),
-                groups: flag,
-            };
-            (Self::key_of(&single), single)
-        })
-        .collect()
+        GROUP_FLAGS
+            .into_iter()
+            .filter(|flag| patch.groups.contains(*flag))
+            .map(|flag| {
+                let single = LinkRow {
+                    link: patch.link.clone(),
+                    groups: flag,
+                };
+                (Self::key_of(&single), single)
+            })
+            .collect()
     }
 
     /// The chunked upsert of [`Database::apply_link_patches`], on the driver's
@@ -1030,13 +1031,7 @@ impl WriteBehind<LinkSpec> {
     /// stay responsive. `groups` is normalised to one entry per flag, so a
     /// stage of `ALL` and a later stage of `RESULT` do not shadow each other.
     pub fn stage(&self, link: &crate::models_toasty::ProfileStats, groups: crate::LinkGroups) {
-        use crate::LinkGroups;
-        for flag in [
-            LinkGroups::RESULT,
-            LinkGroups::PURGE,
-            LinkGroups::TRAFFIC,
-            LinkGroups::STAB,
-        ] {
+        for flag in GROUP_FLAGS {
             if groups.contains(flag) {
                 self.push(LinkRow {
                     link: link.clone(),
@@ -2056,8 +2051,8 @@ mod tests {
         }
         assert_eq!(
             driver.staged_len(),
-            12,
-            "ALL normalises to one entry per group (RESULT/PURGE/TRAFFIC/STAB), per link"
+            15,
+            "ALL normalises to one entry per group (RESULT/PURGE/TRAFFIC/STAB/SEEN), per link"
         );
         assert_eq!(
             driver.flush().await.expect("flush"),
@@ -2089,6 +2084,67 @@ mod tests {
         assert_eq!(row.latency, Latency::fast(44));
         assert_eq!(row.speed_bps, Some(1_000_000));
         assert_eq!(row.traffic.total_up, 5);
+    }
+
+    /// The SEEN seam: the stamp reaches the FILE through the driver, not only
+    /// through the SQL. `stage` carried its own hand-copied group list, so a
+    /// `SEEN` patch was dropped before the writer ever saw it and `last_seen_at`
+    /// never moved — every unit test of `apply_test_result` and of
+    /// `apply_link_patches` still passed while the feature was inert.
+    #[tokio::test]
+    async fn link_flush_writes_the_seen_stamp_and_no_other_column() {
+        let (db, driver) = seeded_links().await;
+        let base = link_row(1);
+        let stored = stored_link(&db, 1).await.last_seen_at;
+
+        let mut result = with_latency(&base, 33);
+        result.speed_bps = Some(2_000_000);
+        let mut approved = base.clone();
+        approved.last_seen_at = stored + 5_000;
+        // The SEEN entry's own latency must never reach the file: the group owns
+        // the clock and nothing else.
+        approved.latency = Latency::fast(999);
+
+        driver.stage(&result, LinkGroups::RESULT);
+        driver.stage(&approved, LinkGroups::SEEN);
+        assert_eq!(
+            driver.staged_len(),
+            2,
+            "SEEN is a staged group like any other"
+        );
+
+        assert_eq!(
+            driver.flush().await.expect("flush"),
+            1,
+            "both groups coalesce into one patch for the link"
+        );
+
+        let row = stored_link(&db, 1).await;
+        assert_eq!(
+            row.last_seen_at,
+            stored + 5_000,
+            "the approval stamp reaches the file"
+        );
+        assert_eq!(
+            row.latency,
+            Latency::fast(33),
+            "a SEEN snapshot must not write the RESULT columns"
+        );
+    }
+
+    /// The fold list is the WHOLE group set: a group missing from it is staged
+    /// by nobody and written by nothing, while its producer and its SQL both
+    /// look correct (the 2026-11-20 shape).
+    #[test]
+    fn the_fold_list_covers_every_group_bit() {
+        let union = super::GROUP_FLAGS
+            .into_iter()
+            .fold(LinkGroups::RESULT, LinkGroups::union);
+        assert_eq!(
+            union,
+            LinkGroups::ALL,
+            "every group bit must appear in GROUP_FLAGS"
+        );
     }
 
     /// `stage` never awaits a write: the flush task's transactions are the only

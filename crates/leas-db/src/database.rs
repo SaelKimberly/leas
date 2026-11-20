@@ -162,6 +162,13 @@ impl LinkGroups {
     /// never sampled the ring — rewrite the counters. Only the producers that
     /// actually append a sample set this bit.
     pub const STAB: Self = Self(0b1000);
+    /// `last_seen_at` (the approval stamp of a data-carrying success).
+    ///
+    /// Its own bit for the same reason as [`Self::PURGE`]: the fixed-column-set
+    /// rule, so a fast half staging a plan-time snapshot cannot rewrite the
+    /// stamp. The write is monotone (`MAX`), because the import writer also
+    /// owns this column and both values mean "seen recently".
+    pub const SEEN: Self = Self(0b1_0000);
     /// Every group.
     ///
     /// Every group can change a STORED ORDERING KEY — the rank columns derive
@@ -169,7 +176,7 @@ impl LinkGroups {
     /// `purge_reason`/`stab_mask`/`stab_len` — so every patch refreshes its
     /// endpoint's keys. (The scheduler's task state used to be a third group;
     /// it is runtime-only now and never reaches this table.)
-    pub const ALL: Self = Self(0b1111);
+    pub const ALL: Self = Self(0b1_1111);
 
     /// Whether `other`'s groups are all present in `self`.
     #[must_use]
@@ -806,13 +813,14 @@ fn link_values_sql(link: &ProfileStats, now: i64) -> String {
 /// persisted value — the disjointness [`LinkGroups`] exists for. A patch that
 /// carries no group at all only creates a missing row (`DO NOTHING`).
 fn link_patch_conflict_sql(groups: LinkGroups) -> String {
-    let (has_result, has_purge, has_traffic, has_stab) = (
+    let (has_result, has_purge, has_traffic, has_stab, has_seen) = (
         groups.contains(LinkGroups::RESULT),
         groups.contains(LinkGroups::PURGE),
         groups.contains(LinkGroups::TRAFFIC),
         groups.contains(LinkGroups::STAB),
+        groups.contains(LinkGroups::SEEN),
     );
-    let mut sets: Vec<&str> = Vec::with_capacity(16);
+    let mut sets: Vec<&str> = Vec::with_capacity(17);
     if has_result {
         sets.extend_from_slice(&[
             "latency_real_delay = excluded.latency_real_delay",
@@ -843,6 +851,12 @@ fn link_patch_conflict_sql(groups: LinkGroups) -> String {
             "stab_mask = excluded.stab_mask",
             "stab_len = excluded.stab_len",
         ]);
+    }
+    if has_seen {
+        // `MAX`, not assignment: the import writer owns the same column with an
+        // unconditional SET, so a patch staged from an older snapshot must not
+        // move the stamp backwards.
+        sets.push("last_seen_at = MAX(excluded.last_seen_at, last_seen_at)");
     }
     if sets.is_empty() {
         return format!(" ON CONFLICT({LINK_COMPARE_KEYS}) DO NOTHING");
@@ -1436,27 +1450,17 @@ impl Database {
         if patches.is_empty() {
             return Ok(0);
         }
-        // The `ON CONFLICT` action is per-STATEMENT, so the patches are
-        // bucketed by the action they need rather than by their exact bit
-        // pattern — `contains` is what decides the columns written, exactly as
-        // the per-row form did. The bucket is the 4-bit presence vector, so a
-        // new group widens the list automatically instead of silently folding
-        // into an existing bucket (which would write the wrong column set).
-        for bucket in 0u8..16 {
-            let (has_result, has_purge, has_traffic, has_stab) = (
-                bucket & 0b0001 != 0,
-                bucket & 0b0010 != 0,
-                bucket & 0b0100 != 0,
-                bucket & 0b1000 != 0,
-            );
+        // The `ON CONFLICT` action is per-STATEMENT, so the patches are bucketed
+        // by the action they need rather than by their exact bit pattern —
+        // `contains` is what decides the columns written, exactly as the
+        // per-row form did. The bucket is the presence vector over EVERY group
+        // bit (`LinkGroups::ALL`, not a hand-copied 4-bit list: a new group
+        // otherwise folds into bucket 0 and its patch is silently skipped by the
+        // `DO NOTHING` action — which is what `SEEN` did on 2026-11-20).
+        for bucket in 0u8..=LinkGroups::ALL.0 {
             let shape: Vec<&LinkPatch> = patches
                 .iter()
-                .filter(|p| {
-                    p.groups.contains(LinkGroups::RESULT) == has_result
-                        && p.groups.contains(LinkGroups::PURGE) == has_purge
-                        && p.groups.contains(LinkGroups::TRAFFIC) == has_traffic
-                        && p.groups.contains(LinkGroups::STAB) == has_stab
-                })
+                .filter(|p| p.groups == LinkGroups(bucket))
                 .collect();
             if shape.is_empty() {
                 continue;

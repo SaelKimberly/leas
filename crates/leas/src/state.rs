@@ -1302,6 +1302,11 @@ impl AppState {
     pub fn start_batch_then_real_ping_scoped(&mut self, scope: leas_db::profiles_query::PlanScope) {
         ping::start_batch_then_real_ping_scoped(self, scope);
     }
+    /// Fast + real over the Purgatory tab's band-2 rows, purged links included
+    /// — the resurrection sweep.
+    pub fn start_batch_then_real_ping_purgatory(&mut self) {
+        ping::start_batch_then_real_ping_purgatory(self);
+    }
     /// Fill the exit IPs of a scope's links — its own command, its own scope,
     /// its own bar and its own rate limiter (spec D10/D11).
     ///

@@ -159,3 +159,39 @@ lands. If `failed` is observed on rows that later succeed, the flag is unsound a
 dropped. If it is observed overwhelmingly on never-succeeding rows, a typed
 `FailureEvidence::AuthRejected` plus a `PurgeReason` variant becomes worth the rebuild. Until then
 the flag is a diagnostic, not a verdict.
+
+## Amendment — 2026-11-20: a data-carrying success also moves the CLOCK
+
+Plan: `plans/2026-11-20-real-test-approval-and-purgatory-resurrection.md`.
+
+Decision 7 defines Purgatory as one range over the live-only newest `last_seen_at`, and decision 8
+says a verdict is cleared by a data-carrying success only. Neither said anything about the **clock**:
+`last_seen_at` had exactly two writers — the import/refresh upsert and `Database::update_last_used`
+on a real dial — so a config whose feed stopped re-listing it was demoted on day 8 and deleted on
+day 31 even though every probe passed.
+
+Two changes, no schema change:
+
+1. **A data-carrying success stamps `last_seen_at`.** `apply_test_result` writes it under the
+   existing `config_evidence` predicate (`RealPing | SpeedTest`) and stages the new
+   `LinkGroups::SEEN` group, whose conflict action is
+   `MAX(excluded.last_seen_at, last_seen_at)` — monotone, because the import writer owns the same
+   column. The Fast Test and the UDP test still stamp nothing. Consequence, accepted:
+   `last_seen_at` now means "the source listed it **or** we proved it works", so a config dropped
+   from its feed but still passing probes stays Active, and its 30-day retention window restarts
+   with each pass.
+2. **Decision 8 is narrowed to FEED-WIDE sweeps.** `Real Test (Purgatory)` walks band 2 with purged
+   links included (`PlanSource::Purgatory`), so a verdict can be re-proved in bulk instead of row
+   by row. The feed sweep still loads its page with purged links excluded; re-proving every verdict
+   on every full run was, and remains, the cost D8 exists to prevent.
+
+The bucket loop in `apply_link_patches_tx` carried a hand-copied four-bit presence vector, so a
+patch holding only the new bit folded into bucket 0 and was dropped by its `DO NOTHING` action. It
+now buckets over `0..=LinkGroups::ALL.0` and compares `groups` to the bucket directly.
+
+The same hand-copied-list shape sat one layer up: `WriteBehind`'s `stage`, `coalesce` (both loops),
+`restage_patch` and `merge_group` each enumerated the four old groups, so a `SEEN` patch was
+discarded before the writer saw it — every producer-side and SQL-side test passed while the stamp
+never reached the file. The folds now iterate one `GROUP_FLAGS` list (guarded by
+`the_fold_list_covers_every_group_bit`) and `merge_group` carries an explicit `SEEN` arm;
+`link_flush_writes_the_seen_stamp_and_no_other_column` is the seam test that would have caught it.

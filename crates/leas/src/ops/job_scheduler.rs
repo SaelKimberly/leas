@@ -49,6 +49,11 @@ pub enum TaskKind {
     MultiFastTest,
     /// `Real Test (Selected)` over a multi-selection.
     MultiRealTest,
+    /// `Real Test (Purgatory)`: the resurrection sweep. Its own kind (not a
+    /// `PlanScope`) because the target set is the tab's band, not an endpoint
+    /// predicate — and its dedup identity must not collide with
+    /// `Real Test (All Profiles)`.
+    RealTestPurgatory,
 }
 
 /// One queued task. A **value**: the parameters are frozen at enqueue time.
@@ -220,6 +225,7 @@ fn started(state: &AppState, spec: &TaskSpec, testing_before: usize) -> bool {
         | TaskKind::RealTest
         | TaskKind::MultiFastTest
         | TaskKind::MultiRealTest
+        | TaskKind::RealTestPurgatory
         | TaskKind::SpeedTestBatch => state.batch_progress.is_some(),
         TaskKind::SpeedTest | TaskKind::UdpTest => {
             // A Selected speed/UDP task with no endpoint cannot start.
@@ -238,9 +244,20 @@ async fn scope_is_empty(state: &AppState, spec: &TaskSpec) -> bool {
     if spec.endpoint.is_some() || matches!(spec.kind, TaskKind::DnsRetry | TaskKind::Compact) {
         return false;
     }
+    // The Purgatory sweep's target is the tab's band, not a `PlanScope`
+    // predicate, so an empty band has to skip the head the same way an empty
+    // scope does.
+    let (view, active_threshold) = if spec.kind == TaskKind::RealTestPurgatory {
+        (
+            PurgatoryView::Purgatory,
+            leas_db::models::now_epoch().saturating_sub(state.purgatory_ttl_secs),
+        )
+    } else {
+        (PurgatoryView::All, 0)
+    };
     let req = PageRequest {
-        view: PurgatoryView::All,
-        active_threshold: 0,
+        view,
+        active_threshold,
         search: None,
         group_id: None,
         scope: spec.scope,
@@ -284,6 +301,7 @@ fn dispatch(state: &mut AppState, spec: &TaskSpec) {
         TaskKind::Compact => state.compact_duplicate_endpoints(),
         TaskKind::MultiFastTest => state.start_endpoint_batch_ping(),
         TaskKind::MultiRealTest => state.start_endpoint_batch_real_ping(),
+        TaskKind::RealTestPurgatory => state.start_batch_then_real_ping_purgatory(),
         TaskKind::SpeedTestBatch => state.start_speed_test_batch(spec.scope),
     }
 }
@@ -311,6 +329,7 @@ const fn expected_kinds(event: TerminalEvent) -> &'static [TaskKind] {
             TaskKind::FillExitIps,
             TaskKind::MultiFastTest,
             TaskKind::MultiRealTest,
+            TaskKind::RealTestPurgatory,
             TaskKind::SpeedTestBatch,
         ],
         TerminalEvent::CompactFinished => &[TaskKind::Compact],

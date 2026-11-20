@@ -522,6 +522,7 @@ cancels the whole batch.
 | `Real Test (New)` | Endpoints nothing has answered for yet |
 | `Real Test (Successful + New)` | Both of the above |
 | `Real Test (Failed)` | Endpoints whose links all failed, including a DNS name that never resolved |
+| `Real Test (Purgatory)` | Every band-2 endpoint — the aged and the purged — with purged links **included**: a passing real probe clears the verdict and restamps `last_seen_at`, which is what moves the row back to Active. The one sweep that re-proves a verdict |
 | `Speed Test (Successful)` | Downloads the configured file through each Successful-band link's own native tunnel and stores the peak one-second-windowed rate in `Speed` (MiB/s) |
 | `Fill Exit IPs (Successful)` | Fetches the exit IP and country for Successful-band links on its own rate limiter |
 | `Remove Bad Servers` | Immediate removal of failed profiles |
@@ -647,8 +648,10 @@ marker are not verdicts.
 
 Run a Real Test on a purged row and a success clears the verdict. The verdict
 outlives `error_ttl_hours`; the sweep deletes the profile only after
-`purgatory.retention_days` (default 30) with no upstream confirmation. `r` on a
-Purgatory row restores it immediately.
+`purgatory.retention_days` (default 30) with no newest-link stamp of any kind —
+an import confirmation **or** a data-carrying success, so a profile nothing
+re-lists survives on passed probes alone. `r` on a Purgatory row restores it
+immediately.
 
 ## Status bar
 
