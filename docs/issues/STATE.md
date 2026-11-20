@@ -2,7 +2,7 @@
 
 ```yaml
 loop:
-  iteration: 3
+  iteration: 4
   status: running
   noop_streak: 0
 coverage:
@@ -19,8 +19,9 @@ coverage:
     last_touched_iteration: 3
     issues: [007, 008, 009]
   - domain: native-transport
-    status: unexplored
-    issues: []
+    status: in-progress
+    last_touched_iteration: 4
+    issues: [010, 011, 012]
   - domain: dns
     status: unexplored
     issues: []
@@ -112,3 +113,60 @@ blocked: []
   `auth_id` HMAC-bound when it is an AES-128-ECB timestamp block). All five
   fixed; second round not run — ref/causality corrections only.
 - Next: pick the next unexplored domain — `native-transport`.
+
+### Iteration 4 — native-transport
+- Pre-existing dirty worktree (user's in-flight DNS-resolvers work, 35 paths)
+  left untouched; only `docs/issues/` written. Start HEAD `668b3b4` (iter 3).
+- Prior-work check: `rg` over `docs/issues/` for
+  `transport/(tcp|quic|ws|grpc|xhttp|httpupgrade)` — only 005/006 touch
+  `transport/mux.rs` internals; no existing issue on transport framing, and
+  `XHTTP_POOL` was uncovered.
+- Read: `transport/mod.rs`, `tcp.rs`, `quic.rs`, `httpupgrade.rs`,
+  `v2rayhttp.rs`, `http/conn.rs`, `http/body.rs`, `ws.rs` (whole), `grpc.rs`
+  (whole), `xhttp.rs` (`:30-300`, `:360-530`, `:660-860`, `:900-1215`,
+  `:1215-1340` + the `http_version` table), `kcp/mod.rs`, `kcp/stream.rs`,
+  `kcp/wire.rs::parse_datagram`/`parse_ack`, `kcp/session.rs::input`.
+- Filed:
+  - 010 (medium) — `xhttp::connect` branches on `ctx.is_tls()`, never on
+    `http_version()`; a TLS row with `alpn=http/1.1` is dispatched to the h2
+    client over an h1-negotiated session. Not a one-liner: the h1 arms' upload
+    dial is a raw `tcp::connect(ctx, None)`.
+  - 011 (low) — the same h1 arms' second dial ignores a chain base: a
+    non-first-hop upload half exits the chain, while the h2 pool refuses exactly
+    that shape (`register`'s `direct_hop` guard, and `chain.rs` refuses to
+    consult the pool when `base.is_some()`).
+  - 012 (high, **reproducer run**) — WS early data captures the first `N` bytes
+    into `Sec-WebSocket-Protocol` and then writes the caller's buffer twice
+    more; the carrier received `HEADERPAYLOADHEADERPAYLOAD` for a 13-byte write.
+    Challenge test appended to `ws.rs`, run, reverted; `git status` shows no
+    `crates/leas-native` path.
+- Dead ends recorded (not filed): hyper's `initial_stream_window_size` is
+  `&mut self -> &mut Self`, so `let _ =` there is NOT a dropped config (checked
+  hyper 1.8/1.11/1.12 source); grpc's `MAX_FRAME_LEN` 16 MiB is a documented
+  bound and its `poll_flush` returning `Ready` is deliberate; kcp
+  `parse_ack` caps `count` at 255 and `KcpSession::input` is bounded by
+  `rcv_wnd`; `v2rayhttp`/`XhttpStream` write-through `kick`/`poll_flushing`
+  cannot report `Ok(0)`; xhttp `drain_incoming`/`drain_h3` are per-tunnel tasks,
+  not per-request leaks.
+- Reviewer round 1: `needs-fix`, 6 findings, all fixed:
+  1. 012's fix sketch was wrong — it kept the `early` replay, so the prefix
+     would still be written after already being in the header. Corrected to the
+     reference's shape (`dialer.go:203-205` returns `len(ed), nil`, quoted in
+     `docs/aegis/specs/2026-09-23-ws-path-canonicalization-design.md` §Residual):
+     the capture branch returns `Ready(Ok(take))`, replay and `.max()` deleted.
+     The reproducer now also decodes `Sec-WebSocket-Protocol` so a fix that
+     leaves the prefix in a frame cannot pass on the frame assertion alone.
+  2. 012 said "twice"; the prefix leaves three times (header + two frames) —
+     fixed in body, title and INDEX row.
+  3. 012 → 008 cross-ref misattributed the retry to 008; repointed to plain
+     `AsyncWrite` + `flush_pending` (`first_flight.rs:85-105`) in both files.
+  4. 010's ingestion-refusal fallback contradicts ADR 0018 D-F and
+     `is_undialable_shape`'s own non-goal; replaced with a dial-time
+     `capability::support_reason` refusal.
+  5. 010's Related 006 misstated 006; reworded to the xhttp pool's own
+     register-before-GET shape.
+  6. 011's guard named a `base` that `xhttp::connect` never receives; corrected
+     to `ctx.direct_hop` (set from `base.is_none()` at `chain.rs:205`).
+- Second reviewer round not run: each fix is backed by the source the first
+  round cited, and the two claim-shaped changes were re-derived from it.
+- Next: pick the next unexplored domain — `dns`.

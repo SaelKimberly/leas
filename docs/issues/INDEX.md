@@ -19,6 +19,9 @@ Loop state: [STATE.md](STATE.md).
 | [007](007-datagram-recv-copies-what-bytes-already-owns.md) | Datagram receive copies payloads that already live in a `Bytes` (hysteria2, VLESS packetaddr) | low | theory | native-protocol | `hysteria2/udp.rs:124-125`, `vless/packet.rs:156`, `protocol/mod.rs:422-426` |
 | [008](008-handshake-buffers-hold-a-credential-and-are-never-wiped.md) | Handshake buffers carry a replayable credential in plain `Vec`s that are never wiped | low | theory | native-protocol | `trojan/mod.rs:78-99,114`, `first_flight.rs:41,104`, `vless/mod.rs:113` |
 | [009](009-hysteria2-defragger-sizes-slots-from-untrusted-frag-count.md) | hysteria2 defragger sizes its slot vector from a peer-controlled `frag_count` | low | theory | native-protocol | `hysteria2/udp.rs:158-168`, `:226-229` |
+| [010](010-xhttp-dispatch-ignores-http-version.md) | xhttp dispatches h1/h2 by TLS presence, not by its own `http_version()` table | medium | theory | native-transport | `xhttp.rs:902-925`, `:119-160` |
+| [011](011-xhttp-h1-upload-dial-bypasses-the-chain.md) | The plaintext xhttp h1 arm dials its upload connection straight to the server, bypassing a chain | low | theory | native-transport | `xhttp.rs:992`, `:1070` |
+| [012](012-ws-early-data-duplicates-the-captured-prefix.md) | WS early data writes the captured prefix into two frames on top of the header — the tunnel's first bytes are corrupted | high | theory | native-transport | `ws.rs:183-193`, `:213-229` |
 
 ## Cross-references
 
@@ -40,6 +43,18 @@ Loop state: [STATE.md](STATE.md).
   holds before traffic, 007 is what it pays per datagram.
 - **008 → 005:** one convention gap, two layers: the mux key's `String` and the
   handshake `Vec` both keep a credential that the rest of the crate zeroizes.
+- **010 ↔ 011:** the same three arms read differently in each issue — 010 is
+  which arm is chosen, 011 is what the chosen arm does with a chain. Fixing 010
+  without 011's guard makes the leak reachable under TLS as well.
+- **012 ↔ 008:** both sit in `HeaderFirst`'s wrapper, different mechanisms —
+  008 is the buffer that keeps a credential unwiped, 012 is a `poll_write` that
+  reports `Pending` after consuming bytes, so the retry re-sends them. 012's
+  cause is `AsyncWrite` semantics, not the buffer.
+- **012 → 007:** same "bytes we already own are copied again" class; 007 is on a
+  protocol's receive side, 012 on a transport's send side.
+- **010 → 004:** a plan input (there the row's mux cap, here the ALPN-derived
+  HTTP version) is computed, documented, then not consulted at the point that
+  dials.
 
 ## Domain coverage
 
@@ -48,7 +63,7 @@ Loop state: [STATE.md](STATE.md).
 | native-inbound | in-progress | 1 |
 | mux-pool | in-progress | 2 |
 | native-protocol | in-progress | 3 |
-| native-transport | unexplored | — |
+| native-transport | in-progress | 4 |
 | dns | unexplored | — |
 | routing-engine | unexplored | — |
 | db-layer | unexplored | — |
