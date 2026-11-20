@@ -113,3 +113,28 @@ fails every resolver (setting is the escape).
   column (the link table is a uniqueness device; showing it would add a query).
 - **T5**: architecture, decisions #18, database, glossary, tui-manual and the
   crate README updated.
+
+## Review round (2026-11-20)
+
+Reviewer `DnsSubsystemReview` on `dbdeaacad3`: 3 Important, 4 Minor, no
+Critical. All fixed:
+
+1. A late refresh resurrected a deleted source (status upsert inserted). Fixed
+   with `update_dns_source_status` (update-only) and an existence check inside
+   the refresh transaction.
+2. `refresh_source_links` was non-atomic and its orphan sweep raced a second
+   refresh (a just-inserted resolver could be swept before its link landed).
+   Now one `Immediate` transaction; `sweep_orphan_resolvers` takes an executor.
+3. A 200 body with zero usable stamps wiped the source's rows. Now a failure;
+   the skipped count is logged (A6).
+4. `lookup_ip` panicked on an unreadable OS resolver config. Now
+   `build_system_resolver` caches `Option` and the lookup returns an error.
+5. `Space` marked DNS rows in the group mask that `d` then ignored. Space is
+   group-only.
+6. A refresh never updated a stored row's protocol/host/port. It now updates
+   only when they differ; the measurement is untouched.
+7. The skipped-stamp count was never reported. Logged per refresh.
+
+Tests added for the review: hermetic UDP pool lookup (`leas-dns`), a late
+refresh for a deleted source, a changed endpoint keeping its measurement
+(`leas-db`), and the `DnsTest` job identity/terminal wiring.

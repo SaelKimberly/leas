@@ -175,3 +175,46 @@ async fn duplicate_source_url_is_refused() {
         "the failure names the constraint: {err}"
     );
 }
+
+#[tokio::test]
+async fn a_refresh_for_a_deleted_source_writes_nothing() {
+    let db = seeded().await;
+    db.refresh_source_links("s1", &[candidate("a")])
+        .await
+        .expect("refresh");
+    db.delete_dns_source("s1").await.expect("delete");
+    // The fetch may still be in flight when the user deletes the source; the
+    // late write must not re-create it or leave a dangling link.
+    db.refresh_source_links("s1", &[candidate("a")])
+        .await
+        .expect("late refresh");
+    assert!(db.list_dns_resolvers().await.expect("rows").is_empty());
+    assert!(db.list_dns_sources().await.expect("sources").is_empty());
+}
+
+#[tokio::test]
+async fn a_refresh_updates_a_changed_endpoint_and_keeps_the_measurement() {
+    let db = seeded().await;
+    db.refresh_source_links("s1", &[candidate("a")])
+        .await
+        .expect("refresh");
+    db.apply_dns_test_results(&[("a".to_string(), Some(5), None)])
+        .await
+        .expect("measure");
+    let mut changed = candidate("a");
+    changed.protocol = "doh".to_string();
+    changed.host = "dns.example".to_string();
+    changed.port = 443;
+    db.refresh_source_links("s1", &[changed])
+        .await
+        .expect("refresh");
+    let row = db.list_dns_resolvers().await.expect("rows").remove(0);
+    assert_eq!(row.protocol, "doh");
+    assert_eq!(row.host, "dns.example");
+    assert_eq!(row.port, 443);
+    assert_eq!(
+        row.latency_ms,
+        Some(5),
+        "the endpoint moved; the measurement did not"
+    );
+}

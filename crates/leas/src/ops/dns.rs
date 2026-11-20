@@ -155,16 +155,17 @@ pub fn spawn_refresh(state: &mut AppState) {
                 }
             } => return,
         }
-        let mut refreshed = false;
+        // Any attempt writes a status row (ok or error), so the UI reloads
+        // even when the fetch failed.
+        let mut touched = false;
         for source in due {
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            if refresh_and_record(&db, &source).await.is_ok() {
-                refreshed = true;
-            }
+            let _ = refresh_and_record(&db, &source).await;
+            touched = true;
         }
-        if refreshed {
+        if touched {
             let _ = tx.send(CoreEvent::DnsChanged).await;
         }
     });
@@ -182,11 +183,11 @@ pub async fn refresh_source(state: &mut AppState, source_id: &str) {
         return;
     };
     match refresh_and_record(&state.db, &source).await {
-        Ok(count) => state.log_trace(
+        Ok((count, skipped)) => state.log_trace(
             "info",
             "tui::ops::dns",
             &format!(
-                "DNS source '{}' refreshed: {count} resolver(s)",
+                "DNS source '{}' refreshed: {count} resolver(s), {skipped} skipped",
                 source.name.as_deref().unwrap_or(&source.id)
             ),
         ),
@@ -204,29 +205,39 @@ pub async fn refresh_source(state: &mut AppState, source_id: &str) {
 
 /// Fetches one source, applies its resolvers, and records the outcome. A
 /// failed fetch marks the source `error` and keeps its rows.
-async fn refresh_and_record(db: &Database, source: &DnsSource) -> anyhow::Result<usize> {
+///
+/// The status write is update-only: a source deleted while the fetch ran must
+/// not be resurrected by it.
+async fn refresh_and_record(db: &Database, source: &DnsSource) -> anyhow::Result<(usize, usize)> {
     let result = refresh_one(db, source).await;
-    let mut updated = source.clone();
-    updated.last_refreshed = Some(now_epoch());
-    match &result {
-        Ok(_) => {
-            updated.status = Some(GroupStatus::Ok);
-            updated.error_message = None;
-        }
-        Err(e) => {
-            updated.status = Some(GroupStatus::Error);
-            updated.error_message = Some(e.to_string());
-        }
-    }
-    if let Err(e) = db.upsert_dns_source(&updated).await {
+    let (status, error) = match &result {
+        Ok(_) => (GroupStatus::Ok, None),
+        Err(e) => (GroupStatus::Error, Some(e.to_string())),
+    };
+    if let Err(e) = db
+        .update_dns_source_status(&source.id, now_epoch(), status, error)
+        .await
+    {
         tracing::warn!(error = %e, "failed to record the DNS source status");
     }
     result
 }
 
-async fn refresh_one(db: &Database, source: &DnsSource) -> anyhow::Result<usize> {
+/// Returns `(accepted, skipped)`, where skipped counts `sdns://` lines the
+/// policy refused (plain DNS, local address, missing `NO_LOGS|NO_FILTER`, or a
+/// duplicate). A body with no usable stamp is a FAILURE: a 200 HTML page
+/// (captive portal, rate limit) must not wipe the source's rows.
+async fn refresh_one(db: &Database, source: &DnsSource) -> anyhow::Result<(usize, usize)> {
     let text = leas_dns::fetch_source(&source.url).await?;
+    let declared = text
+        .lines()
+        .filter(|line| line.trim().starts_with("sdns://"))
+        .count();
     let candidates = leas_dns::parse_stamps(&text);
+    if candidates.is_empty() {
+        anyhow::bail!("source listed no usable sdns:// stamps; keeping the existing rows");
+    }
+    let skipped = declared.saturating_sub(candidates.len());
     let rows: Vec<DnsCandidateRow> = candidates
         .iter()
         .map(|candidate| DnsCandidateRow {
@@ -237,7 +248,7 @@ async fn refresh_one(db: &Database, source: &DnsSource) -> anyhow::Result<usize>
         })
         .collect();
     db.refresh_source_links(&source.id, &rows).await?;
-    Ok(rows.len())
+    Ok((rows.len(), skipped))
 }
 
 /// Starts the test as one queued job: every enabled resolver, measured against

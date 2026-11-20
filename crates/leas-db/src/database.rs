@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use toasty::Executor;
 use toasty::stmt::IntoStatement;
+use toasty_core::driver::operation::TransactionMode;
 use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
     AppMeta, DnsResolver, DnsSetting, DnsSource, DnsSourceResolver, Endpoint, EndpointGroup,
-    EndpointId, EndpointIp, EndpointRank, EndpointRow, Group, Latency, ProfileStats, Protocol,
-    ProtocolId, ResolverStatus, RouteProbes, RoutingRule, TrafficStats, now_epoch,
+    EndpointId, EndpointIp, EndpointRank, EndpointRow, Group, GroupStatus, Latency, ProfileStats,
+    Protocol, ProtocolId, ResolverStatus, RouteProbes, RoutingRule, TrafficStats, now_epoch,
 };
 use crate::retry_on_busy;
 use rapidhash::{HashMapExt as _, RapidHashMap};
@@ -2111,6 +2112,38 @@ impl Database {
         .await
     }
 
+    /// Records a refresh outcome on an EXISTING source. Update-only: a source
+    /// deleted while the fetch ran is not re-created by the status write.
+    pub async fn update_dns_source_status(
+        &self,
+        source_id: &str,
+        last_refreshed: i64,
+        status: GroupStatus,
+        error: Option<String>,
+    ) -> Result<()> {
+        let db = self;
+        let source_id = source_id.to_string();
+        retry_on_busy(
+            move || {
+                let source_id = source_id.clone();
+                let error = error.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    DnsSource::filter_by_id(source_id)
+                        .update()
+                        .last_refreshed(Some(last_refreshed))
+                        .status(Some(status))
+                        .error_message(error)
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
+    }
+
     /// Deletes a source and its links; a resolver another source still lists
     /// survives, a resolver with no link left is removed.
     pub async fn delete_dns_source(&self, source_id: &str) -> Result<()> {
@@ -2151,11 +2184,48 @@ impl Database {
                 let candidates = candidates.clone();
                 async move {
                     let mut conn = db.conn().await?;
-                    let existing: Vec<DnsResolver> = DnsResolver::all().exec(&mut conn).await?;
-                    let mut known: std::collections::HashSet<String> =
-                        existing.into_iter().map(|row| row.stamp).collect();
+                    // One Immediate transaction: resolver inserts, the link
+                    // rewrite and the orphan sweep are one unit, so two
+                    // overlapping refreshes serialize instead of deleting each
+                    // other's just-inserted resolver between the insert and its
+                    // link.
+                    let mut tx = conn
+                        .transaction_builder()
+                        .mode(TransactionMode::Immediate)
+                        .begin()
+                        .await?;
+                    // A source deleted while its fetch ran must not be
+                    // resurrected by its links.
+                    let exists = DnsSource::filter_by_id(source_id.clone())
+                        .first()
+                        .exec(&mut tx)
+                        .await?
+                        .is_some();
+                    if !exists {
+                        tx.commit().await?;
+                        return Ok(());
+                    }
+                    let existing: Vec<DnsResolver> = DnsResolver::all().exec(&mut tx).await?;
+                    let mut known: std::collections::HashMap<String, DnsResolver> = existing
+                        .into_iter()
+                        .map(|row| (row.stamp.clone(), row))
+                        .collect();
                     for candidate in &candidates {
-                        if !known.insert(candidate.stamp.clone()) {
+                        if let Some(stored) = known.remove(&candidate.stamp) {
+                            // A parser change can move the display endpoint; the
+                            // measurement stands until the next test (D4).
+                            if stored.protocol != candidate.protocol
+                                || stored.host != candidate.host
+                                || stored.port != i64::from(candidate.port)
+                            {
+                                DnsResolver::filter_by_stamp(candidate.stamp.clone())
+                                    .update()
+                                    .protocol(candidate.protocol.clone())
+                                    .host(candidate.host.clone())
+                                    .port(i64::from(candidate.port))
+                                    .exec(&mut tx)
+                                    .await?;
+                            }
                             continue;
                         }
                         DnsResolver::create()
@@ -2168,12 +2238,12 @@ impl Database {
                             .error(None)
                             .checked_at(None)
                             .enabled(true)
-                            .exec(&mut conn)
+                            .exec(&mut tx)
                             .await?;
                     }
                     let links: Vec<DnsSourceResolver> =
                         DnsSourceResolver::filter_by_source_id(source_id.clone())
-                            .exec(&mut conn)
+                            .exec(&mut tx)
                             .await?;
                     let old: std::collections::HashSet<String> =
                         links.into_iter().map(|link| link.stamp).collect();
@@ -2184,7 +2254,7 @@ impl Database {
                             DnsSourceResolver::create()
                                 .source_id(source_id.clone())
                                 .stamp(candidate.stamp.clone())
-                                .exec(&mut conn)
+                                .exec(&mut tx)
                                 .await?;
                         }
                     }
@@ -2195,11 +2265,13 @@ impl Database {
                                 stamp.clone(),
                             )
                             .delete()
-                            .exec(&mut conn)
+                            .exec(&mut tx)
                             .await?;
                         }
                     }
-                    Self::sweep_orphan_resolvers(&mut conn).await
+                    Self::sweep_orphan_resolvers(&mut tx).await?;
+                    tx.commit().await?;
+                    Ok(())
                 }
             },
             5,
@@ -2207,8 +2279,9 @@ impl Database {
         .await
     }
 
-    /// Deletes resolvers no source links to. Called after a link set changes.
-    async fn sweep_orphan_resolvers(conn: &mut toasty::Connection) -> Result<()> {
+    /// Deletes resolvers no source links to. Called after a link set changes;
+    /// takes an executor so it runs inside the refresh's transaction.
+    async fn sweep_orphan_resolvers(conn: &mut impl toasty::Executor) -> Result<()> {
         let links: Vec<DnsSourceResolver> = DnsSourceResolver::all().exec(&mut *conn).await?;
         let live: std::collections::HashSet<String> =
             links.into_iter().map(|link| link.stamp).collect();

@@ -385,6 +385,19 @@ pub async fn measure(
     out
 }
 
+/// The OS resolver configuration as a pool, or `None` when the host has none
+/// (a container without `resolv.conf`, a registry failure). A missing
+/// configuration is a lookup error, never a panic: `lookup_ip` runs inside the
+/// routing engine's connection task.
+fn build_system_resolver() -> Option<Arc<Resolver<dnscrypt::DnsCryptProvider>>> {
+    let (config, opts) = system_conf::read_system_conf().ok()?;
+    Resolver::builder_with_config(config, dnscrypt::DnsCryptProvider::new(&[]))
+        .with_options(opts)
+        .build()
+        .ok()
+        .map(Arc::new)
+}
+
 /// The live resolver pool. Reads are one atomic load; a swap is rare and sync.
 ///
 /// `ArcSwapOption` (not a lock): the read side is every lookup, and
@@ -394,8 +407,9 @@ pub async fn measure(
 pub struct DnsResolver {
     resolver: ArcSwapOption<Resolver<dnscrypt::DnsCryptProvider>>,
     /// OS resolver config, built at most once and never replaced: the fallback
-    /// when no candidates are installed.
-    system: OnceLock<Arc<Resolver<dnscrypt::DnsCryptProvider>>>,
+    /// when no candidates are installed. `None` caches an unreadable
+    /// configuration instead of panicking on every lookup.
+    system: OnceLock<Option<Arc<Resolver<dnscrypt::DnsCryptProvider>>>>,
 }
 
 impl DnsResolver {
@@ -436,18 +450,15 @@ impl DnsResolver {
         if let Ok(ip) = hostname.parse::<IpAddr>() {
             return Ok(vec![ip].into_boxed_slice());
         }
-        let resolver = self.resolver.load_full().unwrap_or_else(|| {
-            Arc::clone(self.system.get_or_init(|| {
-                let (config, opts) = system_conf::read_system_conf()
-                    .expect("the OS resolver configuration is readable");
-                Arc::new(
-                    Resolver::builder_with_config(config, dnscrypt::DnsCryptProvider::new(&[]))
-                        .with_options(opts)
-                        .build()
-                        .expect("the OS resolver configuration builds"),
-                )
-            }))
-        });
+        let Some(resolver) = self
+            .resolver
+            .load_full()
+            .or_else(|| self.system.get_or_init(build_system_resolver).clone())
+        else {
+            anyhow::bail!(
+                "no resolver pool installed and the OS resolver configuration is unreadable"
+            );
+        };
         let ips: Vec<IpAddr> = resolver
             .lookup_ip(hostname)
             .await?
@@ -644,6 +655,77 @@ mod tests {
         let ips = resolver.lookup_ip("example.com", true).await?;
         assert!(!ips.is_empty(), "DNSCrypt lookup returned no address");
         Ok(())
+    }
+
+    /// A minimal UDP DNS responder: one A record `203.0.113.7` for every
+    /// query. Proves `set_candidates` installs a pool that SERVES a lookup,
+    /// not merely `is_configured`.
+    async fn serve_dns() -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        std::mem::drop(tokio::spawn(async move {
+            let mut buf = [0_u8; 512];
+            while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+                if len < 12 {
+                    continue;
+                }
+                // End of the question: labels, then QTYPE + QCLASS.
+                let mut off = 12;
+                while off < len && buf[off] != 0 {
+                    off += usize::from(buf[off]) + 1;
+                }
+                off = (off + 5).min(len);
+                let mut response = Vec::with_capacity(off + 16);
+                response.extend_from_slice(&buf[..off]);
+                response[2] = 0x81; // QR=1, RD=1
+                response[3] = 0x80; // RA=1, rcode=0
+                response[6] = 0; // ANCOUNT = 1
+                response[7] = 1;
+                response[8] = 0; // NSCOUNT = 0
+                response[9] = 0;
+                response[10] = 0; // ARCOUNT = 0 (drop any EDNS OPT)
+                response[11] = 0;
+                response.extend_from_slice(&[
+                    0xC0, 0x0C, // name: pointer to the question
+                    0x00, 0x01, // A
+                    0x00, 0x01, // IN
+                    0x00, 0x00, 0x00, 0x3C, // TTL 60
+                    0x00, 0x04, // RDLENGTH
+                    203, 0, 113, 7,
+                ]);
+                let _ = socket.send_to(&response, peer).await;
+            }
+        }));
+        addr
+    }
+
+    /// The swap is only useful if the installed candidate actually answers.
+    #[tokio::test]
+    async fn a_pool_serves_a_lookup_from_the_installed_candidate() {
+        let addr = serve_dns().await;
+        let mut conn = ConnectionConfig::udp();
+        conn.port = addr.port();
+        let candidate = Candidate {
+            stamp: "sdns://test-udp".to_string(),
+            // Label only; `Kind` decides the wire.
+            protocol: DnsProtocol::Dot,
+            host: "test.local".to_string(),
+            port: addr.port(),
+            kind: Kind::Hickory(NameServerConfig::new(addr.ip(), true, vec![conn])),
+        };
+        let resolver = DnsResolver::new();
+        resolver
+            .set_candidates(&[candidate])
+            .expect("install the pool");
+        let ips = resolver
+            .lookup_ip("example.com", true)
+            .await
+            .expect("lookup");
+        assert_eq!(
+            ips.as_ref(),
+            [IpAddr::from([203, 0, 113, 7])],
+            "the installed candidate must answer"
+        );
     }
 
     /// A real `DoH` pool through the same path the app uses.

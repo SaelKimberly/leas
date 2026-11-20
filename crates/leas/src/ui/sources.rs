@@ -301,8 +301,12 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 state.sources_selected += 1;
             }
         }
+        // The mask is the group batch-delete selection; a DNS row has no
+        // batch action, so Space must not mark one as selected.
         KeyCode::Char(' ') => {
-            if let Some(flag) = state.sources_selected_mask.get_mut(state.sources_selected) {
+            if selected < group_count
+                && let Some(flag) = state.sources_selected_mask.get_mut(selected)
+            {
                 *flag = !*flag;
             }
         }

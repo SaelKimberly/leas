@@ -66,6 +66,14 @@ user cannot see or exclude it. That is the defect this design removes.
   - A stamp whose parsed protocol/host/port disagrees with the stored row (a
     parser policy change) updates those three columns only — the measurement
     stands until the next test.
+  - The whole refresh (resolver inserts, endpoint updates, link rewrite, orphan
+    sweep) is ONE `Immediate` transaction, and a source deleted while its fetch
+    ran is detected inside it: two overlapping refreshes serialize instead of
+    deleting each other's resolver between insert and link, and a late fetch
+    cannot resurrect a deleted source (the status write is update-only).
+  - A body with zero usable stamps is a refresh FAILURE, not an empty success:
+    a 200 HTML page (captive portal, rate limit) keeps the existing rows and
+    their measurements. The skipped-stamp count is logged.
 - **D5 — Selection is a query, not a stored rank.**
   `db.dns_pool(limit)`: `enabled AND status='ok' AND latency_ms IS NOT NULL
   ORDER BY latency_ms, stamp LIMIT pool_size`. `pool_size` (default 10) and

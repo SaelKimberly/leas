@@ -462,6 +462,26 @@ mod tests {
         );
     }
 
+    /// `Test DNS Resolvers` is one job: a second enqueue with the same
+    /// identity is ignored, and `DnsTestDone` is the event that ends it.
+    #[tokio::test]
+    async fn the_dns_test_is_one_queued_job() {
+        let mut state = sched_state().await;
+        enqueue(
+            &mut state,
+            spec(TaskKind::DnsTest, PlanScope::All, "Test DNS Resolvers"),
+        );
+        enqueue(
+            &mut state,
+            spec(TaskKind::DnsTest, PlanScope::All, "Test DNS Resolvers"),
+        );
+        assert_eq!(state.task_queue.len(), 1, "one identity, one job");
+        assert!(
+            expected_kinds(TerminalEvent::DnsTestDone).contains(&TaskKind::DnsTest),
+            "the terminal event must end the running DnsTest"
+        );
+    }
+
     /// `Speed Test (Successful)` is its own batched task: a `SpeedTestBatch`
     /// is not deduped against the single-link `SpeedTest` (different shape:
     /// no endpoint), and it is one of the kinds `BatchEnded` may end.

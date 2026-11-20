@@ -224,9 +224,10 @@ pub const V23_DNS_SOURCES: &[&str] = &[
 ];
 
 /// The two `dns_settings` columns, added through `ensure_raw_ddl`'s
-/// duplicate-column tolerance (the `STAB_ADD_COLUMNS` rule): a file stamped
-/// older that already carries them (a test fixture, or a half-applied open)
-/// must not fail the migration.
+/// duplicate-column tolerance (the `STAB_ADD_COLUMNS` rule).
+///
+/// A file stamped older that already carries them (a test fixture, or a
+/// half-applied open) must not fail the migration.
 pub const V23_DNS_ADD_COLUMNS: &[&str] = &[
     "ALTER TABLE dns_settings ADD COLUMN \"resolver_pool_size\" BIGINT",
     "ALTER TABLE dns_settings ADD COLUMN \"resolver_test_domain\" TEXT",

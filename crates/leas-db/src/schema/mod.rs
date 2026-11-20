@@ -97,10 +97,10 @@ async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<()> {
     // step path cannot guess which file shape it is on. The columns are
     // duplicate-tolerant like `STAB_ADD_COLUMNS`; everything is idempotent.
     for alter in ddl::V23_DNS_ADD_COLUMNS {
-        if let Err(e) = toasty::sql::query(*alter).exec(conn).await {
-            if !e.to_string().contains("duplicate column") {
-                return Err(e.into());
-            }
+        if let Err(e) = toasty::sql::query(*alter).exec(conn).await
+            && !e.to_string().contains("duplicate column")
+        {
+            return Err(e.into());
         }
     }
     for statement in ddl::V23_DNS_INDEXES {
