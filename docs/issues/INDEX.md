@@ -36,6 +36,8 @@ Loop state: [STATE.md](STATE.md).
 | [024](024-sniffer-table-builds-every-host-row-per-frame.md) | The Sniffer builds a `Row` for every host on every draw while the widget paints ~20, re-paying 6,000 allocations per frame at the 1000-host cap | low | theory | ui-render | `sniffer.rs:202-215`, `telemetry.rs:196-198` |
 | [025](025-finished-mac-compared-out-of-constant-time.md) | The handshake `Finished` MACs are compared with `!=`, not in constant time, while every other secret-keyed tag comparison in the crate is constant-time | low | theory | tls-security | `handshake/mod.rs:602`, `tls12.rs:531`, `verify/mod.rs:147` |
 | [026](026-servers-key-share-group-is-never-checked-against-the-hello.md) | The client accepts a ServerHello key-share group it never offered, and never checks it against the HelloRetryRequest's `selected_group` — a hybrid hello can be completed classically | low | theory | tls-security | `handshake/mod.rs:1079-1112`, `:247-262`, `:390-395`, `:825-837` |
+| [027](027-udp-association-seen-hosts-vec-is-unbounded.md) | A UDP association's "hosts already counted" list is unbounded, and every datagram scans it linearly | medium | theory | native-inbound | `inbound/mod.rs:884`, `:931-938`, `:1099`/`:1104` |
+| [028](028-udp-association-pins-the-first-dns-answer.md) | A UDP association pins the first DNS answer for its whole life: no TTL, no family fallback, no negative cache | medium | theory | native-inbound | `inbound/mod.rs:1573-1618`, `:1609`, `:1250-1284`, `:1417` |
 
 ## Cross-references
 
@@ -130,11 +132,28 @@ Loop state: [STATE.md](STATE.md).
 - **026 → 010:** the same shape as an input the code computed then ignored:
   there the ALPN-derived HTTP version, here the offered `key_share` list.
 
+- **027 ↔ 028:** the two per-association accumulators in one object, each with
+  the other's defect mirrored — `seen` is capped by nothing and dies with the
+  association, `dns_cache` is capped at 64 and never expires.
+- **027 → 003:** 003 is what the association allocates before traffic, 027 what
+  it accumulates while running; together they are its whole footprint.
+- **027 → 016:** 016 removes the re-routing per datagram, 027 the scan that
+  survives it. A decision memo (016) does not skip `note_conn`, which runs after
+  the decision, so the cap (027) is the only mitigation — comparing them as
+  "fewer datagrams" vs "less work each" would sequence them wrongly.
+- **028 → 016:** 016 counts the same `resolve_domain` call as cost (a second
+  lookup per datagram); 028 is what that lookup's answer is worth — one address,
+  first in the list, kept forever.
+- **028 → 015:** the resolver-TTL family, opposite failures: 015 refreshes a
+  TTL that was meant to expire, 028 has no TTL to refresh.
+- **028 → 013:** both are "a resolver deadline inside a caller that never
+  remembers the failure" — 013 the seconds, 028 the concurrent lookups.
+
 ## Domain coverage
 
 | Domain | Status | Last iteration |
 |---|---|---|
-| native-inbound | in-progress | 1 |
+| native-inbound | in-progress | 11 |
 | mux-pool | in-progress | 2 |
 | native-protocol | in-progress | 3 |
 | native-transport | in-progress | 4 |

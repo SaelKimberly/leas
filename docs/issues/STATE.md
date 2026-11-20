@@ -2,14 +2,14 @@
 
 ```yaml
 loop:
-  iteration: 10
+  iteration: 11
   status: running
   noop_streak: 0
 coverage:
   - domain: native-inbound
     status: in-progress
-    last_touched_iteration: 1
-    issues: [001, 002, 003]
+    last_touched_iteration: 11
+    issues: [001, 002, 003, 027, 028]
   - domain: mux-pool
     status: in-progress
     last_touched_iteration: 2
@@ -776,3 +776,65 @@ blocked: []
 - Next: commit, then convergence check — no `unexplored` domain remains
   (10 of 10 in-progress), so the next iteration is the first that must pick by
   "oldest in-progress".
+
+### Iteration 11 — native-inbound
+- Domain choice (policy): no `unexplored` domain remains; picked the oldest
+  in-progress, `native-inbound` (last touched iteration 1).
+- Prior-work check (`rg` over `docs/issues/`): 001/002/003 cover the accept
+  layer, the relay write deadline and the association's eager buffers; 016
+  already cites `resolve_domain`/`cached_domain` as *cost* and 015 covers the
+  engine-side TTL re-store. No issue covered the `seen` list or the answer's
+  lifetime, so two new files; the DNS duplication stayed in 016 rather than
+  being re-filed.
+- Read (HEAD in `/tmp/iter11`): `inbound/mod.rs` (relay loop :623-700, proxy
+  queue :760-1395, direct leg :1110-1230, association cache :1573-1618),
+  `inbound/mixed.rs`, `inbound/socks5.rs` (greeting/credentials/request),
+  `inbound/http.rs` (head parser :434-560), plus the engine side
+  (`leas-route/src/engine.rs:520-655`, `resolve.rs`), the production wiring
+  (`ops/geodata.rs:481-494`) and the app's TTL policy (`state.rs:909`).
+- Filed:
+  - **027** `027-udp-association-seen-hosts-vec-is-unbounded.md` (medium,
+    theory, measured): `seen: SmallVec<[CompactString; 4]>`
+    (`inbound/mod.rs:884`) grows by one entry per distinct destination and
+    `note_conn` (`:931-938`) linearly scans it on every routed datagram
+    (`:1099`/`:1104`); the sibling `DnsCache` was capped at 64 for the same
+    reason. Probe (standalone `rustc -O`, i7-12700): 1k entries 0.56 µs/miss,
+    10k 2.3 µs, 50k 53 µs (97 µs to the last entry) — linear, and the list is
+    the association's whole history.
+  - **028** `028-udp-association-pins-the-first-dns-answer.md` (medium, theory):
+    `resolve_domain` (`:1601-1618`) caches one address for the association's
+    life (no TTL; the engine's `ResolvedCache` uses 300 s, `engine.rs:467`),
+    keeps `addrs.into_iter().next()` only (`:1609`) so a v6-first answer is
+    dead forever on a host where `[::]:0` failed to bind (`:1250-1284`), and
+    negative-caches nothing — each datagram to an unresolvable name spawns a
+    task and a fresh `getaddrinfo` (`:1168-1180`).
+- Checked and **not** filed: `read_greeting` is stack-buffered but
+  `read_credentials` allocates two `Vec`s + two `String`s per connection
+  (`socks5.rs:238-252`) — under 1 KiB, per connection, no amplification;
+  the SOCKS5/HTTP auth compares are `!=` but the listener is local-only (025's
+  precedent: no reachable oracle); the mixed inbound's shutdown select clones
+  the watch receiver at accept time, so a later shutdown still fires
+  (`mixed.rs:72-118`); `read_head`'s post-extend cap check can overshoot
+  `MAX_HEAD_BYTES` by at most one `BufReader` buffer (`http.rs:459-505`) —
+  bounded, no memory claim; the proxy queue's byte counter is returned on both
+  `try_send` failure arms and dropped with an aborted leg (`:1345-1395`).
+- Reviewer round 1 (`ReviewIter11`, 2m16s): **needs-fix**, 2 findings — both
+  arithmetic/cross-reference, all citations verified against `/tmp/iter11`.
+  Dispositions (all applied):
+  1. 027's "25-50 % of a core" contradicted its own table (53 µs × 2,000/s
+     = 11 %, the 97 µs last-entry column 19 %) and mis-sized the entry: a
+     `CompactString` is 24 B, so 100k hosts is ≈2.4 MB of slots plus heap
+     (≈5 MB worst case), not 7 MB. Sentence now states 11 %/19 % and the
+     corrected memory figures; medium severity rests on unbounded growth, not
+     on the percentage.
+  2. The 027 → 016 bullet claimed a decision memo "shrinks the datagram count"
+     the `seen` scan pays on. `note_conn` runs after the decision
+     (`:1096-1106`), so the memo does not skip it; the two fixes are
+     independent and only the cap bounds the scan. Fixed in 027, 016 and INDEX.
+- Reviewer round 2 (`ReviewIter11b`, 3m23s): **needs-fix**, 1 finding — the
+  inline limit is 24 bytes, not 23 (`compact_str` 0.10's `repr::MAX_SIZE` =
+  `size_of::<String>()`, and the workspace convention note says ≤24 B); the
+  three mentions in 027 corrected. Both round-1 findings verified applied, and
+  the reviewer independently re-checked the arithmetic (10.6 %/19.4 %), the
+  2.4 MB slot figure and every cross-reference against HEAD e752ea5f.
+- Second round applied and closed; no third round (one P3 boundary).

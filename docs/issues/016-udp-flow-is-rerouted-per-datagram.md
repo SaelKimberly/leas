@@ -107,3 +107,9 @@ the association is the thing with a lifetime.
   per-datagram cost described here also slides a TTL that was meant to expire.
 - **003** (native-inbound) — the same `UdpRelay`/association object: 003 is what
   it allocates before any traffic, this is what it redoes per datagram.
+- **027** (native-inbound) — the linear scan of `seen` inside the per-datagram
+  pipeline described here. Independent fixes: the memo removes the re-route,
+  not the scan (`note_conn` runs after the decision), so only 027's cap bounds
+  it.
+- **028** (native-inbound) — the `resolve_domain` call this issue counts as
+  cost, read as correctness: its answer never expires and keeps one address.
