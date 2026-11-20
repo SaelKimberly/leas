@@ -30,6 +30,8 @@ Loop state: [STATE.md](STATE.md).
 | [018](018-merge-does-whole-table-work-per-merged-pair.md) | A merge reads the whole protocol table and rescans it for orphans, once per merged pair | medium | theory | db-layer | `merge.rs:174`, `:486`, `endpoint_rank.rs:1088`, `database.rs:2215` |
 | [019](019-feed-search-scans-the-rank-table-twice-per-keystroke.md) | The feed search scans the whole rank table — the footer count on every keystroke, the page too when fewer than 200 rows match | medium | theory | db-layer | `profiles_query.rs:513-548`, `:762-799`, `ddl.rs:49-51` |
 | [020](020-no-foreign-key-so-deleted-endpoints-leave-orphan-links.md) | No foreign key exists, so a link staged while its endpoint is deleted lands as a permanent orphan row | medium | theory | db-layer | `write_behind.rs:271-289`, `compact.rs:209-217`, `profiles.rs:938-946`, `ping.rs:612-625`, `main.rs:594-630` |
+| [021](021-dns-retry-failure-reports-the-compact-terminal-event.md) | A DNS-retry scan failure reports `CompactFinished`, which cannot end a `DnsRetry` task, so the job queue wedges for the session | medium | theory | app-ops | `compact.rs:428-437`, `job_scheduler.rs:335-336`, `:348-362` |
+| [022](022-dns-failure-mark-sweeps-the-whole-deferral-map.md) | Every DNS failure rescans the whole deferral map, so a burst pays O(F²) scans under the shard locks the dispatch path needs | low | theory | app-ops | `scheduler.rs:337-343`, `:425-433`, `enrich.rs:684-693` |
 
 ## Cross-references
 
@@ -97,6 +99,15 @@ Loop state: [STATE.md](STATE.md).
   paths — delete a profile, "remove failed servers", the retention purge — have
   no sweep at all, and the middle one deletes exactly the endpoints whose
   patches were just staged.
+- **021 → 022:** one flow, two ends. 022 is the failure bookkeeping a DNS-retry
+  run consumes (`mark_dns_failure` per failed host); 021 is how that run reports
+  it is finished. Different modules, same command — and both are wrong in the
+  "costs more than it should" direction, 021 permanently (the queue never
+  drains) and 022 quadratically.
+- **022 → 013:** 013 documents the split between a starved permit and a real
+  resolver answer — the rule that a queue wait must not leave a DNS-failure
+  stamp. 022 is the cost of the stamp that *is* legitimate: it is written once
+  per failed host, and each write currently rescans the whole deferral map.
 
 ## Domain coverage
 
@@ -109,6 +120,6 @@ Loop state: [STATE.md](STATE.md).
 | dns | in-progress | 5 |
 | routing-engine | in-progress | 6 |
 | db-layer | in-progress | 7 |
-| app-ops | unexplored | — |
+| app-ops | in-progress | 8 |
 | ui-render | unexplored | — |
 | tls-security | unexplored | — |

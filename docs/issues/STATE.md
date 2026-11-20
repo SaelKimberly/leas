@@ -2,7 +2,7 @@
 
 ```yaml
 loop:
-  iteration: 7
+  iteration: 8
   status: running
   noop_streak: 0
 coverage:
@@ -35,8 +35,9 @@ coverage:
     last_touched_iteration: 7
     issues: [018, 019, 020]
   - domain: app-ops
-    status: unexplored
-    issues: []
+    status: in-progress
+    last_touched_iteration: 8
+    issues: [021, 022]
   - domain: ui-render
     status: unexplored
     issues: []
@@ -440,3 +441,127 @@ blocked: []
   skip) after iteration 6's body fix; both now cite the warn site `:461-466`,
   matching the body.
 - Next: `app-ops` (next unexplored).
+
+### Iteration 8 — app-ops
+- Pre-existing dirty worktree (the user's DNS-resolvers work, 35 paths) left
+  untouched; `crates/leas/src/ops/*` is in that set, so every read, grep and
+  challenge ran in a detached worktree at HEAD (`81ac1a58` → `/tmp/iter8`,
+  removed before the commit).
+- Prior-work check: `ops/*` appeared only as incidental citations in 001, 004,
+  013, 014, 020 — no issue is about an app-ops flow. No duplicates.
+- Read: `job_scheduler.rs` (whole), `scheduler.rs` (whole), the
+  `CompactFinished`/`MaintenanceDone`/`BatchEnded` handlers in `events.rs`
+  (`:700-790`, `:1039-1082`), `poll_core_events`'s drain budget (`:412-444`),
+  `speed_test.rs` (batch start + terminal emits), `compact.rs` (both maintenance
+  spawns, the merge driver), `enrich.rs` (resolve lifecycle, `should_resolve`,
+  the waiter fan-out, the whitelist/countries passes), `purge.rs`, the tick loop
+  in `ui/mod.rs:280-345`.
+- Filed:
+  - 021 (medium, **theory** — code-proven) — `spawn_dns_retry` reports a scan
+    failure as `CoreEvent::CompactFinished` (`compact.rs:428-437`), whose only
+    accepted `TaskKind` is `Compact`; `handle_terminal` therefore treats it as a
+    stray (spec D43) and restores `running_task`, which nothing clears before
+    quit. Result: the queue never drains again, every later task sits in
+    `task_queue`, `is_busy()` keeps the destructive one-shots disabled, and
+    `stop`/`resume` do not touch `running_task`, so only a restart recovers.
+    The scheduler-level mismatch is *pinned* as intended
+    (`terminal_events_match_the_running_task`); nothing tests producers against
+    the taxonomy, which is the seam the bug slips through.
+  - 022 (low, **theory**, shape proven + cost measured on a lock-free
+    stand-in) — `mark_dns_failure` calls `sweep_dns_failures`, i.e.
+    `dns_failures.retain(..)` over the WHOLE map, on every failure; the map
+    cannot shrink inside the 15 s floor (`MIN_DNS_DEFER_SECS`), so a burst of F
+    failures pays F²/2 entry visits plus a write lock of every DashMap shard per
+    sweep, blocking the dispatch path's `is_dns_unresolved` reads. The repo's
+    own 2026-11-19/20 record (12,093 hosts in six seconds) is the burst shape.
+    Measured stand-in (`rustc -O`, plain `HashMap`, outside the repo): 0.85 ms
+    at F=1,000, 8.17 ms at 4,000, **72.60 ms at 12,093** — visit counts
+    500,500 / 8,002,000 / 73,126,371, i.e. ≈1 ns per visit — a lower bound. The
+    sweep is pure hygiene (`is_dns_unresolved` already drops an expired entry it
+    reads), so a counter or a length bound removes the quadratic term.
+- Rejected / dead ends during the iteration (recorded so they are not re-tried):
+  - `TaskScheduler::reset` clears `states` but not `tasks`, so a live id would
+    stay registered across a batch boundary. **No reachable trigger**: every
+    probe entry point goes through the job scheduler (`start_tcp_ping` /
+    `start_real_ping` / `start_speed_test` / `start_udp_test` have no caller
+    outside `job_scheduler::dispatch`), which is one-job-at-a-time, and both
+    `reset` callers guard on `batch_progress`/`fill_progress`. Recorded, not
+    filed.
+  - `stop()`'s doc says "cancel the running task", but `Compact` and `DnsRetry`
+    never read `speed_test_stop` (only the probe batches and the fill clone it),
+    so those two run to completion with the queue paused. Deliberate-looking,
+    not filed.
+  - `spawn_whitelist_pass` clones every endpoint's `EndpointInfo` and emits one
+    `EndpointInfoUpdated` per endpoint (11k) — the channel is 65,536 slots
+    (`state.rs:783`) and the drain budget 256/tick (`events.rs:405`), so the
+    burst is designed for. `mark_rows_dirty` is a `|=` on a `RefCell<u8>`.
+  - `db_monitor`'s per-statement mutex is documented as deliberate with a
+    profile caveat. `spawn_outbound_enrich`'s linear endpoint lookup is O(n) per
+    real-ping result — a few ms per batch, not worth a file.
+- Reviewer round 1 (`ReviewIter8`, 5m15s): **needs-fix**, 9 findings, all
+  applied. It verified 021's chain end to end (`compact.rs:431-434` →
+  `events.rs:727-730` → `job_scheduler.rs:335-336` → `:357-365` → `drain`
+  `:170`) and 022's mechanism (including dashmap 6.2.1's `_retain` taking each
+  shard's write lock), so no claim changed shape; every finding was a citation
+  or a precision defect.
+  1. **021's Related referenced a phantom 023** and described 022 as a second
+     slot-handback failure — 022 never touches `running_task`. Deleted the
+     phantom, 022 now described as the scan cost.
+  2. 021's counter-test comment was inverted: with `running_task = DnsRetry`,
+     `CompactFinished` is refused, so the sketched assertion **fails today**.
+     Replaced with the two halves a seam test needs — the pairing table (passes
+     today) and the producer half (untested).
+  3. "Nothing tests producers against the taxonomy" was too broad: the retry's
+     **success** exit is pinned by `retry_targets_only_unresolved_dns_hosts`
+     (`compact.rs:708-762`, waiting on the `"DNS retry: complete"` log line only
+     the `MaintenanceDone` handler writes). Now scoped to the failure exit.
+  4. "Nothing else clears `running_task` except the quit path" was false —
+     `drain`'s refused-spawn path (`:198`) also clears it, unreachable behind
+     `drain`'s early return. Text now says so.
+  5. 021's `→ 019` bullet called a slow scan "this issue's trigger"; the trigger
+     is any `load_all_rows` error, and 019's scan only widens the window.
+  6. 022's `retain` sub-citation landed on closing braces: the function is
+     `:425-433` and the `retain` `:431-432`, not `:423-435`/`:433-434`.
+  7. The measured F=4,000 visit count contradicted F²/2. Re-ran the probe
+     (`rustc -O`, outside the repo) and replaced the block with exact counts
+     (500,500 / 8,002,000 / 73,126,371) and the fresh times (0.85 / 8.17 /
+     72.60 ms); the first run's 14.10 ms at F=4,000 was a warm-up outlier.
+  8. "The map cannot shrink during a burst" overreached — `retain` does drop
+     pre-window entries. Now stated as F·(K + F/2) over a pre-existing
+     population K, with the reason nothing inserted in a window can expire in
+     it.
+  9. The INDEX `021 → 013, 022 → 013` bullet attributed a fix 013 did not make
+     and claimed 021 reads the stamp. Split: only `022 → 013` remains, phrased
+     as 013 documenting the starved-vs-answer split.
+- Second reviewer round not run: all nine findings were citation/precision
+  fixes re-derived from the sources the first round itself cited
+  (`compact.rs:708-762`, `:431-434`, `job_scheduler.rs:198`, `:431-432`), plus a
+  re-run of the probe whose numbers the finding disputed.
+- Deferred lead (not filed — third-party advisory, verified partially): the
+  retry's completion counter can also fall short *without* a lost bump.
+  `spawn_dns_retry` sizes `name.total` from DB rows
+  (`is_dns() && resolved_ips.is_empty()`, `compact.rs:439-458`) and
+  `enrich.rs:382-398` (`settle_starved`) says in its own doc that "a silent
+  starvation would hold the maintenance job (and the task queue) for its
+  30-minute bound" — i.e. the repo already knows the class. The residual gap is
+  `spawn_dns_resolve_host`'s `should_resolve == false` early return
+  (`enrich.rs:481-497`): it calls `end_dns_lookup` and returns **without**
+  `bump_resolve_progress()`, so a target whose SESSION entry disagrees with its
+  DB row (the exact split `enrich.rs:486-495` documents for the batch path) is
+  never retried and the counter never reaches `total` — 1,800 × 500 ms in the
+  job slot. Needs: prove a session entry can carry `resolved_ips` non-empty with
+  `resolved_at_secs: None` (the only shape `should_resolve` rejects under
+  `force`), then file with the fix at the counter (settle against what was
+  actually dispatched) rather than at the loop bound.
+- Advisory review (external, two turns later): 021's symptom paragraph was
+  sharpened from it — the `CompactFinished` handler clears `maint_progress`
+  (`events.rs:721`) before forwarding, so the stuck state is `running_task`
+  alone, the status bar renders `" <label> …"` from `running_task_meters`'s
+  `(0,0)` fallback (`ui/status_bar.rs:27-48`, `:78-84`), and the resolve meter
+  installed at `enrich.rs:425` is never cleared (`set_resolve_progress(None)`
+  lives only in the `MaintenanceDone` arm, `events.rs:753`). Its other two
+  points were stale (nothing in 021 claimed the one-shots stay enabled; the
+  phantom 023 and the `→ 019` bullet were already fixed in reviewer round 1),
+  and its proposed `021 → 020` link was rejected: 020 is orphan rows on delete
+  paths, with no causal relation to a read error in the retry's scan.
+- Next: `ui-render` (next unexplored).
