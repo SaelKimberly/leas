@@ -71,6 +71,26 @@ pub fn proxy_params(proxy: &ProxyOutbound, target: &TargetAddr) -> NativeConnect
     params
 }
 
+/// Build the params for one UDP association's proxy leg.
+///
+/// [`proxy_params`] is the TCP shape; a UDP relay must also carry the packet
+/// mode, or `connect_udp` refuses with "requires params.udp" and the whole
+/// association is dropped (the open item `native-core-integration.md` used to
+/// describe as "the proxy UDP leg is missing").
+///
+/// The mode set here is [`PacketMode::Raw`] — the only one a tunnel with a
+/// single header destination can honour. The two-mode rule lives at the one
+/// call site: `inbound::run_proxy_leg` upgrades this to `PacketMode::XUdp`
+/// exactly when the association pools a mux carrier (`connect_mux` refuses any
+/// other mode), so a pooled leg never dials the raw shape this function
+/// describes.
+#[must_use]
+pub fn proxy_udp_params(proxy: &ProxyOutbound, target: &TargetAddr) -> NativeConnectParams {
+    let mut params = proxy_params(proxy, target);
+    params.udp = Some(crate::protocol::vless::PacketMode::Raw);
+    params
+}
+
 /// Open the outbound byte stream to `target`.
 pub(crate) async fn dial(
     kind: &OutboundKind,
@@ -452,6 +472,34 @@ mod tests {
                 remarks: None,
             }
         )));
+    }
+
+    /// The UDP leg must carry the packet mode; the TCP dial must not. Before
+    /// the fix `proxy_params` (the TCP shape) was used for both, so every
+    /// non-pooled proxy association died in `connect_udp` with "requires
+    /// params.udp" (the stale open item this spec re-verified).
+    #[test]
+    fn the_udp_leg_carries_a_packet_mode_and_the_tcp_dial_does_not() {
+        use leas_proto::proto_spec::EndpointEssentials;
+
+        let proxy = super::ProxyOutbound {
+            protocol: ProtocolConfig::Vless(
+                serde_json::from_value(serde_json::json!({
+                    "uuid": "00000000-0000-0000-0000-000000000000",
+                    "transport": { "type": "tcp" }
+                }))
+                .expect("vless config"),
+            ),
+            kind: leas_proto::proto_spec::ProtocolKind::Vless,
+            server: EndpointEssentials::new("127.0.0.1", 443),
+            resolved_ip: None,
+        };
+        let target = TargetAddr::new(Host::Domain("example.com".into()), 53);
+        assert_eq!(super::proxy_params(&proxy, &target).udp, None);
+        assert_eq!(
+            super::proxy_udp_params(&proxy, &target).udp,
+            Some(crate::protocol::vless::PacketMode::Raw)
+        );
     }
 
     async fn command_byte(cfg: &ProtocolConfig) -> u8 {

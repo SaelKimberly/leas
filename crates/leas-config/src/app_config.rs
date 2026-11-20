@@ -158,6 +158,11 @@ pub struct InboundConfig {
     pub mixed_port: Option<u16>,
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Publish the local listener beyond loopback. The native mixed inbound
+    /// authenticates no client, so a non-loopback `listen` without this flag
+    /// is refused at start (spec 2026-11-20 D2) instead of warning.
+    #[serde(default)]
+    pub allow_non_loopback: bool,
     #[serde(default)]
     pub sniffing: bool,
 }
@@ -169,6 +174,7 @@ impl Default for InboundConfig {
             http_port: None,
             mixed_port: None,
             listen: default_listen(),
+            allow_non_loopback: false,
             sniffing: false,
         }
     }
@@ -359,6 +365,15 @@ mod tests {
         assert_eq!(inbound.local_port(), 10810, "mixed beats socks");
     }
 
+    /// A config file written before the flag existed must keep the fail-closed
+    /// default, not fail to parse or opt in silently.
+    #[test]
+    fn a_legacy_inbound_config_stays_loopback_only() {
+        let inbound: InboundConfig =
+            serde_json::from_str(r#"{"socks_port": 10808}"#).expect("legacy inbound parses");
+        assert!(!inbound.allow_non_loopback);
+    }
+
     #[test]
     fn default_config_round_trips() {
         let original = AppConfig::default();
@@ -372,6 +387,10 @@ mod tests {
         );
         assert_eq!(restored.inbound.socks_port, 10808);
         assert_eq!(restored.inbound.listen, "127.0.0.1");
+        assert!(
+            !restored.inbound.allow_non_loopback,
+            "publishing the listener beyond loopback is opt-in (spec D2)"
+        );
         assert!(!restored.inbound.sniffing);
     }
 

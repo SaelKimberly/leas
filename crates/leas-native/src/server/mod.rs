@@ -48,6 +48,10 @@ pub struct ServerConfig {
     pub engine: Arc<Engine>,
     /// Mux carrier policy for the mixed listener (spec 2026-11-17 §6).
     pub mux_policy: MuxPolicy,
+    /// Publish the listener beyond loopback. The mixed listener
+    /// authenticates no client, so a non-loopback bind is refused unless the
+    /// operator opted in (spec 2026-11-20 D2).
+    pub allow_non_loopback: bool,
 }
 
 impl ServerConfig {
@@ -67,6 +71,7 @@ impl ServerConfig {
             udp: true,
             engine,
             mux_policy: MuxPolicy::production(),
+            allow_non_loopback: false,
         }
     }
 }
@@ -92,8 +97,17 @@ impl NativeCoreServer {
         // and HTTP configs are built with `auth: None` (there is no TUI
         // surface for credentials, and inventing one here is out of scope). A
         // non-loopback bind therefore publishes an open proxy to everything
-        // that can route to this host.
+        // that can route to this host, so it is REFUSED unless the operator
+        // opted in (spec 2026-11-20 D2): a warning does not stop the publish.
         if !cfg.listen.ip().is_loopback() {
+            if !cfg.allow_non_loopback {
+                return Err(NativeError::Config(format!(
+                    "native server: listen {} is not loopback and `inbound.allow_non_loopback` \
+                     is off — the mixed listener authenticates no client, so this would publish \
+                     an open proxy; set `inbound.allow_non_loopback = true` to allow it",
+                    cfg.listen
+                )));
+            }
             tracing::warn!(
                 listen = %cfg.listen,
                 "native server: binding a non-loopback address — the proxy is \
@@ -378,6 +392,33 @@ mod tests {
             }
         }
         false
+    }
+
+    /// D2: a non-loopback bind is refused before any listener exists unless
+    /// the operator opted in. The refusal is the security fix — the warning it
+    /// replaced did not stop the publish.
+    #[tokio::test]
+    async fn non_loopback_bind_is_refused_without_the_opt_in() {
+        let Err(error) =
+            NativeCoreServer::start(config_for("0.0.0.0:0".parse().expect("addr"))).await
+        else {
+            panic!("a non-loopback bind without the opt-in must be refused");
+        };
+        assert!(
+            error.to_string().contains("allow_non_loopback"),
+            "the refusal names the flag: {error}"
+        );
+
+        let mut opted_in = config_for("0.0.0.0:0".parse().expect("addr"));
+        opted_in.allow_non_loopback = true;
+        let server = NativeCoreServer::start(opted_in)
+            .await
+            .expect("the opt-in publishes the listener");
+        assert_eq!(
+            server.listen_addr().ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+        server.shutdown().await;
     }
 
     #[tokio::test]

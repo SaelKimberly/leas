@@ -61,17 +61,37 @@ Tier-3 note, 2026-09-03: the vmess UDP row fails identically on the clean baseli
 
 ## Open work items
 
-1. **The proxy UDP leg is missing.** `inbound::outbound::proxy_params` never sets `params.udp`, and `protocol::vless::connect_udp` rejects `params.udp == None`, so a native session drops SOCKS5 UDP ASSOCIATE traffic through the proxy outbound. The capability gate is deliberately TCP-truthful about this (see `capability.rs`).
-2. **UDP association trace rows.** Byte accounting for a relayed association needs the relay loop to count datagrams; until then the activity view shows TCP legs only.
-3. **HTTP CONNECT e2e row.** The status-code surface, auth gate, 16 KiB head cap and pipelined-byte replay are covered by tier-1 tests in `crates/leas-native/src/inbound/http.rs`; no tier-3 row against a real core exists.
-4. **Proxy credentials.** No profile field or UI surface exists, so the native inbounds run unauthenticated and rely on the loopback bind. A non-loopback `inbound.listen` therefore publishes an open proxy; `NativeCoreServer::start` warns once at bind time.
-5. **Shadowsocks 2022 multi-user EIH.** Single-user PSK only: the typed `SsConfig` carries no identity field.
-6. **Sys metrics are process-level approximations** (RSS plus uptime), not xray's Go runtime numbers, so the statistics section shows fewer fields for native.
+1. **The UDP proxy leg is destination-locked when not pooled.** The leg carries
+   `PacketMode::Raw` (`inbound::outbound::proxy_udp_params`), so every datagram
+   of an association goes to the tunnel's header destination; a VLESS row on a
+   pooled carrier (`mux_pool::effective_udp_mux` — an explicit mux, or the
+   `xtls-rprx-vision-udp443` flow, which forces XUDP) carries per-packet
+   destinations instead. Opening a second destination on a non-pooled leg is
+   dropped with a `udp_dropped` count, not mis-routed. (Before 2026-11-20 the
+   mode was never set and every non-pooled association died in `connect_udp`;
+   the pooled path masked it in every e2e row.)
+2. **HTTP CONNECT auth gate is unexercised against a real core.** The tier-3
+   row (`vless_http_connect_against_cores`) covers a successful CONNECT; the
+   `Proxy-Authorization` branch stays tier-1 only.
+3. **Shadowsocks 2022 multi-user EIH.** Single-user PSK only: the typed
+   `SsConfig` carries no identity field.
+
+## Non-goals (revisit on demand)
+
+- **Inbound credentials.** The native inbounds authenticate no client. A
+  non-loopback `inbound.listen` is now REFUSED at start unless
+  `inbound.allow_non_loopback` is set (`NativeCoreServer::start`), because a
+  warning did not stop the publish. Reopen when a shared LAN bind is actually
+  wanted: SOCKS5 RFC 1929 + HTTP Basic, with a credential source in the profile
+  model.
+- **System metrics beyond RSS + uptime.** The statistics section shows fewer
+  fields for native than for a subprocess core. Reopen when a field is wanted
+  that the in-process core can actually observe.
 
 ## Risks
 
 - The native core is the default runtime for its six kinds, reachable with no user action and no migration, so a regression surfaces on real profiles before the e2e suite sees it. Mitigations: the fail-closed gate, the loud downgrade warn, and the `xray`/`sing-box` override veto.
-- A native session is unauthenticated by design (item 4). Treat a non-loopback bind as an open proxy.
+- A native session is unauthenticated by design (the credentials non-goal). A non-loopback bind is refused unless `inbound.allow_non_loopback` is set; an opted-in bind is an open proxy.
 - Display and runtime can differ: the list shows the resolved subprocess core while the gate runs native. Cosmetic; the connect log names the runtime core.
 
 ## Verification

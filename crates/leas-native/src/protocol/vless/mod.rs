@@ -262,6 +262,19 @@ fn random_global_id() -> [u8; 8] {
 ///   mux tunnel (`connect_mux`), opens one UDP session with a fresh
 ///   random `GlobalID`, and wraps it in the `XUdp` [`PacketConn`].
 ///
+/// Whether this row's UDP rides the mux tunnel: `params.mux`, or the
+/// `xtls-rprx-vision-udp443` flow, which forces XUDP regardless of the row's
+/// mux key (spec §4.3 — xray's `allowUDP443`).
+///
+/// One predicate for both owners: [`connect_udp`] dispatches on it, and the
+/// inbound's pooling decision (`mux_pool::effective_udp_mux`) reads the same
+/// function, so a flow row cannot be dialed as XUDP by one and as a raw tunnel
+/// by the other.
+#[must_use]
+pub fn udp_uses_mux(flow: Option<&str>, params_mux: bool) -> bool {
+    params_mux || matches!(flow, Some(FLOW_XTLS_RPRX_VISION_UDP443))
+}
+
 /// The vision+UDP guard ([`check_udp_allowed`]) runs before any
 /// protocol-phase I/O (the header write).
 pub async fn connect_udp(
@@ -273,7 +286,7 @@ pub async fn connect_udp(
     // The udp443 flow rewrites UDP to the mux tunnel regardless of
     // `params.mux` — xray's `allowUDP443` skips the vision UDP rejection
     // and the mux rewrite applies to all UDP under vision (spec §4.3).
-    let mux = ctx.params.mux || cfg.flow.as_deref() == Some(FLOW_XTLS_RPRX_VISION_UDP443);
+    let mux = udp_uses_mux(cfg.flow.as_deref(), ctx.params.mux);
     check_udp_allowed(cfg.flow.as_deref(), ctx.params.udp, mux)?;
     let mode = ctx.params.udp.ok_or_else(|| {
         NativeError::Config("vless udp connect requires params.udp (None = TCP path)".into())
@@ -509,6 +522,23 @@ mod tests {
             obj["security"] = serde_json::json!({ "type": "tls", "sni": "example.com" });
         }
         serde_json::from_value(obj).expect("vless config parses")
+    }
+
+    /// One predicate, two callers: the protocol phase and the inbound's
+    /// pooling decision. Pinned as a truth table so a change to one cannot
+    /// drift from the other.
+    #[rstest]
+    #[case::udp443_forces_mux(Some(FLOW_XTLS_RPRX_VISION_UDP443), false, true)]
+    #[case::udp443_with_row_mux_on(Some(FLOW_XTLS_RPRX_VISION_UDP443), true, true)]
+    #[case::plain_vision_does_not(Some(FLOW_XTLS_RPRX_VISION), false, false)]
+    #[case::row_mux_alone(None, true, true)]
+    #[case::no_flow_no_mux(None, false, false)]
+    fn udp_uses_mux_follows_the_flow_and_the_row(
+        #[case] flow: Option<&str>,
+        #[case] params_mux: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(udp_uses_mux(flow, params_mux), expected);
     }
 
     fn ctx_for(cfg: &VlessConfig) -> LinkContext {

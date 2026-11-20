@@ -48,6 +48,7 @@ pub async fn run_native_session(
     protocol_id: i64,
     engine: std::sync::Arc<leas_route::Engine>,
     mux: &leas_config::MuxConfig,
+    allow_non_loopback: bool,
 ) {
     if protocol.config.is_unloaded() {
         try_send_or_warn(
@@ -82,6 +83,7 @@ pub async fn run_native_session(
     let (telemetry, mut events_rx) = Telemetry::new(TELEMETRY_CAP);
     let mut server_config = ServerConfig::new(listen_addr, proxy, telemetry.clone(), engine);
     server_config.mux_policy = mux_policy(mux);
+    server_config.allow_non_loopback = allow_non_loopback;
     let server = match NativeCoreServer::start(server_config).await {
         Ok(server) => server,
         Err(e) => {

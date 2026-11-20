@@ -123,6 +123,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     // can wait out that teardown before binding its own listeners.
     let db = state.db.clone();
     let mux_config = state.config.mux.clone();
+    let allow_non_loopback = state.config.inbound.allow_non_loopback;
     let prev_task = state.core_task_handle.take();
     let handle = tokio::spawn(async move {
         // 0a. Wait out the previous session's teardown — the stop signal above
@@ -204,6 +205,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             protocol_id.get(),
             engine,
             &mux_config,
+            allow_non_loopback,
         )
         .await;
     });

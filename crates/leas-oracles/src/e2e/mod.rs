@@ -355,6 +355,70 @@ pub async fn run_against(
     ))
 }
 
+/// Run one HTTP CONNECT row: spawn the core, drive a single CONNECT through
+/// the REAL `HttpInbound` (spec 2026-11-20 D5), assert the status surface and
+/// the body.
+///
+/// The same lifecycle as [`run_against`] minus the SOCKS probe: the point is
+/// the HTTP inbound path (head cap, CONNECT reply, relay), against a real
+/// core instead of the unit tests' fake peer.
+pub async fn run_http_against(
+    case: &CaseSpec,
+    core: &CoreUnderTest,
+    certs: &Certs,
+    echo: &EchoServer,
+    tls_echo: &TlsEchoServer,
+) -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+    let cert_path = dir.path().join("server.crt");
+    let key_path = dir.path().join("server.key");
+    std::fs::write(&cert_path, &certs.cert_pem).map_err(|e| format!("cert write: {e}"))?;
+    std::fs::write(&key_path, &certs.key_pem).map_err(|e| format!("key write: {e}"))?;
+    let config_path = dir.path().join("config.json");
+
+    for attempt in 1..=ATTEMPTS {
+        let port = free_port();
+        let env = ServerEnv {
+            port,
+            certs,
+            tmp: dir.path(),
+            echo: echo.addr,
+            tls_echo: tls_echo.addr,
+            inner_tls_echo: None,
+            udp_echo: None,
+        };
+        let config_json = case.server_config(core.kind, &env);
+        if std::fs::write(&config_path, &config_json).is_err() {
+            return Err(format!("attempt {attempt}: config write failed"));
+        }
+        let _core = spawn_core(&core.bin, core.kind, &config_path, port, false);
+
+        case.client_trust(certs);
+        let params = case.client_params(port, case.probe_target(&env));
+        let probe = leas_native::e2e_support::probe_http_connect(
+            params.protocol.clone(),
+            case.protocol_kind().proto_kind(),
+            params.server.clone(),
+            case.probe_target(&env),
+        )
+        .await;
+        if probe.status == 200 && probe.body == config::BODY {
+            return Ok(());
+        }
+        eprintln!(
+            "[e2e] {}: attempt {attempt}/{ATTEMPTS} http connect status {} body {:?} accepted {}",
+            case.label(),
+            probe.status,
+            probe.body,
+            probe.accepted
+        );
+    }
+    Err(format!(
+        "{}: http connect failed after {ATTEMPTS} attempts",
+        case.label()
+    ))
+}
+
 /// Whether the tunnel's OUTER TLS/REALITY handshake negotiated a hybrid
 /// (post-quantum) key-share group — the PQ rows' honesty gate (spec §7.3:
 /// a PQ row that silently fell back to classical must fail).

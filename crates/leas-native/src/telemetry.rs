@@ -388,6 +388,36 @@ impl Telemetry {
         );
     }
 
+    /// Emit [`TraceEvent::Closed`] for a leg whose bytes were already counted
+    /// per unit, so folding this close into the host row would count them
+    /// twice.
+    ///
+    /// A UDP association is that shape: every datagram already lands in
+    /// `udp_sent`/`udp_received`, and the association row only reports the
+    /// totals it accumulated. The pending host entry from [`Telemetry::opened`]
+    /// is dropped so it cannot leak.
+    pub fn closed_precounted(
+        &self,
+        conn_id: u64,
+        up_bytes: u64,
+        down_bytes: u64,
+        duration_ms: u64,
+        error: Option<String>,
+    ) {
+        self.pending.lock().remove(&conn_id);
+        Self::emit(
+            &self.traces,
+            &self.dropped_traces,
+            NativeEvent::Trace(TraceEvent::Closed(TraceClosed {
+                conn_id,
+                up_bytes,
+                down_bytes,
+                duration_ms,
+                error,
+            })),
+        );
+    }
+
     /// Own the [`TraceEvent::Closed`] row of the leg `conn_id`, reading its
     /// totals from the per-leg counters `up`/`down`.
     ///

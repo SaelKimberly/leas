@@ -124,6 +124,23 @@ pub const fn effective_mux(params: &NativeConnectParams, policy: &MuxPolicy) -> 
     }
 }
 
+/// Whether this dial's UDP association rides a pooled mux carrier.
+///
+/// The TCP rule above plus the one flow that forces UDP onto the mux tunnel:
+/// `xtls-rprx-vision-udp443` (the same predicate `connect_udp` dispatches on,
+/// [`crate::protocol::vless::udp_uses_mux`]). Without it a udp443 row is
+/// dialed as XUDP by the protocol phase but built as a per-association raw
+/// tunnel by the inbound — the two owners disagreeing is what made
+/// `case_37_vision_udp443` red.
+#[must_use]
+pub fn effective_udp_mux(params: &NativeConnectParams, policy: &MuxPolicy) -> bool {
+    let ProtocolConfig::Vless(cfg) = &params.protocol else {
+        return false;
+    };
+    effective_mux(params, policy)
+        || crate::protocol::vless::udp_uses_mux(cfg.flow.as_deref(), false)
+}
+
 /// The wire this dial uses: the row's named multiplexer wins, a flow row is
 /// pinned to MUX.Cool (Xray rejects TCP mux under XRV), otherwise the profile
 /// default applies.
@@ -729,6 +746,17 @@ mod tests {
         ProtocolConfig::Vless(cfg)
     }
 
+    fn vless_flow(flow: Option<&str>) -> ProtocolConfig {
+        let mut cfg: leas_proto::proto_spec::VlessConfig =
+            serde_json::from_value(serde_json::json!({
+                "uuid": "11111111-2222-3333-4444-555555555555",
+                "transport": { "type": "tcp" }
+            }))
+            .expect("vless config");
+        cfg.flow = flow.map(Into::into);
+        ProtocolConfig::Vless(cfg)
+    }
+
     fn params(cfg: ProtocolConfig) -> NativeConnectParams {
         NativeConnectParams::new(
             cfg,
@@ -795,6 +823,41 @@ mod tests {
             Some(leas_proto::proto_spec::VlessMux::Limited(8)),
         ));
         assert!(effective_mux(&on_row, &MuxPolicy::default()), "row on wins");
+    }
+
+    /// The UDP pooling decision must agree with `connect_udp`'s rewrite: a
+    /// udp443 row spells no mux key and the TCP rule keeps flow rows off, so
+    /// without the flow term the leg is built as a raw tunnel for a config
+    /// whose protocol phase only speaks XUDP (`case_37`/`case_38` in
+    /// `leas-oracles` is the real-core guard).
+    #[test]
+    fn effective_udp_mux_honours_the_udp443_flow() {
+        let udp443 = params(vless_flow(Some("xtls-rprx-vision-udp443")));
+        assert!(
+            !effective_mux(&udp443, &policy()),
+            "TCP mux stays off for a flow row"
+        );
+        assert!(
+            effective_udp_mux(&udp443, &policy()),
+            "the flow is the UDP mux declaration"
+        );
+
+        let vision = params(vless_flow(Some("xtls-rprx-vision")));
+        assert!(
+            !effective_udp_mux(&vision, &policy()),
+            "plain vision does not force UDP mux"
+        );
+
+        let on_row = params(vless(
+            None,
+            Some(leas_proto::proto_spec::VlessMux::Limited(8)),
+        ));
+        assert!(effective_udp_mux(&on_row, &policy()));
+        let off_row = params(vless(
+            None,
+            Some(leas_proto::proto_spec::VlessMux::Limited(0)),
+        ));
+        assert!(!effective_udp_mux(&off_row, &policy()), "row off wins");
     }
 
     #[test]

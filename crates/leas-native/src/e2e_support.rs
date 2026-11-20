@@ -167,6 +167,126 @@ where
         .map_or_else(String::new, |(_, body)| body.to_owned())
 }
 
+/// One HTTP CONNECT probe run (spec 2026-11-20 D5).
+pub struct HttpConnect {
+    /// CONNECT status code (0 when the inbound never answered).
+    pub status: u16,
+    /// Body of the HTTP GET that follows a successful CONNECT.
+    pub body: String,
+    /// Carrier handshakes counted in front of the core.
+    pub accepted: usize,
+}
+
+/// Drive one HTTP CONNECT through the REAL [`crate::inbound::HttpInbound`]
+/// whose proxy outbound dials the core through a counting TCP proxy, then GET
+/// over the tunnel.
+///
+/// Tier-3 counterpart of the unit tests in `inbound/http.rs`: the status
+/// surface, the head cap and the relay, against a real core instead of a fake
+/// peer.
+pub async fn probe_http_connect(
+    protocol: ProtocolConfig,
+    kind: ProtocolKind,
+    server: EndpointEssentials,
+    target: SocketAddr,
+) -> HttpConnect {
+    let ip: IpAddr = server.host.parse().expect("oracle core host is an IP");
+    let core = SocketAddr::new(ip, server.port);
+    let (proxy_addr, accepted) = spawn_counting_proxy(core).await;
+
+    let proxy_server = EndpointEssentials::new(server.host.clone(), proxy_addr.port());
+    let proxy_out = ProxyOutbound {
+        protocol,
+        kind,
+        server: proxy_server,
+        resolved_ip: Some(proxy_addr),
+    };
+    let engine = Arc::new(
+        Engine::build(RuleSet {
+            rules: Vec::new(),
+            default: DefaultRoute::Route {
+                tag: "proxy".to_owned(),
+            },
+            resolve_strategy: ResolveStrategy::AsIs,
+            probes: Vec::new(),
+        })
+        .expect("http probe engine"),
+    );
+    let mut config = crate::inbound::HttpInboundConfig::new(
+        "127.0.0.1:0".parse().expect("http addr"),
+        engine,
+        vec![Outbound {
+            tag: "proxy".to_owned(),
+            kind: OutboundKind::Proxy(Box::new(proxy_out)),
+        }],
+    );
+    config.mux_policy = MuxPolicy::production();
+    let inbound = crate::inbound::HttpInbound::bind(config)
+        .await
+        .expect("bind http inbound");
+    let http = inbound.local_addr().expect("http addr");
+    let task = tokio::spawn(async move {
+        let _ = inbound.serve().await;
+    });
+
+    let (status, body) = http_connect_session(http, target).await;
+    let accepted = accepted.load(Ordering::Acquire);
+    task.abort();
+    HttpConnect {
+        status,
+        body,
+        accepted,
+    }
+}
+
+/// One CONNECT + GET through the inbound. `(0, "")` for a broken handshake.
+async fn http_connect_session(http: SocketAddr, target: SocketAddr) -> (u16, String) {
+    let Some(mut stream) = tokio::net::TcpStream::connect(http).await.ok() else {
+        return (0, String::new());
+    };
+    let authority = match target.ip() {
+        IpAddr::V4(v4) => format!("{v4}:{}", target.port()),
+        IpAddr::V6(v6) => format!("[{v6}]:{}", target.port()),
+    };
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        stream.write_all(request.as_bytes()),
+    )
+    .await
+    .is_err()
+    {
+        return (0, String::new());
+    }
+    // Read the response head (bounded: the inbound caps its own head at
+    // 16 KiB, and a 200 has no body).
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    let deadline = std::time::Duration::from_secs(15);
+    loop {
+        if head.ends_with(b"\r\n\r\n") || head.len() > 16 * 1024 {
+            break;
+        }
+        match tokio::time::timeout(deadline, stream.read(&mut byte)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => head.push(byte[0]),
+            Ok(Err(_)) | Err(_) => return (0, String::new()),
+        }
+    }
+    let text = String::from_utf8_lossy(&head);
+    let Some(status) = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+    else {
+        return (0, String::new());
+    };
+    if status != 200 {
+        return (status, String::new());
+    }
+    (status, http_get(&mut stream).await)
+}
+
 /// A transparent TCP forwarder + accept counter (one per carrier handshake).
 async fn spawn_counting_proxy(target: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

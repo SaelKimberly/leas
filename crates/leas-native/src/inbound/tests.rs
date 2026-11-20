@@ -1415,8 +1415,87 @@ async fn udp_datagrams_are_accounted_per_host_and_one_conn_per_association() {
     handle.abort();
 }
 
+/// D4: a relayed association writes its OWN activity row — `Opened` naming
+/// the first destination, `Closed` carrying the association's byte totals —
+/// so the activity pane no longer shows TCP legs only. The row is emitted by
+/// the association, not by the per-host Sniffer accounting beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_udp_association_writes_one_activity_row_with_its_totals() {
+    use crate::telemetry::{NativeEvent, Telemetry, TraceEvent, TraceKind, TraceSecurity};
+
+    let echo = spawn_udp_echo().await;
+    let (telemetry, mut events) = Telemetry::new(64);
+    let mut config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".into(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    config.trace = Some(super::TraceCtx {
+        telemetry: telemetry.clone(),
+        kind: TraceKind::Tcp,
+        protocol: "vless".into(),
+        transport: "tcp".into(),
+        security: TraceSecurity::Plain,
+    });
+    let (addr, handle) = spawn_inbound(config).await;
+    let (stream, reply) = udp_associate(addr).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client udp");
+    let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+    let payload = b"row-bytes";
+    client
+        .send_to(&udp_datagram(&target, 0, payload), reply)
+        .await
+        .expect("send datagram");
+    let mut buf = vec![0u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("echo reply timed out")
+        .expect("recv reply");
+    assert!(socks5::parse_udp_request(&buf[..n]).is_ok());
+    // Control EOF ends the association; its row closes then.
+    drop(stream);
+
+    let opened = loop {
+        match tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("association row never opened")
+            .expect("event")
+        {
+            NativeEvent::Trace(TraceEvent::Opened(opened)) => break opened,
+            NativeEvent::Trace(_) | NativeEvent::Log { .. } | NativeEvent::Traffic { .. } => {}
+        }
+    };
+    assert_eq!(opened.kind, TraceKind::UdpAssoc);
+    assert_eq!(opened.dest.as_ref(), format!("127.0.0.1:{}", echo.port()));
+
+    let closed = loop {
+        match tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("association row never closed")
+            .expect("event")
+        {
+            NativeEvent::Trace(TraceEvent::Closed(closed)) => break closed,
+            NativeEvent::Trace(_) | NativeEvent::Log { .. } | NativeEvent::Traffic { .. } => {}
+        }
+    };
+    assert_eq!(closed.conn_id, opened.conn_id);
+    assert_eq!(
+        closed.up_bytes,
+        u64::try_from(payload.len()).expect("len"),
+        "uplink is the client payload"
+    );
+    assert!(
+        closed.down_bytes > 0 && closed.down_bytes == closed.up_bytes,
+        "the echo returns one datagram of the same size: {closed:?}"
+    );
+    assert!(closed.error.is_none());
+    handle.abort();
+}
+
 // ── Pooled carriers through the real inbound (spec A1/A10, hermetic) ─────────
-//
 // A fake carrier whose peer only drains frames stands in for the proxy
 // server: the pool is seeded with it, so a successful SOCKS CONNECT proves the
 // leg reused that carrier rather than dialing the (unreachable) server.

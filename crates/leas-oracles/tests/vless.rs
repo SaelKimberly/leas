@@ -159,6 +159,16 @@ fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
         .with_udp(PacketMode::XUdp)
         .with_mux(true)
 )]
+// D1 bisect (spec 2026-11-20 §3): the mux+UDP shape with only the flow
+// toggled, so a red/green split against `xudp_tls` isolates the padded-record
+// mux carrier (`connect_mux_vision`) from the udp443 rewrite.
+#[case::xudp_vision(
+    vless("tcp")
+        .with_flow(Flow::Vision)
+        .with_app(AppKind::Udp)
+        .with_udp(PacketMode::XUdp)
+        .with_mux(true)
+)]
 // vision_udp443 (spec §7.3): the udp443 flow — the client carries the
 // full `xtls-rprx-vision-udp443` name (selects the XUDP path client-side:
 // mux-forced via `case.mux()`, guard lifted), the wire addon truncates to
@@ -392,4 +402,23 @@ async fn vless_pq_enc_with_a_reference_pair(
     run_against(&case, pick(cores, CoreKind::Xray), certs, &echo, &tls_echo)
         .await
         .expect("pq-enc with a reference-generated pair");
+}
+
+/// D5 (spec 2026-11-20): one tier-3 HTTP CONNECT row. The same VLESS tunnel is
+/// opened by the REAL `HttpInbound` instead of the SOCKS half of the mixed
+/// listener, so the CONNECT reply, the 16 KiB head cap and the relay are
+/// exercised against a real core — the surface `inbound/http.rs` covers only
+/// tier-1 today.
+#[rstest]
+#[tokio::test]
+async fn vless_http_connect_against_cores(
+    #[values(CoreKind::Xray, CoreKind::SingBox)] core: CoreKind,
+    cores: &Cores,
+    certs: &Certs,
+    echo: EchoServer,
+    tls_echo: TlsEchoServer,
+) {
+    leas_oracles::e2e::run_http_against(&vless("tcp"), pick(cores, core), certs, &echo, &tls_echo)
+        .await
+        .expect("vless http connect e2e failed");
 }

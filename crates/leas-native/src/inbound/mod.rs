@@ -23,7 +23,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use compact_str::CompactString;
@@ -658,6 +658,7 @@ async fn run_udp_relay(
         bind_retry_at: None,
         hijack_warned: false,
         seen: SmallVec::new(),
+        row: None,
     };
 
     let mut client_buf = vec![0u8; 64 * 1024];
@@ -801,6 +802,58 @@ struct ProxyLeg {
     _task: AbortOnDrop,
 }
 
+/// One association's datagram totals, shared with the tasks that move its
+/// bytes (the proxy leg's two halves, the direct resolver task).
+#[derive(Clone)]
+struct UdpBytes {
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+}
+
+impl UdpBytes {
+    fn new() -> Self {
+        Self {
+            up: Arc::new(AtomicU64::new(0)),
+            down: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn sent(&self, bytes: usize) {
+        self.up
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    fn received(&self, bytes: usize) {
+        self.down
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+}
+
+/// The association's activity row (spec D4): `Opened` on the first forwarded
+/// datagram, `Closed` with the association's totals on every exit path.
+///
+/// The close goes through [`Telemetry::closed_precounted`] — the per-datagram
+/// `udp_sent`/`udp_received` calls are the host accounting, so folding this
+/// close again would double it.
+struct UdpRow {
+    telemetry: Telemetry,
+    conn_id: u64,
+    bytes: UdpBytes,
+    started: Instant,
+}
+
+impl Drop for UdpRow {
+    fn drop(&mut self) {
+        self.telemetry.closed_precounted(
+            self.conn_id,
+            self.bytes.up.load(Ordering::Relaxed),
+            self.bytes.down.load(Ordering::Relaxed),
+            u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            None,
+        );
+    }
+}
+
 /// Per-association UDP relay state.
 struct UdpRelay {
     config: Arc<Socks5InboundConfig>,
@@ -829,9 +882,42 @@ struct UdpRelay {
     hijack_warned: bool,
     /// Hosts this association already counted in `conns` (inline, no hashing).
     seen: SmallVec<[CompactString; 4]>,
+    /// The association's activity row, opened on the first forwarded datagram.
+    row: Option<UdpRow>,
 }
 
 impl UdpRelay {
+    /// Open the association's activity row on its first forwarded datagram:
+    /// the destination is what the row names, and an association that never
+    /// forwards one writes no row.
+    fn open_row(&mut self, dest: &TargetAddr) {
+        if self.row.is_some() {
+            return;
+        }
+        let Some(trace) = &self.config.trace else {
+            return;
+        };
+        let conn_id = trace.telemetry.opened(
+            TraceKind::UdpAssoc,
+            dest_str(dest),
+            trace.protocol.clone(),
+            trace.transport.clone(),
+            trace.security,
+        );
+        let bytes = UdpBytes::new();
+        self.row = Some(UdpRow {
+            telemetry: trace.telemetry.clone(),
+            conn_id,
+            bytes,
+            started: Instant::now(),
+        });
+    }
+
+    /// The counters a spawned task needs, if the row exists.
+    fn row_bytes(&self) -> Option<UdpBytes> {
+        self.row.as_ref().map(|row| row.bytes.clone())
+    }
+
     /// Report one datagram this association could not deliver.
     fn drop_datagram(&self, host: Option<&str>, bytes: usize) {
         if let Some(trace) = &self.config.trace {
@@ -905,6 +991,9 @@ impl UdpRelay {
         write_reply(&mut self.reply_buf, src, &buf[..len]);
         match self.client_udp.send_to(&self.reply_buf, source).await {
             Ok(_) => {
+                if let Some(row) = &self.row {
+                    row.bytes.received(len);
+                }
                 if let Some(trace) = &self.config.trace {
                     trace
                         .telemetry
@@ -1000,6 +1089,9 @@ impl UdpRelay {
         };
         let dest = override_addr.map(|a| net_to_target(&a)).unwrap_or(target);
         let host = host_key(&dest.host);
+        // The association's activity row names its first forwarded
+        // destination; later ones are the Sniffer's per-host rows.
+        self.open_row(&dest);
 
         match &outbound.kind {
             OutboundKind::Block => self.drop_datagram(Some(&host), payload.len()),
@@ -1083,6 +1175,7 @@ impl UdpRelay {
                 let v4 = self.out_v4.clone();
                 let v6 = self.out_v6.clone();
                 let trace = self.config.trace.clone();
+                let row = self.row_bytes();
                 let host = CompactString::new(host);
                 tokio::spawn(async move {
                     let Some(addr) = resolve_domain(&cache, &domain, port).await else {
@@ -1106,6 +1199,9 @@ impl UdpRelay {
                     };
                     match socket.send_to(&payload, addr).await {
                         Ok(_) => {
+                            if let Some(row) = &row {
+                                row.sent(len);
+                            }
                             if let Some(trace) = &trace {
                                 trace
                                     .telemetry
@@ -1133,6 +1229,9 @@ impl UdpRelay {
 
     /// Account one datagram accepted onto the wire.
     fn sent(&self, host: &str, bytes: usize) {
+        if let Some(row) = &self.row {
+            row.bytes.sent(bytes);
+        }
         if let Some(trace) = &self.config.trace {
             trace
                 .telemetry
@@ -1231,6 +1330,7 @@ impl UdpRelay {
                 Arc::clone(&self.dns_cache),
                 Arc::clone(&queued_bytes),
                 self.config.trace.clone(),
+                self.row_bytes(),
                 Arc::clone(&self.config.mux_pool),
                 self.config.mux_policy.clone(),
                 rx,
@@ -1304,11 +1404,12 @@ async fn run_proxy_leg(
     dns_cache: Arc<DnsCache>,
     queued_bytes: Arc<AtomicUsize>,
     trace: Option<TraceCtx>,
+    row: Option<UdpBytes>,
     mux_pool: Arc<crate::mux_pool::MuxPool>,
     mux_policy: crate::mux_pool::MuxPolicy,
     mut queue: mpsc::Receiver<ProxyDatagram>,
 ) {
-    let params = outbound::proxy_params(&proxy, &session_target);
+    let mut params = outbound::proxy_udp_params(&proxy, &session_target);
     // Resolved once, for reply headers from a carrier that reports no
     // per-packet address (and for the sbox UDP destination check). A domain
     // that will not resolve costs only those replies (the tunnel itself
@@ -1317,10 +1418,13 @@ async fn run_proxy_leg(
     // A VLESS row with effective mux rides a pooled carrier (A12): XUDP on the
     // mux.cool wire, a UDP stream on an sbox wire. The lease holds the carrier
     // for this association's lifetime. A plugin row's mux is TCP-only.
-    let pooled = matches!(
-        params.protocol,
-        leas_proto::proto_spec::ProtocolConfig::Vless(_)
-    ) && crate::mux_pool::effective_mux(&params, &mux_policy);
+    let pooled = crate::mux_pool::effective_udp_mux(&params, &mux_policy);
+    // The mux tunnel only carries XUDP; the raw tunnel only Raw. One mode,
+    // chosen by the same predicate that chose the carrier (`connect_mux`
+    // refuses a mismatched mode rather than silently dropping it).
+    if pooled {
+        params.udp = Some(crate::protocol::vless::PacketMode::XUdp);
+    }
     let (tunnel, _lease) = if pooled {
         match mux_pool
             .open_udp(&params, &session_target, session_addr, &mux_policy)
@@ -1355,6 +1459,7 @@ async fn run_proxy_leg(
     // relay drops the queue, so a detached handle leaks a task plus a tunnel
     // per proxy association — including when THIS task is itself aborted.
     let reply_trace = trace.clone();
+    let reply_row = row.clone();
     let _replies = AbortOnDrop(tokio::spawn(async move {
         // One framing buffer for the leg, like the direct path's.
         let mut packet = Vec::new();
@@ -1386,6 +1491,9 @@ async fn run_proxy_leg(
                             &ip_key(src.ip()),
                             u64::try_from(payload.len()).unwrap_or(u64::MAX),
                         );
+                    }
+                    if let Some(row) = &reply_row {
+                        row.received(payload.len());
                     }
                 }
                 Ok(None) => {
@@ -1432,7 +1540,16 @@ async fn run_proxy_leg(
                 .flatten()
         });
         match writer.send(per_packet, &datagram.payload).await {
-            Ok(()) => {}
+            Ok(()) => {
+                // The association row's uplink plus the Sniffer's per-host
+                // `up`: this leg used to account replies and drops only.
+                if let Some(row) = &row {
+                    row.sent(datagram.payload.len());
+                }
+                if let Some(trace) = &trace {
+                    trace.telemetry.udp_sent(&host, len);
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
                 tracing::debug!(
                     %error,
