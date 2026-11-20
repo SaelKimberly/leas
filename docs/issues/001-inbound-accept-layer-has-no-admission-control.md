@@ -98,3 +98,6 @@ a bug).
 - [002](002-relay-write-has-no-deadline.md) — a stalled connection is held by a
   write that no timeout bounds; admission is the only thing that would cap how
   many of those exist.
+- [006](006-mux-build-gate-is-pool-wide-and-drops-its-fallback-carrier.md) — an
+  uncapped burst is what keeps hitting the mux build gate's 1 s deadline, where
+  each timed-out waiter pays a handshake and keeps nothing.
