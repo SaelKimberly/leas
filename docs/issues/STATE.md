@@ -2,7 +2,7 @@
 
 ```yaml
 loop:
-  iteration: 6
+  iteration: 7
   status: running
   noop_streak: 0
 coverage:
@@ -31,8 +31,9 @@ coverage:
     last_touched_iteration: 6
     issues: [015, 016, 017]
   - domain: db-layer
-    status: unexplored
-    issues: []
+    status: in-progress
+    last_touched_iteration: 7
+    issues: [018, 019, 020]
   - domain: app-ops
     status: unexplored
     issues: []
@@ -322,3 +323,120 @@ blocked: []
   a cold `crates/leas` binary-target build, and its shape is already pinned by
   `unparseable_ip_entry_warns_not_errors` (`route_compile.rs:642`).
 - Next: `db-layer` (next unexplored).
+
+### Iteration 7 — db-layer
+- Pre-existing dirty worktree unchanged (35 paths, the user's in-flight DNS
+  work, incl. `crates/leas-db/*`); HEAD `936d42f2`. Because `leas-db` is in the
+  dirty set, every line reference below is to **HEAD**, read in a detached
+  worktree (`/tmp/iter7`, removed after) — never the working tree.
+- Read at HEAD: `write_behind.rs` (whole driver + `LinkSpec`), `retry.rs`,
+  `database.rs` (open/wipe, `conn`, `drain_dirty_ranks`, `apply_link_patches_tx`,
+  `link_values_sql`, page loaders, delete/purge cascades,
+  `purge_invalid_shapes_once`), `merge.rs`, `profiles_query.rs` (SQL builders,
+  `page_ids_direct`, aggregates), `endpoint_rank.rs` (refresh, write,
+  `protocol_weights`, `backfill_all`), `endpoint_ip.rs`, `export.rs`,
+  `driver/mod.rs`, `schema/{mod,steps,ddl}.rs`, `docs/research/2026-11-16-turso-0.9-delta.md`.
+- Filed:
+  - 018 (medium, **theory** — both halves measured in-repo) —
+    `merge_in` loads the WHOLE protocol table (`protocol_weights` =
+    `Protocol::all()`, ~0.47 s at 6,111 protocols per the crate's own page-load
+    measurement) to answer for the two endpoints' link protocol ids it has
+    already loaded, and `delete_absorbed` runs the whole-table orphan anti-join
+    (23 + 29 ms at 74k protocols, 31 ms inside the transaction). One pair per
+    transaction, driven by the compact loop ⇒ 171 merges pay 171 of each. The
+    repo's own study already recommends the batch half (delta doc §6 item 3) and
+    the crate's `endpoint_rank::refresh` already documents avoiding the other
+    ("a separate load would re-scan the whole protocols table on every flush
+    window"). Fix: restrict both to the pair's ids.
+  - 019 (medium, **theory** — plan and timings measured on the turso shell) —
+    the D6 search predicate claims "an index seek, not a full scan". It is a
+    scan: `rank_domain` is the 5th column of `endpoint_rank_key_v2` (no index
+    leads with it; the tab opens on `Active`, binding `band < 2`, a range on the
+    leading column), and the `CAST(e.port AS TEXT) LIKE '%…%'` arm is
+    unindexable by construction and OR-ed with the range arms. Measured at 50k
+    rows: no-search page 0.5 µs, all three arms 40 ms, `COUNT(*)` with the same
+    WHERE 15 ms — the count runs on every keystroke and the page degrades to the
+    same scan whenever fewer than 200 rows match. Adding `rank_domain` /
+    `rank_sub_domain` indexes AND dropping the port arm gives `MULTI-INDEX OR` +
+    a sorter at **53 µs**; with the port arm left in, the plan does not move.
+    Caveat stated in the issue: the probe ran on the 0.6.1 shell, the app pins
+    `=0.9.0-pre.5`; the two structural facts are planner-independent, and the
+    repo's own gate for the shape is `arm_plan_sweep`, whose 13 statements omit
+    the search page.
+  - 020 (medium, **theory** — schema-proven, exposure from four delete paths) —
+    the schema declares NO foreign keys (`docs/reference/database.md`: "none:
+    toasty emits no SQL `REFERENCES`"; no `REFERENCES` in `crates/leas-db`; the
+    db-rewamp spec §9.5 already measured `PRAGMA foreign_key_list` empty), while
+    `driver/mod.rs:450` applies `foreign_keys=ON` and `discard_where`'s doc
+    justifies itself with a "live-FK error … re-stage it, retrying forever" that
+    cannot happen. The real consequence of a missed sweep is a silent orphan
+    `profile_stats` row. Only the compact merge sweeps (`compact.rs:213-214`);
+    `delete_profile` (`profiles.rs:938`), "remove failed servers"
+    (`ping.rs:612`, which deletes exactly the endpoints whose patches the probe
+    just staged, `events.rs:875`) and the 10-minute retention purge
+    (`main.rs:596-630`) do not.
+- Rejected during the iteration (recorded so they are not re-tried):
+  - "`SCHEMA_VERSION` can be bumped without a `steps` entry and wipe every user
+    database" — plausible (`steps_after(22)` returns `None`, and `migrate` maps
+    that to `IncompatibleSchema` → file deleted), but **already guarded**:
+    `schema_migrate.rs:747-760` opens a v20 fixture and asserts the cursor
+    reaches `SCHEMA_VERSION`, so a stale step list reds the suite. Not filed.
+  - `is_busy_error`'s `to_string().contains(..)` allocation; `drain()`'s
+    `Vec`-of-keys + `Vec`-of-rows passes; `discard_where`'s one-shot sweep
+    (kept, with 020's caveat); `purge_invalid_shapes_once` materialising every
+    config once per database; `apply_link_patches_tx`'s 32-bucket presence-vector
+    loop (bounded, and the bucketing is what makes one `ON CONFLICT` per group
+    set possible). All deliberate or trivial.
+- Dead ends: `profiles_walk_page` has no production caller (documented); the
+  `Coalesced` doc comment says "coalesce returns the row alongside the patch"
+  while `Coalesced` holds only key+patch and restage reconstructs from the patch
+  — doc drift, not worth a file; `sql_lit`'s "values come from our own rows"
+  comment is stale (domains come from share links) but `sql_lit` doubles quotes,
+  so there is no injection.
+- Plan-sweep caveat for the next db-layer pass: the `arm_plan_sweep` statement
+  list (`tests/turso09_lab.rs:684-780`) should gain the search page before 019's
+  fix is adopted, so the plan change is pinned by the lab rather than by the CLI.
+- Reviewer round 1 (`ReviewIter7`, 5m12s): **needs-fix**, 9 findings, all
+  addressed. It confirmed every core mechanism (both 018 halves, the 019 plan
+  facts incl. `arm_plan_sweep`'s statement list, the 020 schema premise — and it
+  found an additional, stronger citation for it: the db-rewamp spec's §9.5
+  `PRAGMA foreign_key_list` empty measurement).
+  1. **020 understated exposure** (P2, the only substantive finding): it said
+     the guard existed in "one of the two delete paths". There are FOUR and only
+     compact guards — `delete_profile` (`profiles.rs:938`), "remove failed
+     servers" (`ping.rs:612`, which deletes exactly the endpoints whose failure
+     patches the probe just staged via `events.rs:875`), and the retention
+     purge. Severity raised low → **medium** with the impact bounded explicitly
+     (orphans are invisible to the page; they cost a metrics count and a
+     permanently-live protocol row), fix option 3 re-scoped from "both paths" to
+     all three call sites and downgraded to window-narrowing only.
+  2. `page_ids_direct` cited at `:974-1010` (that range is `Projection`) — it is
+     `:762-799`; fixed in header, body and INDEX. (I had fixed this before the
+     review ran; the reviewer read the pre-fix copy.)
+  3. Pragma test cited at `turso09_lab.rs:1315` — the test is at `:1286`, the
+     assertion `:1308`.
+  4. `discard_where`'s doc cited at `:249-256` — it is `:271-275` (already
+     fixed pre-review).
+  5. 018's 0.47 s measurement cited at `:1247-1251` — it is `:1226-1229`.
+  6. 018's `delete_endpoints` quote cited at `:1929-1936` — it is `:1918-1921`.
+  7. 020's cascade range `1864-1892` stopped before the `endpoint_ip`/`endpoints`
+     /rank deletes it listed — now `:1877-1900` with per-step lines.
+  8. 019 called `All` the tab's default view; `PurgatoryView` derives
+     `#[default] Active` (`models_toasty.rs:1019-1023`, `state.rs:831`). The
+     structural claim survives (`Active` binds `band < 2`, a RANGE on the
+     leading column) and the paragraph now says so.
+  9. 019's "two full scans per keystroke" overreached the measurement: the count
+     always scans, the page only when fewer than 200 rows match. Hypothesis and
+     title corrected.
+  Minor, also fixed: STATE labelled 018/019 "code-proven"/"reproducer run" while
+  the issue headers say `theory` — both now say theory.
+- Second reviewer round not run: six of the nine findings were citation lags
+  already fixed before the review returned, and the remaining three (020's
+  delete-path inventory, 019's default view, 019's double-scan wording) were
+  each re-verified directly against HEAD (`profiles.rs:938`, `ping.rs:612`,
+  `events.rs:875`, `models_toasty.rs:1019`, `state.rs:831`).
+- Carried in this iteration's commit: 017's Location line and INDEX row still
+  cited `geodata.rs:452-471` (a range that also spans the `incompatibility`
+  skip) after iteration 6's body fix; both now cite the warn site `:461-466`,
+  matching the body.
+- Next: `app-ops` (next unexplored).

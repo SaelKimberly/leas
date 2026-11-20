@@ -26,7 +26,10 @@ Loop state: [STATE.md](STATE.md).
 | [014](014-cold-resolver-list-download-livelocks-dns.md) | A slow resolver list host makes DNS resolve nothing, forever — the list download runs inside the lookup's own deadline | medium | theory | dns | `leas-dns/src/lib.rs:36-42`, `:289-306`, `:311`, `:348` |
 | [015](015-resolved-cache-refreshes-its-own-ttl-on-every-hit.md) | A cache hit re-stores the answer it just read, so the resolver TTL never runs out for a host in use | medium | theory | routing-engine | `engine.rs:610-645`, `resolve.rs:59-83` |
 | [016](016-udp-flow-is-rerouted-per-datagram.md) | A UDP flow is fully re-routed per datagram, through two DNS caches and a payload copy | low | theory | routing-engine | `inbound/mod.rs:1035-1058`, `:1145`, `:1417` |
-| [017](017-dropped-condition-token-widens-the-rule.md) | When every token of a condition field is unrepresentable the field vanishes, so the rule silently matches MORE traffic | medium | theory | routing-engine | `route_compile.rs:164-256`, `geodata.rs:452-471` |
+| [017](017-dropped-condition-token-widens-the-rule.md) | When every token of a condition field is unrepresentable the field vanishes, so the rule silently matches MORE traffic | medium | theory | routing-engine | `route_compile.rs:164-256`, `geodata.rs:461-466` |
+| [018](018-merge-does-whole-table-work-per-merged-pair.md) | A merge reads the whole protocol table and rescans it for orphans, once per merged pair | medium | theory | db-layer | `merge.rs:174`, `:486`, `endpoint_rank.rs:1088`, `database.rs:2215` |
+| [019](019-feed-search-scans-the-rank-table-twice-per-keystroke.md) | The feed search scans the whole rank table — the footer count on every keystroke, the page too when fewer than 200 rows match | medium | theory | db-layer | `profiles_query.rs:513-548`, `:762-799`, `ddl.rs:49-51` |
+| [020](020-no-foreign-key-so-deleted-endpoints-leave-orphan-links.md) | No foreign key exists, so a link staged while its endpoint is deleted lands as a permanent orphan row | medium | theory | db-layer | `write_behind.rs:271-289`, `compact.rs:209-217`, `profiles.rs:938-946`, `ping.rs:612-625`, `main.rs:594-630` |
 
 ## Cross-references
 
@@ -82,6 +85,18 @@ Loop state: [STATE.md](STATE.md).
   widening the rule). Both are cases where the project's documented pattern is a
   named refusal — `incompatibility` disables a geo row, ADR 0018 refuses an
   undialable config — and neither refuses.
+- **018 ↔ 019:** one failure class, two paths: a query priced by a table instead
+  of by the rows it needs. 018 pays it per merged pair inside a write
+  transaction (a whole-table protocol read plus a whole-table anti-join); 019
+  pays it per keystroke on the read path (two full scans of `endpoint_rank`).
+  Both are fixable by scoping to the ids already in hand, and neither needs a
+  schema change — 019 needs two indexes.
+- **020 → 018:** 018's merge path carries the only working instance of
+  `discard_where`, and 020 is why it matters: with no foreign key, a missed
+  sweep writes an orphan link instead of failing loudly. Three other delete
+  paths — delete a profile, "remove failed servers", the retention purge — have
+  no sweep at all, and the middle one deletes exactly the endpoints whose
+  patches were just staged.
 
 ## Domain coverage
 
@@ -93,7 +108,7 @@ Loop state: [STATE.md](STATE.md).
 | native-transport | in-progress | 4 |
 | dns | in-progress | 5 |
 | routing-engine | in-progress | 6 |
-| db-layer | unexplored | — |
+| db-layer | in-progress | 7 |
 | app-ops | unexplored | — |
 | ui-render | unexplored | — |
 | tls-security | unexplored | — |

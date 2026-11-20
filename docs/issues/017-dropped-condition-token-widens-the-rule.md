@@ -2,7 +2,7 @@
 
 - **Location**: `crates/leas/src/route_compile.rs:164-256` (`match_items`: the
   three drop sites), `:42-49` (bare catch-all rejection),
-  `crates/leas/src/ops/geodata.rs:452-471` (warn-and-continue at engine build),
+  `crates/leas/src/ops/geodata.rs:461-466` (warn-and-continue at engine build),
   `:477-486` (default route is PROXY)
 - **Severity**: medium
 - **Status**: theory (code-proven; the shape is asserted by an existing test)
