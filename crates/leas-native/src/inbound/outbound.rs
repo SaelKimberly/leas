@@ -294,7 +294,7 @@ impl Drop for RelayBuf {
 
 /// The tunnel's shared idle deadline.
 ///
-/// [`timeouts::TUNNEL_READ`] bounds inactivity of the TUNNEL, not of one
+/// [`timeouts::RELAY_IDLE`] bounds inactivity of the TUNNEL, not of one
 /// direction: a download goes quiet on the uplink for as long as it lasts.
 /// The previous `select!`-per-iteration shape got this for free (it rebuilt
 /// both reads, and therefore both timeouts, after activity in either
@@ -323,13 +323,13 @@ impl Idle {
     fn deadline(&self) -> tokio::time::Instant {
         self.base
             + Duration::from_nanos(self.last_ns.load(Ordering::Relaxed))
-            + timeouts::TUNNEL_READ
+            + timeouts::RELAY_IDLE
     }
 }
 
 /// Bidirectionally copy bytes between the client and the outbound stream,
 /// half-closing each direction on EOF and failing the tunnel once NEITHER
-/// direction has moved bytes for [`timeouts::TUNNEL_READ`].
+/// direction has moved bytes for [`timeouts::RELAY_IDLE`].
 pub(crate) async fn relay(client: TcpStream, upstream: BoxStream) -> Result<(), NativeError> {
     // Owned halves for the client: `tokio::io::split` puts the stream behind
     // an `Arc<Mutex<..>>` that is locked on every poll. The upstream is a
@@ -844,9 +844,9 @@ mod tests {
         let _ = relayed.await.unwrap();
     }
 
-    /// `TUNNEL_READ` bounds inactivity of the TUNNEL, not of one direction: on
+    /// `RELAY_IDLE` bounds inactivity of the TUNNEL, not of one direction: on
     /// any download the uplink is quiet for the whole transfer. With a timer
-    /// per direction the quiet half fires at 30s and `try_join!` takes the
+    /// per direction the quiet half would fire and `try_join!` would take the
     /// streaming half down with it.
     #[tokio::test(start_paused = true)]
     async fn relay_idle_deadline_is_shared_between_directions() {
@@ -866,7 +866,9 @@ mod tests {
         peer_r.read_exact(&mut req).await.unwrap();
 
         // Downlink: three chunks 20 virtual seconds apart. Every gap is under
-        // TUNNEL_READ (30s), but the uplink stays quiet for 40s in total.
+        // RELAY_IDLE, but the uplink stays quiet for 40 s in total — a Discord
+        // gateway heartbeat interval, and exactly the case the old 30 s cap
+        // reaped.
         let mut got = [0u8; 512];
         for tag in [1u8, 2, 3] {
             if tag > 1 {
@@ -885,6 +887,45 @@ mod tests {
             !relayed.is_finished(),
             "relay ended while the tunnel was live"
         );
+    }
+
+    /// The cap must outlast the protocols the tunnel carries. 41 s (a Discord
+    /// gateway heartbeat) and 45 s are live sessions; the 2026-11-19/20 run
+    /// reaped 652 of 661 gateway connections at 30 s and produced a reconnect
+    /// loop with no transport fault.
+    #[tokio::test(start_paused = true)]
+    async fn relay_idle_outlives_a_heartbeat_and_then_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (upstream_side, peer) = tokio::io::duplex(4096);
+        let relayed = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            relay(sock, Box::new(upstream_side)).await
+        });
+        let (mut peer_r, mut peer_w) = tokio::io::split(peer);
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        client.write_all(b"GET /\r\n").await.unwrap();
+        let mut req = [0u8; 7];
+        peer_r.read_exact(&mut req).await.unwrap();
+
+        // Below the cap, completely silent: the tunnel must live.
+        tokio::time::advance(Duration::from_secs(45)).await;
+        peer_w.write_all(b"\x01").await.unwrap();
+        let mut one = [0u8; 1];
+        client.read_exact(&mut one).await.unwrap();
+        assert!(
+            !relayed.is_finished(),
+            "45 s of silence must not reap a live tunnel"
+        );
+
+        // Past the cap with traffic in neither direction: the relay ends.
+        tokio::time::advance(Duration::from_secs(70)).await;
+        let err = relayed
+            .await
+            .unwrap()
+            .expect_err("the idle cap must close a dead tunnel");
+        assert!(err.to_string().contains("relay read timed out"), "{err}");
     }
 
     /// The promotion trigger is the whole memory contract: an interactive

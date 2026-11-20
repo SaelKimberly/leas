@@ -592,11 +592,11 @@ const fn default_task_queue_limit() -> u16 {
 }
 
 const fn default_dns_failure_defer_secs() -> i64 {
-    // Must outlast one resolution (`enrich::DNS_LOOKUP_TIMEOUT`, 8s): the
-    // failure stamp is written when the lookup reports, so a shorter window
-    // has already expired by the time there is anything to defer. The
-    // scheduler clamps to the same floor, so a hand-edited config.json cannot
-    // reinstall the inverted pair.
+    // Must outlast one resolution — `enrich::DNS_QUEUE_WAIT` (5s) plus
+    // `enrich::DNS_LOOKUP_TIMEOUT` (8s) = 13s: the failure stamp is written when
+    // the lookup reports, so a shorter window has already expired by the time
+    // there is anything to defer. The scheduler clamps to the same floor, so a
+    // hand-edited config.json cannot reinstall the inverted pair.
     15
 }
 

@@ -159,7 +159,7 @@ impl AsyncRead for EarlyDataDial {
                     // the next read (or the relay's half-close): resuming a
                     // completed `async fn` panics.
                     this.upgrading = None;
-                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+                    return Poll::Ready(Err(io::Error::other(e)));
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -187,7 +187,7 @@ impl AsyncWrite for EarlyDataDial {
                 };
                 let req = match early_data_request(&this.cfg, &this.host, &this.early) {
                     Ok(req) => req,
-                    Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+                    Err(e) => return Poll::Ready(Err(io::Error::other(e))),
                 };
                 this.upgrading = Some(Box::pin(upgrade_with(req, stream, "ws")));
                 return Poll::Pending;
@@ -204,7 +204,7 @@ impl AsyncWrite for EarlyDataDial {
                     // Finished: clearing the slot keeps a later flush or
                     // shutdown from resuming the completed `async fn`.
                     this.upgrading = None;
-                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+                    return Poll::Ready(Err(io::Error::other(e)));
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -422,6 +422,40 @@ mod early_data_tests {
         let err = stream.read(&mut [0u8; 1]).await.unwrap_err();
         assert!(err.to_string().contains("400"), "{err}");
         stream.shutdown().await.unwrap_err();
+        srv.await.unwrap();
+    }
+
+    /// A rejected upgrade must keep the typed `NativeError` inside the io
+    /// error: the TLS layer's `map_tls_err` recovers it, and a formatted string
+    /// classified 3 261 ws-status rows as TLS alerts on the 2026-11-20 run.
+    #[tokio::test]
+    async fn a_rejected_upgrade_keeps_the_typed_transport_error() {
+        use crate::protocol::first_flight::HeaderFirst;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut head = [0u8; 4096];
+            let _ = server.read(&mut head).await;
+            server
+                .write_all(b"HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let dial = EarlyDataDial::new(cfg(Some(64)), "example.com".into(), Box::new(client), 64);
+        let mut stream = HeaderFirst::new(Box::new(dial), b"HEADER".to_vec());
+        stream.write_all(b"PAYLOAD").await.unwrap();
+        let err = stream.read(&mut [0u8; 1]).await.unwrap_err();
+        let inner = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<crate::error::NativeError>());
+        assert!(
+            matches!(
+                inner,
+                Some(crate::error::NativeError::TransportRejected { status: 409, .. })
+            ),
+            "the io error boxes the typed transport error: {inner:?} / {err}"
+        );
         srv.await.unwrap();
     }
 

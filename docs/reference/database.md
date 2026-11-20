@@ -273,7 +273,15 @@ hold a real delay or a fast delay, never both. The merged probe produces both in
 one pass, so provenance is now carried by which delay column is populated; a
 real delay outranks a fast delay of any value. `latency_auth` is the auth flag,
 a quad-state value stored as a plain integer (a toasty enum embed would emit a
-CHECK list, and a column's CHECK cannot be altered afterwards). `stab_mask` and
+CHECK list, and a column's CHECK cannot be altered afterwards). In practice
+`Unknown` (4) dominates: the ack is observed inside the tunnel's first read,
+which a failed target handshake never reaches — the 2026-11-20 snapshot of a
+full run held 56 685 `Unknown`, 2 382 `n/a`, 86 `Ok` and **0** `Failed` across
+59 396 real failures, so it supports a best-effort label, not a verdict.
+`error_kind = 'name'` is legacy read-only: the CHECK still admits it and four
+readers map it, but no writer produces it (DNS failures land as `fast` with
+`server dial failed: …`), and it leaves the CHECK only when the table is
+rebuilt for another reason. `stab_mask` and
 `stab_len` are the stability ring: the last 16 real outcomes, bit `i` the `i`-th
 oldest, `1` a success, with bits `[stab_len, 64)` always zero. `#[version]` makes
 typed single-row updates optimistic-concurrency safe; the bulk patch path bumps

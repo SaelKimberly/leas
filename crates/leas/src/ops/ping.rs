@@ -2526,12 +2526,12 @@ impl BatchShared {
         // booked 12 halves unprobed exactly that way: `2 × dns_defer_secs` (30 s)
         // against a window armed later still open.
         //
-        // Now that the resolver's permit wait is bounded by
-        // `DNS_LOOKUP_TIMEOUT` (see `enrich::spawn_dns_resolve_host`), report
-        // time is a function of that timeout alone, so
-        // `window + timeout + slack` cannot be beaten.
+        // Now that the resolver's permit wait is bounded by `DNS_QUEUE_WAIT`
+        // (see `enrich::spawn_dns_resolve_host`), report time is a function of
+        // two constants, so `window + DNS_REPORT_BUDGET + slack` cannot be
+        // beaten.
         let budget = Duration::from_secs(self.sched.dns_defer_secs().max(1) as u64)
-            .saturating_add(crate::ops::enrich::DNS_LOOKUP_TIMEOUT)
+            .saturating_add(crate::ops::enrich::DNS_REPORT_BUDGET)
             .saturating_add(Duration::from_secs(1));
         let mut waited = Duration::ZERO;
         // Backoff schedule for the re-entry polls: 250 ms, then doubling, capped

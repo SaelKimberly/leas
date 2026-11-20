@@ -749,10 +749,11 @@ pub async fn load_protocol_with_config(
 /// actually defer anything.
 ///
 /// The window is measured from the moment a resolution REPORTS, so a window
-/// shorter than [`crate::ops::enrich::DNS_LOOKUP_TIMEOUT`] has already expired
-/// by the time there is a failure to defer. The shipped 5s against an 8s
-/// deadline is exactly that inversion, and it is why the 2026-09-27 Windows run
-/// reported `deferred=0` against 196 DNS failures.
+/// shorter than that report budget — the permit wait plus the lookup deadline,
+/// [`crate::ops::enrich::DNS_REPORT_BUDGET`] — has already expired by the time
+/// there is a failure to defer. The shipped 5s against an 8s deadline is
+/// exactly that inversion, and it is why the 2026-09-27 Windows run reported
+/// `deferred=0` against 196 DNS failures.
 ///
 /// Applied here, where the user's setting enters the runtime, rather than
 /// inside `TaskScheduler`: the scheduler is also constructed directly by the
@@ -766,7 +767,7 @@ pub(crate) fn clamp_dns_defer_secs(configured: i64) -> i64 {
             target: "tui::state",
             configured,
             MIN_DNS_DEFER_SECS,
-            lookup_timeout_secs = crate::ops::enrich::DNS_LOOKUP_TIMEOUT.as_secs(),
+            report_budget_secs = crate::ops::enrich::DNS_REPORT_BUDGET.as_secs(),
             "DNS-failure deferral window is shorter than one resolution; a \
              window that expires before the lookup reports defers nothing, \
              so it was raised",

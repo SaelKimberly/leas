@@ -703,9 +703,13 @@ pub async fn import_http_subscription(
     let response = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(target: "tui::ops::subscriptions", "HTTP fetch failed: {e}");
+            // reqwest's Display is "error sending request for url (…)" — the
+            // stage (DNS, TLS, timeout, disk) is only in the source chain, and
+            // the 2026-11-19/20 run left 24 such lines with no cause.
+            let why = describe_error(&e);
+            tracing::error!(target: "tui::ops::subscriptions", "HTTP fetch failed: {why}");
             return ImportOutcome {
-                ended_early: Some(format!("HTTP fetch failed: {e}")),
+                ended_early: Some(format!("HTTP fetch failed: {why}")),
                 ..ImportOutcome::default()
             };
         }
@@ -720,6 +724,28 @@ pub async fn import_http_subscription(
         budget,
     )
     .await
+}
+
+/// `Display` plus the source chain, bounded to three causes.
+///
+/// `reqwest::Error`'s own `Display` is `error sending request for url (…)`;
+/// the actionable stage (resolve, connect, TLS, timeout) is its source. The
+/// persisted log keeps this text, so a fetch failure names the stage instead of
+/// only the URL (2026-11-19/20: 24 such lines, no cause).
+fn describe_error(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    let mut depth = 0;
+    while let Some(cause) = source {
+        if depth == 3 {
+            break;
+        }
+        out.push_str(" — caused by: ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+        depth += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1474,5 +1500,46 @@ mod tests {
             "an unbounded budget must not truncate a large feed",
         );
         assert!(outcome.links > 0, "the feed must import links");
+    }
+
+    /// A fetch failure must name its stage, not only the URL: reqwest's own
+    /// `Display` is the top line, and the 24 persisted failures of the
+    /// 2026-11-19/20 run carried nothing below it.
+    #[test]
+    fn a_fetch_failure_names_its_source_chain() {
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct Stage;
+        static STAGE: Stage = Stage;
+        impl fmt::Display for Stage {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("dns error: failed to lookup address")
+            }
+        }
+        impl std::error::Error for Stage {}
+
+        #[derive(Debug)]
+        struct Top;
+        impl fmt::Display for Top {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("error sending request for url (https://example.com)")
+            }
+        }
+        impl std::error::Error for Top {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&STAGE)
+            }
+        }
+
+        let text = describe_error(&Top);
+        assert!(
+            text.contains("error sending request for url (https://example.com)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("caused by: dns error: failed to lookup address"),
+            "the stage must survive into the persisted text: {text}"
+        );
     }
 }

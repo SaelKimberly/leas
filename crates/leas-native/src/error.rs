@@ -239,7 +239,18 @@ pub mod timeouts {
     pub const TRANSPORT: Duration = Duration::from_secs(10);
     pub const SECURITY: Duration = Duration::from_secs(10);
     pub const PROTOCOL: Duration = Duration::from_secs(10);
-    pub const TUNNEL_READ: Duration = Duration::from_secs(30);
+    /// Idle cap for a LIVE tunnel (`relay`): the deadline is shared between
+    /// directions, so it fires only when neither moved a byte.
+    ///
+    /// Deliberately larger than a connect step: 30 s was the old cap and is
+    /// below the idle interval of the protocols a tunnel actually carries. A
+    /// Discord gateway heartbeat is 41.25 s, so a healthy session is silent for
+    /// longer than 30 s; the 2026-11-19/20 run reaped 652 of 661
+    /// `gateway.discord.gg` connections and 8 760 of 10 217 in total, producing
+    /// a reconnect loop with no transport fault (log study,
+    /// `docs/research/2026-11-20-log-review-real-test.md` §3). The CONNECT
+    /// budget is [`Self::CONNECT`] and is unaffected.
+    pub const RELAY_IDLE: Duration = Duration::from_secs(60);
     /// One carrier build's aggregate ceiling, per chain link (spec 2026-11-17 §6).
     ///
     /// The four stage limits above bound each step; this bounds their sum

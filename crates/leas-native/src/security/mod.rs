@@ -260,6 +260,17 @@ fn map_tls_err(e: TlsError) -> NativeError {
         // A pin mismatch is a statement about THIS row's trust anchor, so it
         // keeps its own variant (and earns `[cert]` through the evidence map).
         TlsError::PinMismatch(detail) => NativeError::CertPinMismatch(detail),
+        // The record layer reads the tunnel with `read_exact`, so a transport
+        // or protocol failure underneath surfaces as `TlsError::Io`. Returning
+        // it as text counted 3 261 ws-status rows and ~1 900 framing rows as
+        // TLS alerts (2026-11-20 run): the class, the pair and the purge
+        // evidence all read the wrong stage. The bridge that boxes the error
+        // (ws early-data, `io::Error::other(native)`) keeps the type, so
+        // recover it here; a plain io error still falls back to the string.
+        TlsError::Io(io) => match io.downcast::<NativeError>() {
+            Ok(inner) => inner,
+            Err(io) => NativeError::Tls(io.to_string()),
+        },
         // The variant's own Display already carries the `TLS error: ` prefix.
         other => NativeError::Tls(other.to_string()),
     }
@@ -617,5 +628,41 @@ mod tests {
             params,
             TargetAddr::new(Host::Domain("example.com".into()), 80),
         )
+    }
+
+    /// The TLS layer wraps the tunnel's own failures as `TlsError::Io`. A
+    /// boxed `NativeError` must survive the mapping: the class, the typed pair
+    /// and the purge evidence all read it (2026-11-20: 3 261 ws-status rows
+    /// were classified as TLS alerts because the type was flattened to text).
+    #[test]
+    fn the_tls_io_wrap_keeps_a_boxed_transport_error_typed() {
+        let inner = NativeError::TransportRejected {
+            detail: "ws: HTTP error: 409 Conflict".into(),
+            status: 409,
+        };
+        let mapped = map_tls_err(TlsError::Io(std::io::Error::other(inner)));
+        assert!(
+            matches!(mapped, NativeError::TransportRejected { status: 409, .. }),
+            "the inner typed error survives: {mapped:?}"
+        );
+        assert!(
+            matches!(
+                mapped.evidence(),
+                Some(crate::error::FailureEvidence::HttpRejected(409))
+            ),
+            "the status evidence stays readable"
+        );
+    }
+
+    /// A text-only I/O error has nothing to recover and stays a TLS failure —
+    /// the `UnexpectedEof` kind that `target_leg_error` reclassifies does not
+    /// apply here, because this is the SERVER handshake, not the target leg.
+    #[test]
+    fn a_text_only_io_error_stays_a_tls_failure() {
+        let mapped = map_tls_err(TlsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "early eof",
+        )));
+        assert!(matches!(mapped, NativeError::Tls(_)), "{mapped:?}");
     }
 }

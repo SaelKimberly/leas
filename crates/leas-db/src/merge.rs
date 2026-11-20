@@ -299,16 +299,33 @@ async fn overwrite_link_fields(
     let speed = absorbed
         .speed_bps
         .map_or_else(|| "NULL".to_owned(), |s| s.to_string());
-    let (error, error_kind, error_text) = absorbed.error.as_ref().map_or_else(
-        || ("NULL".to_owned(), "NULL".to_owned(), "NULL".to_owned()),
-        |e| {
-            (
-                "1".to_owned(),
-                sql_lit(crate::database::error_kind_str(e.kind)),
-                sql_lit(&e.text),
-            )
-        },
-    );
+    let (error, error_kind, error_text, error_stage, error_cause) =
+        absorbed.error.as_ref().map_or_else(
+            || {
+                (
+                    "NULL".to_owned(),
+                    "NULL".to_owned(),
+                    "NULL".to_owned(),
+                    "NULL".to_owned(),
+                    "NULL".to_owned(),
+                )
+            },
+            |e| {
+                (
+                    "1".to_owned(),
+                    sql_lit(crate::database::error_kind_str(e.kind)),
+                    sql_lit(&e.text),
+                    e.stage.map_or_else(
+                        || "NULL".to_owned(),
+                        |s| sql_lit(crate::database::failure_stage_str(s)),
+                    ),
+                    e.cause.map_or_else(
+                        || "NULL".to_owned(),
+                        |c| sql_lit(crate::database::failure_cause_str(c)),
+                    ),
+                )
+            },
+        );
     let mut sql = String::with_capacity(512);
     let _ = write!(
         sql,
@@ -317,6 +334,7 @@ async fn overwrite_link_fields(
          latency_ip = {latency_ip}, latency_auth = {latency_auth}, \
          speed_bps = {speed}, error = {error}, \
          error_kind = {error_kind}, error_text = {error_text}, \
+         error_stage = {error_stage}, error_cause = {error_cause}, \
          stab_mask = {}, stab_len = {}, \
          last_seen_at = MAX(last_seen_at, {}), \
          last_used_at = MAX(COALESCE(last_used_at, 0), COALESCE({}, 0)), \

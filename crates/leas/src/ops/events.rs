@@ -1449,6 +1449,12 @@ mod tests {
     /// S1: the stage × cause pair is persisted with the marker and cleared by
     /// the success that supersedes it. A row that carries NULL means "class
     /// unknown", never "typed as something else".
+    ///
+    /// This asserts the STRUCT only. The SQL seam is what shipped broken (the
+    /// shared writer's column list had no pair, so 0 of 124 392 rows carried
+    /// one on 2026-11-20); `leas-db`'s
+    /// `database::tests::link_upsert_persists_the_failure_pair` is the test that
+    /// covers it, and this one must not be read as persistence proof.
     #[test]
     fn the_failure_pair_is_persisted_and_a_success_clears_it() {
         use leas_db::models::{FailureCause, FailureStage};

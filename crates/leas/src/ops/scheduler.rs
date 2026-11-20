@@ -121,7 +121,10 @@ pub struct TaskScheduler {
 
 /// Smallest DNS-failure deferral window that can outlast one resolution.
 ///
-/// A window shorter than [`crate::ops::enrich::DNS_LOOKUP_TIMEOUT`] is
+/// A window shorter than one resolution's REPORT budget — the permit wait
+/// ([`crate::ops::enrich::DNS_QUEUE_WAIT`]) plus the lookup deadline
+/// ([`crate::ops::enrich::DNS_LOOKUP_TIMEOUT`]), i.e.
+/// [`crate::ops::enrich::DNS_REPORT_BUDGET`] — is
 /// self-defeating: the stamp is written when the lookup REPORTS, so a window
 /// that has already elapsed by then never defers anything. The two were
 /// unrelated constants and the window was the shorter — the shipped 5s against
@@ -762,8 +765,8 @@ mod tests {
     #[test]
     fn the_configured_floor_outlasts_one_resolution() {
         assert!(
-            MIN_DNS_DEFER_SECS > crate::ops::enrich::DNS_LOOKUP_TIMEOUT.as_secs() as i64,
-            "deferral floor {MIN_DNS_DEFER_SECS} must exceed the resolver deadline"
+            MIN_DNS_DEFER_SECS > crate::ops::enrich::DNS_REPORT_BUDGET.as_secs() as i64,
+            "deferral floor {MIN_DNS_DEFER_SECS} must exceed the resolver report budget"
         );
     }
 

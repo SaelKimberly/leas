@@ -732,7 +732,8 @@ const LINK_COMPARE_KEYS: &str = "protocol_id, endpoint_id";
 const LINK_UPSERT_PREFIX: &str = "INSERT INTO profile_stats (protocol_id, endpoint_id, \
      last_used_at, last_seen_at, latency_real_delay, latency_fast_delay, latency_ip, \
      latency_auth, speed_bps, \
-     error, error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
+     error, error_kind, error_text, error_stage, error_cause, purge_reason, \
+     traffic_today_up, traffic_today_down, \
      traffic_total_up, traffic_total_down, created_at, updated_at, version, \
      stab_mask, stab_len) VALUES ";
 
@@ -768,12 +769,14 @@ fn link_values_sql(link: &ProfileStats, now: i64) -> String {
         Some(error) => {
             let _ = write!(
                 sql,
-                "1, {}, {}",
+                "1, {}, {}, {}, {}",
                 sql_lit(error_kind_str(error.kind)),
-                sql_lit(&error.text)
+                sql_lit(&error.text),
+                sql_opt_lit(error.stage.map(failure_stage_str)),
+                sql_opt_lit(error.cause.map(failure_cause_str))
             );
         }
-        None => sql.push_str("NULL, NULL, NULL"),
+        None => sql.push_str("NULL, NULL, NULL, NULL, NULL"),
     }
     let _ = write!(
         sql,
@@ -820,6 +823,8 @@ fn link_patch_conflict_sql(groups: LinkGroups) -> String {
             "error = excluded.error",
             "error_kind = excluded.error_kind",
             "error_text = excluded.error_text",
+            "error_stage = excluded.error_stage",
+            "error_cause = excluded.error_cause",
         ]);
     }
     if has_purge {
@@ -895,6 +900,39 @@ pub(crate) const fn error_kind_str(kind: crate::models_toasty::ProfileErr) -> &'
         crate::models_toasty::ProfileErr::Real => "real",
         crate::models_toasty::ProfileErr::Fast => "fast",
         crate::models_toasty::ProfileErr::Name => "name",
+    }
+}
+
+/// The storage text of a [`FailureStage`](crate::models_toasty::FailureStage).
+///
+/// Unlike `error_kind`, the pair columns carry NO value CHECK (the pair trigger
+/// only enforces both-or-none), so a wrong spelling would store silently. The
+/// SQL round-trip test (`link_upsert_persists_the_failure_pair`) reads the row
+/// back through the typed embed, whose decode is the guard.
+pub(crate) const fn failure_stage_str(stage: crate::models_toasty::FailureStage) -> &'static str {
+    use crate::models_toasty::FailureStage as S;
+    match stage {
+        S::Dial => "dial",
+        S::Transport => "transport",
+        S::Protocol => "protocol",
+        S::Target => "target",
+    }
+}
+
+/// The storage text of a [`FailureCause`](crate::models_toasty::FailureCause);
+/// see [`failure_stage_str`] for why there is no CHECK to catch a typo.
+pub(crate) const fn failure_cause_str(cause: crate::models_toasty::FailureCause) -> &'static str {
+    use crate::models_toasty::FailureCause as C;
+    match cause {
+        C::Timeout => "timeout",
+        C::Refused => "refused",
+        C::NoRoute => "no_route",
+        C::Nxdomain => "nxdomain",
+        C::Alert => "alert",
+        C::Status => "status",
+        C::Framing => "framing",
+        C::Config => "config",
+        C::Io => "io",
     }
 }
 
@@ -1699,6 +1737,63 @@ impl Database {
 
     // ── Purge / delete ───────────────────────────────────────────────────
 
+    /// Rows per keyset page of the never-observed sweep. A page is short enough
+    /// that one statement cannot hold a pool connection for minutes behind a
+    /// batch's writers (the 2026-11-20 run measured 143.7 s on the unpaged
+    /// form against a 0.36 s cold cost).
+    const SWEEP_PAGE: usize = 10_000;
+
+    /// The keyset-paged candidate scan behind [`Self::purge_expired`].
+    async fn never_observed_candidates(
+        conn: &mut toasty::Connection,
+        cutoff: i64,
+    ) -> Result<Vec<EndpointId>> {
+        Self::never_observed_candidates_paged(conn, cutoff, Self::SWEEP_PAGE).await
+    }
+
+    /// `page` is a parameter so the test can force several pages with a small
+    /// fixture; production always passes [`Self::SWEEP_PAGE`].
+    async fn never_observed_candidates_paged(
+        conn: &mut toasty::Connection,
+        cutoff: i64,
+        page: usize,
+    ) -> Result<Vec<EndpointId>> {
+        debug_assert!(page > 0);
+        let mut out: Vec<EndpointId> = Vec::new();
+        let mut last = i64::MIN;
+        loop {
+            let rows = toasty::sql::query(format!(
+                "SELECT e.id FROM endpoints e WHERE e.id > {last} AND NOT EXISTS \
+                 (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id \
+                 AND p.last_seen_at >= {cutoff}) \
+                 ORDER BY e.id LIMIT {page}"
+            ))
+            .exec(&mut *conn)
+            .await?;
+            let before = out.len();
+            for row in &rows {
+                let id = match row {
+                    toasty_core::stmt::Value::Record(r) => r.fields.first(),
+                    _ => None,
+                };
+                if let Some(toasty_core::stmt::Value::I64(id)) = id {
+                    out.push(EndpointId::new(*id));
+                    last = *id;
+                }
+            }
+            if out.len() - before < page {
+                break;
+            }
+            // A page that parsed no id would otherwise re-query the same key
+            // forever (this schema always returns I64, but the guard costs
+            // nothing and turns a malformed row into a stop rather than a spin).
+            if out.len() == before {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Purge endpoints where EVERY link's `last_seen_at < cutoff` — the old
     /// `COALESCE(MAX(p.last_seen_at), 0) < cutoff` predicate, including
     /// linkless endpoints (`links().all(...)` is vacuously true for them).
@@ -1735,24 +1830,13 @@ impl Database {
         // §3.5). Raw because toasty's `.all()` quantifier compiled to a
         // whole-table projection (145 ms, dump-3.log); this is an indexed
         // NOT EXISTS on `profile_stats.last_seen_at`.
-        let rows = toasty::sql::query(format!(
-            "SELECT e.id FROM endpoints e WHERE NOT EXISTS \
-             (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id \
-             AND p.last_seen_at >= {cutoff})"
-        ))
-        .exec(&mut conn)
-        .await?;
-        let candidates: Vec<EndpointId> = rows
-            .iter()
-            .filter_map(|row| match row {
-                toasty_core::stmt::Value::Record(r) => r.fields.first().cloned(),
-                _ => None,
-            })
-            .filter_map(|v| match v {
-                toasty_core::stmt::Value::I64(id) => Some(EndpointId::new(id)),
-                _ => None,
-            })
-            .collect();
+        //
+        // Keyset-paged (2026-11-20): the statement measured 143.7 s inside a
+        // batch while the same file answers it in 0.36 s cold, i.e. the cost is
+        // a pool connection held behind writers, not the scan. A short page
+        // releases the connection between chunks; the candidate set is
+        // identical because `e.id` is the PK and the walk is ordered.
+        let candidates = Self::never_observed_candidates(&mut conn, cutoff).await?;
         if candidates.is_empty() {
             return Ok(0);
         }
@@ -2055,23 +2139,39 @@ impl Database {
         if endpoint_ids.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn().await?;
-        let now = crate::models_toasty::now_epoch();
-        for chunk in endpoint_ids.chunks(500) {
-            let list = chunk
-                .iter()
-                .map(|id| id.get().to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            toasty::sql::query(format!(
-                "UPDATE profile_stats SET error = NULL, error_kind = NULL, error_text = NULL, \
-                 error_stage = NULL, error_cause = NULL, updated_at = {now} \
-                 WHERE error_kind = 'name' AND endpoint_id IN ({list})"
-            ))
-            .exec(&mut conn)
-            .await?;
-        }
-        Ok(())
+        // This is a write the events handler fires per `NamesResolved` event,
+        // so it lands in exactly the burst a batch's flushes are also writing
+        // (2026-11-20: 62 `database is locked` failures in 10 s). The UPDATE is
+        // idempotent, so retrying the whole chunk loop is safe — the same shape
+        // `refresh_endpoint_ranks` uses.
+        let db = self;
+        let ids = endpoint_ids.to_vec();
+        crate::retry_on_busy(
+            move || {
+                let ids = ids.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    let now = crate::models_toasty::now_epoch();
+                    for chunk in ids.chunks(500) {
+                        let list = chunk
+                            .iter()
+                            .map(|id| id.get().to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        toasty::sql::query(format!(
+                            "UPDATE profile_stats SET error = NULL, error_kind = NULL, error_text = NULL, \
+                             error_stage = NULL, error_cause = NULL, updated_at = {now} \
+                             WHERE error_kind = 'name' AND endpoint_id IN ({list})"
+                        ))
+                        .exec(&mut conn)
+                        .await?;
+                    }
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
     }
 
     pub async fn endpoint_ids_with_errors_before(&self, cutoff: i64) -> Result<Vec<EndpointId>> {
@@ -4384,6 +4484,97 @@ mod tests {
         assert_eq!(stored.last_seen_at, ts(200), "source column updates");
     }
 
+    /// Spec S1's pair must survive the SQL seam, not just `apply_test_result`
+    /// (the unit test in `ops::events` asserts the struct and never reaches
+    /// SQLite — 0 of 124 392 rows carried a pair on 2026-11-20 because the
+    /// shared writer's column list had no `error_stage`/`error_cause`).
+    #[tokio::test]
+    async fn link_upsert_persists_the_failure_pair() {
+        use crate::models_toasty::{ErrorInfo, FailureCause, FailureStage, ProfileErr};
+
+        async fn read_row(conn: &mut toasty::Connection) -> ProfileStats {
+            ProfileStats::filter_by_protocol_id_and_endpoint_id(
+                ProtocolId::new(1001),
+                EndpointId::new(1),
+            )
+            .first()
+            .exec(conn)
+            .await
+            .expect("read")
+            .expect("row")
+        }
+
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        db.upsert_endpoint(&endpoint_struct(1, "1.2.3.4", HostType::Ipv4, 443))
+            .await
+            .expect("endpoint");
+        db.upsert_protocol(&protocol_struct(1001))
+            .await
+            .expect("protocol");
+
+        let mut probed = link_struct(1001, 1, 100);
+        probed.error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "timeout on probe attempt (limit 5s)".to_string(),
+            stage: Some(FailureStage::Dial),
+            cause: Some(FailureCause::Timeout),
+        });
+        db.upsert_link(&probed).await.expect("probed link");
+
+        let stored = read_row(&mut conn).await;
+        let marker = stored.error.as_ref().expect("marker");
+        assert_eq!(marker.stage, Some(FailureStage::Dial));
+        assert_eq!(marker.cause, Some(FailureCause::Timeout));
+
+        // The patch writer's RESULT group must move the pair too: a
+        // bulk-upsert-only column would be overwritten back to NULL here.
+        let mut patch = stored.clone();
+        patch.error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "HTTP error: 409 Conflict".to_string(),
+            stage: Some(FailureStage::Transport),
+            cause: Some(FailureCause::Status),
+        });
+        db.apply_link_patches(&[LinkPatch {
+            link: patch,
+            groups: LinkGroups::RESULT,
+        }])
+        .await
+        .expect("patch");
+
+        let stored = read_row(&mut conn).await;
+        let marker = stored.error.as_ref().expect("marker");
+        assert_eq!(marker.stage, Some(FailureStage::Transport));
+        assert_eq!(marker.cause, Some(FailureCause::Status));
+
+        // A success clears both columns with the marker.
+        let mut cleared = stored.clone();
+        cleared.error = None;
+        db.apply_link_patches(&[LinkPatch {
+            link: cleared,
+            groups: LinkGroups::RESULT,
+        }])
+        .await
+        .expect("clear");
+
+        let stored = read_row(&mut conn).await;
+        assert!(stored.error.is_none(), "the success clears the marker");
+        let mut conn = db.connection().await.expect("conn");
+        let rows = toasty::sql::query("SELECT error_stage, error_cause FROM profile_stats")
+            .exec(&mut conn)
+            .await
+            .expect("raw read");
+        let nulls = rows.iter().all(|row| match row {
+            toasty::stmt::Value::Record(record) => record
+                .fields
+                .iter()
+                .all(|v| matches!(v, toasty::stmt::Value::Null)),
+            _ => false,
+        });
+        assert!(nulls, "both columns are NULL after the clear");
+    }
+
     #[tokio::test]
     async fn import_insert_writes_the_whole_snapshot() {
         let db = Database::in_memory().await.expect("in-memory db");
@@ -5321,5 +5512,40 @@ mod tests {
             }
         );
         assert!(rows.next().is_none());
+    }
+
+    /// The keyset walk must return exactly the single-statement set: an
+    /// off-by-one in the page boundary would silently skip an endpoint every
+    /// 10 000 rows, and the sweep is the only thing that reclaims it.
+    #[tokio::test]
+    async fn the_sweep_pages_to_the_same_candidate_set() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        for id in 1..=5 {
+            db.upsert_endpoint(&endpoint_struct(id, "1.2.3.4", HostType::Ipv4, 443))
+                .await
+                .expect("endpoint");
+        }
+        db.upsert_protocol(&protocol_struct(1001))
+            .await
+            .expect("protocol");
+        // Endpoint 3 is fresh; the other four are stale at the cutoff.
+        db.upsert_link(&link_struct(1001, 3, 100))
+            .await
+            .expect("link");
+
+        let cutoff = 50;
+        let paged = Database::never_observed_candidates_paged(&mut conn, cutoff, 2)
+            .await
+            .expect("paged");
+        let whole = Database::never_observed_candidates_paged(&mut conn, cutoff, 1000)
+            .await
+            .expect("whole");
+
+        assert_eq!(paged, whole, "the page size must not change the set");
+        assert_eq!(
+            paged.iter().map(|id| id.get()).collect::<Vec<_>>(),
+            vec![1, 2, 4, 5]
+        );
     }
 }

@@ -56,7 +56,7 @@ Startup order in `main`:
 1. `install_tls_provider()` installs the ring `CryptoProvider` process-wide, before any TLS consumer (reqwest, QUIC ping, hickory DoH).
 2. `AppConfig::load()` reads `~/.config/leas/config.json`.
 3. `Database::open()` opens `~/.config/leas/data.db`; the directory is tightened to `0700` and the database plus `-wal`/`-shm` sidecars to `0600` on Unix, because the file holds cleartext proxy credentials. A failed open (another instance's lock, an IO error, a corrupt file) PROPAGATES and leaves the file untouched; only an unknown schema cursor wipes it.
-4. `HeedLogStorage::new()` opens `~/.config/leas/logs.lmdb`; a `spawn_blocking` writer drains a bounded 4096-message channel in batches of up to 100 per heed transaction, polling every 200 ms so it can notice `shutdown_token` at quit.
+4. `HeedLogStorage::new()` opens `~/.config/leas/logs.lmdb`; a `spawn_blocking` writer drains a bounded 4096-message channel in batches of up to 100 per heed transaction, polling every 200 ms so it can notice `shutdown_token` at quit. The persisted half is the message plus a bounded, non-secret allowlist (`error`, `target`, `tag`, `kind`, `endpoint_id`); every other field, `db.params` above all, stays session-only because a bind value can be `protocols.config`.
 5. `AppState::new()` builds the shared state, then `ui::run(&mut state)` owns the terminal and the event loop.
 
 Module layout beyond the UI: `state.rs` (`AppState`), `types.rs` (`CoreEvent`, `AppMode`, pane enums, view types), `route_compile.rs` (routing-rule compilation into the native engine), `ops/` (every asynchronous action), `ui/` (rendering and key handling).
@@ -254,7 +254,7 @@ A scoped batch checks `scope_is_empty` first with a one-row `profiles_page` over
 
 Entry points in `ops/ping.rs`: `start_batch_ping` (fast only, whole feed), `start_batch_then_real_ping` and `start_batch_then_real_ping_scoped` (merged fast plus real), `start_endpoint_batch_ping` and `start_endpoint_batch_real_ping` (selected endpoint), `start_speed_test_batch`, `start_fill_exit_ips`. Every one funnels into `start_batch`, which refuses a second concurrent batch, clears `speed_test_stop`, resets the scheduler, and spawns `run_batch`.
 
-`BatchParams` fixes the budgets before the walk starts: `fast_timeout` and `transport_timeout` both from `speed_test.tcp_timeout_secs`, `real_timeout` from `real_ping_timeout_secs`, retries from `real_ping_retries`, `real_concurrency` from `real_ping_concurrency` (default 100), page size `PROFILES_PAGE_SIZE` (200), the DNS deferral window from `TaskScheduler::dns_defer_secs`, and the DNS cache TTL.
+`BatchParams` fixes the budgets before the walk starts: `fast_timeout` and `transport_timeout` both from `speed_test.tcp_timeout_secs`, `real_timeout` from `real_ping_timeout_secs`, retries from `real_ping_retries`, `real_concurrency` from `real_ping_concurrency` (default 100), page size `PROFILES_PAGE_SIZE` (200), the DNS deferral window from `TaskScheduler::dns_defer_secs`, and the DNS cache TTL. A deferred link's re-entry budget is that window plus `enrich::DNS_REPORT_BUDGET` (queue wait + lookup) plus one second of slack — never `DNS_LOOKUP_TIMEOUT` alone, because a starved queue is part of the report time.
 
 `run_batch`:
 

@@ -2161,8 +2161,8 @@ async fn apply_link_patches_isolates_column_groups() {
     row.latency = Latency::real_with_ip(7, None);
     row.speed_bps = Some(1_000);
     row.error = Some(ErrorInfo {
-        stage: None,
-        cause: None,
+        stage: Some(leas_db::models::FailureStage::Dial),
+        cause: Some(leas_db::models::FailureCause::Timeout),
         kind: ProfileErr::Real,
         text: "old".to_string(),
     });
@@ -2231,6 +2231,11 @@ async fn apply_link_patches_isolates_column_groups() {
         "stale result snapshot ignored"
     );
     assert_eq!(after.error.as_ref().map(|e| e.kind), Some(ProfileErr::Real));
+    assert_eq!(
+        after.error.as_ref().and_then(|e| e.stage),
+        Some(leas_db::models::FailureStage::Dial),
+        "a TRAFFIC patch cannot touch the error pair"
+    );
 
     // RESULT-only patch: traffic and task state must survive untouched.
     db.apply_link_patches(&[LinkPatch {
@@ -2575,7 +2580,7 @@ async fn merge_keeps_survivor_purge_verdict_over_absorbed_measured_link() {
     let mut conn = db.connection().await.expect("connection");
 
     // Same pair shape, but the SURVIVOR's link carries a purge verdict and no
-    // measurement; the absorbed side is measured and clean.
+    // measurement; the absorbed side is measured and carries a typed failure.
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(1),
@@ -2610,6 +2615,12 @@ async fn merge_keeps_survivor_purge_verdict_over_absorbed_measured_link() {
         stab_mask: 0b1,
         stab_len: 1,
         traffic: zero_traffic(),
+        error: Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "absorbed".to_string(),
+            stage: Some(leas_db::models::FailureStage::Transport),
+            cause: Some(leas_db::models::FailureCause::Status),
+        }),
     })
     .exec(&mut conn)
     .await
@@ -2630,6 +2641,15 @@ async fn merge_keeps_survivor_purge_verdict_over_absorbed_measured_link() {
         link.latency,
         Latency::fast(30),
         "measured fields still move in"
+    );
+    let err = link.error.expect("the absorbed marker moves in");
+    assert_eq!(
+        (err.stage, err.cause),
+        (
+            Some(leas_db::models::FailureStage::Transport),
+            Some(leas_db::models::FailureCause::Status)
+        ),
+        "the typed pair must move with the text it describes"
     );
 }
 

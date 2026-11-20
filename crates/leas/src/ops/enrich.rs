@@ -50,6 +50,30 @@ pub(crate) fn extract_sni(protocol: &Protocol, endpoint_host: &str) -> Option<St
 /// — and the window was the shorter of the pair.
 pub const DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Budget for WAITING on a [`RESOLVE_SEM`] permit, separate from the lookup
+/// deadline above.
+///
+/// The two are distinct because they mean different things: a lookup deadline
+/// is a resolver answer ("no answer in time"), while a queue wait is congestion
+/// and must never become a DNS verdict. The 2026-11-19/20 run proved the cost of
+/// conflating them — 64 permits, one 8 s budget around both, and 12 093 hosts
+/// reported as DNS failures in six seconds while only ~64 had ever been asked.
+///
+/// `DNS_QUEUE_WAIT + DNS_LOOKUP_TIMEOUT` must stay inside the batch's DNS-failure
+/// deferral window (`speed_test.dns_failure_defer_secs`, default 15 s): that
+/// window is what the batch's deferral budget is measured against, and a report
+/// that lands after it expires leaves the link unprobed. Hence 5 + 8 = 13 s.
+pub const DNS_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest one resolution can take to REPORT.
+///
+/// That is the queue wait plus the lookup deadline. Every budget that must
+/// outlast a resolution — the batch's deferral accounting and
+/// [`crate::ops::scheduler::MIN_DNS_DEFER_SECS`] — reads this, never
+/// `DNS_LOOKUP_TIMEOUT` alone (the wait is part of the report time).
+pub const DNS_REPORT_BUDGET: std::time::Duration =
+    DNS_QUEUE_WAIT.saturating_add(DNS_LOOKUP_TIMEOUT);
+
 /// The tick interval of the country driver's flush task.
 ///
 /// NOT the loss window. Results are not lost on a crash, only delayed, and the
@@ -310,6 +334,68 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
 static RESOLVE_SEM: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(64)));
 
+/// How a permit acquisition ended. Only [`Self::Acquired`] permits a lookup and
+/// therefore a resolver verdict; the other two are bookkeeping outcomes and must
+/// never set a DNS failure or a `resolved_at` stamp.
+enum Permit {
+    Acquired(tokio::sync::OwnedSemaphorePermit),
+    /// The semaphore was closed (the runtime is going away).
+    Closed,
+    /// The queue budget expired: congestion, not an answer.
+    Starved,
+}
+
+/// Wait at most [`DNS_QUEUE_WAIT`] for one [`RESOLVE_SEM`] permit.
+async fn acquire_permit(sem: &Arc<Semaphore>) -> Permit {
+    match tokio::time::timeout(DNS_QUEUE_WAIT, Arc::clone(sem).acquire_owned()).await {
+        Ok(Ok(permit)) => Permit::Acquired(permit),
+        Ok(Err(_)) => Permit::Closed,
+        Err(_) => Permit::Starved,
+    }
+}
+
+/// Starved hosts since the last report, and when that report was written.
+static STARVED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static STARVED_LAST_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One line per minute at most: a feed-wide pass can starve thousands of hosts
+/// in one tick, and a `warn!` per host is the flood this split exists to avoid.
+fn report_queue_starvation() {
+    let count = STARVED.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = unix_now().max(0) as u64;
+    let last = STARVED_LAST_REPORT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 60 {
+        return;
+    }
+    if STARVED_LAST_REPORT
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        STARVED.store(0, Ordering::Relaxed);
+        tracing::warn!(
+            target: "tui::ops::enrich",
+            "{count} DNS host(s) waited past the queue budget; not counted as resolver failures"
+        );
+    }
+}
+
+/// Settle a lookup that never got a permit.
+///
+/// Two facts, both load-bearing:
+/// - the retry METER counts it as done — `spawn_dns_retry` waits until every
+///   dispatched leader has reported, so a silent starvation would hold the
+///   maintenance job (and the task queue) for its 30-minute bound;
+/// - no verdict: no `mark_dns_failure` (a queue is not a resolver answer) and no
+///   `resolved_at` stamp (which would pin the host for `dns_cache_ttl_secs`).
+fn settle_starved(
+    waiters_key: Option<&String>,
+    endpoint_id: i64,
+    scheduler: &crate::ops::scheduler::TaskScheduler,
+) {
+    bump_resolve_progress();
+    release_waiters(waiters_key, endpoint_id, scheduler);
+}
+
 /// Who asked for a lookup — the three knobs (`TTL` gate, `RESOLVE_SEM`
 /// permit, per-host waiter dedup) never vary independently:
 ///
@@ -482,22 +568,48 @@ pub fn spawn_dns_resolve_host(
                             // that queued past the budget armed a window the
                             // budget could never outlast; the 2026-10-01 run
                             // booked 12 halves unprobed that way. Bounding the
-                            // wait to `DNS_LOOKUP_TIMEOUT` makes report time a
-                            // function of the timeout alone.
-                            let bounded = async {
-                                let _permit = if trigger == ResolveTrigger::Forced {
-                                    None
-                                } else {
-                                    let permit =
-                                        Arc::clone(&RESOLVE_SEM).acquire_owned().await.ok()?;
-                                    Some(permit)
-                                };
-                                Some(r.lookup_ip(&host, true).await)
+                            // wait to `DNS_QUEUE_WAIT` keeps report time a
+                            // function of two constants, and the split below
+                            // keeps a starved queue from being recorded as
+                            // a resolver verdict at all.
+                            // Bound to `_permit` on purpose: the permit must be
+                            // HELD across the lookup below (it is the
+                            // concurrency gate), not merely acquired.
+                            let _permit = if trigger == ResolveTrigger::Forced {
+                                None
+                            } else {
+                                match acquire_permit(&RESOLVE_SEM).await {
+                                    // The semaphore closed (the runtime is going
+                                    // away): release the waiters so their
+                                    // endpoints do not defer forever.
+                                    Permit::Closed => {
+                                        release_waiters(
+                                            waiters_key.as_ref(),
+                                            endpoint_id,
+                                            &scheduler,
+                                        );
+                                        return;
+                                    }
+                                    // Congestion, not an answer: no
+                                    // `mark_dns_failure`, no `resolved_at` stamp
+                                    // (the stamp is what pins the host against
+                                    // re-asking for `dns_cache_ttl_secs`).
+                                    Permit::Starved => {
+                                        report_queue_starvation();
+                                        settle_starved(
+                                            waiters_key.as_ref(),
+                                            endpoint_id,
+                                            &scheduler,
+                                        );
+                                        return;
+                                    }
+                                    Permit::Acquired(permit) => Some(permit),
+                                }
                             };
-                            match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, bounded).await {
-                                // `Some(...)` means the permit was taken and the
-                                // lookup ran inside the deadline.
-                                Ok(Some(Ok(ips))) => {
+                            match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, r.lookup_ip(&host, true))
+                                .await
+                            {
+                                Ok(Ok(ips)) => {
                                     // SESSION-ONLY, deliberately. This was `info`,
                                     // and the 2026-10-01 run showed it was **933 of
                                     // the 1,313 persisted entries (79%)** — one
@@ -517,7 +629,7 @@ pub fn spawn_dns_resolve_host(
                                     // allocation, no copy.
                                     (Vec::from(ips), Some(now))
                                 }
-                                Ok(Some(Err(e))) => {
+                                Ok(Err(e)) => {
                                     resolved_ok = false;
                                     if e.to_string().contains("no records found") {
                                         // Host without any DNS record — the
@@ -534,15 +646,6 @@ pub fn spawn_dns_resolve_host(
                                         );
                                     }
                                     (Vec::new(), Some(now))
-                                }
-                                // `None` means the permit was never taken: the
-                                // semaphore closed (the runtime is going away).
-                                // Release the waiters so their endpoints do not
-                                // defer forever — the old `acquire_owned`
-                                // failure path did exactly this.
-                                Ok(None) => {
-                                    release_waiters(waiters_key.as_ref(), endpoint_id, &scheduler);
-                                    return;
                                 }
                                 Err(_) => {
                                     resolved_ok = false;
@@ -1396,6 +1499,52 @@ mod tests {
             driver.staged_len(),
             0,
             "the re-staged rows must land on the next flush",
+        );
+    }
+
+    /// The split that makes a starved queue harmless: a lookup that never got a
+    /// permit is `Starved`, not a resolver verdict, so the caller returns before
+    /// the `(ips, resolved_at)` tuple and no `mark_dns_failure` runs (2026-11-19/20:
+    /// 12 093 hosts timed out in six seconds while only ~64 were ever asked).
+    #[tokio::test(start_paused = true)]
+    async fn the_queue_budget_reports_starvation_not_an_answer() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&sem).acquire_owned().await.expect("first");
+        assert!(
+            matches!(acquire_permit(&sem).await, Permit::Starved),
+            "a held permit must starve the queue, not answer it"
+        );
+        drop(held);
+        assert!(matches!(acquire_permit(&sem).await, Permit::Acquired(_)));
+        sem.close();
+        assert!(matches!(acquire_permit(&sem).await, Permit::Closed));
+    }
+
+    /// Starvation must REPORT (the retry meter) and must not VERDICT (no DNS
+    /// failure stamp, no `resolved_at`). Both halves are load-bearing: a
+    /// silent starvation holds the maintenance job for its 30-minute bound, and
+    /// a failure stamp pins the host for `dns_cache_ttl_secs` while a verdict
+    /// it never received.
+    #[tokio::test]
+    async fn a_starved_lookup_completes_the_meter_without_a_verdict() {
+        let sched = crate::ops::scheduler::TaskScheduler::new(3, 15);
+        let id = leas_db::models::EndpointId::new(42);
+        sched.begin_dns_lookup(id);
+        assert!(sched.dns_state_stamp(id).is_some(), "in flight");
+
+        let meters = Arc::new(crate::types::PhaseMeters::default());
+        set_resolve_progress(Some(Arc::clone(&meters)));
+        settle_starved(None, 42, &sched);
+        set_resolve_progress(None);
+
+        assert_eq!(
+            meters.done.load(Ordering::Relaxed),
+            1,
+            "the retry bar must count a starved lookup as reported"
+        );
+        assert!(
+            sched.dns_state_stamp(id).is_none(),
+            "a starved queue must leave no failure stamp and no in-flight marker"
         );
     }
 }

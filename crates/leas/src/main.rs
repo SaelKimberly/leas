@@ -72,7 +72,11 @@ struct LogVisitor {
 impl LogVisitor {
     /// Split into the persisted message and the session-only `detail`.
     ///
-    /// The message half is what heed stores and deliberately excludes `detail`.
+    /// The message half is what heed stores. It keeps timing, the statement
+    /// text, and a bounded ALLOWLIST of diagnostic labels; `detail` (everything
+    /// else, `db.params` first) stays session-only because a bind value can be
+    /// `protocols.config`. The allowlist below is the whole exception: none of
+    /// its fields can carry a config value.
     fn split(self) -> (String, Option<String>) {
         let Self {
             message,
@@ -80,22 +84,72 @@ impl LogVisitor {
             statement,
             detail,
         } = self;
+        let persisted = persisted_fields(&detail);
         let detail = if detail.is_empty() {
             None
         } else {
             Some(detail.join(" "))
         };
-        let message = match (duration_ms, statement) {
+        let mut message = match (duration_ms, statement) {
             (Some(ms), Some(sql)) => format!("{message} [{ms:.1}ms]: {sql}"),
             (Some(ms), None) => format!("{message} [{ms:.1}ms]"),
             _ => message,
         };
+        if let Some(persisted) = persisted {
+            message.push(' ');
+            message.push_str(&persisted);
+        }
         (message, detail)
     }
 
     fn push_detail(&mut self, name: &str, rendered: &str) {
         self.detail.push(format!("{name}={rendered}"));
     }
+}
+
+/// Fields that may be PERSISTED beside the message: connection and identity
+/// labels only. `db.params` and every other field stay session-only — the
+/// security boundary the visitor's doc records.
+const PERSISTED_FIELDS: [&str; 5] = ["error", "target", "tag", "kind", "endpoint_id"];
+
+/// Longest allowlisted tail written to the persistent store (a whole export is
+/// 10 000+ lines; a per-line cap keeps one pathological error from dominating).
+const PERSISTED_FIELDS_MAX: usize = 256;
+
+/// Render the allowlisted entries of `detail` into one bounded suffix.
+///
+/// Without this a persisted failure line names no row: the 2026-11-19/20 run
+/// stored 1 132 `socks5 inbound: outbound dial failed` entries with no target
+/// and no error, because `%tag, ?target, %error` all landed in `detail`. The
+/// same file records the older 2026-10-01 case (12 deferral warnings that named
+/// no row), so this is a repeat, not a new idea.
+fn persisted_fields(detail: &[String]) -> Option<String> {
+    let mut out = String::new();
+    for entry in detail {
+        let name = entry.split_once('=').map_or("", |(name, _)| name);
+        if !PERSISTED_FIELDS.contains(&name) {
+            continue;
+        }
+        let sep = usize::from(!out.is_empty());
+        if out.len() + sep + entry.len() > PERSISTED_FIELDS_MAX {
+            // Truncate at a char boundary inside the budget.
+            let room = PERSISTED_FIELDS_MAX.saturating_sub(out.len() + sep);
+            let mut cut = room.min(entry.len());
+            while cut > 0 && !entry.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&entry[..cut]);
+            break;
+        }
+        if sep == 1 {
+            out.push(' ');
+        }
+        out.push_str(entry);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 impl Visit for LogVisitor {
@@ -612,7 +666,10 @@ async fn run_app() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogVisitor, install_tls_provider, stderr_mirror_enabled};
+    use super::{
+        LogVisitor, PERSISTED_FIELDS_MAX, install_tls_provider, persisted_fields,
+        stderr_mirror_enabled,
+    };
 
     /// Regression: release panic "Could not automatically determine the
     /// process-level `CryptoProvider` from Rustls crate" on Fast+Real ping.
@@ -673,6 +730,41 @@ mod tests {
             detail.contains("secret-uuid"),
             "the session-only detail must carry them: {detail}",
         );
+    }
+
+    /// The diagnostic allowlist reaches the persisted half, bounded, while
+    /// `db.params` still never does. Without it the export named no row: 1 132
+    /// `socks5 inbound: outbound dial failed` entries with no target/error.
+    #[test]
+    fn the_diagnostic_allowlist_is_persisted_and_bounded() {
+        let mut v = LogVisitor {
+            message: "socks5 inbound: outbound dial failed".to_string(),
+            duration_ms: None,
+            statement: None,
+            detail: Vec::new(),
+        };
+        v.push_detail("tag", "proxy-a");
+        v.push_detail("target", "example.com:443");
+        v.push_detail("error", "connection refused");
+        v.push_detail("db.params", "[secret-uuid]");
+        let (message, detail) = v.split();
+        assert!(message.contains("tag=proxy-a"), "{message}");
+        assert!(message.contains("target=example.com:443"), "{message}");
+        assert!(message.contains("error=connection refused"), "{message}");
+        assert!(
+            !message.contains("secret-uuid"),
+            "db.params must stay session-only: {message}"
+        );
+        assert!(
+            detail.expect("detail").contains("secret-uuid"),
+            "the session keeps the full detail"
+        );
+
+        // A pathological value is cut inside the cap, at a char boundary.
+        let long = "я".repeat(400);
+        let capped = persisted_fields(&[format!("error={long}")]).expect("suffix");
+        assert!(capped.len() <= PERSISTED_FIELDS_MAX, "{}", capped.len());
+        assert!(capped.is_char_boundary(capped.len()), "cut on a boundary");
     }
 
     /// Duration without a statement still gets the timing, and a line with no
