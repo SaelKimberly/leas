@@ -22,6 +22,8 @@ Loop state: [STATE.md](STATE.md).
 | [010](010-xhttp-dispatch-ignores-http-version.md) | xhttp dispatches h1/h2 by TLS presence, not by its own `http_version()` table | medium | theory | native-transport | `xhttp.rs:902-925`, `:119-160` |
 | [011](011-xhttp-h1-upload-dial-bypasses-the-chain.md) | The plaintext xhttp h1 arm dials its upload connection straight to the server, bypassing a chain | low | theory | native-transport | `xhttp.rs:992`, `:1070` |
 | [012](012-ws-early-data-duplicates-the-captured-prefix.md) | WS early data writes the captured prefix into two frames on top of the header — the tunnel's first bytes are corrupted | high | theory | native-transport | `ws.rs:183-193`, `:213-229` |
+| [013](013-wedged-resolver-costs-15s-under-an-8s-deadline.md) | A wedged resolver costs up to 15 s per lookup; the caller's 8 s deadline then books the host as failed | medium | theory | dns | `leas-dns/src/lib.rs:25-30`, `enrich.rs:51`, `:609` |
+| [014](014-cold-resolver-list-download-livelocks-dns.md) | A slow resolver list host makes DNS resolve nothing, forever — the list download runs inside the lookup's own deadline | medium | theory | dns | `leas-dns/src/lib.rs:36-42`, `:289-306`, `:311`, `:348` |
 
 ## Cross-references
 
@@ -55,6 +57,13 @@ Loop state: [STATE.md](STATE.md).
 - **010 → 004:** a plan input (there the row's mux cap, here the ALPN-derived
   HTTP version) is computed, documented, then not consulted at the point that
   dials.
+- **013 ↔ 014:** one asymmetry seen from two sides of `init()` — 013 is the read
+  side (a caller deadline of 8 s doing the bounding that no inner budget does:
+  the connect/handshake bound is a hardcoded 5 s × 3 sends, and 8 s also cuts
+  lookups that work), 014 is the fetch side (a 10 s download inside that same
+  8 s, cancelled instead of timed out, so its own fallback never runs). A fix for
+  one that assumes the other's budget is derived from the caller will re-break
+  it.
 
 ## Domain coverage
 
@@ -64,7 +73,7 @@ Loop state: [STATE.md](STATE.md).
 | mux-pool | in-progress | 2 |
 | native-protocol | in-progress | 3 |
 | native-transport | in-progress | 4 |
-| dns | unexplored | — |
+| dns | in-progress | 5 |
 | routing-engine | unexplored | — |
 | db-layer | unexplored | — |
 | app-ops | unexplored | — |

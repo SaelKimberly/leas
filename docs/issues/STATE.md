@@ -2,7 +2,7 @@
 
 ```yaml
 loop:
-  iteration: 4
+  iteration: 5
   status: running
   noop_streak: 0
 coverage:
@@ -23,8 +23,9 @@ coverage:
     last_touched_iteration: 4
     issues: [010, 011, 012]
   - domain: dns
-    status: unexplored
-    issues: []
+    status: in-progress
+    last_touched_iteration: 5
+    issues: [013, 014]
   - domain: routing-engine
     status: unexplored
     issues: []
@@ -170,3 +171,76 @@ blocked: []
 - Second reviewer round not run: each fix is backed by the source the first
   round cited, and the two claim-shaped changes were re-derived from it.
 - Next: pick the next unexplored domain — `dns`.
+
+### Iteration 5 — dns
+- Pre-existing dirty worktree (user's in-flight DNS-resolvers work, 35 paths)
+  left untouched; only `docs/issues/` written. Start HEAD `0cde89f` (iter 4).
+- Prior-work check: `rg 'leas-dns|dns_cache|mark_dns_failure|DNS_QUEUE_WAIT|
+  resolve\.rs'` over `docs/issues/` — no hits.
+- Read (all at HEAD): `crates/leas-dns/src/lib.rs` (whole), `dnscrypt.rs`
+  (whole), `crates/leas-route/src/{dns_adapter,resolve}.rs`,
+  `crates/leas/src/ops/enrich.rs` (the resolve task, permit layer, TTL gate,
+  waiter registry). Dependency source read: hickory-resolver 0.26.3
+  (`config.rs`, `connection_provider.rs`, `name_server_pool.rs`, `resolver.rs`).
+- Filed:
+  - 013 (medium, **measured**) — `ResolverOpts::timeout = 500 ms` bounds
+    requests, not connection establishment: hickory-net's `CONNECT_TIMEOUT` is a
+    hardcoded 5 s (`xfer/mod.rs:473`, applied at `tls.rs:223`), and `attempts=2`
+    means 3 sends, so a wedged resolver costs 15.0 s. Measured: a silent-accept
+    DoT endpoint took 15.006 s at 500 ms and at 2000 ms alike, and 20 real hosts
+    over the real published list resolved 20/20 under both 500 ms and 5 s, worst
+    10.22 s (= 2 × 5 s). The caller's 8 s `DNS_LOOKUP_TIMEOUT` is therefore the
+    only real bound — it books the host as a failure, and it is below the tail of
+    a working lookup.
+  - 014 (medium, **reproducer run**) — the cold list download runs inside the
+    lookup deadline, its own budget is 10 s (longer than the caller's 8 s), a
+    caller cancellation never reaches the `downloaded.or(cached)` gate in front of
+    the `system_conf` fallback, and a cancelled download caches nothing: a slow
+    list host makes DNS resolve nothing, forever. Test passed (two cancelled
+    attempts, no cache; control with a longer deadline caches). The test models
+    the mechanism, not the 8 s/10 s ratio — recorded as such in the issue.
+- Disproved first theory (recorded so it is not retried): "500 ms is too tight,
+  so lookups fail on a slow path". Raising it 10× changed nothing on this host —
+  20/20 either way, identical worst latency. The constant is not a fail-fast
+  knob.
+- Dead ends recorded (not filed): `lookup_ip`'s `Ok(empty)` after the
+  `allow_ipv6` filter (every in-tree caller passes `true`, so it is unreachable
+  today — noted, not filed); the DNSCrypt nonce (8 ns bytes + 4 random bytes per
+  ephemeral session key) is unique per key; `write_dnscrypt_cache`'s temp+rename
+  leaves no partial cache; `LOOKUP_WAITERS` cannot race because
+  `spawn_dns_resolve_host` takes `&mut AppState`.
+- Runbooks: both reproducers ran in a detached worktree (`git worktree add
+  --detach /tmp/iter5 HEAD`, `CARGO_TARGET_DIR` shared, removed and pruned
+  afterwards) because `crates/leas-dns` is dirty in this tree. One accident: the
+  first append went to the DIRTY file; removed with a marker-delimited truncation
+  and the tree verified against the pre-iteration path list.
+- Reviewer round 1 (`ReviewIter5`, 3m20s): **needs-fix**, 6 findings, all fixed:
+  1. 013's mechanism was wrong: `ResolverOpts::timeout` DOES bound a request
+     (hickory-net `tls.rs:107` `DnsMultiplexer::with_timeout`,
+     `dns_multiplexer.rs:236`); what escapes it is connection establishment,
+     bounded by the hardcoded `CONNECT_TIMEOUT = 5 s` (`xfer/mod.rs:473`,
+     `tls.rs:223`), and `attempts=2` makes 3 sends = 15.006 s, exactly the
+     measurement. The issue, its title, its INDEX row and the cross-reference
+     were rewritten around that; also renamed the file
+     (`013-wedged-resolver-costs-15s-under-an-8s-deadline.md`).
+  2. 013's fix sketch proposed a timeout around `NameServer::send`, which is
+     `pub(crate)` — not implementable here, and the per-request bound it would
+     add already exists. Replaced with the real levers (`attempts`, an outer
+     per-lookup bound, or a connection provider like `dnscrypt.rs`'s).
+  3. 014 said 10 s was "twice the caller's"; it is 1.25×, and the ratio is not
+     load-bearing (only that the download outlives the caller).
+  4. 014 said the fallback fires "only on `Err`"; the gate is
+     `downloaded.or(cached)` (`lib.rs:311`), which also covers a download that
+     parses to zero stamps. The real gap is that a CANCELLATION never reaches the
+     gate at all — now stated as such, and the fix bullet was rewritten around it.
+  5. 014's "mirrored 16× smaller" was false: the fixture is a 2 s response
+     against a 500 ms deadline and never exercises the 10 s client budget. The
+     issue now states exactly what the test models (the mechanism) and what it
+     does not (the ratio).
+  6. The STATE log carried 013's wrong mechanism as fact — corrected here.
+- Second reviewer round not run: each fix re-derives from the source the reviewer
+  cited, and those citations were verified directly in the vendored crates
+  (`CONNECT_TIMEOUT` at hickory-net `src/xfer/mod.rs:473`, applied at
+  `src/tls.rs:223`; `RetrySendStream` decrementing at
+  `src/xfer/retry_dns_handle.rs:60,98-101`).
+- Next: pick the next unexplored domain — `routing-engine`.
