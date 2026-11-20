@@ -24,6 +24,9 @@ Loop state: [STATE.md](STATE.md).
 | [012](012-ws-early-data-duplicates-the-captured-prefix.md) | WS early data writes the captured prefix into two frames on top of the header — the tunnel's first bytes are corrupted | high | theory | native-transport | `ws.rs:183-193`, `:213-229` |
 | [013](013-wedged-resolver-costs-15s-under-an-8s-deadline.md) | A wedged resolver costs up to 15 s per lookup; the caller's 8 s deadline then books the host as failed | medium | theory | dns | `leas-dns/src/lib.rs:25-30`, `enrich.rs:51`, `:609` |
 | [014](014-cold-resolver-list-download-livelocks-dns.md) | A slow resolver list host makes DNS resolve nothing, forever — the list download runs inside the lookup's own deadline | medium | theory | dns | `leas-dns/src/lib.rs:36-42`, `:289-306`, `:311`, `:348` |
+| [015](015-resolved-cache-refreshes-its-own-ttl-on-every-hit.md) | A cache hit re-stores the answer it just read, so the resolver TTL never runs out for a host in use | medium | theory | routing-engine | `engine.rs:610-645`, `resolve.rs:59-83` |
+| [016](016-udp-flow-is-rerouted-per-datagram.md) | A UDP flow is fully re-routed per datagram, through two DNS caches and a payload copy | low | theory | routing-engine | `inbound/mod.rs:1035-1058`, `:1145`, `:1417` |
+| [017](017-dropped-condition-token-widens-the-rule.md) | When every token of a condition field is unrepresentable the field vanishes, so the rule silently matches MORE traffic | medium | theory | routing-engine | `route_compile.rs:164-256`, `geodata.rs:452-471` |
 
 ## Cross-references
 
@@ -64,6 +67,21 @@ Loop state: [STATE.md](STATE.md).
   8 s, cancelled instead of timed out, so its own fallback never runs). A fix for
   one that assumes the other's budget is derived from the caller will re-break
   it.
+- **015 ↔ 016:** the same per-datagram pipeline. 016 is the shape (every
+  datagram re-routes the flow); 015 is the one bug inside it that a per-flow memo
+  would also mask — a hit path that re-writes the cache entry it just read, which
+  is both a wasted two-copy store per datagram and a TTL that never expires for
+  a host in use. Fix 016 and 015's cost disappears but its staleness stays; fix
+  015 and 016's cost stays but stops compounding.
+- **013 → 015:** 013 is what a cache *miss* can cost (up to 15 s under an 8 s
+  caller deadline); 015 is why a host that already has a cached answer never
+  takes that hit again — nor ever picks up a rotated answer.
+- **017 → 014:** the same refusal principle from two directions. 014 is a
+  silent degradation on the network side (the only bound is the caller's timer);
+  017 is one on the policy side (an unrepresentable token is healed by deletion,
+  widening the rule). Both are cases where the project's documented pattern is a
+  named refusal — `incompatibility` disables a geo row, ADR 0018 refuses an
+  undialable config — and neither refuses.
 
 ## Domain coverage
 
@@ -74,7 +92,7 @@ Loop state: [STATE.md](STATE.md).
 | native-protocol | in-progress | 3 |
 | native-transport | in-progress | 4 |
 | dns | in-progress | 5 |
-| routing-engine | unexplored | — |
+| routing-engine | in-progress | 6 |
 | db-layer | unexplored | — |
 | app-ops | unexplored | — |
 | ui-render | unexplored | — |

@@ -2,7 +2,7 @@
 
 ```yaml
 loop:
-  iteration: 5
+  iteration: 6
   status: running
   noop_streak: 0
 coverage:
@@ -27,8 +27,9 @@ coverage:
     last_touched_iteration: 5
     issues: [013, 014]
   - domain: routing-engine
-    status: unexplored
-    issues: []
+    status: in-progress
+    last_touched_iteration: 6
+    issues: [015, 016, 017]
   - domain: db-layer
     status: unexplored
     issues: []
@@ -244,3 +245,80 @@ blocked: []
   `src/tls.rs:223`; `RetrySendStream` decrementing at
   `src/xfer/retry_dns_handle.rs:60,98-101`).
 - Next: pick the next unexplored domain — `routing-engine`.
+
+### Iteration 6 — routing-engine
+- Pre-existing dirty worktree unchanged (35 paths, the user's in-flight
+  DNS-resolvers work); HEAD `ad6fdee6`. 015's reproducer ran in a detached
+  worktree (`/tmp/iter6`, removed after); 016 and 017 are code-proven from the
+  sources and needed no run.
+- Read (all at HEAD): `crates/leas-route/src/{lib,engine,matchers,resolve,sniff,geo,dns_adapter}.rs`
+  (engine and matchers in full through the compiled-cond and
+  `matches_domain`/`CidrSet` paths), `crates/leas/src/route_compile.rs`,
+  `crates/leas/src/ops/geodata.rs` around the build,
+  `crates/leas-native/src/inbound/mod.rs` (`handle_connect`, `forward_client`,
+  `forward_direct`, the proxy leg).
+- Filed:
+  - 015 (medium, **reproducer run**) — `decide_async` puts the answer back into
+    `ResolvedCache` on the *hit* path (`engine.rs:643` runs for `cached = Some`
+    too), and `put` re-stamps (`resolve.rs:79-82`), so the 300 s TTL slides:
+    a host under traffic never expires. Contradicts `get_fresh`'s documented
+    `peek` rationale and `new`'s "ttl_secs past their store time". Also pays two
+    `Vec<IpAddr>` copies, a second lock, and a `Resolved` event per hit —
+    latent only because no production caller installs an event sink.
+  - 016 (low, **code-proven shape, cost unmeasured**) — `forward_client`
+    re-routes every UDP datagram: sniff copy → rule scan → engine cache →
+    probe lock, then a *second* DNS cache (`self.dns_cache`) for the same host
+    in `forward_direct`/`run_proxy_leg`. No per-flow memo, while every reference
+    implementation routes per flow.
+  - 017 (medium, **code-proven**, shape pinned by an existing test) —
+    `match_items` deletes a field whose every token is unrepresentable, and the
+    fields are AND-ed, so `A AND unrepresentable` becomes `A`:
+    `protocols: [bittorrent]` + a domain matches all protocols, `network: "icmp"`
+    vanishes entirely, `ips: ["oops"]` + ports matches every host on the port. A
+    field that keeps at least one token instead *narrows* (fail-closed), which is
+    the boundary the advisory and the reviewer both flagged and the issue now
+    states explicitly. Only a `tracing::warn!` at build; the row stays active and
+    the default is PROXY. Same refusal principle the repo applies to geo codes
+    (`incompatibility`) and undialable configs (ADR 0018 D-C/D-F).
+- Dead ends (recorded so they are not re-tried): `needs_resolve()` is a public
+  O(rules×items) walk with **no production caller** (tests only) — dead-ish API,
+  not worth an issue; `CompiledDomainItem`'s `positive || any(!negated)` reads
+  like an OR-of-negations bug but is exactly OR semantics for a reversed token;
+  `suffix_hit`'s dot walk, merged-CIDR `contains`, the `SCAN_MAX` split, and
+  `GeoCompiler::preload`/`take_site` are all deliberate and already
+  allocation-aware; `compile_domain_item`'s per-token work is build-time only.
+- Reviewer round 1 (`ReviewIter6`, 5m31s): **needs-fix**, 8 findings, all fixed.
+  It confirmed the three mechanisms and the 015 reproducer, then corrected
+  citations and one false claim:
+  1. 016 asserted an engine rebuild can re-route a live flow. False: the engine
+     is `Arc<Engine>` pinned in `Socks5InboundConfig` per session
+     (`inbound/mod.rs:100`, `ops/native_connect.rs:49`); a rebuild swaps the
+     `EngineCell` slot, a profile switch ends the association. The real
+     per-datagram variance is the stateless `probe` (Initial vs 1-RTT) and a
+     re-resolved domain; the Fix sketch's invalidation premise went with it.
+  2. `:1166` is a comment — `cached_domain` is `:1145` (fixed in the issue and
+     its INDEX row).
+  3. The proxy leg resolves once per leg (`:1417`), per datagram only for a
+     different destination (`:1522-1525`) — the per-datagram second lookup is
+     `forward_direct` only.
+  4. 016's cross-reference to 001 was wrong (001 is the TCP accept loop); 003
+     owns the same `UdpRelay`.
+  5. 017's "losing one [token] turns `A AND B` into `A`" over-generalized: each
+     field is OR-valued internally and 2+ recognised protocols lower to
+     `Cond::Any`, so a partially recognised field *narrows*. Only a field whose
+     last surviving item is dropped widens. Rewritten, and confirmed
+     independently by the advisory.
+  6. `geodata.rs:452-457` is the `incompatibility` warn; the row warnings are
+     `:461-466`.
+  7. 015's `IfNonMatch` anchor is `geodata.rs:481` (479 is the PROXY tag).
+  8. STATE said "no worktree run was needed and none was started" while 015
+     recorded one — provenance contradiction, fixed.
+- Second reviewer round not run: every fix is a citation correction or a claim
+  deletion, each re-verified directly against HEAD (`:1145`, `:1417`,
+  `:1522-1525`, `:461-466`, `:481`, `Socks5InboundConfig`), not re-derived.
+- 015's reproducer: detached worktree `/tmp/iter6`,
+  `test resolve::hit_path_restamp_slides_the_ttl ... ok` (control assertion
+  expires), removed afterwards. 017 stays **code-proven only**: a run would need
+  a cold `crates/leas` binary-target build, and its shape is already pinned by
+  `unparseable_ip_entry_warns_not_errors` (`route_compile.rs:642`).
+- Next: `db-layer` (next unexplored).
