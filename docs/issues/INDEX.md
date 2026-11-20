@@ -34,6 +34,8 @@ Loop state: [STATE.md](STATE.md).
 | [022](022-dns-failure-mark-sweeps-the-whole-deferral-map.md) | Every DNS failure rescans the whole deferral map, so a burst pays O(F²) scans under the shard locks the dispatch path needs | low | theory | app-ops | `scheduler.rs:337-343`, `:425-433`, `enrich.rs:684-693` |
 | [023](023-sniffer-scroll-clamps-to-the-last-host-not-the-last-page.md) | The Sniffer's scroll clamps to the last *host* rather than the last *page*, so `End` leaves a one-row table in a full-height pane | low | theory | ui-render | `sniffer.rs:41-44`, `:255-272`, `:232` |
 | [024](024-sniffer-table-builds-every-host-row-per-frame.md) | The Sniffer builds a `Row` for every host on every draw while the widget paints ~20, re-paying 6,000 allocations per frame at the 1000-host cap | low | theory | ui-render | `sniffer.rs:202-215`, `telemetry.rs:196-198` |
+| [025](025-finished-mac-compared-out-of-constant-time.md) | The handshake `Finished` MACs are compared with `!=`, not in constant time, while every other secret-keyed tag comparison in the crate is constant-time | low | theory | tls-security | `handshake/mod.rs:602`, `tls12.rs:531`, `verify/mod.rs:147` |
+| [026](026-servers-key-share-group-is-never-checked-against-the-hello.md) | The client accepts a ServerHello key-share group it never offered, and never checks it against the HelloRetryRequest's `selected_group` — a hybrid hello can be completed classically | low | theory | tls-security | `handshake/mod.rs:1079-1112`, `:247-262`, `:390-395`, `:825-837` |
 
 ## Cross-references
 
@@ -118,6 +120,16 @@ Loop state: [STATE.md](STATE.md).
   path" shape, one layer apart: 022 rescans the deferral map per failure, 024
   rebuilds every host row per draw.
 
+- **025 ↔ 026:** one server-authentication surface, two omissions: 025 is a
+  comparison the code makes the wrong way, 026 the check it never makes
+  (§4.2.8's two group rules). Both sit in code that already has the right
+  pattern one branch over.
+- **025 → 008:** the same "a credential is treated as ordinary bytes" gap,
+  one layer apart — 008 is the buffer that keeps a key unwiped, 025 the
+  comparison that leaks it.
+- **026 → 010:** the same shape as an input the code computed then ignored:
+  there the ALPN-derived HTTP version, here the offered `key_share` list.
+
 ## Domain coverage
 
 | Domain | Status | Last iteration |
@@ -131,4 +143,4 @@ Loop state: [STATE.md](STATE.md).
 | db-layer | in-progress | 7 |
 | app-ops | in-progress | 8 |
 | ui-render | in-progress | 9 |
-| tls-security | unexplored | — |
+| tls-security | in-progress | 10 |

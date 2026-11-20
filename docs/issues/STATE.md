@@ -2,7 +2,7 @@
 
 ```yaml
 loop:
-  iteration: 9
+  iteration: 10
   status: running
   noop_streak: 0
 coverage:
@@ -43,8 +43,9 @@ coverage:
     last_touched_iteration: 9
     issues: [023, 024]
   - domain: tls-security
-    status: unexplored
-    issues: []
+    status: in-progress
+    last_touched_iteration: 10
+    issues: [025, 026]
 blocked: []
 ```
 
@@ -642,3 +643,136 @@ blocked: []
   first round cited (the ratatui widget source for 1-4, `sniffer.rs` for 5,
   `ops/profiles.rs:226` + `ui/profiles.rs:1276/1285` for 8).
 - Next: `tls-security` (last unexplored).
+
+### Iteration 10 — tls-security
+- Selected: the last `unexplored` domain. Scope: `crates/leas-tls` (verify
+  tiers, record layer, REALITY/ECH, hello/extension parsing) with the
+  `crates/leas-native/transport/tls*` seams.
+- Dirty worktree untouched (35 user paths, unchanged since iteration 9);
+  all reads at HEAD in a detached `/tmp/iter10`.
+- Prior-work check: `rg 'tls-security|leas-tls|tls13' docs/issues/` → only the
+  coverage row and the "Next:" line; no issue had ever cited a `leas-tls` file.
+- Filed (both `theory`, both read-proven from HEAD):
+  - **025** `025-finished-mac-compared-out-of-constant-time.md` (low): the
+    server `Finished` MAC is compared with slice `!=` in both drivers
+    (`handshake/mod.rs:602`, `handshake/tls12.rs:531`) and the SPKI pin digest
+    at `verify/mod.rs:147`, while the crate's own standard is `subtle::ct_eq`
+    (`reality/verify.rs:77-78` + `Cargo.toml:22-24`, `dnscrypt.rs:230`) and the
+    ECH confirmation is hand-written branchless (`handshake/mod.rs:434-443`).
+    Hardening, NOT an exploitable oracle: round 1 killed the prefix-oracle
+    narrative (the record is AEAD-opened before the compare and the tag is
+    derived from the same secret, so the submitter already knows it). Filed at
+    low for the convention gap only; no reproducer and no test proposed, by the
+    review's own rule against source-text tests.
+  - **026** `026-servers-key-share-group-is-never-checked-against-the-hello.md`
+    (low): two RFC 8446 §4.2.8 rules are unenforced on the `ServerHello` path —
+    the client MUST compare the server's group with the `HelloRetryRequest`'s
+    `selected_group` (verbatim MUST + `illegal_parameter` abort in the RFC;
+    `hrr.selected_group` is consumed only by `retry.rebuild`, `:247-262`,
+    nothing compares it afterwards) and the `server_share` "MUST be in the same
+    group as the KeyShareEntry value offered" (the suite at `:394` and the
+    sigalg at `:557` are both re-derived from the hello actually sent; the
+    group is not, `:1079-1112`; `offered_share` `:825-837` has no caller outside
+    the retry rebuild, `:269`/`:275`). The retried case is a working downgrade:
+    `ClientHello2` carries only the hybrid entry (`retry_extensions`,
+    `:843-885`), whose body includes the client's X25519 public half
+    (`spec/mod.rs:165-168`), so a hostile server can answer `0x001D` and
+    complete classically — `:494-508` takes the `_` arm, `:643` records
+    `negotiated_hybrid = false`, and no PRODUCTION path surfaces that flag (the
+    e2e oracle asserts it, `leas-oracles/src/e2e/mod.rs:328`, `:429-444`).
+    Explicitly scoped: selecting the classical share when it WAS offered is
+    legal and is not the bug.
+- Checked and **not** filed:
+  - read-side per-key record limit: RFC 8446 §5.5 is a SHOULD on the sender
+    ("SHOULD do a key update prior to reaching these limits"), and a failed
+    decrypt kills the stream here, so there is no receiver obligation to
+    enforce; `should_update` (write-only, `record/stream.rs:63`, `:421-427`,
+    call `:945`) seals the KeyUpdate at `seq == limit`, inside the 2^24.5
+    margin. Not a defect.
+  - the flight reassembly is bounded (`MAX_FLIGHT_BUFFER` = `4 + 0xFF_FFFF`,
+    `handshake/mod.rs:176`, enforced at `flight.rs:148-152` and `tls12.rs:131`) and the RFC 8879 decompressor is capped at
+    1 MiB (`flight.rs:358-378`); the ECH parser uses `get(..)`/`checked` shapes
+    (`ech.rs:75-140`) and the REALITY DER walker bounds every `pos + len`
+    (`read_tlv`, `reality/verify.rs:353-390`); no panic path found on peer input.
+  - ECH inner hellos are padded to 32-byte units (`seal_inner` →
+    `pad_inner`, `ech.rs:192-233`) and a rejected ECH is a hard error, never a
+    plain-SNI fallback (`handshake/mod.rs:434-457`); a malformed `ech=` value
+    is refused by name at capability checking and never dialed
+    (`capability.rs:173-174` → `security_reason`, which `ops/ping.rs:361` and
+    `ops/connect.rs:174` turn into the marker text — NOT a `config_invalid`
+    purge verdict; corrected in round 1).
+  - the `insecure` flag defaults to false where it is read
+    (`security/mod.rs:96`, `opts.insecure.unwrap_or(false)`); `verifier_for`
+    only forwards it (`fingerprint.rs:160-172`), and `WebPkiVerifier` itself
+    starts `insecure: false` (`verify/mod.rs:78`). The probe builds
+    `webpki_roots()` with no insecure fallback (`probe.rs:625`).
+  - `make_handshake_record`/`make_app_data_record` silently clamp a >64 KiB
+    length with `unwrap_or(u16::MAX)` (`record/mod.rs:195-222`) — real smell,
+    but `make_app_data_record` has no production caller and the handshake
+    builder only frames hand-sized messages; recorded here instead of an issue.
+  - `spider::run` issues bounded browser-shaped GETs to the peer that failed
+    REALITY auth (`reality/spider.rs:53-100`), which is xray's documented
+    `!Verified` behaviour, not a defect.
+- Reviewer (`ReviewIter10`, 7m9s): **needs-fix**, 7 findings — 2 substantive,
+  5 citation/mechanism drift. Dispositions:
+  1. **Accepted, and it reshaped 025.** The prefix-oracle narrative was
+     unreachable: the `Finished` record is AEAD-opened under the handshake
+     traffic key before the compare, and `finished_key` is expanded from that
+     same secret, so whoever submits a candidate tag already knows it. 025 is
+     now filed explicitly as hardening (convention gap), with a "no oracle is
+     reachable today" paragraph and the old Lucky13 parallel removed.
+  2. **Accepted, and it reshaped 026.** The quoted "server MUST select a group
+     from `key_share`" is not RFC text. Re-read §4.2.8: the real rules are
+     "`server_share` … MUST be in the same group as the KeyShareEntry value
+     offered by the client" (server MUST) and, after an HRR, "the client MUST
+     verify that the selected NamedGroup in the ServerHello is the same as that
+     in the HelloRetryRequest … abort with an `illegal_parameter` alert" (an
+     explicit CLIENT MUST, and a stronger finding: `hrr.selected_group` is
+     consumed only by `retry.rebuild`). 026 now leads with the verbatim client
+     MUST and the retried-downgrade case; the "compliant client rejects"
+     overstatement is gone.
+  3. Coverage row `issues: []` → `[025, 026]` (fixed; the only row that
+     disagreed with its own iteration block).
+  4. "malformed `ech=` is `config_invalid` at ingestion" was wrong: the
+     capability gate refuses it by name (`capability.rs:173-174`) and the
+     consumers turn that into marker text (`ops/ping.rs:361`,
+     `ops/connect.rs:174`), not a purge verdict. Corrected.
+  5. `reality/verify.rs:10` → `:11` for the `subtle` import, and the snippet
+     header is `:76-78` (comment 76-77, `ct_eq` 78). Fixed in 025.
+  6. "`verifier_for` defaults `insecure` to false" mis-attributed the default:
+     it is `opts.insecure.unwrap_or(false)` at `security/mod.rs:96`; the helper
+     only forwards it. Corrected.
+  7. "nobody surfaces `negotiated_hybrid`" was absolute: the e2e oracle reads it
+     (`leas-oracles/src/e2e/mod.rs:328`, `:429-444`). Narrowed to "no production
+     path surfaces it".
+- Second reviewer round not run: each fix was re-derived from the files the
+  first round cited (RFC 8446 §4.2.8 text, `handshake/mod.rs` helper lines,
+  `capability.rs`, `security/mod.rs`, the oracle). 025's *mechanism* changed
+  (exploit → hardening), which is the one place a second round would have been
+  justified; the new text only drops claims, it adds none.
+- Reviewer round 2 (`ReviewIter10b`, 5m42s): **needs-fix**, 4 findings — all in
+  the two fix sketches plus one absolute in a title. Round-1 items 1-7 verified
+  gone against HEAD. Dispositions (all applied):
+  1. 025's title claimed "every other secret-keyed tag uses `ct_eq`", which its
+     own body contradicts (the ECH check is a branchless fold, constant-time but
+     not `ct_eq`). Title and INDEX row now say "every other secret-keyed tag
+     comparison is constant-time".
+  2. 025's `tags_equal` sketch was a private `fn` used from two modules — it
+     cannot compile as written. Now `pub(crate)` in `crypto/mod.rs` (the
+     AEAD/KDF home both modules already read) with the reachability reason
+     stated.
+  3. 026 said §4.2.8 defines "exactly two server obligations"; the paragraph
+     also carries `supported_groups`, `psk_ke` and "exactly one entry" rules.
+     Reworded to "several … two of them are the ones this engine does not
+     enforce", with the rest declared out of scope.
+  4. 026's sketch called `ensure_offered_share` unconditionally in the
+     version-generic block that also dispatches TLS 1.2 (`sh.suite12` is read
+     two lines up), so it would reject every legitimate 1.2 reply. The recorded
+     group is now `Option<u16>` and both checks are guarded on `Some`.
+- Third round not run: the four fixes are the reviewer's own wording (title,
+  visibility, enumeration, guard) applied at the exact lines it named; no claim
+  changed shape. State of the slate: 025 hardening / 026 two §4.2.8 group
+  rules, both `low` + `theory`.
+- Next: commit, then convergence check — no `unexplored` domain remains
+  (10 of 10 in-progress), so the next iteration is the first that must pick by
+  "oldest in-progress".
