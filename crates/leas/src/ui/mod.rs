@@ -1,5 +1,6 @@
 pub mod add_server;
 pub mod details;
+pub mod dns;
 pub mod export;
 pub mod logs;
 pub mod metrics;
@@ -174,6 +175,7 @@ pub fn confirmation_text(state: &AppState) -> Option<String> {
             format!(" Delete {} profiles? (y/N) ", ids.len())
         }
         Some(crate::ConfirmAction::DeleteGroup(_)) => " Delete group? (y/N) ".to_string(),
+        Some(crate::ConfirmAction::DeleteDnsSource(_)) => " Delete DNS source? (y/N) ".to_string(),
         Some(crate::ConfirmAction::ClearGroup(group_id)) => {
             let group_name = state
                 .groups
@@ -619,6 +621,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             KeyCode::Char('y') | KeyCode::Enter => match state.confirmation.take() {
                 Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(id).await,
                 Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id).await,
+                Some(ConfirmAction::DeleteDnsSource(id)) => {
+                    crate::ops::dns::delete_source(state, &id).await;
+                }
                 Some(ConfirmAction::DeleteProfiles(ids)) => {
                     for id in &ids {
                         state.delete_profile(*id).await;
@@ -1285,6 +1290,47 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('2') => {
             state.focused_pane = crate::FocusedPane::Pane2;
         }
+        // DNS tab (pane 1): tab-scoped, so `t`/`s`/Space do not collide with
+        // the Profiles actions below.
+        KeyCode::Char('t')
+            if matches!(state.pane1_tab, crate::Pane1Tab::Dns)
+                && matches!(state.focused_pane, crate::FocusedPane::Pane1)
+                && matches!(state.mode, crate::AppMode::List) =>
+        {
+            job_scheduler::enqueue(
+                state,
+                TaskSpec {
+                    kind: TaskKind::DnsTest,
+                    scope: PlanScope::All,
+                    endpoint: None,
+                    label: "Test DNS Resolvers".to_string(),
+                },
+            );
+        }
+        KeyCode::Char('s')
+            if matches!(state.pane1_tab, crate::Pane1Tab::Dns)
+                && matches!(state.focused_pane, crate::FocusedPane::Pane1)
+                && matches!(state.mode, crate::AppMode::List) =>
+        {
+            crate::ops::dns::reload(state).await;
+        }
+        KeyCode::Char(' ')
+            if matches!(state.pane1_tab, crate::Pane1Tab::Dns)
+                && matches!(state.focused_pane, crate::FocusedPane::Pane1)
+                && matches!(state.mode, crate::AppMode::List) =>
+        {
+            if let Some(row) = state.dns_resolvers.get(state.dns_selected) {
+                let stamp = row.stamp.clone();
+                crate::ops::dns::toggle_resolver(state, &stamp).await;
+            }
+        }
+        KeyCode::Up | KeyCode::Down
+            if matches!(state.pane1_tab, crate::Pane1Tab::Dns)
+                && matches!(state.focused_pane, crate::FocusedPane::Pane1)
+                && matches!(state.mode, crate::AppMode::List) =>
+        {
+            crate::ui::dns::handle_key(state, key);
+        }
         KeyCode::Char('[') => match state.focused_pane {
             crate::FocusedPane::Pane1 => {
                 state.pane1_tab = state.pane1_tab.prev();
@@ -1581,6 +1627,7 @@ fn render_pane1(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState
     match state.pane1_tab {
         crate::Pane1Tab::Profiles => profiles::render(frame, area, state),
         crate::Pane1Tab::Sniffer => sniffer::render(frame, area, state),
+        crate::Pane1Tab::Dns => dns::render(frame, area, state),
         crate::Pane1Tab::Sources => sources::render(frame, area, state),
         crate::Pane1Tab::Logs => logs::render_inner(frame, area, state),
     }
@@ -1920,6 +1967,7 @@ fn render(frame: &mut Frame, state: &AppState) {
             "Sniffer",
             matches!(state.pane1_tab, crate::Pane1Tab::Sniffer),
         ),
+        ("DNS", matches!(state.pane1_tab, crate::Pane1Tab::Dns)),
         (
             "Sources",
             matches!(state.pane1_tab, crate::Pane1Tab::Sources),
@@ -2047,10 +2095,18 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
                 ],
+                crate::Pane1Tab::Dns => vec![
+                    ("↑↓", "Navigate resolvers"),
+                    ("t", "Test every resolver"),
+                    ("s", "Re-apply the fastest pool"),
+                    ("Space", "Enable/disable the selected resolver"),
+                    ("[ / ]", "Cycle the focused pane's tabs"),
+                ],
                 crate::Pane1Tab::Sources => vec![
                     ("↑↓", "Navigate sources"),
                     ("Space", "Toggle the selected group"),
-                    ("a", "Add a group"),
+                    ("a", "Add a subscription group"),
+                    ("A", "Add a DNS source"),
                     ("e", "Edit the selected group"),
                     ("d", "Delete selected group(s)"),
                     ("u", "Update every group"),

@@ -225,8 +225,12 @@ fn build_hints(state: &AppState) -> Cow<'static, str> {
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Sniffer) => {
                     " [↑↓] Scroll  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit ".into()
                 }
+                (crate::FocusedPane::Pane1, crate::Pane1Tab::Dns) => {
+                    " [t] Test  [s] Apply pool  [Space] Enable  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                        .into()
+                }
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Sources) => {
-                    " [a] Add  [e] Edit  [d] Delete  [u] Update  [Space] Select  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
+                    " [a] Add  [A] Add DNS  [e] Edit  [d] Delete  [u] Update  [Space] Select  [Tab] Pane  [?] Help  [q/Ctrl+C] Quit "
                         .into()
                 }
                 (crate::FocusedPane::Pane1, crate::Pane1Tab::Logs) => {

@@ -73,6 +73,10 @@ pub const STEPS: &[Step] = &[
         version: 22,
         kind: StepKind::Sql(crate::schema::ddl::V22_STAGE_CAUSE),
     },
+    Step {
+        version: 23,
+        kind: StepKind::Sql(crate::schema::ddl::V23_DNS_SOURCES),
+    },
 ];
 
 /// The steps a cursor at `cursor` must apply, in order.
@@ -126,20 +130,21 @@ mod tests {
 
     #[test]
     fn a_cursor_below_the_first_step_gets_it() {
-        let steps = steps_after(18).expect("the v19..v22 steps");
-        assert_eq!(steps.len(), 4);
+        let steps = steps_after(18).expect("the v19..v23 steps");
+        assert_eq!(steps.len(), 5);
         assert_eq!(steps[0].version, 19);
         assert_eq!(steps[1].version, 20);
         assert_eq!(steps[2].version, 21);
         assert_eq!(steps[3].version, 22);
+        assert_eq!(steps[4].version, 23);
     }
 
     /// The migration this change depends on: a v20 database gets exactly the
     /// credential-purge rebuild, and nothing else.
     #[test]
     fn a_v20_cursor_gets_the_credential_purge_then_the_pair() {
-        let steps = steps_after(20).expect("the v21 and v22 steps");
-        assert_eq!(steps.len(), 2);
+        let steps = steps_after(20).expect("the v21..v23 steps");
+        assert_eq!(steps.len(), 3);
         assert_eq!(steps[0].version, 21);
         assert_eq!(steps[1].version, 22);
         assert!(matches!(
@@ -153,8 +158,8 @@ mod tests {
     /// A v19 database gets the ruleset ALTER first, then the purge rebuild.
     #[test]
     fn a_v19_cursor_gets_the_ruleset_and_purge_steps() {
-        let steps = steps_after(19).expect("the v20, v21 and v22 steps");
-        assert_eq!(steps.len(), 3);
+        let steps = steps_after(19).expect("the v20..v23 steps");
+        assert_eq!(steps.len(), 4);
         assert_eq!(steps[0].version, 20);
         assert_eq!(steps[1].version, 21);
         assert_eq!(steps[2].version, 22);
@@ -174,19 +179,20 @@ mod tests {
 
     #[test]
     fn the_version_after_a_step_is_that_step() {
-        assert_eq!(version_after(18), 22);
-        assert_eq!(version_after(19), 22);
-        assert_eq!(version_after(20), 22);
-        assert_eq!(version_after(21), 22);
-        assert_eq!(version_after(22), 22);
+        assert_eq!(version_after(18), 23);
+        assert_eq!(version_after(19), 23);
+        assert_eq!(version_after(20), 23);
+        assert_eq!(version_after(21), 23);
+        assert_eq!(version_after(22), 23);
+        assert_eq!(version_after(23), 23);
     }
 
     /// The pair's migration: a v21 database gets exactly the stage/cause
     /// rebuild — two nullable columns, the pair CHECK, and no other table.
     #[test]
     fn a_v21_cursor_gets_only_the_stage_cause_step() {
-        let steps = steps_after(21).expect("the v22 step");
-        assert_eq!(steps.len(), 1);
+        let steps = steps_after(21).expect("the v22 and v23 steps");
+        assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].version, 22);
         assert!(matches!(
             steps[0].kind,
@@ -194,6 +200,23 @@ mod tests {
                 if statements.iter().any(|s| s.contains("\"error_stage\" TEXT"))
                     && statements.iter().any(|s| s.contains("error_stage\" IS NULL"))
                     && statements.iter().any(|s| s.contains("INSERT INTO profile_stats_v22"))
+        ));
+    }
+
+    /// The DNS step: a v22 database gets exactly the three tables and the two
+    /// nullable pool knobs — no rebuild of any existing table.
+    #[test]
+    fn a_v22_cursor_gets_only_the_dns_step() {
+        let steps = steps_after(22).expect("the v23 step");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].version, 23);
+        assert!(matches!(
+            steps[0].kind,
+            StepKind::Sql(statements)
+                if statements.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS dns_sources"))
+                    && statements.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS dns_resolvers"))
+                    && statements.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS dns_source_resolvers"))
+                    && !statements.iter().any(|s| s.contains("DROP TABLE"))
         ));
     }
 }

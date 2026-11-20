@@ -211,6 +211,35 @@ pub const V22_STAGE_CAUSE: &[&str] = &[
     "CREATE INDEX \"index_profile_stats_by_last_seen_at\" ON \"profile_stats\" (\"last_seen_at\")",
 ];
 
+/// v23: DNS sources, resolvers, links, and the pool knobs (spec
+/// `2026-11-20-dns-resolvers`, D14).
+///
+/// Additive: three tables and two nullable `dns_settings` columns. The cursor
+/// gates the step; the indexes live in [`V23_DNS_INDEXES`] because
+/// `push_schema` does not emit a composite/unique index for a non-key field.
+pub const V23_DNS_SOURCES: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS dns_sources (\"id\" TEXT NOT NULL PRIMARY KEY, \"name\" TEXT, \"url\" TEXT NOT NULL, \"enabled\" BOOLEAN NOT NULL, \"user_agent\" TEXT, \"sort_order\" INTEGER, \"last_refreshed\" BIGINT, \"status\" TEXT, \"error_message\" TEXT, \"refresh_interval\" BIGINT)",
+    "CREATE TABLE IF NOT EXISTS dns_resolvers (\"stamp\" TEXT NOT NULL PRIMARY KEY, \"protocol\" TEXT NOT NULL, \"host\" TEXT NOT NULL, \"port\" BIGINT NOT NULL, \"latency_ms\" BIGINT, \"status\" TEXT NOT NULL, \"error\" TEXT, \"checked_at\" BIGINT, \"enabled\" BOOLEAN NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS dns_source_resolvers (\"source_id\" TEXT NOT NULL, \"stamp\" TEXT NOT NULL, PRIMARY KEY (\"source_id\", \"stamp\"))",
+];
+
+/// The two `dns_settings` columns, added through `ensure_raw_ddl`'s
+/// duplicate-column tolerance (the `STAB_ADD_COLUMNS` rule): a file stamped
+/// older that already carries them (a test fixture, or a half-applied open)
+/// must not fail the migration.
+pub const V23_DNS_ADD_COLUMNS: &[&str] = &[
+    "ALTER TABLE dns_settings ADD COLUMN \"resolver_pool_size\" BIGINT",
+    "ALTER TABLE dns_settings ADD COLUMN \"resolver_test_domain\" TEXT",
+];
+
+/// Indexes v23 needs on both a migrated and a fresh file. Idempotent; run by
+/// `ensure_raw_ddl` after every migrate (and on every open).
+pub const V23_DNS_INDEXES: &[&str] = &[
+    "CREATE UNIQUE INDEX IF NOT EXISTS \"index_dns_sources_by_url\" ON \"dns_sources\" (\"url\")",
+    "CREATE INDEX IF NOT EXISTS \"index_dns_resolvers_pool\" ON \"dns_resolvers\" (\"enabled\", \"status\", \"latency_ms\")",
+    "CREATE INDEX IF NOT EXISTS \"index_dns_source_resolvers_by_stamp\" ON \"dns_source_resolvers\" (\"stamp\")",
+];
+
 /// The stage × cause pair invariant for a FRESH database.
 ///
 /// A migrated file gets it from [`V22_STAGE_CAUSE`]'s table CHECK; `push_schema`

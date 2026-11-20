@@ -170,18 +170,26 @@ impl NativeActivityLog {
 pub enum Pane1Tab {
     Profiles,
     Sniffer,
+    Dns,
     Sources,
     Logs,
 }
 
 impl Pane1Tab {
-    pub const ALL: &'static [Self] = &[Self::Profiles, Self::Sniffer, Self::Sources, Self::Logs];
+    pub const ALL: &'static [Self] = &[
+        Self::Profiles,
+        Self::Sniffer,
+        Self::Dns,
+        Self::Sources,
+        Self::Logs,
+    ];
 
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
             Self::Profiles => Self::Sniffer,
-            Self::Sniffer => Self::Sources,
+            Self::Sniffer => Self::Dns,
+            Self::Dns => Self::Sources,
             Self::Sources => Self::Logs,
             Self::Logs => Self::Profiles,
         }
@@ -192,7 +200,8 @@ impl Pane1Tab {
         match self {
             Self::Profiles => Self::Logs,
             Self::Sniffer => Self::Profiles,
-            Self::Sources => Self::Sniffer,
+            Self::Dns => Self::Sniffer,
+            Self::Sources => Self::Dns,
             Self::Logs => Self::Sources,
         }
     }
@@ -470,6 +479,16 @@ pub struct EndpointInfo {
     pub resolved_at_secs: Option<i64>,
 }
 
+/// Which Source form the Sources tab opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceFormKind {
+    /// A proxy subscription group (`groups`).
+    #[default]
+    Subscription,
+    /// A DNS resolver list (`dns_sources`).
+    Dns,
+}
+
 /// Tracks what the UI is currently showing.
 #[derive(Debug, Clone)]
 pub enum AppMode {
@@ -507,9 +526,11 @@ pub enum AppMode {
         input: String,
         error: Option<String>,
     },
-    /// Add/edit a subscription group (Sources tab). None = adding.
+    /// Add/edit a source (Sources tab). None = adding. `kind` selects the
+    /// proxy-subscription or the DNS-resolver form behind the same renderer.
     GroupForm {
         group_id: Option<String>,
+        kind: SourceFormKind,
         fields: Vec<(String, String)>,
         focus_index: usize,
         form_errors: HashMap<String, String>,
@@ -570,6 +591,12 @@ pub enum CoreEvent {
     SysStatsUpdate(grpc_client::SysStats),
     /// A per-connection trace event from the in-process native core.
     NativeTrace(TraceEvent),
+    /// A DNS source refresh or resolver test wrote new rows; reload the
+    /// sources/resolvers and reinstall the pool.
+    DnsChanged,
+    /// The DNS latency test finished (or was stopped): clear the meters and
+    /// let the job scheduler advance.
+    DnsTestDone,
     /// One per-host accounting snapshot from the in-process native core
     /// (emitted once a second for the Sniffer pane). Boxed: the inline
     /// `SmallVec` would otherwise dominate every `CoreEvent`.
@@ -756,6 +783,7 @@ pub enum ConfirmAction {
     DeleteProfile(i64),
     DeleteProfiles(Vec<i64>),
     DeleteGroup(String),
+    DeleteDnsSource(String),
     ClearGroup(String),
     ClearLogs,
     PurgeLogsDatabase,
@@ -904,12 +932,14 @@ mod tests {
 
     #[test]
     fn tabs_cycle_through_the_sniffer() {
-        // The Sources tab sits between Sniffer and Logs (spec §1).
+        // DNS sits between Sniffer and Sources; Sources between DNS and Logs
+        // (spec §1, 2026-11-20-dns-resolvers).
         assert_eq!(Pane1Tab::Profiles.next(), Pane1Tab::Sniffer);
-        assert_eq!(Pane1Tab::Sniffer.next(), Pane1Tab::Sources);
+        assert_eq!(Pane1Tab::Sniffer.next(), Pane1Tab::Dns);
+        assert_eq!(Pane1Tab::Dns.next(), Pane1Tab::Sources);
         assert_eq!(Pane1Tab::Sources.next(), Pane1Tab::Logs);
         assert_eq!(Pane1Tab::Logs.next(), Pane1Tab::Profiles);
         assert_eq!(Pane1Tab::Profiles.prev(), Pane1Tab::Logs);
-        assert_eq!(Pane1Tab::ALL.len(), 4);
+        assert_eq!(Pane1Tab::ALL.len(), 5);
     }
 }

@@ -55,7 +55,10 @@ for the tables, and `schema/ddl.rs` owns everything toasty cannot express.
 | `endpoint_groups` | model | membership link |
 | `groups` | model | subscription |
 | `routing_rules` | model | routing table |
-| `dns_settings` | model | DNS configuration |
+| `dns_settings` | model | DNS configuration + pool knobs |
+| `dns_sources` | model | DNS resolver list sources (URL unique) |
+| `dns_resolvers` | model | resolvers, one row per exact stamp |
+| `dns_source_resolvers` | model | source → resolver link |
 | `route_probes` | model | must-resolve hostnames |
 | `app_meta` | model | key/value stamp (`psl_version`, `stability_seeded_v2`, `tg_watermark:<group>:<channel>`) |
 | `endpoint_rank` | model + raw columns | derived ordering keys |
@@ -308,7 +311,25 @@ which are `Vec<u16>`. `group_id` scopes a rule to a subscription's endpoints;
 `NULL` means global. `type` is an opaque integer carried for the form only.
 
 **`dns_settings`**: the DNS configuration rows (`servers` and `hosts` are JSON
-arrays; `cache_ttl_secs` is the TUI-side resolution cache TTL, `NULL` = 300).
+arrays; `cache_ttl_secs` is the TUI-side resolution cache TTL, `NULL` = 300;
+`resolver_pool_size` is how many measured resolvers the live pool keeps,
+`NULL` = 10; `resolver_test_domain` is the name the test queries, `NULL` =
+`www.google.com`).
+
+**`dns_sources` / `dns_resolvers` / `dns_source_resolvers`** (schema 23): a
+source is one `sdns://` list URL — `url` is `NOT NULL UNIQUE`, so the same list
+cannot be added twice. A resolver is unique by its exact stamp (the wire
+identity: key + address + path); two stamps for one endpoint are two rows and
+only the live one answers. The link table carries no measurement: a refresh
+inserts missing resolvers with `DO NOTHING` semantics, rewrites the source's
+links, and deletes a resolver only when its last link is gone — so re-importing
+never erases a latency and never forces a retest. The pool query is
+`enabled AND status='ok' AND latency_ms IS NOT NULL ORDER BY latency_ms, stamp
+LIMIT resolver_pool_size`, served by `index_dns_resolvers_pool`. The step also
+added the two `dns_settings` columns; the indexes live in
+`ddl::V23_DNS_INDEXES` because `push_schema` does not emit a composite or
+non-key unique index, and `migrate` now runs `ensure_raw_ddl` after a
+migration so both provenance paths converge.
 
 **`route_probes`**: a single row (`id = 'global'`) holding the hostnames the
 routing engine must resolve.

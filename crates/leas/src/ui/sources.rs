@@ -15,6 +15,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::{Column, ColumnWidth, DataTable, DataTableRow, DataTableState};
+use leas_db::models::GroupStatus;
+
 use crate::{AppMode, AppState};
 
 /// Group table columns, widest set first: `Name · Enabled · Status ·
@@ -24,6 +26,7 @@ fn columns_for(width: u16) -> Vec<Column<'static>> {
     // Name shares two tenths of the pane, clamped so a narrow table keeps at
     // least a usable name column.
     let mut cols = vec![
+        Column::new("Kind", ColumnWidth::Fixed(6)),
         Column::new(
             "Name",
             ColumnWidth::Fixed((width.saturating_sub(4) as usize * 2 / 10).clamp(8, 20) as u16),
@@ -59,6 +62,7 @@ fn columns_for(width: u16) -> Vec<Column<'static>> {
 /// plus the per-group endpoint count. Styles are precomputed where the theme
 /// is available (`render`); the [`DataTableRow`] impl only draws.
 struct SourceRow {
+    kind: String,
     name: String,
     enabled: String,
     status: String,
@@ -100,12 +104,13 @@ impl DataTableRow for SourceRow {
                 continue;
             }
             let (text, style) = match logical {
-                0 => (self.name.clone(), self.name_style),
-                1 => (format!("{enabled}{enabled_suffix}"), self.enabled_style),
-                2 => (self.status.clone(), self.status_style),
-                3 => (self.updated.clone(), self.updated_style),
-                4 => (self.endpoints.to_string(), self.name_style),
-                5 => (self.url.clone(), self.url_style),
+                0 => (self.kind.clone(), self.url_style),
+                1 => (self.name.clone(), self.name_style),
+                2 => (format!("{enabled}{enabled_suffix}"), self.enabled_style),
+                3 => (self.status.clone(), self.status_style),
+                4 => (self.updated.clone(), self.updated_style),
+                5 => (self.endpoints.to_string(), self.name_style),
+                6 => (self.url.clone(), self.url_style),
                 _ => (String::new(), self.name_style),
             };
             buf.set_stringn(
@@ -141,75 +146,122 @@ fn format_updated(last_refreshed: Option<i64>) -> String {
     )
 }
 
+struct SourceRowFields<'a> {
+    kind: &'static str,
+    name: String,
+    enabled: bool,
+    status_text: String,
+    updated: String,
+    endpoints: usize,
+    url: &'a str,
+    updating: bool,
+    width: u16,
+}
+
+fn build_row(theme: &opaline::Theme, selected: bool, f: SourceRowFields<'_>) -> SourceRow {
+    let base = if selected {
+        ThemeStyles::table_row_selected(theme)
+    } else {
+        ThemeStyles::table_row_normal(theme)
+    };
+    let url_width = usize::from(f.width.max(100).saturating_sub(60)).max(10);
+    let status_style = if f.status_text.starts_with("error") {
+        ThemeStyles::error(theme)
+    } else {
+        ThemeStyles::hint(theme)
+    };
+    SourceRow {
+        kind: f.kind.to_string(),
+        name: f.name,
+        enabled: if f.enabled { "true" } else { "false" }.to_string(),
+        status: f.status_text,
+        updated: f.updated,
+        endpoints: f.endpoints,
+        url: crate::ui::textfit::truncate(f.url, url_width),
+        updating: f.updating,
+        name_style: base,
+        enabled_style: if f.enabled {
+            ThemeStyles::success(theme)
+        } else {
+            ThemeStyles::hint(theme)
+        },
+        status_style,
+        updated_style: ThemeStyles::hint(theme),
+        url_style: ThemeStyles::hint(theme),
+    }
+}
+
+fn group_status_text(status: Option<GroupStatus>, error: Option<&str>) -> String {
+    let name = match status {
+        Some(GroupStatus::Ok) => "ok",
+        Some(GroupStatus::Error) => "error",
+        Some(GroupStatus::Never) | None => "never",
+    };
+    let reason = error
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map_or_default(|reason| crate::ui::textfit::truncate(reason, 60));
+    if name == "error" && !reason.is_empty() {
+        format!("error: {reason}")
+    } else {
+        name.to_string()
+    }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
-    let rows: Vec<SourceRow> = state
-        .groups
-        .iter()
-        .enumerate()
-        .map(|(i, g)| {
-            use leas_db::models::GroupStatus;
-            let status = match g.status {
-                Some(GroupStatus::Ok) => "ok",
-                Some(GroupStatus::Error) => "error",
-                Some(GroupStatus::Never) | None => "never",
-            };
-            let url = g.url.as_deref().unwrap_or("");
-            let url_display = crate::ui::textfit::truncate(
-                url,
-                usize::from(area.width.max(100).saturating_sub(60)).max(10),
-            );
-            // On an error, show WHY. The bare word "error" is what left the
-            // 2026-10-01 truncated import undiagnosable — the reason was in
-            // the activity log, which the user has to know to look in.
-            // `specs/2026-10-02-import-budget-design.md` §5.
-            //
-            // 60 here is only an upper bound: the Status column clips it (20
-            // cells, 40 on a wide pane), so the reason must LEAD with what the
-            // user can act on, and the full text stays in the activity log.
-            let error_reason = g
-                .error_message
-                .as_deref()
-                .map(str::trim)
-                .filter(|r| !r.is_empty())
-                .map_or_default(|r| crate::ui::textfit::truncate(r, 60));
-            let status_text = if status == "error" && !error_reason.is_empty() {
-                format!("error: {error_reason}")
-            } else {
-                status.to_string()
-            };
-            let endpoints = state.sources_counts.get(&g.id).copied().unwrap_or(0);
-            let masked = state.sources_selected_mask.get(i).copied().unwrap_or(false);
-            let selected = i == state.sources_selected || masked;
-            let base = if selected {
-                ThemeStyles::table_row_selected(theme)
-            } else {
-                ThemeStyles::table_row_normal(theme)
-            };
-            SourceRow {
-                name: g.name.clone().unwrap_or_else(|| "Unnamed".to_string()),
-                enabled: if g.enabled { "true" } else { "false" }.to_string(),
-                status: status_text,
-                updated: format_updated(g.last_refreshed),
-                endpoints,
-                url: url_display,
-                updating: state.updating_groups.contains(&g.id),
-                name_style: base,
-                enabled_style: if g.enabled {
-                    ThemeStyles::success(theme)
-                } else {
-                    ThemeStyles::hint(theme)
-                },
-                status_style: if status == "error" {
-                    ThemeStyles::error(theme)
-                } else {
-                    ThemeStyles::hint(theme)
-                },
-                updated_style: ThemeStyles::hint(theme),
-                url_style: ThemeStyles::hint(theme),
-            }
-        })
-        .collect();
+    let selected_index = state.sources_selected;
+    let mut rows: Vec<SourceRow> = Vec::with_capacity(state.groups.len() + state.dns_sources.len());
+    for (index, group) in state.groups.iter().enumerate() {
+        let selected = index == selected_index
+            || state
+                .sources_selected_mask
+                .get(index)
+                .copied()
+                .unwrap_or(false);
+        rows.push(build_row(
+            theme,
+            selected,
+            SourceRowFields {
+                kind: "proxy",
+                name: group.name.clone().unwrap_or_else(|| "Unnamed".to_string()),
+                enabled: group.enabled,
+                status_text: group_status_text(group.status, group.error_message.as_deref()),
+                updated: format_updated(group.last_refreshed),
+                endpoints: state.sources_counts.get(&group.id).copied().unwrap_or(0),
+                url: group.url.as_deref().unwrap_or(""),
+                updating: state.updating_groups.contains(&group.id),
+                width: area.width,
+            },
+        ));
+    }
+    for (offset, source) in state.dns_sources.iter().enumerate() {
+        let index = state.groups.len() + offset;
+        let selected = index == selected_index
+            || state
+                .sources_selected_mask
+                .get(index)
+                .copied()
+                .unwrap_or(false);
+        rows.push(build_row(
+            theme,
+            selected,
+            SourceRowFields {
+                kind: "dns",
+                name: source
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Unnamed DNS".to_string()),
+                enabled: source.enabled,
+                status_text: group_status_text(source.status, source.error_message.as_deref()),
+                updated: format_updated(source.last_refreshed),
+                endpoints: 0,
+                url: &source.url,
+                updating: false,
+                width: area.width,
+            },
+        ));
+    }
     let columns = columns_for(area.width);
     let table = DataTable::new(&columns, &rows)
         .highlight_style(ThemeStyles::table_row_selected(theme).add_modifier(Modifier::BOLD));
@@ -230,13 +282,16 @@ pub async fn enter_sources_if_selected(state: &mut AppState) {
         return;
     }
     state.sources_selected = 0;
-    state.sources_selected_mask = vec![false; state.groups.len()];
+    state.sources_selected_mask = vec![false; state.groups.len() + state.dns_sources.len()];
     crate::ops::subscriptions::reload_sources_counts(state).await;
 }
 
 pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
     let selected = state.sources_selected;
-    let max = state.groups.len().saturating_sub(1);
+    let group_count = state.groups.len();
+    let max = group_count
+        .saturating_add(state.dns_sources.len())
+        .saturating_sub(1);
     match key.code {
         KeyCode::Up => {
             state.sources_selected = selected.saturating_sub(1);
@@ -251,19 +306,22 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 *flag = !*flag;
             }
         }
-        KeyCode::Char('a' | 'A') => {
-            crate::ops::subscriptions::start_add_group(state);
-        }
+        // `a` adds a proxy subscription, `A` a DNS source: one form, two kinds.
+        KeyCode::Char('a') => crate::ops::subscriptions::start_add_group(state),
+        KeyCode::Char('A') => crate::ops::dns::start_add_source(state),
         KeyCode::Char('e' | 'E') => {
-            if let Some(group) = state.groups.get(selected) {
-                let group_id = group.id.clone();
-                crate::ops::subscriptions::start_edit_group(state, &group_id);
+            if selected < group_count {
+                if let Some(group) = state.groups.get(selected) {
+                    let group_id = group.id.clone();
+                    crate::ops::subscriptions::start_edit_group(state, &group_id);
+                }
+            } else if let Some(source) = state.dns_sources.get(selected - group_count) {
+                let source_id = source.id.clone();
+                crate::ops::dns::start_edit_source(state, &source_id);
             }
         }
         KeyCode::Char('d' | 'D') => {
-            // Masked rows win; otherwise the cursor row. The y/N overlay owns
-            // the confirmation (`ConfirmAction::DeleteGroup`); the modal is
-            // one at a time, so the first id queues.
+            // Masked groups win; otherwise the cursor row, whichever kind.
             let masked: Vec<String> = state
                 .sources_selected_mask
                 .iter()
@@ -271,24 +329,22 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 .filter(|&(_, m)| *m)
                 .filter_map(|(i, _)| state.groups.get(i).map(|g| g.id.clone()))
                 .collect();
-            let ids = if masked.is_empty() {
-                state
-                    .groups
-                    .get(selected)
-                    .map_or_default(|g| vec![g.id.clone()])
-            } else {
-                masked
-            };
-            if let Some(id) = ids.first() {
+            if let Some(id) = masked.first() {
                 state.confirmation = Some(crate::ConfirmAction::DeleteGroup(id.clone()));
+            } else if selected < group_count {
+                if let Some(group) = state.groups.get(selected) {
+                    state.confirmation = Some(crate::ConfirmAction::DeleteGroup(group.id.clone()));
+                }
+            } else if let Some(source) = state.dns_sources.get(selected - group_count) {
+                state.confirmation = Some(crate::ConfirmAction::DeleteDnsSource(source.id.clone()));
             }
         }
         KeyCode::Char('u' | 'U') => {
             crate::ops::subscriptions::update_all_subscriptions(state);
+            crate::ops::dns::refresh_all(state);
         }
         _ => {}
     }
-    let _ = KeyModifiers::NONE;
 }
 
 /// Full-screen group form (add/edit): one row per field, `›` focus marker,
@@ -304,6 +360,7 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.theme();
     let AppMode::GroupForm {
         group_id,
+        kind,
         fields,
         focus_index,
         ..
@@ -311,9 +368,11 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState) {
     else {
         return;
     };
-    let title = match group_id {
-        Some(_) => " Edit Source ",
-        None => " Add Source ",
+    let title = match (kind, group_id) {
+        (crate::types::SourceFormKind::Dns, Some(_)) => " Edit DNS Source ",
+        (crate::types::SourceFormKind::Dns, None) => " Add DNS Source ",
+        (crate::types::SourceFormKind::Subscription, Some(_)) => " Edit Source ",
+        (crate::types::SourceFormKind::Subscription, None) => " Add Source ",
     };
     let block = Block::default()
         .title(title)
@@ -443,24 +502,24 @@ mod tests {
     #[test]
     fn sources_columns_shed_by_width_thresholds() {
         let count = |w: u16| columns_for(w).len();
-        assert_eq!(count(120), 6);
-        assert_eq!(count(100), 6);
-        assert_eq!(count(99), 5, "URL sheds first");
-        assert_eq!(count(80), 5);
-        assert_eq!(count(79), 4, "Endpoints sheds second");
-        assert_eq!(count(64), 4);
-        assert_eq!(count(63), 3, "Updated sheds third");
-        assert_eq!(count(52), 3);
-        assert_eq!(count(51), 2, "Status sheds fourth");
-        assert_eq!(count(40), 2, "Name and Enabled always stay");
+        assert_eq!(count(120), 7);
+        assert_eq!(count(100), 7);
+        assert_eq!(count(99), 6, "URL sheds first");
+        assert_eq!(count(80), 6);
+        assert_eq!(count(79), 5, "Endpoints sheds second");
+        assert_eq!(count(64), 5);
+        assert_eq!(count(63), 4, "Updated sheds third");
+        assert_eq!(count(52), 4);
+        assert_eq!(count(51), 3, "Status sheds fourth");
+        assert_eq!(count(40), 3, "Kind, Name and Enabled always stay");
     }
 
-    /// The new tab is part of the cycle, between Sniffer and Logs.
+    /// The tab is part of the cycle, between DNS and Logs.
     #[test]
-    fn sources_sits_between_sniffer_and_logs() {
-        assert_eq!(Pane1Tab::Sniffer.next(), Pane1Tab::Sources);
+    fn sources_sits_between_dns_and_logs() {
+        assert_eq!(Pane1Tab::Dns.next(), Pane1Tab::Sources);
         assert_eq!(Pane1Tab::Sources.next(), Pane1Tab::Logs);
-        assert_eq!(Pane1Tab::Sources.prev(), Pane1Tab::Sniffer);
+        assert_eq!(Pane1Tab::Sources.prev(), Pane1Tab::Dns);
         assert_eq!(Pane1Tab::Logs.prev(), Pane1Tab::Sources);
     }
 }
@@ -497,7 +556,7 @@ mod flow_tests {
         }
         state.reload_groups().await;
         state.pane1_tab = Pane1Tab::Sources;
-        state.sources_selected_mask = vec![false; state.groups.len()];
+        state.sources_selected_mask = vec![false; state.groups.len() + state.dns_sources.len()];
         (dir, state)
     }
 

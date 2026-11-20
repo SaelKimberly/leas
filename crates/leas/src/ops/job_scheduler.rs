@@ -41,6 +41,8 @@ pub enum TaskKind {
     FillExitIps,
     /// `Retry Failed DNS Lookups`.
     DnsRetry,
+    /// `Test DNS Resolvers`: measure every listed resolver.
+    DnsTest,
     /// `Compact Duplicate Endpoints`.
     Compact,
     /// `Fast Test (Selected)` over a MULTI-selection — every link of the
@@ -226,7 +228,8 @@ fn started(state: &AppState, spec: &TaskSpec, testing_before: usize) -> bool {
         | TaskKind::MultiFastTest
         | TaskKind::MultiRealTest
         | TaskKind::RealTestPurgatory
-        | TaskKind::SpeedTestBatch => state.batch_progress.is_some(),
+        | TaskKind::SpeedTestBatch
+        | TaskKind::DnsTest => state.batch_progress.is_some(),
         TaskKind::SpeedTest | TaskKind::UdpTest => {
             // A Selected speed/UDP task with no endpoint cannot start.
             spec.endpoint.is_some()
@@ -241,7 +244,12 @@ async fn scope_is_empty(state: &AppState, spec: &TaskSpec) -> bool {
     // The Selected variants and the non-probe jobs have no plan scope to go
     // stale: a selected endpoint is a concrete target, and Compact/DNS-retry
     // derive their own work from the table.
-    if spec.endpoint.is_some() || matches!(spec.kind, TaskKind::DnsRetry | TaskKind::Compact) {
+    if spec.endpoint.is_some()
+        || matches!(
+            spec.kind,
+            TaskKind::DnsRetry | TaskKind::Compact | TaskKind::DnsTest
+        )
+    {
         return false;
     }
     // The Purgatory sweep's target is the tab's band, not a `PlanScope`
@@ -298,6 +306,7 @@ fn dispatch(state: &mut AppState, spec: &TaskSpec) {
         }
         TaskKind::FillExitIps => state.start_fill_exit_ips(spec.scope),
         TaskKind::DnsRetry => state.retry_failed_dns(),
+        TaskKind::DnsTest => crate::ops::dns::start_test(state),
         TaskKind::Compact => state.compact_duplicate_endpoints(),
         TaskKind::MultiFastTest => state.start_endpoint_batch_ping(),
         TaskKind::MultiRealTest => state.start_endpoint_batch_real_ping(),
@@ -316,6 +325,7 @@ pub enum TerminalEvent {
     BatchEnded,
     CompactFinished,
     MaintenanceDone,
+    DnsTestDone,
 }
 
 /// The task kinds each terminal event can end.
@@ -334,6 +344,7 @@ const fn expected_kinds(event: TerminalEvent) -> &'static [TaskKind] {
         ],
         TerminalEvent::CompactFinished => &[TaskKind::Compact],
         TerminalEvent::MaintenanceDone => &[TaskKind::DnsRetry],
+        TerminalEvent::DnsTestDone => &[TaskKind::DnsTest],
     }
 }
 

@@ -2,6 +2,7 @@ pub mod clipboard;
 pub mod compact;
 pub mod connect;
 pub mod db_monitor;
+pub mod dns;
 pub mod enrich;
 pub mod events;
 pub mod export;

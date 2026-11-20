@@ -27,6 +27,7 @@ pub fn start_add_group(state: &mut AppState) {
     ];
     state.mode = crate::AppMode::GroupForm {
         group_id: None,
+        kind: crate::types::SourceFormKind::Subscription,
         fields,
         focus_index: 0,
         form_errors: HashMap::new(),
@@ -57,6 +58,7 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
     ];
     state.mode = crate::AppMode::GroupForm {
         group_id: Some(group_id.into()),
+        kind: crate::types::SourceFormKind::Subscription,
         fields,
         focus_index: 0,
         form_errors: HashMap::new(),
@@ -64,6 +66,16 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
 }
 
 pub async fn confirm_add_group(state: &mut AppState) {
+    if matches!(
+        &state.mode,
+        crate::AppMode::GroupForm {
+            kind: crate::types::SourceFormKind::Dns,
+            ..
+        }
+    ) {
+        crate::ops::dns::confirm_add_source(state).await;
+        return;
+    }
     let fields = match &state.mode {
         crate::AppMode::GroupForm { fields, .. } => fields.clone(),
         _ => return,
@@ -104,6 +116,16 @@ pub async fn confirm_add_group(state: &mut AppState) {
     state.mode = crate::AppMode::List;
 }
 pub async fn confirm_edit_group(state: &mut AppState) {
+    if matches!(
+        &state.mode,
+        crate::AppMode::GroupForm {
+            kind: crate::types::SourceFormKind::Dns,
+            ..
+        }
+    ) {
+        crate::ops::dns::confirm_edit_source(state).await;
+        return;
+    }
     let (group_id_opt, fields) = match &state.mode {
         crate::AppMode::GroupForm {
             group_id, fields, ..

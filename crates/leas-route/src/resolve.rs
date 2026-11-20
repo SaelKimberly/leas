@@ -279,7 +279,7 @@ mod tests {
 #[tokio::test]
 async fn dns_adapter_ip_literal_passthrough() {
     let adapter = crate::dns_adapter::DnsSinkAdapter {
-        resolver: std::sync::Arc::new(leas_dns::DnsResolver::new("/tmp")),
+        resolver: std::sync::Arc::new(leas_dns::DnsResolver::new()),
     };
     let ips = adapter.lookup_ip("127.0.0.1").await.unwrap();
     assert_eq!(ips, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);

@@ -371,6 +371,18 @@ const DNS_DEFS: &[FieldDef] = &[
         ftype: "Number",
         description: "TUI DNS cache TTL, empty = 300",
     },
+    FieldDef {
+        key: "resolver_pool_size",
+        label: "Resolver Pool Size",
+        ftype: "Number",
+        description: "Fastest resolvers used for lookups, empty = 10",
+    },
+    FieldDef {
+        key: "resolver_test_domain",
+        label: "Resolver Test Domain",
+        ftype: "Text",
+        description: "Name the DNS test queries, empty = www.google.com",
+    },
 ];
 
 const ROUTE_PROBES_DEFS: &[FieldDef] = &[FieldDef {
@@ -449,6 +461,15 @@ pub async fn build_settings_fields(
                     "cache_ttl_secs".into(),
                     dns.cache_ttl_secs
                         .map_or_else(String::new, |t| t.to_string()),
+                ),
+                (
+                    "resolver_pool_size".into(),
+                    dns.resolver_pool_size
+                        .map_or_else(String::new, |n| n.to_string()),
+                ),
+                (
+                    "resolver_test_domain".into(),
+                    dns.resolver_test_domain.clone().unwrap_or_default(),
                 ),
             ],
             _ => dns_fresh_fields(),
@@ -1060,6 +1081,8 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
         disable_fallback: get_str("disable_fallback") == "true",
         client_ip: get_opt("client_ip"),
         cache_ttl_secs: get_opt("cache_ttl_secs").and_then(|s| s.parse().ok()),
+        resolver_pool_size: get_opt("resolver_pool_size").and_then(|s| s.parse().ok()),
+        resolver_test_domain: get_opt("resolver_test_domain"),
     };
     let result: Result<(), String> = async {
         let mut conn = state.db.connection().await.map_err(|e| e.to_string())?;
@@ -1072,6 +1095,8 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
             .disable_fallback(dns.disable_fallback)
             .client_ip(dns.client_ip.clone())
             .cache_ttl_secs(dns.cache_ttl_secs)
+            .resolver_pool_size(dns.resolver_pool_size)
+            .resolver_test_domain(dns.resolver_test_domain.clone())
             .exec(&mut conn)
             .await
             .map_err(|e| e.to_string())?;
@@ -1084,6 +1109,9 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
             if let Some(ttl) = dns.cache_ttl_secs {
                 state.dns_cache_ttl_secs = ttl;
             }
+            // The pool knobs change the live resolver immediately; this also
+            // reinstalls the pool after a manual edit.
+            crate::ops::dns::apply_settings(state, Some(&dns)).await;
             state.log_trace("info", "tui::ops::settings", "DNS settings saved");
         }
         Err(e) => state.log_trace(

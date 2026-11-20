@@ -93,6 +93,19 @@ async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<()> {
     for statement in ddl::PAIR_GUARD {
         toasty::sql::query(*statement).exec(conn).await?;
     }
+    // v23 columns and indexes: `push_schema` does not emit the latter, and the
+    // step path cannot guess which file shape it is on. The columns are
+    // duplicate-tolerant like `STAB_ADD_COLUMNS`; everything is idempotent.
+    for alter in ddl::V23_DNS_ADD_COLUMNS {
+        if let Err(e) = toasty::sql::query(*alter).exec(conn).await {
+            if !e.to_string().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+    }
+    for statement in ddl::V23_DNS_INDEXES {
+        toasty::sql::query(*statement).exec(conn).await?;
+    }
     Ok(())
 }
 
@@ -184,6 +197,10 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
                 let steps = steps::steps_after(other);
                 if let Some(steps) = steps {
                     apply_steps(conn, steps).await?;
+                    // A migrated file must converge on the same idempotent raw
+                    // DDL a current/fresh file gets — the step path used to
+                    // skip it, which left new indexes to the step alone.
+                    ensure_raw_ddl(conn).await?;
                     rekey::rekey_once(conn).await?;
                     rekey::normalize_encryption_once(conn).await?;
                     return Ok(());

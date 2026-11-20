@@ -9,12 +9,23 @@ use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    AppMeta, DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointIp, EndpointRank,
-    EndpointRow, Group, Latency, ProfileStats, Protocol, ProtocolId, RouteProbes, RoutingRule,
-    TrafficStats, now_epoch,
+    AppMeta, DnsResolver, DnsSetting, DnsSource, DnsSourceResolver, Endpoint, EndpointGroup,
+    EndpointId, EndpointIp, EndpointRank, EndpointRow, Group, Latency, ProfileStats, Protocol,
+    ProtocolId, ResolverStatus, RouteProbes, RoutingRule, TrafficStats, now_epoch,
 };
 use crate::retry_on_busy;
 use rapidhash::{HashMapExt as _, RapidHashMap};
+
+/// One parsed resolver, as a source refresh writes it. The app converts a
+/// `leas_dns::Candidate` into this shape — `leas-db` does not depend on the DNS
+/// transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsCandidateRow {
+    pub stamp: String,
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+}
 
 // ── Database handle ─────────────────────────────────────────────────────
 
@@ -107,7 +118,7 @@ use rapidhash::{HashMapExt as _, RapidHashMap};
 // 21 = `PurgeReason::CredentialRejected`: SQLite cannot widen a CHECK in
 // place, so the step rebuilds `profile_stats` (spec `2026-09-17-purge-reason`
 // amendment, D8/D9).
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
 /// geo step wrote (`None` until it does).
@@ -587,6 +598,9 @@ impl Database {
                 Group,
                 RoutingRule,
                 DnsSetting,
+                DnsSource,
+                DnsResolver,
+                DnsSourceResolver,
                 RouteProbes,
                 AppMeta,
                 EndpointRank,
@@ -645,6 +659,9 @@ impl Database {
                 Group,
                 RoutingRule,
                 DnsSetting,
+                DnsSource,
+                DnsResolver,
+                DnsSourceResolver,
                 RouteProbes,
                 AppMeta,
                 EndpointRank,
@@ -2018,6 +2035,274 @@ impl Database {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    // ── DNS sources and resolvers ───────────────────────────────────────
+
+    /// Inserts `source` when the table is empty (the built-in seed). Returns
+    /// whether it inserted.
+    pub async fn seed_dns_source_if_empty(&self, source: &DnsSource) -> Result<bool> {
+        let db = self;
+        let source = source.clone();
+        retry_on_busy(
+            move || {
+                let source = source.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    let existing: Vec<DnsSource> = DnsSource::all().exec(&mut conn).await?;
+                    if !existing.is_empty() {
+                        return Ok(false);
+                    }
+                    DnsSource::create()
+                        .id(source.id.clone())
+                        .name(source.name.clone())
+                        .url(source.url.clone())
+                        .enabled(source.enabled)
+                        .user_agent(source.user_agent.clone())
+                        .sort_order(source.sort_order)
+                        .last_refreshed(source.last_refreshed)
+                        .status(source.status)
+                        .error_message(source.error_message.clone())
+                        .refresh_interval(source.refresh_interval)
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(true)
+                }
+            },
+            5,
+        )
+        .await
+    }
+
+    /// All DNS sources, in display order.
+    pub async fn list_dns_sources(&self) -> Result<Vec<DnsSource>> {
+        let mut conn = self.conn().await?;
+        Ok(DnsSource::all()
+            .order_by(DnsSource::fields().sort_order().asc())
+            .exec(&mut conn)
+            .await?)
+    }
+
+    pub async fn upsert_dns_source(&self, source: &DnsSource) -> Result<()> {
+        let db = self;
+        let source = source.clone();
+        retry_on_busy(
+            move || {
+                let source = source.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    DnsSource::upsert_by_id(source.id.clone())
+                        .name(source.name.clone())
+                        .url(source.url.clone())
+                        .enabled(source.enabled)
+                        .user_agent(source.user_agent.clone())
+                        .sort_order(source.sort_order)
+                        .last_refreshed(source.last_refreshed)
+                        .status(source.status)
+                        .error_message(source.error_message.clone())
+                        .refresh_interval(source.refresh_interval)
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
+    }
+
+    /// Deletes a source and its links; a resolver another source still lists
+    /// survives, a resolver with no link left is removed.
+    pub async fn delete_dns_source(&self, source_id: &str) -> Result<()> {
+        retry_on_busy(|| self.delete_dns_source_once(source_id), 5).await
+    }
+
+    async fn delete_dns_source_once(&self, source_id: &str) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let mut tx = conn.transaction().await?;
+        DnsSourceResolver::filter_by_source_id(source_id.to_string())
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        DnsSource::filter_by_id(source_id.to_string())
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        tx.commit().await?;
+        Self::sweep_orphan_resolvers(&mut conn).await
+    }
+
+    /// Applies one source's parsed candidates.
+    ///
+    /// A resolver is unique by stamp and its measurement columns are never
+    /// written here, so refreshing a source costs no retest (spec D4). Links
+    /// are added before removed, so a crash cannot leave a resolver unlinked.
+    pub async fn refresh_source_links(
+        &self,
+        source_id: &str,
+        candidates: &[DnsCandidateRow],
+    ) -> Result<()> {
+        let db = self;
+        let source_id = source_id.to_string();
+        let candidates = candidates.to_vec();
+        retry_on_busy(
+            move || {
+                let source_id = source_id.clone();
+                let candidates = candidates.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    let existing: Vec<DnsResolver> = DnsResolver::all().exec(&mut conn).await?;
+                    let mut known: std::collections::HashSet<String> =
+                        existing.into_iter().map(|row| row.stamp).collect();
+                    for candidate in &candidates {
+                        if !known.insert(candidate.stamp.clone()) {
+                            continue;
+                        }
+                        DnsResolver::create()
+                            .stamp(candidate.stamp.clone())
+                            .protocol(candidate.protocol.clone())
+                            .host(candidate.host.clone())
+                            .port(i64::from(candidate.port))
+                            .latency_ms(None)
+                            .status(ResolverStatus::Unchecked)
+                            .error(None)
+                            .checked_at(None)
+                            .enabled(true)
+                            .exec(&mut conn)
+                            .await?;
+                    }
+                    let links: Vec<DnsSourceResolver> =
+                        DnsSourceResolver::filter_by_source_id(source_id.clone())
+                            .exec(&mut conn)
+                            .await?;
+                    let old: std::collections::HashSet<String> =
+                        links.into_iter().map(|link| link.stamp).collect();
+                    let wanted: std::collections::HashSet<&str> =
+                        candidates.iter().map(|c| c.stamp.as_str()).collect();
+                    for candidate in &candidates {
+                        if !old.contains(&candidate.stamp) {
+                            DnsSourceResolver::create()
+                                .source_id(source_id.clone())
+                                .stamp(candidate.stamp.clone())
+                                .exec(&mut conn)
+                                .await?;
+                        }
+                    }
+                    for stamp in &old {
+                        if !wanted.contains(stamp.as_str()) {
+                            DnsSourceResolver::filter_by_source_id_and_stamp(
+                                source_id.clone(),
+                                stamp.clone(),
+                            )
+                            .delete()
+                            .exec(&mut conn)
+                            .await?;
+                        }
+                    }
+                    Self::sweep_orphan_resolvers(&mut conn).await
+                }
+            },
+            5,
+        )
+        .await
+    }
+
+    /// Deletes resolvers no source links to. Called after a link set changes.
+    async fn sweep_orphan_resolvers(conn: &mut toasty::Connection) -> Result<()> {
+        let links: Vec<DnsSourceResolver> = DnsSourceResolver::all().exec(&mut *conn).await?;
+        let live: std::collections::HashSet<String> =
+            links.into_iter().map(|link| link.stamp).collect();
+        let resolvers: Vec<DnsResolver> = DnsResolver::all().exec(&mut *conn).await?;
+        for resolver in resolvers {
+            if !live.contains(&resolver.stamp) {
+                DnsResolver::filter_by_stamp(resolver.stamp)
+                    .delete()
+                    .exec(&mut *conn)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every listed resolver (the DNS tab's rows).
+    pub async fn list_dns_resolvers(&self) -> Result<Vec<DnsResolver>> {
+        let mut conn = self.conn().await?;
+        Ok(DnsResolver::all().exec(&mut conn).await?)
+    }
+
+    pub async fn set_dns_resolver_enabled(&self, stamp: &str, enabled: bool) -> Result<()> {
+        let db = self;
+        let stamp = stamp.to_string();
+        retry_on_busy(
+            move || {
+                let stamp = stamp.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    DnsResolver::filter_by_stamp(stamp)
+                        .update()
+                        .enabled(enabled)
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
+    }
+
+    /// The live pool: enabled resolvers that answered the last test, fastest
+    /// first, limited to `limit`.
+    pub async fn dns_pool(&self, limit: usize) -> Result<Vec<DnsResolver>> {
+        let mut conn = self.conn().await?;
+        let mut rows: Vec<DnsResolver> = DnsResolver::all().exec(&mut conn).await?;
+        rows.retain(|row| {
+            row.enabled && row.status == ResolverStatus::Ok && row.latency_ms.is_some()
+        });
+        rows.sort_by(|a, b| {
+            a.latency_ms
+                .cmp(&b.latency_ms)
+                .then_with(|| a.stamp.cmp(&b.stamp))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    /// Writes one test run: `(stamp, latency_ms, error)`. A `None` latency is
+    /// a failed measurement and stores the error class.
+    pub async fn apply_dns_test_results(
+        &self,
+        results: &[(String, Option<u32>, Option<String>)],
+    ) -> Result<()> {
+        let db = self;
+        let results = results.to_vec();
+        retry_on_busy(
+            move || {
+                let results = results.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    let at = now_epoch();
+                    for (stamp, latency, error) in &results {
+                        let status = if latency.is_some() {
+                            ResolverStatus::Ok
+                        } else {
+                            ResolverStatus::Error
+                        };
+                        DnsResolver::filter_by_stamp(stamp.clone())
+                            .update()
+                            .latency_ms(latency.map(i64::from))
+                            .status(status)
+                            .error(error.clone())
+                            .checked_at(Some(at))
+                            .exec(&mut conn)
+                            .await?;
+                    }
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
     }
 
     // ── Stats / restore ─────────────────────────────────────────────────

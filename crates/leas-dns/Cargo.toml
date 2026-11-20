@@ -15,6 +15,9 @@ rust-version.workspace = true
 # ============ DNS ============
 hickory-resolver = { version = "0.26.3", features = ["tls-ring", "https-ring", "quic-ring", "webpki-roots"] }
 dns-stamp-parser = "3.0.1"
+# The live pool swap: reads are one atomic load (`load_full`), writes are rare.
+# Already in the lock transitively; direct here because only this crate uses it.
+arc-swap = "1.9"
 # DNSCrypt v2 (crates/leas-dns/src/dnscrypt.rs). The AEAD is NaCl secretbox,
 # which no RustCrypto AEAD crate implements: `chacha20poly1305` follows RFC
 # 8439's Poly1305 input, DNSCrypt does not. See docs/reference/crypto-dependencies.md.

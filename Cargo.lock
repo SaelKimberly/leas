@@ -3355,6 +3355,7 @@ name = "leas-dns"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "base64 0.23.1",
  "chacha20",
  "dns-stamp-parser",

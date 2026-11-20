@@ -2493,7 +2493,7 @@ mod section_list_tests {
         // The `/` filter narrows sections only (R1): GUI's three fields are all
         // listed whatever the query is.
         assert_eq!(visible_field_rows(SettingsSection::Gui).len(), 3);
-        assert_eq!(visible_field_rows(SettingsSection::Dns).len(), 7);
+        assert_eq!(visible_field_rows(SettingsSection::Dns).len(), 9);
     }
 
     #[rstest]

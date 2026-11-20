@@ -1,9 +1,24 @@
-use std::collections::HashSet;
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+//! Secure DNS transport for leas: `sdns://` stamp parsing, a live resolver
+//! pool over DNSCrypt/DoH/DoT/DoQ, and a latency probe.
+//!
+//! The crate owns the wire and the policy; it does not own persistence or
+//! source URLs. [`parse_stamps`] turns source text into [`Candidate`]s,
+//! [`fetch_source`] downloads one, [`measure`] times one candidate, and
+//! [`DnsResolver`] serves lookups from whatever pool the caller installed via
+//! [`DnsResolver::set_candidates`] — the app decides that pool and when it
+//! changes.
+//!
+//! Policy, applied at parse: a stamp must claim `NO_LOGS|NO_FILTER`, its
+//! transport address must be IPv4 and outside the local-use classes, and plain
+//! DNS (and every unimplemented stamp kind) is refused. A refused stamp never
+//! becomes a candidate.
 
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwapOption;
 use dns_stamp_parser::{Addr, DnsStamp, Props};
 use hickory_resolver::{
     Resolver,
@@ -12,31 +27,32 @@ use hickory_resolver::{
     },
     system_conf,
 };
-use tokio::io::AsyncWriteExt;
 
 mod dnscrypt;
 
-const DNSCRYPT_RESOLVERS_URL: &str =
-    "https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md";
-const DNSCRYPT_RESOLVERS_CACHE: &str = "dsncrypt.resolvers.txt";
-/// Cached resolver lists older than this are refreshed on the next lookup.
-const DNSCRYPT_CACHE_MAX_AGE: Duration = Duration::from_hours(168);
+/// Upper bound on a source body (the published list is under 1 MB).
+pub const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 
-static DEFAULT_RESOLVER_OPTS: std::sync::LazyLock<ResolverOpts> = std::sync::LazyLock::new(|| {
-    let mut resolver_opts = ResolverOpts::default();
-    resolver_opts.timeout = Duration::from_millis(500);
-    resolver_opts.server_ordering_strategy = ServerOrderingStrategy::RoundRobin;
-    resolver_opts
+/// Hard deadline for one source download.
+const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pool behavior: 500 ms per attempt, rotate. The pool is already the measured
+/// fast set, so rotation never needs to be smarter than round-robin.
+static POOL_OPTS: std::sync::LazyLock<ResolverOpts> = std::sync::LazyLock::new(|| {
+    let mut opts = ResolverOpts::default();
+    opts.timeout = Duration::from_millis(500);
+    opts.server_ordering_strategy = ServerOrderingStrategy::RoundRobin;
+    opts
 });
 
-/// Process-wide reqwest client, built once: per-call `Client::build` pays
-/// a full TLS-provider setup + connection pool on every `DNSCrypt` list
-/// refresh. `rustls-no-provider` needs the ring provider installed before
-/// first build — done here, idempotently.
+/// Process-wide reqwest client, built once: per-call `Client::build` pays a
+/// full TLS-provider setup + connection pool on every source refresh.
+/// `rustls-no-provider` needs the ring provider installed before first build —
+/// done here, idempotently.
 static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     ensure_tls_provider();
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(SOURCE_TIMEOUT)
         .build()
         .expect("reqwest client build must succeed")
 });
@@ -47,11 +63,11 @@ static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::
 const ALLOW_LOCAL_RESOLVERS: bool = false;
 
 /// Whether an artifact-supplied stamp address may become the client's
-/// resolver. Mirrors the host policy the config layer applies to profile
-/// hosts (`crates/leas-config/src/import_export.rs`): an unspecified
-/// address is never acceptable, and the local-use classes need an explicit
-/// opt-in. Without this, an artifact line could point the client's own
-/// resolver at loopback/LAN/metadata addresses and at arbitrary ports.
+/// resolver. Mirrors the host policy the config layer applies to profile hosts
+/// (`crates/leas-config/src/import_export.rs`): an unspecified address is never
+/// acceptable, and the local-use classes need an explicit opt-in. Without this,
+/// an artifact line could point the client's own resolver at loopback/LAN/
+/// metadata addresses and at arbitrary ports.
 const fn stamp_addr_allowed(addr: IpAddr) -> bool {
     if ALLOW_LOCAL_RESOLVERS {
         return !addr.is_unspecified();
@@ -75,127 +91,169 @@ const fn stamp_addr_allowed(addr: IpAddr) -> bool {
     }
 }
 
-fn sdns_to_nsc(url: &url::Url, allow_ipv6: bool) -> Option<NameServerConfig> {
-    let Ok(stamp) = DnsStamp::decode(url.as_str()) else {
+/// The transports this client can dial. Stored as the lowercase name the
+/// database column carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsProtocol {
+    Dnscrypt,
+    Doh,
+    Dot,
+    Doq,
+}
+
+impl DnsProtocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dnscrypt => "dnscrypt",
+            Self::Doh => "doh",
+            Self::Dot => "dot",
+            Self::Doq => "doq",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "dnscrypt" => Some(Self::Dnscrypt),
+            "doh" => Some(Self::Doh),
+            "dot" => Some(Self::Dot),
+            "doq" => Some(Self::Doq),
+            _ => None,
+        }
+    }
+}
+
+/// One resolver, identified by its exact stamp. Two stamps for one endpoint
+/// differ by key/path and are distinct resolvers: only the live one answers.
+#[derive(Clone)]
+pub struct Candidate {
+    /// The exact `sdns://` string — the persisted identity.
+    pub stamp: String,
+    pub protocol: DnsProtocol,
+    /// Display endpoint: the TLS name for DoH/DoT/DoQ, the IP for `DNSCrypt`.
+    pub host: String,
+    pub port: u16,
+    kind: Kind,
+}
+
+#[derive(Clone)]
+enum Kind {
+    Hickory(NameServerConfig),
+    DnsCrypt(dnscrypt::DnsCryptServer),
+}
+
+/// The address a stamp dials, as a socket address.
+fn stamp_addr(addr: Option<&Addr>) -> Option<SocketAddr> {
+    match addr? {
+        Addr::SocketAddr(addr) => Some(*addr),
+        Addr::Port(_) => None,
+    }
+}
+
+/// One stamp → one candidate, or `None` when the policy refuses it.
+#[must_use]
+pub fn candidate_from_stamp(stamp: &str) -> Option<Candidate> {
+    let url = stamp.parse::<url::Url>().ok()?;
+    let Ok(decoded) = DnsStamp::decode(url.as_str()) else {
         return None;
     };
-    match stamp {
+    // DNSCrypt is its own wire; the parser applies the same address policy.
+    if let Some(server) = dnscrypt::parse_stamp(stamp) {
+        return Some(Candidate {
+            stamp: stamp.to_string(),
+            protocol: DnsProtocol::Dnscrypt,
+            host: server.addr.ip().to_string(),
+            port: server.addr.port(),
+            kind: Kind::DnsCrypt(server),
+        });
+    }
+    let (protocol, host, port, config) = match decoded {
         DnsStamp::DnsOverHttps(s) => {
-            if let Some(Addr::SocketAddr(addr)) = s.addr
-                && (allow_ipv6 || addr.is_ipv4())
-                && stamp_addr_allowed(addr.ip())
-                && s.props.contains(Props::NO_LOGS)
-                && s.props.contains(Props::NO_FILTER)
-            {
-                let mut conn =
-                    ConnectionConfig::https(Arc::from(s.hostname), Some(Arc::from(s.path)));
-                conn.port = addr.port();
-                Some(NameServerConfig::new(addr.ip(), true, vec![conn]))
-            } else {
-                None
-            }
+            let addr = stamp_addr(s.addr.as_ref())?;
+            allowed(addr, &s.props)?;
+            let host = s.hostname;
+            let mut conn =
+                ConnectionConfig::https(Arc::from(host.as_str()), Some(Arc::from(s.path)));
+            conn.port = addr.port();
+            (
+                DnsProtocol::Doh,
+                host,
+                addr.port(),
+                NameServerConfig::new(addr.ip(), true, vec![conn]),
+            )
         }
         DnsStamp::DnsOverTls(s) => {
-            if let Some(Addr::SocketAddr(addr)) = s.addr
-                && (allow_ipv6 || addr.is_ipv4())
-                && stamp_addr_allowed(addr.ip())
-                && s.props.contains(Props::NO_LOGS)
-                && s.props.contains(Props::NO_FILTER)
-            {
-                let mut conn = ConnectionConfig::tls(Arc::from(s.hostname));
-                conn.port = addr.port();
-                Some(NameServerConfig::new(addr.ip(), true, vec![conn]))
-            } else {
-                None
-            }
+            let addr = stamp_addr(s.addr.as_ref())?;
+            allowed(addr, &s.props)?;
+            let host = s.hostname;
+            let mut conn = ConnectionConfig::tls(Arc::from(host.as_str()));
+            conn.port = addr.port();
+            (
+                DnsProtocol::Dot,
+                host,
+                addr.port(),
+                NameServerConfig::new(addr.ip(), true, vec![conn]),
+            )
         }
         DnsStamp::DnsOverQuic(s) => {
-            if let Some(Addr::SocketAddr(addr)) = s.addr
-                && (allow_ipv6 || addr.is_ipv4())
-                && stamp_addr_allowed(addr.ip())
-                && s.props.contains(Props::NO_LOGS)
-                && s.props.contains(Props::NO_FILTER)
-            {
-                let mut conn = ConnectionConfig::quic(Arc::from(s.hostname));
-                conn.port = addr.port();
-                Some(NameServerConfig::new(addr.ip(), true, vec![conn]))
-            } else {
-                None
-            }
+            let addr = stamp_addr(s.addr.as_ref())?;
+            allowed(addr, &s.props)?;
+            let host = s.hostname;
+            let mut conn = ConnectionConfig::quic(Arc::from(host.as_str()));
+            conn.port = addr.port();
+            (
+                DnsProtocol::Doq,
+                host,
+                addr.port(),
+                NameServerConfig::new(addr.ip(), true, vec![conn]),
+            )
         }
         // A plain stamp carries no authenticated transport, so its answers are
         // forgeable by anyone on the path; never install one from artifact data.
         // The same holds for any stamp kind this client does not implement.
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(Candidate {
+        stamp: stamp.to_string(),
+        protocol,
+        host,
+        port,
+        kind: Kind::Hickory(config),
+    })
 }
 
-/// The two stamp families the parser separates: hickory's DoH/DoT/DoQ name
-/// server configs, and the `DNSCrypt` server endpoints the custom provider
-/// serves from the same hickory pool.
-#[derive(Default)]
-struct ResolverList {
-    hickory: ResolverConfig,
-    dnscrypt: Vec<dnscrypt::DnsCryptServer>,
+/// Policy gate: address family/local use plus the `NO_LOGS|NO_FILTER` claim.
+fn allowed(addr: SocketAddr, props: &Props) -> Option<()> {
+    (addr.is_ipv4()
+        && stamp_addr_allowed(addr.ip())
+        && props.contains(Props::NO_LOGS)
+        && props.contains(Props::NO_FILTER))
+    .then_some(())
 }
 
-impl ResolverList {
-    fn is_empty(&self) -> bool {
-        self.hickory.name_servers().is_empty() && self.dnscrypt.is_empty()
-    }
-}
-
-/// Parses `DNSCrypt` resolver list text (fetched markdown or cache file) into
-/// hickory name server configs and `DNSCrypt` servers. Lines that are not
-/// `sdns://` stamps, or that do not decode to a usable resolver, are skipped.
+/// Parses source text into candidates, deduplicated by the exact stamp.
 ///
-/// Stamp addresses stay IPv4-only (`allow_ipv6 = false`): a stamp is the
-/// client-side transport to the DNS server itself, so an unreachable family
-/// there is a pure latency tax — 467 of 893 published stamps are IPv6-only, and
-/// with no IPv6 route each one burns a dial timeout inside hickory's rotation
-/// (~10 s per lookup, over enrich's 8 s deadline). This is deliberately narrower
-/// than `lookup_ip(allow_ipv6)`: there the flag gates which ANSWER families a
-/// host's records may carry — a server the app dials is the lookup's subject,
-/// not its transport.
-fn parse_dnscrypt_lines(text: &str) -> ResolverList {
-    let mut list = ResolverList::default();
-    for line in text.lines().filter(|s| s.starts_with("sdns://")) {
-        if let Some(server) = dnscrypt::parse_stamp(line) {
-            list.dnscrypt.push(server);
+/// Non-`sdns://` lines (markdown headers, comments, blank lines) are ignored.
+/// Stamp addresses stay IPv4-only: 467 of 893 published stamps are IPv6-only,
+/// and with no IPv6 route each one burns a dial timeout.
+#[must_use]
+pub fn parse_stamps(text: &str) -> Vec<Candidate> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("sdns://"))
+    {
+        if !seen.insert(line) {
             continue;
         }
-        if let Ok(url) = line.parse::<url::Url>()
-            && let Some(name_server) = sdns_to_nsc(&url, false)
-        {
-            list.hickory.add_name_server(name_server);
+        if let Some(candidate) = candidate_from_stamp(line) {
+            out.push(candidate);
         }
     }
-    list
-}
-
-/// Reads the cache file, returning the parsed name servers and whether the
-/// file is stale (mtime older than [`DNSCRYPT_CACHE_MAX_AGE`], or undatable).
-/// Missing, unreadable, or empty/corrupt caches yield `None` so they get
-/// re-downloaded instead of serving a 0-server config forever.
-async fn read_dnscrypt_cache(cache_file: &Path) -> (Option<ResolverList>, bool) {
-    let Ok(metadata) = tokio::fs::metadata(cache_file).await else {
-        return (None, false);
-    };
-    let Ok(contents) = tokio::fs::read_to_string(cache_file).await else {
-        return (None, false);
-    };
-    let parsed = parse_dnscrypt_lines(&contents);
-    if parsed.is_empty() {
-        return (None, false);
-    }
-    // A future-dated mtime makes `elapsed()` fail; treat that as stale so an
-    // undatable cache is eventually re-fetched instead of living forever.
-    let stale = metadata.modified().is_ok_and(|mtime| {
-        mtime
-            .elapsed()
-            .map_or(true, |age| age > DNSCRYPT_CACHE_MAX_AGE)
-    });
-    (Some(parsed), stale)
+    out
 }
 
 /// Idempotent install of the process-level rustls `CryptoProvider` (ring).
@@ -205,133 +263,166 @@ fn ensure_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Upper bound on the `DNSCrypt` resolver list (the published list is under 1 MB).
-const MAX_RESOLVER_LIST_BYTES: usize = 8 * 1024 * 1024;
-
-/// Downloads the `DNSCrypt` public resolver list under a hard 10s deadline;
-/// without the timeout a blocked network hangs every lookup forever.
-async fn download_dnscrypt_resolvers(resolvers_url: &str) -> anyhow::Result<String> {
-    let mut response = HTTP_CLIENT
-        .get(resolvers_url)
-        .send()
-        .await?
-        .error_for_status()?;
+/// Downloads one resolver source, bounded by [`SOURCE_TIMEOUT`] and
+/// [`MAX_SOURCE_BYTES`].
+///
+/// Without the size cap a hostile or broken endpoint can exhaust memory;
+/// without the timeout a blocked network hangs the refresh.
+pub async fn fetch_source(url: &str) -> anyhow::Result<String> {
+    let mut response = HTTP_CLIENT.get(url).send().await?.error_for_status()?;
     if let Some(n) = response.content_length()
-        && n > MAX_RESOLVER_LIST_BYTES as u64
+        && n > MAX_SOURCE_BYTES as u64
     {
-        anyhow::bail!(
-            "resolver list declares {n} bytes, over the {MAX_RESOLVER_LIST_BYTES}-byte cap"
-        );
+        anyhow::bail!("resolver source declares {n} bytes, over the {MAX_SOURCE_BYTES}-byte cap");
     }
     let mut bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if bytes.len() + chunk.len() > MAX_RESOLVER_LIST_BYTES {
-            anyhow::bail!("resolver list exceeds the {MAX_RESOLVER_LIST_BYTES}-byte cap");
+        if bytes.len() + chunk.len() > MAX_SOURCE_BYTES {
+            anyhow::bail!("resolver source exceeds the {MAX_SOURCE_BYTES}-byte cap");
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(String::from_utf8(bytes)?)
 }
 
-/// Atomically writes the fetched list to the cache file (temp file + rename,
-/// so a crash or concurrent reader never observes a partial cache). Only the
-/// `sdns://` lines are kept, deduplicated, one per line.
-async fn write_dnscrypt_cache(
-    cache_dir: &Path,
-    cache_file: &Path,
-    text: &str,
-) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(cache_dir).await?;
-    let tmp_path = cache_file.with_file_name(format!(
-        "{}.tmp{}",
-        cache_file
-            .file_name()
-            .map_or_default(|n| n.to_string_lossy()),
-        std::process::id()
-    ));
-    let write = async {
-        let mut file = tokio::fs::File::create(&tmp_path).await?;
-        // Borrowed keys: `line` lives in `text`, so dedup costs no per-line
-        // String allocation.
-        let mut seen = HashSet::new();
-        for line in text.lines().filter(|s| s.starts_with("sdns://")) {
-            if seen.insert(line) {
-                file.write_all(line.as_bytes()).await?;
-                file.write_all(b"\n").await?;
+/// One candidate's measured outcome. `latency_ms` is present exactly when the
+/// lookup returned at least one address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestOutcome {
+    pub stamp: String,
+    /// Wall time from the call to a non-empty answer, in whole milliseconds.
+    pub latency_ms: Option<u32>,
+    /// The error class on failure; `None` on success.
+    pub error: Option<String>,
+}
+
+/// Builds a resolver over `candidates` with the given options.
+fn build_resolver(
+    candidates: &[Candidate],
+    opts: &ResolverOpts,
+) -> anyhow::Result<Resolver<dnscrypt::DnsCryptProvider>> {
+    let mut config = ResolverConfig::default();
+    let mut servers = Vec::new();
+    for candidate in candidates {
+        match &candidate.kind {
+            Kind::Hickory(name_server) => config.add_name_server(name_server.clone()),
+            Kind::DnsCrypt(server) => {
+                config.add_name_server(dnscrypt::name_server_config(server));
+                servers.push(server.clone());
             }
         }
-        file.sync_all().await?;
-        tokio::fs::rename(&tmp_path, cache_file).await
-    };
-    if let Err(e) = write.await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e.into());
     }
-    Ok(())
+    let provider = dnscrypt::DnsCryptProvider::new(&servers);
+    Ok(Resolver::builder_with_config(config, provider)
+        .with_options(opts.clone())
+        .build()?)
 }
 
-async fn get_dns_servers(cache_dir: &Path) -> anyhow::Result<ResolverList> {
-    get_dns_servers_from(cache_dir, DNSCRYPT_RESOLVERS_URL).await
-}
-
-/// Core implementation of [`get_dns_servers`]; the resolver list URL is a
-/// parameter so tests can exercise the download paths hermetically.
-async fn get_dns_servers_from(
-    cache_dir: &Path,
-    resolvers_url: &str,
-) -> anyhow::Result<ResolverList> {
-    let cache_file = cache_dir.join(DNSCRYPT_RESOLVERS_CACHE);
-    let (cached, cache_stale) = read_dnscrypt_cache(&cache_file).await;
-
-    // Re-download when the cache is missing/empty or stale. A failed refresh
-    // keeps the (stale) cache; an empty download is never written; a failed
-    // cache write only costs the next run's refresh, never this lookup.
-    let downloaded = if cached.is_none() || cache_stale {
-        match download_dnscrypt_resolvers(resolvers_url).await {
-            Ok(text) => {
-                let parsed = parse_dnscrypt_lines(&text);
-                if parsed.is_empty() {
-                    None
-                } else {
-                    if let Err(e) = write_dnscrypt_cache(cache_dir, &cache_file, &text).await {
-                        tracing::warn!(
-                            error = %e,
-                            "failed to write DNSCrypt resolver cache; using in-memory list"
-                        );
-                    }
-                    Some(parsed)
-                }
-            }
-            Err(_) => None,
+/// Times one candidate against `domain`. Never fails: a build error is an
+/// outcome with its message.
+async fn measure_one(candidate: &Candidate, domain: &str, timeout: Duration) -> TestOutcome {
+    let mut opts = ResolverOpts::default();
+    opts.timeout = timeout;
+    opts.attempts = 1;
+    let resolver = match build_resolver(std::slice::from_ref(candidate), &opts) {
+        Ok(resolver) => resolver,
+        Err(e) => {
+            return TestOutcome {
+                stamp: candidate.stamp.clone(),
+                latency_ms: None,
+                error: Some(e.to_string()),
+            };
         }
-    } else {
-        None
     };
-
-    if let Some(list) = downloaded.or(cached) {
-        Ok(list)
-    } else {
-        // Last resort: the OS-provided resolver configuration (e.g.
-        // /etc/resolv.conf) so lookups still work without the DNSCrypt list.
-        let (hickory, _) = system_conf::read_system_conf()?;
-        Ok(ResolverList {
-            hickory,
-            dnscrypt: Vec::new(),
-        })
+    let started = Instant::now();
+    match tokio::time::timeout(timeout, resolver.lookup_ip(domain)).await {
+        Ok(Ok(answer)) if answer.iter().next().is_some() => TestOutcome {
+            stamp: candidate.stamp.clone(),
+            latency_ms: Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)),
+            error: None,
+        },
+        Ok(Ok(_)) => TestOutcome {
+            stamp: candidate.stamp.clone(),
+            latency_ms: None,
+            error: Some("empty answer".to_string()),
+        },
+        Ok(Err(e)) => TestOutcome {
+            stamp: candidate.stamp.clone(),
+            latency_ms: None,
+            error: Some(e.to_string()),
+        },
+        Err(_) => TestOutcome {
+            stamp: candidate.stamp.clone(),
+            latency_ms: None,
+            error: Some("timed out".to_string()),
+        },
     }
 }
 
+/// Measures every candidate against `domain`, at most `concurrency` in flight.
+/// Results keep the input order.
+pub async fn measure(
+    candidates: &[Candidate],
+    domain: &str,
+    timeout: Duration,
+    concurrency: usize,
+) -> Vec<TestOutcome> {
+    let mut out = Vec::with_capacity(candidates.len());
+    // `join_all` per chunk, not a `buffered` stream: the stream adapter needs
+    // the per-item future type to be uniform across lifetimes, which a future
+    // borrowing `domain` is not (the spawn in `ops::dns` saw it as
+    // "FnOnce is not general enough"). Chunking is the same concurrency bound.
+    for chunk in candidates.chunks(concurrency.max(1)) {
+        out.extend(
+            futures_util::future::join_all(
+                chunk
+                    .iter()
+                    .map(|candidate| measure_one(candidate, domain, timeout)),
+            )
+            .await,
+        );
+    }
+    out
+}
+
+/// The live resolver pool. Reads are one atomic load; a swap is rare and sync.
+///
+/// `ArcSwapOption` (not a lock): the read side is every lookup, and
+/// `load_full` hands the `Arc` back with no guard, so an in-flight lookup
+/// finishes on the pool it started with while every holder — including the
+/// routing adapter's `Arc<DnsResolver>` — sees the next one.
 pub struct DnsResolver {
-    cache_dir: PathBuf,
-    resolver: tokio::sync::OnceCell<Resolver<dnscrypt::DnsCryptProvider>>,
+    resolver: ArcSwapOption<Resolver<dnscrypt::DnsCryptProvider>>,
+    /// OS resolver config, built at most once and never replaced: the fallback
+    /// when no candidates are installed.
+    system: OnceLock<Arc<Resolver<dnscrypt::DnsCryptProvider>>>,
 }
 
 impl DnsResolver {
-    pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
-            cache_dir: cache_dir.into(),
-            resolver: tokio::sync::OnceCell::new(),
+            resolver: ArcSwapOption::empty(),
+            system: OnceLock::new(),
         }
+    }
+
+    /// Installs a new pool. An empty slice leaves the resolver unconfigured
+    /// (lookups fall back to the OS configuration).
+    pub fn set_candidates(&self, candidates: &[Candidate]) -> anyhow::Result<()> {
+        if candidates.is_empty() {
+            self.resolver.store(None);
+            return Ok(());
+        }
+        let resolver = build_resolver(candidates, &POOL_OPTS)?;
+        self.resolver.store(Some(Arc::new(resolver)));
+        Ok(())
+    }
+
+    /// Whether a pool is installed (the UI's "no resolvers yet" state).
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.resolver.load().is_some()
     }
 
     /// Resolves `hostname`, returning all addresses as a boxed slice — one
@@ -345,7 +436,18 @@ impl DnsResolver {
         if let Ok(ip) = hostname.parse::<IpAddr>() {
             return Ok(vec![ip].into_boxed_slice());
         }
-        let resolver = self.resolver.get_or_try_init(|| self.init()).await?;
+        let resolver = self.resolver.load_full().unwrap_or_else(|| {
+            Arc::clone(self.system.get_or_init(|| {
+                let (config, opts) = system_conf::read_system_conf()
+                    .expect("the OS resolver configuration is readable");
+                Arc::new(
+                    Resolver::builder_with_config(config, dnscrypt::DnsCryptProvider::new(&[]))
+                        .with_options(opts)
+                        .build()
+                        .expect("the OS resolver configuration builds"),
+                )
+            }))
+        });
         let ips: Vec<IpAddr> = resolver
             .lookup_ip(hostname)
             .await?
@@ -354,28 +456,18 @@ impl DnsResolver {
             .collect();
         Ok(ips.into_boxed_slice())
     }
+}
 
-    async fn init(&self) -> anyhow::Result<Resolver<dnscrypt::DnsCryptProvider>> {
-        let list = get_dns_servers(&self.cache_dir).await?;
-        let mut config = list.hickory;
-        let mut seen = HashSet::new();
-        for server in &list.dnscrypt {
-            // The provider keys on the endpoint; two stamps for one endpoint
-            // would otherwise add the same name server twice.
-            if seen.insert((server.addr.ip(), server.addr.port())) {
-                config.add_name_server(dnscrypt::name_server_config(server));
-            }
-        }
-        let provider = dnscrypt::DnsCryptProvider::new(&list.dnscrypt);
-        Ok(Resolver::builder_with_config(config, provider)
-            .with_options(DEFAULT_RESOLVER_OPTS.clone())
-            .build()?)
+impl Default for DnsResolver {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A dns.aa.net.uk `DoH` stamp published with an IPv4 address.
     const STAMP_IPV4: &str =
@@ -383,8 +475,8 @@ mod tests {
     /// The same resolver published with an IPv6-only address.
     const STAMP_IPV6: &str =
         "sdns://AgcAAAAAAAAAEFsyMDAxOjhiMDo6MjAyMl0ADWRucy5hYS5uZXQudWsKL2Rucy1xdWVyeQ";
-    /// Nothing listens here; downloads fail fast (ECONNREFUSED).
-    const UNREACHABLE_URL: &str = "http://127.0.0.1:1/unreachable";
+    /// `AdGuard` `2.dnscrypt.unfiltered.ns1.adguard.com`.
+    const STAMP_DNSCRYPT: &str = "sdns://AQcAAAAAAAAAEjk0LjE0MC4xNC4xNDA6NTQ0MyC16ETWuDo-PhJo62gfvqcN48X6aNvWiBQdvy7AZrLa-iUyLmRuc2NyeXB0LnVuZmlsdGVyZWQubnMxLmFkZ3VhcmQuY29t";
 
     /// Serves `body` as a single HTTP response on an ephemeral loopback port,
     /// returning the URL. Lets the download path run without the network.
@@ -395,7 +487,6 @@ mod tests {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let body = body.clone();
                 tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
                     let mut buf = [0_u8; 4096];
                     let _ = stream.read(&mut buf).await;
                     let response = format!(
@@ -409,56 +500,29 @@ mod tests {
         format!("http://{addr}/public-resolvers.md")
     }
 
-    /// Asserts the result is either a non-empty config, or an error that is
-    /// justified by the host having no OS-level resolver config to fall back
-    /// to. Never tolerates a 0-server Ok config.
-    fn assert_usable(result: anyhow::Result<ResolverList>) {
-        match result {
-            Ok(list) => assert!(
-                !list.is_empty(),
-                "resolver config must not have 0 name servers"
-            ),
-            Err(_) => assert!(
-                system_conf::read_system_conf().is_err(),
-                "get_dns_servers must not fail when system resolvers are available"
-            ),
-        }
-    }
-
     #[test]
-    fn parse_dnscrypt_lines_skips_garbage_and_ipv6_stamps() {
-        // dns.aa.net.uk published as an IPv4 DoH stamp and as an IPv6 DoH
-        // stamp; the IPv6-only entry must be filtered out (allow_ipv6=false).
+    fn parse_stamps_dedupes_and_applies_policy() {
+        // The markdown header, a duplicate, an IPv6-only stamp, a bogus line
+        // and a plain stamp must all collapse to the one usable candidate.
         let text = format!(
-            "# DNSCrypt resolver list (markdown header)\n{STAMP_IPV4}\nnot a stamp\n{STAMP_IPV6}\n"
+            "# DNSCrypt resolver list\n{STAMP_IPV4}\nnot a stamp\n{STAMP_IPV4}\n{STAMP_IPV6}\nsdns://AAYAAAAAAAAACTEyNy4wLjAuMQ\n"
         );
-        let parsed = parse_dnscrypt_lines(&text);
-        assert_eq!(
-            parsed.hickory.name_servers().len(),
-            1,
-            "only the IPv4 stamp should parse"
-        );
-        assert!(parsed.hickory.name_servers()[0].ip.is_ipv4());
-        assert!(parsed.dnscrypt.is_empty());
+        let parsed = parse_stamps(&text);
+        assert_eq!(parsed.len(), 1, "only the IPv4 DoH stamp is usable");
+        assert_eq!(parsed[0].protocol, DnsProtocol::Doh);
+        assert_eq!(parsed[0].host, "dns.aa.net.uk");
+        assert_eq!(parsed[0].port, 443);
     }
 
-    /// A `DNSCrypt` server stamp feeds the `DNSCrypt` engine, not hickory.
     #[test]
-    fn dnscrypt_stamps_go_to_the_dnscrypt_engine() {
-        // AdGuard `2.dnscrypt.unfiltered.ns1.adguard.com`.
-        const STAMP: &str = "sdns://AQcAAAAAAAAAEjk0LjE0MC4xNC4xNDA6NTQ0MyC16ETWuDo-PhJo62gfvqcN48X6aNvWiBQdvy7AZrLa-iUyLmRuc2NyeXB0LnVuZmlsdGVyZWQubnMxLmFkZ3VhcmQuY29t";
-        let text = format!("# list\n{STAMP}\n{STAMP_IPV4}\n");
-        let parsed = parse_dnscrypt_lines(&text);
-        assert_eq!(parsed.dnscrypt.len(), 1);
-        assert_eq!(
-            parsed.dnscrypt[0].addr,
-            "94.140.14.140:5443".parse().unwrap()
-        );
-        assert_eq!(parsed.hickory.name_servers().len(), 1);
+    fn dnscrypt_stamps_become_candidates() {
+        let parsed = parse_stamps(&format!("# list\n{STAMP_DNSCRYPT}\n"));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].protocol, DnsProtocol::Dnscrypt);
+        assert_eq!(parsed[0].host, "94.140.14.140");
+        assert_eq!(parsed[0].port, 5443);
     }
 
-    /// The stamp address policy must match the config layer's host policy:
-    /// unspecified is never allowed, local-use classes need an opt-in.
     #[test]
     fn stamp_addr_policy_matches_host_policy() {
         for bad in [
@@ -491,163 +555,103 @@ mod tests {
     }
 
     /// A plain (unauthenticated) stamp and a stamp pointing at a local-use
-    /// address must both be refused, while the published public stamp is
-    /// still accepted (finding f4).
+    /// address must both be refused, while the published public stamp is still
+    /// accepted (finding f4).
     #[test]
-    fn sdns_refuses_plain_and_local_stamps() {
+    fn plain_and_local_stamps_never_become_candidates() {
         // Plain 127.0.0.1, props NO_LOGS|NO_FILTER.
         const PLAIN_LOOPBACK: &str = "sdns://AAYAAAAAAAAACTEyNy4wLjAuMQ";
         // DoT 127.0.0.1:<port>, TLS name v12-verify.example.
         const DOT_LOOPBACK: &str =
             "sdns://AwYAAAAAAAAADzEyNy4wLjAuMTozMzk5OQASdjEyLXZlcmlmeS5leGFtcGxl";
-        for s in [PLAIN_LOOPBACK, DOT_LOOPBACK] {
-            let url = url::Url::parse(s).expect("fixture parses");
+        for stamp in [PLAIN_LOOPBACK, DOT_LOOPBACK] {
             assert!(
-                DnsStamp::decode(url.as_str()).is_ok(),
-                "fixture must decode (rejection must be policy, not parse): {s}"
+                candidate_from_stamp(stamp).is_none(),
+                "must be refused: {stamp}"
             );
-            assert!(sdns_to_nsc(&url, false).is_none(), "must be refused: {s}");
         }
-        // The published public DoH stamp is still accepted.
-        let public = url::Url::parse(STAMP_IPV4).expect("fixture parses");
-        assert!(sdns_to_nsc(&public, false).is_some());
+        assert!(candidate_from_stamp(STAMP_IPV4).is_some());
+    }
+
+    #[test]
+    fn an_empty_pool_leaves_the_resolver_unconfigured() {
+        let resolver = DnsResolver::new();
+        assert!(!resolver.is_configured());
+        resolver.set_candidates(&[]).unwrap();
+        assert!(!resolver.is_configured());
+        let candidates = parse_stamps(&format!("{STAMP_IPV4}\n"));
+        resolver.set_candidates(&candidates).unwrap();
+        assert!(resolver.is_configured());
+    }
+
+    /// A TCP listener that accepts and never answers: the probe must time out
+    /// and report the class, not hang.
+    #[tokio::test]
+    async fn measure_times_out_a_stalled_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::mem::drop(tokio::spawn(async move {
+            // Hold every accepted stream open without writing.
+            // Leak every accepted stream: the point is a connected peer that
+            // never answers, and a dropped stream would close it.
+            while let Ok((stream, _)) = listener.accept().await {
+                std::mem::forget(stream);
+            }
+        }));
+        let mut conn = ConnectionConfig::tls(Arc::from("stalled.example"));
+        conn.port = addr.port();
+        let candidate = Candidate {
+            stamp: "sdns://test-stalled".to_string(),
+            protocol: DnsProtocol::Dot,
+            host: "stalled.example".to_string(),
+            port: addr.port(),
+            kind: Kind::Hickory(NameServerConfig::new(addr.ip(), true, vec![conn])),
+        };
+        let started = Instant::now();
+        let outcomes = measure(&[candidate], "example.com", Duration::from_millis(200), 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].latency_ms.is_none());
+        assert_eq!(outcomes[0].error.as_deref(), Some("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
-    async fn stale_cache_is_refreshed_or_falls_back_to_stale() -> anyhow::Result<()> {
-        // A cache older than 7 days triggers a refresh attempt; with the list
-        // unreachable the refresh fails and the stale entries must be kept.
-        let dir = tempfile::tempdir()?;
-        let cache = dir.path().join(DNSCRYPT_RESOLVERS_CACHE);
-        tokio::fs::write(&cache, format!("{STAMP_IPV4}\n")).await?;
-        let file = std::fs::File::options().write(true).open(&cache)?;
-        file.set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::SystemTime::now() - Duration::from_hours(192)),
-        )?;
-        drop(file);
-
-        let cfg = get_dns_servers_from(dir.path(), UNREACHABLE_URL)
-            .await
-            .expect("failed refresh must keep the stale cache");
-        assert_eq!(
-            cfg.hickory.name_servers().len(),
-            1,
-            "stale cache entry must be kept"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_cache_is_not_used() -> anyhow::Result<()> {
-        // An empty cache file (e.g. a rate-limit HTML page saved as 200) must
-        // never yield a 0-server config: re-download, and if that fails, the
-        // system resolver config.
-        let dir = tempfile::tempdir()?;
-        let cache = dir.path().join(DNSCRYPT_RESOLVERS_CACHE);
-        tokio::fs::write(&cache, "").await?;
-        let result = get_dns_servers_from(dir.path(), UNREACHABLE_URL).await;
-        assert_usable(result);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_download_is_never_written() -> anyhow::Result<()> {
-        // A 200 response without any stamps (e.g. a rate-limit HTML page)
-        // must not be written to the cache and must not yield 0 servers.
-        let url = serve("<html>rate limited</html>".to_string()).await;
-        let dir = tempfile::tempdir()?;
-        let cache = dir.path().join(DNSCRYPT_RESOLVERS_CACHE);
-        tokio::fs::write(&cache, "").await?;
-        let result = get_dns_servers_from(dir.path(), &url).await;
-        assert_usable(result);
-        let contents = tokio::fs::read_to_string(&cache).await?;
-        assert!(
-            contents.is_empty(),
-            "empty download must not be written to cache"
-        );
-        Ok(())
-    }
-
-    /// An over-cap body must be refused outright, so the unbounded artifact
-    /// fetch can never write a huge cache file (finding f1).
-    #[tokio::test]
-    async fn oversized_resolver_list_is_refused() -> anyhow::Result<()> {
-        let url = serve("x".repeat(MAX_RESOLVER_LIST_BYTES + 1)).await;
-        let err = download_dnscrypt_resolvers(&url)
+    async fn fetch_source_refuses_an_oversized_body() {
+        let url = serve("x".repeat(MAX_SOURCE_BYTES + 1)).await;
+        let err = fetch_source(&url)
             .await
             .expect_err("an over-cap body must be refused");
         assert!(
             err.to_string().contains("cap"),
             "error names the cap: {err}"
         );
-        Ok(())
     }
 
     #[tokio::test]
-    async fn download_succeeds_writes_cache() -> anyhow::Result<()> {
-        // A successful first download populates the cache (happy path).
-        let url = serve(format!("# DNSCrypt resolver list\n{STAMP_IPV4}\n")).await;
-        let dir = tempfile::tempdir()?;
-        let cache = dir.path().join(DNSCRYPT_RESOLVERS_CACHE);
-        let cfg = get_dns_servers_from(dir.path(), &url).await?;
-        assert_eq!(cfg.hickory.name_servers().len(), 1);
-        let contents = tokio::fs::read_to_string(&cache).await?;
-        assert_eq!(
-            contents,
-            format!("{STAMP_IPV4}\n"),
-            "cache must hold the sdns:// lines"
-        );
-        Ok(())
+    async fn fetch_source_returns_the_body() {
+        let url = serve(format!("# list\n{STAMP_IPV4}\n")).await;
+        let body = fetch_source(&url).await.expect("body");
+        assert_eq!(parse_stamps(&body).len(), 1);
     }
 
-    #[tokio::test]
-    async fn download_write_failure_keeps_in_memory_list() -> anyhow::Result<()> {
-        // The cache path is a directory, so the atomic rename fails; the
-        // freshly downloaded list must still be returned — a failed cache
-        // write never fails DNS init.
-        let url = serve(format!("# DNSCrypt resolver list\n{STAMP_IPV4}\n")).await;
-        let dir = tempfile::tempdir()?;
-        tokio::fs::create_dir(dir.path().join(DNSCRYPT_RESOLVERS_CACHE)).await?;
-        let cfg = get_dns_servers_from(dir.path(), &url).await?;
-        assert_eq!(cfg.hickory.name_servers().len(), 1);
-
-        let mut entries = tokio::fs::read_dir(dir.path()).await?;
-        let mut count = 0;
-        while entries.next_entry().await?.is_some() {
-            count += 1;
-        }
-        assert_eq!(
-            count, 1,
-            "failed cache write must not leave temp files behind"
-        );
-        Ok(())
-    }
-
-    /// The `DNSCrypt` transport end to end: a cache holding one published
-    /// server stamp, no hickory name server at all.
+    /// The `DNSCrypt` transport end to end: one published server stamp and no
+    /// hickory name server at all.
     #[tokio::test]
     #[ignore = "requires network (DNSCrypt resolver)"]
     async fn live_dnscrypt_only_lookup() -> anyhow::Result<()> {
-        // AdGuard `2.dnscrypt.unfiltered.ns1.adguard.com`.
-        const STAMP: &str = "sdns://AQcAAAAAAAAAEjk0LjE0MC4xNC4xNDA6NTQ0MyC16ETWuDo-PhJo62gfvqcN48X6aNvWiBQdvy7AZrLa-iUyLmRuc2NyeXB0LnVuZmlsdGVyZWQubnMxLmFkZ3VhcmQuY29t";
-        let dir = tempfile::tempdir()?;
-        tokio::fs::write(
-            dir.path().join(DNSCRYPT_RESOLVERS_CACHE),
-            format!("{STAMP}\n"),
-        )
-        .await?;
-        let resolver = DnsResolver::new(dir.path());
+        let resolver = DnsResolver::new();
+        resolver.set_candidates(&parse_stamps(STAMP_DNSCRYPT))?;
         let ips = resolver.lookup_ip("example.com", true).await?;
         assert!(!ips.is_empty(), "DNSCrypt lookup returned no address");
         Ok(())
     }
 
+    /// A real `DoH` pool through the same path the app uses.
     #[tokio::test]
-    #[ignore = "requires network (fetches dnscrypt resolver list)"]
-    async fn test_lookup_ip() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let resolver = DnsResolver::new(dir.path());
+    #[ignore = "requires network (DoH resolver)"]
+    async fn live_doh_lookup() -> anyhow::Result<()> {
+        let resolver = DnsResolver::new();
+        resolver.set_candidates(&parse_stamps(STAMP_IPV4))?;
         let ips = resolver.lookup_ip("example.com", true).await?;
         assert!(!ips.is_empty());
         Ok(())

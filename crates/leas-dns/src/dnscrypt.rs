@@ -75,7 +75,7 @@ pub struct DnsCryptServer {
 ///
 /// Returns `None` for any other stamp kind, for a stamp whose properties do not
 /// claim no logs and no filtering, and for an address the local-use policy
-/// refuses (the same policy [`crate::sdns_to_nsc`] applies).
+/// refuses (the same policy [`crate::stamp_addr_allowed`] applies).
 pub fn parse_stamp(stamp: &str) -> Option<DnsCryptServer> {
     let bytes = URL_SAFE_NO_PAD
         .decode(stamp.strip_prefix("sdns://")?)

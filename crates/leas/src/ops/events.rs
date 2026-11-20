@@ -1067,6 +1067,18 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // snapshot.
                 crate::alloc::job_boundary("batch-ended");
             }
+            CoreEvent::DnsChanged => {
+                crate::ops::dns::reload(state).await;
+            }
+            CoreEvent::DnsTestDone => {
+                state.batch_progress = None;
+                state.speed_test_stop.store(false, Ordering::Relaxed);
+                crate::ops::dns::reload(state).await;
+                crate::ops::job_scheduler::handle_terminal(
+                    state,
+                    crate::ops::job_scheduler::TerminalEvent::DnsTestDone,
+                );
+            }
             CoreEvent::HostFeaturesLoaded(checker) => {
                 state.host_features = Some(checker);
                 state.log_trace("info", "tui::state", "Whitelist loaded");

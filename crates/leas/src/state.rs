@@ -369,6 +369,16 @@ pub struct AppState {
     pub outbound_country_cache: Arc<parking_lot::Mutex<lru::LruCache<String, Option<String>>>>,
     /// TTL (secs) for the DNS-resolution cache; default 300.
     pub dns_cache_ttl_secs: i64,
+    /// How many of the fastest measured resolvers form the live pool.
+    pub dns_pool_size: usize,
+    /// The name the resolver test queries.
+    pub dns_test_domain: String,
+    /// DNS source rows (the Sources tab's second kind).
+    pub dns_sources: Vec<leas_db::models::DnsSource>,
+    /// Resolver rows (the DNS tab).
+    pub dns_resolvers: Vec<leas_db::models::DnsResolver>,
+    /// DNS tab cursor.
+    pub dns_selected: usize,
     /// Profiles display-row cache (part-2 runtime bounds): rebuilt when a row
     /// input changed — structural `endpoints_gen`, selection/connection (in
     /// the key), or the dirty bits set by the async mutation sites
@@ -907,6 +917,11 @@ impl AppState {
                 std::num::NonZeroUsize::new(512).expect("512 is nonzero"),
             ))),
             dns_cache_ttl_secs: 300,
+            dns_pool_size: crate::ops::dns::DEFAULT_POOL_SIZE,
+            dns_test_domain: crate::ops::dns::DEFAULT_TEST_DOMAIN.to_string(),
+            dns_sources: Vec::new(),
+            dns_resolvers: Vec::new(),
+            dns_selected: 0,
             display_rows_cache: RefCell::new(crate::ui::profiles::DisplayRowsCache::default()),
             grid_header_cache: RefCell::new(crate::ui::profiles::GridHeaderCache::default()),
         };
@@ -917,20 +932,30 @@ impl AppState {
         state.geo_ip = Some(Arc::new(leas_geoip::GeoIp::new(
             config_dir.join("GeoLite2-City.mmdb"),
         )));
-        state.dns_resolver = Some(Arc::new(leas_dns::DnsResolver::new(
-            config_dir.join("dns-cache"),
-        )));
-        state.dns_cache_ttl_secs = state
-            .db
-            .get_dns_settings()
-            .await
-            .ok()
-            .flatten()
+        // The pool is installed by `ops::dns` once the DB is read; until then
+        // lookups fall back to the OS resolver configuration.
+        state.dns_resolver = Some(Arc::new(leas_dns::DnsResolver::new()));
+        let dns_settings = state.db.get_dns_settings().await.ok().flatten();
+        state.dns_cache_ttl_secs = dns_settings
+            .as_ref()
             .and_then(|d| d.cache_ttl_secs)
             .unwrap_or(300);
+        state.dns_pool_size = dns_settings
+            .as_ref()
+            .and_then(|d| d.resolver_pool_size)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(crate::ops::dns::DEFAULT_POOL_SIZE);
+        state.dns_test_domain = dns_settings
+            .as_ref()
+            .and_then(|d| d.resolver_test_domain.clone())
+            .filter(|domain| !domain.is_empty())
+            .unwrap_or_else(|| crate::ops::dns::DEFAULT_TEST_DOMAIN.to_string());
         state.reload_profiles().await;
         state.reload_groups().await;
         state.spawn_auto_update();
+        // DNS sources and the resolver pool: the DB is the only persisted
+        // truth; a stale source refreshes in the background.
+        crate::ops::dns::boot(&mut state).await;
         // Routing rules + the shared engine (no downloads unless a rule
         // references geo data).
         state.reload_routing_rules().await;

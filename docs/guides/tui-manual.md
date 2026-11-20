@@ -31,7 +31,7 @@ The window is two framed panes, a shell-level log row, and a status bar.
 
 | Part | Tabs / behaviour |
 | --- | --- |
-| Pane 1 | `Profiles` (endpoint table), `Sniffer` (per-host traffic for the native session), `Sources` (subscription groups), `Logs` (core log viewer) |
+| Pane 1 | `Profiles` (endpoint table), `Sniffer` (per-host traffic for the native session), `DNS` (resolvers + measurements), `Sources` (subscription groups and DNS sources), `Logs` (core log viewer) |
 | Pane 2 | `Details` (selected server's static facts plus DB aggregates), `Metrics` (connection status, traffic, native connection ring, core stats), `Tasks` (job queue) |
 | Log row | Newest log line, between pane 2's bottom border and the status bar. It is outside pane 2's frame, so the pane stays a complete rectangle; it is dropped when pane 2 collapses to one row |
 | Status bar | Connection state and mode on the left, contextual keys on the right (`## Status bar`) |
@@ -301,21 +301,42 @@ hints for the current mode.
   `d` dumps the last 20 database-monitor lines plus a `mem:` line (process RSS
   and the size of every session-lifetime cache) into the log.
 
+### DNS (pane 1)
+
+The resolver list with its last measurement, a pane-1 tab between Sniffer and
+Sources. Columns: `Protocol · Endpoint · Latency · Status · Checked`. A row is
+`untested` until a test runs; a failed probe stores the error class and a NULL
+latency. The live pool is the fastest enabled-and-ok rows (10 by default,
+Settings → DNS → Resolver Pool Size); before the first test every enabled row
+is used, so behaviour is unchanged out of the box.
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Navigate resolvers |
+| `t` | Queue `Test DNS Resolvers` (measures every enabled row against `Resolver Test Domain`, 2 s each) |
+| `s` | Re-apply the pool after a manual edit |
+| `Space` | Enable/disable the selected resolver |
+| `[` / `]` | Cycle pane tabs |
+
 ### Sources (pane 1)
 
-The subscription groups as a table, a pane-1 tab between Sniffer and Logs;
+The subscription groups and the DNS sources as one table, a pane-1 tab
+between DNS and Logs;
 `g` on the Profiles tab jumps straight here. Columns, widest set first:
-`Name · Enabled · Status · Updated · Endpoints · URL`; narrow panes shed whole
-columns from the right (URL first), so nothing renders half-drawn. An error
+`Kind · Name · Enabled · Status · Updated · Endpoints · URL`; `Kind` is
+`proxy` (a subscription group) or `dns` (an `sdns://` resolver list); narrow
+panes shed whole columns from the right (URL first), so nothing renders
+half-drawn. An error
 row shows WHY in the Status column (error color); a group being updated gets a
 `⟳` beside its `✓`.
 
 | Key | Action |
 | --- | --- |
-| `a` | Add a group |
-| `e` | Edit the selected group |
-| `d` | Delete the selected group(s) (`y` confirms; the Space mask selects) |
-| `u` | Update every group's subscription |
+| `a` | Add a subscription group |
+| `A` | Add a DNS source (a URL to an `sdns://` list) |
+| `e` | Edit the selected source (group or DNS) |
+| `d` | Delete the selected source (`y` confirms; the Space mask selects groups) |
+| `u` | Update every group's subscription and refresh every DNS source |
 | `Space` | Toggle the selected group's mask |
 | `[` / `]` | Cycle pane tabs |
 

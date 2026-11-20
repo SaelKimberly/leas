@@ -754,6 +754,66 @@ pub struct DnsSetting {
     pub client_ip: Option<String>,
     /// TTL (secs) for the TUI-side DNS resolution cache; None = default 300.
     pub cache_ttl_secs: Option<i64>,
+    /// How many of the fastest tested resolvers form the live pool; None = 10.
+    pub resolver_pool_size: Option<i64>,
+    /// The name the resolver test queries; None = `www.google.com`.
+    pub resolver_test_domain: Option<String>,
+}
+
+/// A user-managed `sdns://` source. `url` is unique after canonicalisation,
+/// so one list cannot be added twice (spec `2026-11-20-dns-resolvers` D3).
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "dns_sources"]
+pub struct DnsSource {
+    #[key]
+    pub id: String,
+    pub name: Option<String>,
+    pub url: String,
+    pub enabled: bool,
+    pub user_agent: Option<String>,
+    pub sort_order: Option<i32>,
+    pub last_refreshed: Option<i64>,
+    pub status: Option<GroupStatus>,
+    pub error_message: Option<String>,
+    pub refresh_interval: Option<i64>,
+}
+
+/// Outcome of the last measurement of one resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum ResolverStatus {
+    /// Listed, never measured.
+    Unchecked,
+    /// Answered the test query.
+    Ok,
+    /// Failed the last test (see `error`).
+    Error,
+}
+
+/// One resolver, unique by its exact stamp. Measurement columns are written by
+/// the test job only; a source refresh never touches them (D4).
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "dns_resolvers"]
+pub struct DnsResolver {
+    #[key]
+    pub stamp: String,
+    pub protocol: String,
+    pub host: String,
+    pub port: i64,
+    pub latency_ms: Option<i64>,
+    pub status: ResolverStatus,
+    pub error: Option<String>,
+    pub checked_at: Option<i64>,
+    pub enabled: bool,
+}
+
+/// Which sources list a resolver. Deleting a source removes its links only; a
+/// resolver another source still lists survives (D4).
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "dns_source_resolvers"]
+#[key(source_id, stamp)]
+pub struct DnsSourceResolver {
+    pub source_id: String,
+    pub stamp: String,
 }
 
 /// Must-resolve probe hostnames, one global singleton row (`id == "global"`).
