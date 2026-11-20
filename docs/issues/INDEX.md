@@ -32,6 +32,8 @@ Loop state: [STATE.md](STATE.md).
 | [020](020-no-foreign-key-so-deleted-endpoints-leave-orphan-links.md) | No foreign key exists, so a link staged while its endpoint is deleted lands as a permanent orphan row | medium | theory | db-layer | `write_behind.rs:271-289`, `compact.rs:209-217`, `profiles.rs:938-946`, `ping.rs:612-625`, `main.rs:594-630` |
 | [021](021-dns-retry-failure-reports-the-compact-terminal-event.md) | A DNS-retry scan failure reports `CompactFinished`, which cannot end a `DnsRetry` task, so the job queue wedges for the session | medium | theory | app-ops | `compact.rs:428-437`, `job_scheduler.rs:335-336`, `:348-362` |
 | [022](022-dns-failure-mark-sweeps-the-whole-deferral-map.md) | Every DNS failure rescans the whole deferral map, so a burst pays O(F²) scans under the shard locks the dispatch path needs | low | theory | app-ops | `scheduler.rs:337-343`, `:425-433`, `enrich.rs:684-693` |
+| [023](023-sniffer-scroll-clamps-to-the-last-host-not-the-last-page.md) | The Sniffer's scroll clamps to the last *host* rather than the last *page*, so `End` leaves a one-row table in a full-height pane | low | theory | ui-render | `sniffer.rs:41-44`, `:255-272`, `:232` |
+| [024](024-sniffer-table-builds-every-host-row-per-frame.md) | The Sniffer builds a `Row` for every host on every draw while the widget paints ~20, re-paying 6,000 allocations per frame at the 1000-host cap | low | theory | ui-render | `sniffer.rs:202-215`, `telemetry.rs:196-198` |
 
 ## Cross-references
 
@@ -108,6 +110,13 @@ Loop state: [STATE.md](STATE.md).
   resolver answer — the rule that a queue wait must not leave a DNS-failure
   stamp. 022 is the cost of the stamp that *is* legitimate: it is written once
   per failed host, and each write currently rescans the whole deferral map.
+- **023 ↔ 024:** one render function, two halves of the same window bug: 024
+  builds every host's row for a ~20-row pane, 023 lets the offset scroll past
+  the last page. They must land together — slicing the list (024, offset reset
+  to 0) turns the `len - 1` clamp (023) into a **one-host** last page.
+- **024 → 022:** the same "work proportional to the whole collection on a hot
+  path" shape, one layer apart: 022 rescans the deferral map per failure, 024
+  rebuilds every host row per draw.
 
 ## Domain coverage
 
@@ -121,5 +130,5 @@ Loop state: [STATE.md](STATE.md).
 | routing-engine | in-progress | 6 |
 | db-layer | in-progress | 7 |
 | app-ops | in-progress | 8 |
-| ui-render | unexplored | — |
+| ui-render | in-progress | 9 |
 | tls-security | unexplored | — |

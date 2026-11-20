@@ -2,7 +2,7 @@
 
 ```yaml
 loop:
-  iteration: 8
+  iteration: 9
   status: running
   noop_streak: 0
 coverage:
@@ -39,8 +39,9 @@ coverage:
     last_touched_iteration: 8
     issues: [021, 022]
   - domain: ui-render
-    status: unexplored
-    issues: []
+    status: in-progress
+    last_touched_iteration: 9
+    issues: [023, 024]
   - domain: tls-security
     status: unexplored
     issues: []
@@ -565,3 +566,79 @@ blocked: []
   and its proposed `021 → 020` link was rejected: 020 is orphan rows on delete
   paths, with no causal relation to a read error in the retry's scan.
 - Next: `ui-render` (next unexplored).
+
+### Iteration 9 — ui-render
+- Dirty worktree unchanged (the user's 35 paths, including
+  `crates/leas/src/ui/**`); all reads/greps at HEAD in a detached worktree
+  (`/tmp/iter9`), removed before the commit.
+- Prior work: `docs/issues/` had **no** issue about a `crates/leas/src/ui/`
+  file — `ui/` appeared only as incidental citations (status bar, tasks pane,
+  settings) inside app-ops issues. Domain was `unexplored` in INDEX.
+- Scope: the pane-1 `Sniffer` tab (`ui/sniffer.rs`, 386 lines) — the only
+  per-host view of a live native session, and its producer
+  (`crates/leas-native/src/telemetry.rs`).
+- Filed:
+  - 023 (low, **theory**) — `scroll_offset` clamps the offset to `len - 1`
+    (`sniffer.rs:41-44`) and `handle_key` repeats the bound (`:271`), so `End`
+    parks the window on the last host: `ratatui`'s `visible_rows` starts at
+    `state.offset.min(last_row)` and never backs up unless a *selected* row is
+    past the end (`ratatui-widgets-0.3.2/src/table.rs:998-1031`), and this
+    table sets no selection — one host painted, the rest of the pane blank.
+    The `TableState`-selection alternative was checked and does **not** fix it
+    (at `offset = len-1` the selected last row is already visible).
+  - 024 (low, **theory**, cost measured outside the repo) — `render_table`
+    maps every host into a `Row` (5 `String`s + a `Row` each,
+    `sniffer.rs:202-215`) while `render_rows` paints `visible_rows` only
+    (`table.rs:846-884`); widths come from the constraints, not the cells
+    (`:1041-1068`), so the slice preserves the paint **once the widget's offset
+    is reset to 0** — it re-applies `state.offset` to whatever rows it gets
+    (`:998`, `:865`), reviewed and corrected in round 1. Host list cap 1000
+    (`telemetry.rs:196-198`); probe (`rustc -O`, **six** Strings per host — one
+    above the repo's five, so an upper bound): 58 µs / 1,200 Strings at 200
+    hosts, **180 µs / 6,000 Strings at 1,000**. Draws
+    fire per input and per core event (`ui/mod.rs:374`), and the core publishes
+    a sample every second (`native_connect.rs:138-141`), so the tab re-pays it
+    at ≥1 Hz while connected. Probe kept at `/tmp/probe23` (outside the repo).
+- Checked and **not** filed (recorded so the next pass does not re-derive):
+  - `telemetry.rs:527-534` — `with_host` scans all 1000 rows for the LRU victim
+    on a *new* host at cap, under the mutex every datagram's accounting takes
+    (`udp_sent`/`udp_received` are per datagram, `inbound/mod.rs:1000`,
+    `:1208`). Real, but ~1 µs and only on first sight of a host; the per-second
+    `snapshot()` merge (`telemetry.rs:575-633`, O(hosts × open legs)) is 1 Hz.
+    Below the bar for an issue.
+  - the display-row cache (`profiles.rs:1271-1306`) is keyed on
+    `endpoints_gen` + expanded flags + multi-select — checked every writer of
+    `state.endpoints` (`ops/profiles.rs:189` bumps at `:196`;
+    `:226` — the load-error arm — clears WITHOUT a bump; `:1365`/`:1769` are
+    test-only). No stale rows result, for a different reason than the gen: the
+    key also requires `!cache.rows.is_empty()` and
+    `cache.expanded.len() == rows.len()` (`ui/profiles.rs:1276`, `:1285`), so
+    a cleared page can never match.
+  - `textfit::truncate` guards `width == 0` (`textfit.rs:30-38`); the routing
+    list indexes are guarded (`settings.rs:1946`, `:1972`); the log cache is a
+    `VecDeque` with a `pop_front` beside every `push_back` (`logs.rs:613`,
+    `events.rs:560`, `:598`) and the pane's scroll is saturating
+    (`logs.rs:208`).
+- Reviewer (`ReviewIter9`, 5m55s): **needs-fix**, 8 findings, all citation or
+  reasoning defects — no mechanism changed. Dispositions:
+  1. 024's slice recipe kept the widget offset — fixed: the `TableState` must be
+     built without `with_offset`, since `render_rows` re-applies
+     `state.offset` to whatever rows it receives (`table.rs:998`, `:865-866`).
+  2. "empty slice" was wrong — `len - 1` yields exactly one host
+     (`len-1..len`); corrected in 023, 024 and the INDEX bullet.
+  3. 023's clamp must record the **data-row** height, not `area.height` (the
+     header is split off first, `table.rs:775-777`) — one row short otherwise.
+  4. the header renders at `table.rs:777` (`render_footer` is `:781`) — cite
+     fixed in 023.
+  5. `PageUp` does recover the view (`sniffer.rs:265`) — "no key but Home/Up"
+     corrected.
+  6. STATE's "behaviour-preserving" now carries the offset-reset caveat.
+  7. the probe builds six `String`s per host, not five — described as an upper
+     bound in both the issue and STATE (its timings were not re-run).
+  8. `reload_profiles`'s error arm clears `endpoints` WITHOUT bumping
+     `endpoints_gen`; the no-stale-rows conclusion stands on the other two key
+     terms (`ui/profiles.rs:1276`, `:1285`) and STATE now says so.
+- Second reviewer round not run: all eight were re-derived from the files the
+  first round cited (the ratatui widget source for 1-4, `sniffer.rs` for 5,
+  `ops/profiles.rs:226` + `ui/profiles.rs:1276/1285` for 8).
+- Next: `tls-security` (last unexplored).
