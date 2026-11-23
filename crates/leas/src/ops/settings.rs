@@ -75,6 +75,12 @@ const INBOUND_DEFS: &[FieldDef] = &[
         ftype: "Boolean",
         description: "Sniff destination domains for routing",
     },
+    FieldDef {
+        key: "max_connections",
+        label: "Max Connections",
+        ftype: "Number",
+        description: "Concurrent tunnel cap for the local listener, empty = 1024",
+    },
 ];
 
 const SYSTEM_PROXY_DEFS: &[FieldDef] = &[
@@ -524,6 +530,10 @@ fn config_value(config: &leas_config::AppConfig, section: SettingsSection, key: 
         (Inbound, "mixed_port") => config.inbound.mixed_port.map_or_default(|p| p.to_string()),
         (Inbound, "listen") => config.inbound.listen.clone(),
         (Inbound, "sniffing") => config.inbound.sniffing.to_string(),
+        (Inbound, "max_connections") => config
+            .inbound
+            .max_connections
+            .map_or_default(|n| n.to_string()),
         (SystemProxy, "enabled") => config.system_proxy.enabled.to_string(),
         (SystemProxy, "http_port") => config
             .system_proxy
@@ -674,6 +684,7 @@ fn apply_settings_fields(
                 state.config.inbound.listen = get("listen");
             }
             state.config.inbound.sniffing = get_str("sniffing") == "true";
+            state.config.inbound.max_connections = get_str("max_connections").parse().ok();
         }
         SystemProxy => {
             state.config.system_proxy.enabled = get_str("enabled") == "true";

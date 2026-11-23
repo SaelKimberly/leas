@@ -368,6 +368,11 @@ where
 {
     let sleep = tokio::time::sleep_until(idle.deadline());
     tokio::pin!(sleep);
+    // Write progress gets its OWN deadline: the shared idle stamp is slid by
+    // the other direction, so a peer that stops reading would otherwise pin
+    // this half forever while a live downlink keeps the tunnel "alive".
+    let stall = tokio::time::sleep(timeouts::RELAY_IDLE);
+    tokio::pin!(stall);
     loop {
         let deadline = idle.deadline();
         sleep.as_mut().reset(deadline);
@@ -393,8 +398,33 @@ where
         // Stamp before the write: while this direction blocks on a slow peer,
         // the other direction must not read the tunnel as idle.
         idle.touch();
-        // Outside the `select!`: bytes that were read are always written.
-        w.write_all(&buf.as_mut_slice()[..n]).await?;
+        // Write the chunk under its OWN deadline (re-armed per attempt, unlike
+        // the read's shared stamp): the other direction may keep the tunnel
+        // "alive" while this peer stops reading, and before this `write_all`
+        // sat outside every timer (issue 002).
+        let chunk = &buf.as_mut_slice()[..n];
+        let mut off = 0usize;
+        while off < chunk.len() {
+            stall
+                .as_mut()
+                .reset(tokio::time::Instant::now() + timeouts::RELAY_IDLE);
+            let written = tokio::select! {
+                // `write` is cancel-safe between bytes: a cancelled arm keeps
+                // the count and the loop resumes at `off`.
+                res = w.write(&chunk[off..]) => res?,
+                () = stall.as_mut() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "relay write timed out",
+                    ));
+                }
+            };
+            if written == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+            off += written;
+            idle.touch();
+        }
         // Promote only after the write: the read filled this buffer, and
         // replacing it earlier would discard the bytes just read.
         buf.filled(n);
@@ -926,6 +956,65 @@ mod tests {
             .unwrap()
             .expect_err("the idle cap must close a dead tunnel");
         assert!(err.to_string().contains("relay read timed out"), "{err}");
+    }
+
+    /// A peer that stops READING must not pin its direction forever while the
+    /// other direction keeps the shared stamp alive. Before the write bound,
+    /// the uplink's liveness masked a dead downlink and the tunnel held both
+    /// sockets + both buffers indefinitely (issue 002).
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_reader_ends_the_write_half() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (upstream_side, peer) = tokio::io::duplex(64 * 1024);
+        let relayed = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            relay(sock, Box::new(upstream_side)).await
+        });
+        let (mut peer_r, mut peer_w) = tokio::io::split(peer);
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Uplink stays alive for the whole test: this is the masking case.
+        let uplink = tokio::spawn(async move {
+            loop {
+                if client.write_all(&[0xAB; 4096]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        // The client never reads; the peer keeps pushing downlink.
+        let drain = tokio::spawn(async move {
+            let mut sink = [0u8; 4096];
+            while matches!(peer_r.read(&mut sink).await, Ok(n) if n > 0) {}
+        });
+        let downlink = tokio::spawn(async move {
+            let block = vec![0xCD; 64 * 1024];
+            for _ in 0..64 {
+                if peer_w.write_all(&block).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Let the buffers fill, then let the write deadline expire.
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(70)).await;
+
+        let err = relayed
+            .await
+            .expect("relay task must finish once the write half is stalled")
+            .expect_err("a stalled reader must end the tunnel");
+        assert!(
+            err.to_string().contains("relay write timed out"),
+            "the WRITE half must be the one that fires: {err}"
+        );
+        uplink.abort();
+        drain.abort();
+        downlink.abort();
     }
 
     /// The promotion trigger is the whole memory contract: an interactive

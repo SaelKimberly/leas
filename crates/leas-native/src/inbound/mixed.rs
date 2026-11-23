@@ -93,10 +93,17 @@ impl MixedInbound {
             if let Err(error) = conn.set_nodelay(true) {
                 tracing::debug!(%peer, %error, "mixed inbound: set_nodelay failed");
             }
+            let Some(permit) = self.socks.admission.try_enter() else {
+                // One socket, one cap: the mixed listener refuses rather than
+                // parking, so a stalled peer cannot starve new clients.
+                drop(conn);
+                continue;
+            };
             let socks = Arc::clone(&self.socks);
             let http = Arc::clone(&self.http);
             let shutdown = socks.shutdown.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 // The handler future now carries the pool and both inbound
                 // configs; pinning it keeps the spawned task's frame bounded.
                 let handle = Box::pin(handle_conn(socks, http, conn, peer));

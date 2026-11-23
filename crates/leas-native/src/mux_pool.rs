@@ -63,6 +63,17 @@ pub struct MuxPolicy {
 
 pub use leas_proto::proto_spec::MuxWire;
 
+/// The stream cap a carrier for `params` may reach: the row's own magnitude
+/// when it names a bounded one, the profile policy otherwise (issue 004).
+#[must_use]
+pub fn effective_cap(params: &NativeConnectParams, policy: &MuxPolicy) -> usize {
+    params
+        .mux_cap
+        .filter(|cap| *cap > 0)
+        .unwrap_or(policy.cap)
+        .max(1)
+}
+
 impl Default for MuxPolicy {
     fn default() -> Self {
         Self {
@@ -306,8 +317,7 @@ impl MuxPool {
         policy: &MuxPolicy,
     ) -> Result<BoxStream, NativeError> {
         self.ensure_sweeper(policy.idle);
-        let key = MuxKey::of(params, policy);
-        let carrier = self.acquire(params, policy).await?;
+        let (carrier, key) = self.acquire(params, policy).await?;
         let (carrier, stream) = if let Ok(stream) = carrier.tunnel.open_session(target).await {
             (carrier, stream)
         } else {
@@ -358,11 +368,24 @@ impl MuxPool {
         &self,
         params: &NativeConnectParams,
         policy: &MuxPolicy,
-    ) -> Result<Arc<Carrier>, NativeError> {
+    ) -> Result<(Arc<Carrier>, MuxKey), NativeError> {
+        // Built ONCE here: the key is the caller's eviction handle too, so
+        // neither `open_session` nor `open_udp` formats it a second time
+        // (issue 005).
         let key = MuxKey::of(params, policy);
-        match self.choose(&key, policy) {
-            Choice::Use(carrier) => Ok(carrier),
-            Choice::Build | Choice::Spill => {
+        let cap = effective_cap(params, policy);
+        match self.choose(&key, policy, cap) {
+            Choice::Use(carrier) => Ok((carrier, key)),
+            // A spill is never shared, so there is nothing to coalesce and
+            // nothing to pool: build it directly (issue 006).
+            Choice::Spill => {
+                let tunnel = build_tunnel(params, policy).await?;
+                let carrier = Arc::new(Carrier::new(tunnel));
+                carrier.live.fetch_add(1, Ordering::AcqRel);
+                carrier.touch();
+                Ok((carrier, key))
+            }
+            Choice::Build => {
                 // Coalesce cold-start builds: without this every concurrent
                 // acquire in a burst takes its own `Build` decision and dials
                 // (12 CONNECTs → 12 handshakes). The gate is held across
@@ -380,28 +403,35 @@ impl MuxPool {
                 )
                 .await
                 else {
+                    // The gate was busy for a whole second: build without
+                    // waiting, but REGISTER the carrier anyway — a fallback
+                    // nobody can reuse is one handshake per CONNECT, the waste
+                    // this gate exists to prevent (issue 006).
                     let tunnel = build_tunnel(params, policy).await?;
                     let carrier = Arc::new(Carrier::new(tunnel));
+                    self.register(&key, &carrier, policy);
                     carrier.live.fetch_add(1, Ordering::AcqRel);
                     carrier.touch();
-                    return Ok(carrier);
+                    return Ok((carrier, key));
                 };
-                match self.choose(&key, policy) {
-                    Choice::Use(carrier) => Ok(carrier),
+                match self.choose(&key, policy, cap) {
+                    Choice::Use(carrier) => Ok((carrier, key)),
                     Choice::Build => {
                         let tunnel = build_tunnel(params, policy).await?;
                         let carrier = Arc::new(Carrier::new(tunnel));
                         self.register(&key, &carrier, policy);
                         carrier.live.fetch_add(1, Ordering::AcqRel);
                         carrier.touch();
-                        Ok(carrier)
+                        Ok((carrier, key))
                     }
+                    // Another waiter registered a carrier at the cap while we
+                    // held the gate; build unpooled as before.
                     Choice::Spill => {
                         let tunnel = build_tunnel(params, policy).await?;
                         let carrier = Arc::new(Carrier::new(tunnel));
                         carrier.live.fetch_add(1, Ordering::AcqRel);
                         carrier.touch();
-                        Ok(carrier)
+                        Ok((carrier, key))
                     }
                 }
             }
@@ -426,8 +456,7 @@ impl MuxPool {
         policy: &MuxPolicy,
     ) -> Result<(crate::PacketTunnel, MuxLease), NativeError> {
         self.ensure_sweeper(policy.idle);
-        let key = MuxKey::of(params, policy);
-        let carrier = self.acquire(params, policy).await?;
+        let (carrier, key) = self.acquire(params, policy).await?;
         let (carrier, tunnel) = if let Ok(tunnel) = udp_tunnel(&carrier, target, session) {
             (carrier, tunnel)
         } else {
@@ -450,13 +479,13 @@ impl MuxPool {
     }
 
     /// Pick, build or spill, and sweep dead/idle carriers on the way.
-    fn choose(&self, key: &MuxKey, policy: &MuxPolicy) -> Choice {
+    fn choose(&self, key: &MuxKey, policy: &MuxPolicy, cap: usize) -> Choice {
         let mut entries = self.inner.entries.lock();
         sweep(&mut entries, policy.idle);
         let carriers = entries.entry(key.clone()).or_default();
         let pick = carriers
             .iter()
-            .filter(|c| !c.is_dead() && c.live() < policy.cap)
+            .filter(|c| !c.is_dead() && c.live() < cap)
             .min_by_key(|c| c.live())
             .cloned();
         // Reserve the stream slot UNDER the lock: concurrent CONNECTs must see
@@ -782,6 +811,47 @@ mod tests {
         )))))
     }
 
+    /// The row's magnitude is the carrier's stream cap; the policy is only
+    /// the default (issue 004: `mux=4` used to behave exactly like `mux=32`).
+    #[test]
+    fn a_rows_mux_cap_reaches_the_pool() {
+        use leas_proto::proto_spec::VlessMux;
+        let policy = policy();
+        let limited = params(vless(None, Some(VlessMux::Limited(3))));
+        assert_eq!(effective_cap(&limited, &policy), 3);
+        let unlimited = params(vless(None, Some(VlessMux::Unlimited)));
+        assert_eq!(
+            effective_cap(&unlimited, &policy),
+            policy.cap,
+            "-1 means unlimited, which the pool caps at the policy"
+        );
+        let silent = params(vless(None, None));
+        assert_eq!(effective_cap(&silent, &policy), policy.cap);
+    }
+
+    /// A carrier that reached the ROW's cap is not reused, even when the
+    /// policy cap is larger: the row's value is the one that decides.
+    #[tokio::test]
+    async fn a_carrier_at_the_rows_cap_is_not_shared() {
+        use leas_proto::proto_spec::VlessMux;
+        let pool = MuxPool::new();
+        let p = params(vless(None, Some(VlessMux::Limited(1))));
+        let key = MuxKey::of(&p, &policy());
+        let carrier = fake_carrier();
+        carrier.live.fetch_add(1, Ordering::AcqRel);
+        pool.seed(key.clone(), Arc::clone(&carrier));
+        let policy = policy();
+        let cap = effective_cap(&p, &policy);
+        assert!(
+            matches!(pool.choose(&key, &policy, cap), Choice::Build),
+            "a full carrier must not take another session"
+        );
+        assert!(
+            matches!(pool.choose(&key, &policy, 2), Choice::Use(_)),
+            "the policy cap would reuse it — the row's cap must win"
+        );
+    }
+
     #[test]
     fn key_ignores_remarks_and_cap_but_not_identity() {
         let a = MuxKey::of(&params(vless(Some("one"), None)), &policy());
@@ -934,7 +1004,7 @@ mod tests {
         carrier.dead.store(true, Ordering::Release);
         let mut policy = policy();
         policy.carriers = 0; // force the sweep to run without dialling
-        let _ = pool.choose(&key, &policy);
+        let _ = pool.choose(&key, &policy, policy.cap);
         assert_eq!(pool.carrier_count(&key), 0, "dead carrier is evicted");
 
         let pool = MuxPool::new();
@@ -943,7 +1013,7 @@ mod tests {
         *carrier.last_used.lock() = Instant::now()
             .checked_sub(Duration::from_secs(60))
             .expect("now is after 60s ago");
-        let _ = pool.choose(&key, &policy);
+        let _ = pool.choose(&key, &policy, policy.cap);
         assert_eq!(pool.carrier_count(&key), 0, "idle carrier is reaped");
     }
 

@@ -52,6 +52,9 @@ pub struct ServerConfig {
     /// authenticates no client, so a non-loopback bind is refused unless the
     /// operator opted in (spec 2026-11-20 D2).
     pub allow_non_loopback: bool,
+    /// Ceiling on concurrent accepted tunnels; the mixed listener's two faces
+    /// share one gate. `0` = [`crate::inbound::DEFAULT_MAX_CONNECTIONS`].
+    pub max_connections: usize,
 }
 
 impl ServerConfig {
@@ -72,6 +75,7 @@ impl ServerConfig {
             engine,
             mux_policy: MuxPolicy::production(),
             allow_non_loopback: false,
+            max_connections: crate::inbound::DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
@@ -149,7 +153,9 @@ impl NativeCoreServer {
             security,
         });
         socks_config.shutdown = Some(shutdown_rx.clone());
+        socks_config.admission = crate::inbound::Admission::new(cfg.max_connections);
         let mut http_config = HttpInboundConfig::new(cfg.listen, engine, outbounds);
+        http_config.admission = socks_config.admission.clone();
         // One pool per session: SOCKS and HTTP legs of the same profile share
         // carriers (the key is the carrier identity, not the inbound).
         http_config.mux_pool = Arc::clone(&socks_config.mux_pool);

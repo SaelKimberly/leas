@@ -1622,3 +1622,100 @@ mod pooled_carrier {
         assert_ne!(codes, vec![0], "policy off must dial, not reuse");
     }
 }
+
+/// The admission gate bounds how many tunnels a session can have open, and a
+/// refusal must be an immediate close rather than a parked connection: a
+/// stalled peer holds a socket, both relay buffers and a proxy sub-stream
+/// (issue 001/002).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_gate_refuses_past_the_cap() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let engine = engine(Vec::new(), route_default("direct"));
+    let outbounds = vec![Outbound {
+        tag: "direct".into(),
+        kind: OutboundKind::Direct,
+    }];
+    let config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine,
+        outbounds,
+    )
+    .with_admission(crate::inbound::Admission::new(1));
+    let (addr, handle) = spawn_inbound(config).await;
+
+    // Hold the only permit with an idle connection.
+    let first = TcpStream::connect(addr).await.expect("first connect");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // The second connection must be closed, not queued behind the gate.
+    let mut second = TcpStream::connect(addr).await.expect("second connect");
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), second.read(&mut byte))
+        .await
+        .expect("a refused connection must close, not park");
+    assert_eq!(read.expect("read refused"), 0, "refusal is an EOF");
+
+    // Releasing the first admits the next client again (greeting answered).
+    drop(first);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let mut third = TcpStream::connect(addr).await.expect("third connect");
+    third
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("greeting");
+    let mut greet = [0u8; 2];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        third.read_exact(&mut greet),
+    )
+    .await
+    .expect("the freed permit admits the next client")
+    .expect("greeting reply");
+    assert_eq!(greet, [0x05, 0x00]);
+
+    handle.abort();
+}
+
+/// The mixed listener's SOCKS and HTTP faces share ONE gate: a SOCKS client
+/// holding the only permit must keep an HTTP CONNECT out (issue 001's cap is
+/// per session, not per protocol).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_listener_shares_one_admission_gate() {
+    use tokio::io::AsyncReadExt;
+
+    let engine = engine(Vec::new(), route_default("direct"));
+    let outbounds = vec![Outbound {
+        tag: "direct".into(),
+        kind: OutboundKind::Direct,
+    }];
+    let admission = crate::inbound::Admission::new(1);
+    let socks = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine.clone(),
+        outbounds.clone(),
+    )
+    .with_admission(admission.clone());
+    let http = HttpInboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine,
+        outbounds,
+    )
+    .with_admission(admission);
+    let (addr, handle) = spawn_mixed(socks, http).await;
+
+    // SOCKS face takes the only permit and keeps it (no greeting sent).
+    let socks_conn = TcpStream::connect(addr).await.expect("socks connect");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // HTTP face on the same socket must be refused immediately.
+    let mut http_conn = TcpStream::connect(addr).await.expect("http connect");
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), http_conn.read(&mut byte))
+        .await
+        .expect("a refused connection must close, not park");
+    assert_eq!(read.expect("read refused"), 0, "refusal is an EOF");
+
+    drop(socks_conn);
+    handle.abort();
+}

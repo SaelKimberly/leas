@@ -33,7 +33,7 @@ use leas_route::{ConnMeta, Decision, Engine, NetAddr, NetHost};
 use smallvec::SmallVec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 use crate::BoxStream;
 use crate::addr::{Host, TargetAddr};
@@ -46,6 +46,74 @@ use crate::telemetry::{
 pub use http::{HttpInbound, HttpInboundConfig};
 pub use mixed::MixedInbound;
 pub use outbound::{Outbound, OutboundKind, ProxyOutbound};
+/// Default ceiling on concurrent accepted tunnels (spec 2026-11-23 T4).
+///
+/// One cap per session, shared by the mixed listener's two faces. It bounds
+/// the resource a stalled peer can pin: without it a broken relay write holds
+/// a socket, both relay buffers and a proxy sub-stream forever (issue 002).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// The accept-layer admission gate: a semaphore plus the reject count.
+///
+/// Cloned into every face of a listener that shares one socket, so the cap is
+/// per session rather than per protocol.
+#[derive(Clone, Debug)]
+pub struct Admission {
+    inner: Arc<AdmissionInner>,
+}
+
+#[derive(Debug)]
+struct AdmissionInner {
+    permits: Arc<Semaphore>,
+    max: usize,
+    rejected: std::sync::atomic::AtomicU64,
+}
+
+impl Admission {
+    /// A gate admitting `max` concurrent connections (`0` = the default).
+    #[must_use]
+    pub fn new(max: usize) -> Self {
+        let max = if max == 0 {
+            DEFAULT_MAX_CONNECTIONS
+        } else {
+            max
+        };
+        Self {
+            inner: Arc::new(AdmissionInner {
+                permits: Arc::new(Semaphore::new(max)),
+                max,
+                rejected: std::sync::atomic::AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Take one permit without queueing. `TryAcquireError` on a full gate: the
+    /// caller refuses the connection instead of parking the accept loop.
+    pub(crate) fn try_enter(&self) -> Option<OwnedSemaphorePermit> {
+        if let Ok(permit) = Arc::clone(&self.inner.permits).try_acquire_owned() {
+            return Some(permit);
+        }
+        let now = self
+            .inner
+            .rejected
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if now.is_multiple_of(1000) {
+            tracing::warn!(
+                max = self.inner.max,
+                rejected = now + 1,
+                "inbound admission gate full: refusing new connections"
+            );
+        }
+        None
+    }
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_CONNECTIONS)
+    }
+}
+
 /// Inbound tag reported to the router when [`HttpInboundConfig`] doesn't
 /// override it.
 pub const DEFAULT_HTTP_INBOUND_TAG: &str = "http-in";
@@ -114,6 +182,9 @@ pub struct Socks5InboundConfig {
     pub mux_pool: Arc<MuxPool>,
     /// Mux policy for this inbound (default-on, caps, idle window).
     pub mux_policy: MuxPolicy,
+    /// Accept-layer cap; a mixed listener shares this one gate with its HTTP
+    /// face.
+    pub admission: Admission,
 }
 
 impl Socks5InboundConfig {
@@ -132,7 +203,16 @@ impl Socks5InboundConfig {
             shutdown: None,
             mux_pool: Arc::new(MuxPool::new()),
             mux_policy: MuxPolicy::default(),
+            admission: Admission::default(),
         }
+    }
+
+    /// Sets the accept-layer admission gate (shared with a mixed listener's
+    /// HTTP face).
+    #[must_use]
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = admission;
+        self
     }
 
     /// Requires RFC 1929 username/password authentication.
@@ -224,9 +304,16 @@ impl Socks5Inbound {
             if let Err(error) = conn.set_nodelay(true) {
                 tracing::debug!(%peer, %error, "socks5 inbound: set_nodelay failed");
             }
+            let Some(permit) = self.config.admission.try_enter() else {
+                // The gate is full: refuse the connection instead of parking
+                // this loop (a stalled peer must not block new clients).
+                drop(conn);
+                continue;
+            };
             let config = Arc::clone(&self.config);
             let shutdown = config.shutdown.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let handle = handle_conn(config, conn, peer);
                 match shutdown {
                     Some(rx) => {
@@ -608,13 +695,15 @@ async fn run_udp_associate(
     socks5::write_reply(&mut conn, socks5::ReplyCode::Succeeded, &bind).await?;
     tracing::debug!(%peer, bind_port, "socks5 inbound: udp associate established");
 
-    // The relay owns the TCP stream (its read half signals association end)
-    // and the client-facing socket, so it outlives `handle_conn`.
-    tokio::spawn(async move {
-        if let Err(error) = run_udp_relay(config, conn, client_udp, peer).await {
-            tracing::debug!(%error, "socks5 inbound: udp relay closed");
-        }
-    });
+    // AWAIT the relay: the accept-layer permit is held by this connection's
+    // task, and a spawned relay would outlive it — releasing the permit while
+    // the association still holds its control socket, its UDP sockets and its
+    // buffers, which is exactly what the cap exists to bound (admission
+    // review, 2026-11-23). The relay observes `config.shutdown` itself, so a
+    // profile switch still ends the association.
+    if let Err(error) = run_udp_relay(config, conn, client_udp, peer).await {
+        tracing::debug!(%error, "socks5 inbound: udp relay closed");
+    }
     Ok(())
 }
 
@@ -626,11 +715,11 @@ async fn run_udp_associate(
 /// this task (and its two sockets) forever. An association that never
 /// receives a datagram also expires after [`UDP_PIN_DEADLINE`].
 ///
-/// The inbound's `shutdown` signal ends the association too: this task is
-/// spawned by [`run_udp_associate`] and outlives the accept loop's
-/// per-connection future, so without an arm of its own a live association would
-/// keep forwarding datagrams through the PREVIOUS profile's tunnel after a
-/// disconnect.
+/// The inbound's `shutdown` signal ends the association too: the relay is
+/// awaited by the connection's own task (so the admission permit covers it),
+/// but the signal arrives asynchronously, so without an arm of its own a live
+/// association would keep forwarding datagrams through the PREVIOUS profile's
+/// tunnel after a disconnect.
 async fn run_udp_relay(
     config: Arc<Socks5InboundConfig>,
     conn: TcpStream,
@@ -651,6 +740,8 @@ async fn run_udp_relay(
         client_udp: Arc::new(client_udp),
         out_v4: None,
         out_v6: None,
+        out4_buf: Vec::new(),
+        out6_buf: Vec::new(),
         dns_cache: Arc::new(DnsCache::default()),
         reply_buf: Vec::new(),
         proxy: None,
@@ -661,9 +752,10 @@ async fn run_udp_relay(
         row: None,
     };
 
+    // Eager: a datagram needs a buffer to land in, so this 64 KiB is paid by
+    // every association that gets this far. Only the UPSTREAM buffers below
+    // are deferred (they wait for their socket).
     let mut client_buf = vec![0u8; 64 * 1024];
-    let mut out4_buf = vec![0u8; 64 * 1024];
-    let mut out6_buf = vec![0u8; 64 * 1024];
     let mut control_byte = [0u8; 1];
     let pin_deadline = tokio::time::sleep(UDP_PIN_DEADLINE);
     tokio::pin!(pin_deadline);
@@ -710,18 +802,18 @@ async fn run_udp_relay(
                 relay.forward_client(&client_buf[..len]).await;
             }
             // A direct-outbound reply (IPv4 upstream).
-            result = recv_from_opt(relay.out_v4.as_deref(), &mut out4_buf),
+            result = recv_from_opt(relay.out_v4.as_deref(), &mut relay.out4_buf),
                 if relay.out_v4.is_some() =>
             {
-                if !relay.reply_to_client(result, &out4_buf).await {
+                if !relay.reply_to_client(result, true).await {
                     return Ok(());
                 }
             }
             // A direct-outbound reply (IPv6 upstream).
-            result = recv_from_opt(relay.out_v6.as_deref(), &mut out6_buf),
+            result = recv_from_opt(relay.out_v6.as_deref(), &mut relay.out6_buf),
                 if relay.out_v6.is_some() =>
             {
-                if !relay.reply_to_client(result, &out6_buf).await {
+                if !relay.reply_to_client(result, false).await {
                     return Ok(());
                 }
             }
@@ -868,6 +960,10 @@ struct UdpRelay {
     /// Direct-outbound sockets, one per address family, created on demand.
     out_v4: Option<Arc<UdpSocket>>,
     out_v6: Option<Arc<UdpSocket>>,
+    /// Receive buffers, allocated when their socket is (issue 003: an
+    /// association that never forwards a datagram used to pin 192 KiB).
+    out4_buf: Vec<u8>,
+    out6_buf: Vec<u8>,
     /// Domain → address cache for the association lifetime, shared with the
     /// spawned resolve-and-send tasks.
     dns_cache: Arc<DnsCache>,
@@ -974,7 +1070,7 @@ impl UdpRelay {
     async fn reply_to_client(
         &mut self,
         result: std::io::Result<(usize, SocketAddr)>,
-        buf: &[u8],
+        ipv4: bool,
     ) -> bool {
         let (len, src) = match result {
             Ok(pair) => pair,
@@ -988,7 +1084,12 @@ impl UdpRelay {
             // pins the source.
             return false;
         };
-        write_reply(&mut self.reply_buf, src, &buf[..len]);
+        let buf = if ipv4 {
+            &self.out4_buf[..len]
+        } else {
+            &self.out6_buf[..len]
+        };
+        write_reply(&mut self.reply_buf, src, buf);
         match self.client_udp.send_to(&self.reply_buf, source).await {
             Ok(_) => {
                 if let Some(row) = &self.row {
@@ -1269,6 +1370,14 @@ impl UdpRelay {
                     tracing::debug!(%error, bind, "socks5 inbound: upstream udp bind failed");
                 }
             }
+        }
+        // The receive buffers follow their sockets: an association that never
+        // forwards a datagram allocates none of them.
+        if self.out_v4.is_some() && self.out4_buf.is_empty() {
+            self.out4_buf.resize(64 * 1024, 0);
+        }
+        if self.out_v6.is_some() && self.out6_buf.is_empty() {
+            self.out6_buf.resize(64 * 1024, 0);
         }
         // A transient failure (fd pressure) still recovers on the next
         // datagram after the backoff; a permanent one costs one attempt per

@@ -86,6 +86,8 @@ pub struct HttpInboundConfig {
     pub mux_pool: Arc<crate::mux_pool::MuxPool>,
     /// Mux policy for this inbound.
     pub mux_policy: crate::mux_pool::MuxPolicy,
+    /// Accept-layer cap shared with the SOCKS face of a mixed listener.
+    pub admission: super::Admission,
 }
 
 impl HttpInboundConfig {
@@ -102,7 +104,15 @@ impl HttpInboundConfig {
             shutdown: None,
             mux_pool: Arc::new(crate::mux_pool::MuxPool::new()),
             mux_policy: crate::mux_pool::MuxPolicy::default(),
+            admission: super::Admission::default(),
         }
+    }
+
+    /// Sets the accept-layer admission gate.
+    #[must_use]
+    pub fn with_admission(mut self, admission: super::Admission) -> Self {
+        self.admission = admission;
+        self
     }
 
     /// Requires `Basic` proxy authentication with these credentials.
@@ -193,9 +203,14 @@ impl HttpInbound {
             if let Err(error) = conn.set_nodelay(true) {
                 tracing::debug!(%peer, %error, "http inbound: set_nodelay failed");
             }
+            let Some(permit) = self.config.admission.try_enter() else {
+                drop(conn);
+                continue;
+            };
             let config = Arc::clone(&self.config);
             let shutdown = config.shutdown.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let handle = handle_conn(config, conn, peer);
                 match shutdown {
                     Some(rx) => {

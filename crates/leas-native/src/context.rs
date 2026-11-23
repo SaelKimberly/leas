@@ -60,6 +60,11 @@ pub struct NativeConnectParams {
     /// never mentions mux, so the profile default (`MuxPolicy::enabled`) can
     /// apply without overriding an explicit `mux=false`.
     pub mux_explicit: Option<bool>,
+    /// The ROW's stream cap (`mux=4`, `muxConcurrency=32`), when it names a
+    /// bounded one. `None` for "no cap named", `-1`/unlimited, and non-VLESS
+    /// rows — the profile policy's cap then applies (issue 004: the magnitude
+    /// used to be collapsed to the boolean before the pool ever saw it).
+    pub mux_cap: Option<usize>,
 }
 
 impl NativeConnectParams {
@@ -74,6 +79,24 @@ impl NativeConnectParams {
             ProtocolConfig::Vless(cfg) => cfg.mux.as_ref().map(VlessMux::is_active),
             _ => None,
         };
+        let mux_cap = match &protocol {
+            // The SIP003 plugin's `mux=N` keeps its magnitude too
+            // (`MuxSetting::On(n)`); a plugin row is a pooled row.
+            ProtocolConfig::Ss(cfg) => match cfg.plugin.as_ref().map(|plugin| &plugin.mux) {
+                Some(leas_proto::proto_spec::ss_plugin::MuxSetting::On(n)) if *n > 0 => {
+                    Some(*n as usize)
+                }
+                _ => None,
+            },
+            ProtocolConfig::Vless(cfg) => match cfg.mux {
+                Some(VlessMux::Limited(n)) if n > 0 && n != u32::MAX => Some(n as usize),
+                Some(VlessMux::Named { cap, .. }) if cap > 0 && cap != u32::MAX => {
+                    Some(cap as usize)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
         Self {
             protocol,
             server,
@@ -82,6 +105,7 @@ impl NativeConnectParams {
             reality_provisioner: HelloProvisionerChoice::FixedChrome130Hybrid,
             udp: None,
             mux_explicit,
+            mux_cap,
             // **Derived here, once.** The mux decision is the row's RESOLVED
             // plugin mux (`PluginSpec::mux_active`: the resolved value, never the
             // stored key, and never a QUIC mode), so the app's `proxy_params`, the

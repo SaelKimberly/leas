@@ -165,6 +165,11 @@ pub struct InboundConfig {
     pub allow_non_loopback: bool,
     #[serde(default)]
     pub sniffing: bool,
+    /// Ceiling on concurrent accepted tunnels for the native session (one
+    /// gate shared by the mixed listener's SOCKS and HTTP faces). `None` =
+    /// the engine default (1024).
+    #[serde(default)]
+    pub max_connections: Option<usize>,
 }
 
 impl Default for InboundConfig {
@@ -176,6 +181,7 @@ impl Default for InboundConfig {
             listen: default_listen(),
             allow_non_loopback: false,
             sniffing: false,
+            max_connections: None,
         }
     }
 }
