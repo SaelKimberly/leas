@@ -82,10 +82,10 @@ workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
-# `lab-mimalloc`: the shipped allocator (3.6.1) for allocator-sensitive numbers.
+# `lab-mimalloc`: the shipped allocator (3.6.2) for allocator-sensitive numbers.
 # A plain dev-dependency (cargo forbids optional ones); the feature only flips
 # the `#[global_allocator]` in `tests/turso09_lab.rs`.
-mimalloc = { package = "mimalloc-safe", version = "0.1.70", default-features = false, features = ["v3"] }
+mimalloc = { package = "rustfs-mimalloc", version = "0.7.4" }
 toasty = { workspace = true, features = ["serde", "jiff"] }
 jiff = { workspace = true }
 leas-proto = { path = "../leas-proto", version = "0.1.0" }

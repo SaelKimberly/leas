@@ -950,15 +950,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3257,7 +3248,6 @@ dependencies = [
  "leas-proto",
  "leas-route",
  "lru 0.19.0",
- "mimalloc-safe",
  "opaline",
  "parking_lot 0.13.0",
  "rapidhash",
@@ -3265,6 +3255,7 @@ dependencies = [
  "ratatui-cheese",
  "reqwest",
  "rstest",
+ "rustfs-mimalloc",
  "rustls",
  "scraper",
  "serde_json",
@@ -3334,9 +3325,9 @@ dependencies = [
  "jiff",
  "leas-hakari",
  "leas-proto",
- "mimalloc-safe",
  "rapidhash",
  "rstest",
+ "rustfs-mimalloc",
  "serde_json",
  "smallvec",
  "tempfile",
@@ -3776,17 +3767,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
-name = "libmimalloc-sys2"
-version = "0.1.66"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dba4922950d581f24b14e2331e64777f6800a6155877cb2e2b5b8ea7749b4b5"
-dependencies = [
- "cc",
- "cmake",
- "libc",
-]
-
-[[package]]
 name = "libredox"
 version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4081,15 +4061,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "mimalloc-safe"
-version = "0.1.70"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deca8fbcd65d382e64050604b1e608e99d6c0bdcf3ff0d36c20ca852e847c458"
-dependencies = [
- "libmimalloc-sys2",
 ]
 
 [[package]]
@@ -5891,6 +5862,24 @@ checksum = "2dd18cd2bae1820af0b6ad5e54f4a51d0f3fcc53b05f845675074efcc7af071d"
 dependencies = [
  "rustc_version",
  "semver",
+]
+
+[[package]]
+name = "rustfs-mimalloc"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc7914232a854336c62058c24a8362c553ac8e7adba2e2395ce9097db24d1510"
+dependencies = [
+ "rustfs-mimalloc-sys",
+]
+
+[[package]]
+name = "rustfs-mimalloc-sys"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8073624242781448512682f1931624ee67108b6b7873b22fb29c1a1df689ac0c"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

@@ -7,11 +7,16 @@
 //! and the single `#[global_allocator]` lives here — the one place a different
 //! allocator (a tracing allocator for a profile run, say) has to be put.
 //!
-//! Version: `mimalloc-safe` 0.1.70 with the `v3` feature (mimalloc 3.6.1, the
-//! current 3.x). The older `mimalloc` 0.1.52 crate (3.3.2) was 2-4x slower on
-//! the allocator lab's batch shape (`alloc/lab.rs`), and its `mi_collect(true)`
-//! left abandoned blocking-thread heaps resident (41 MiB after 262 threads vs
-//! 8 MiB here).
+//! Version: `rustfs-mimalloc` 0.7.4 (mimalloc 3.6.2). Its sys crate compiles
+//! `static.c` with `cc` on every target, so `windows-gnu` builds without CMake;
+//! `mimalloc-safe` 0.1.70 (3.6.1) took the CMake path everywhere except
+//! windows-msvc and could not install there. The older `mimalloc` 0.1.52 crate
+//! (3.3.2) was 2-4x slower on the allocator lab's batch shape (`alloc/lab.rs`),
+//! and its `mi_collect(true)` left abandoned blocking-thread heaps resident
+//! (41 MiB after 262 threads vs 8 MiB here).
+//!
+//! The numbers quoted below were measured on 3.6.1 built by CMake; the `cc`
+//! build of 3.6.2 has not been re-measured, and its compile-time defines differ.
 //!
 //! Purging: do NOT override `purge_delay`. 3.6.x purges a page on its own free
 //! path, so `purge_delay=0` turns every free into a purge — measured ~1.7-3x
@@ -25,7 +30,7 @@
 //! workload the defaults cost ~45 MiB at idle and ~125 MiB after a feed-wide
 //! batch against 3.3.2. The tuned set below restores parity (idle 93 vs 79 MB,
 //! settle 183 vs 182 MB on the 13,803-link feed) while keeping 3.6.1's 2-4x
-//! faster allocation. Windows needs none of it: v3's own commit reductions are
+//! faster allocation (3.6.1 measured; 3.6.2 re-check pending). Windows needs none of it: v3's own commit reductions are
 //! the reason the same build measured better there with default options.
 //!
 //! ## Feature switches
@@ -159,7 +164,7 @@ mod mimalloc_alloc {
     #[global_allocator]
     static GLOBAL: MiMalloc = MiMalloc;
 
-    // Option indices from mimalloc 3.6.1's `mi_option_e`
+    // Option indices from mimalloc 3.6.2's `mi_option_e`
     // (`c_src/mimalloc3/include/mimalloc.h`), 0-based. The C API takes the enum as
     // an `int`; [`tests::retention_options_index_are_stable`] reads every one back
     // so a dependency bump that renumbers the enum fails a test instead of
