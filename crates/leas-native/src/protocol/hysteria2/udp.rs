@@ -144,6 +144,13 @@ struct Defragger {
     size: usize,
 }
 
+/// Most fragments one datagram may claim.
+///
+/// `frag_count` is a peer-controlled byte; the vector it sized was unbounded
+/// (64 KiB datagrams × 255 slots), so a hostile peer could make one packet
+/// allocate megabytes (issue 009).
+const MAX_FRAGS: u8 = 64;
+
 impl Defragger {
     const fn new() -> Self {
         Self {
@@ -158,6 +165,9 @@ impl Defragger {
     fn feed(&mut self, m: UdpMessage) -> Option<UdpMessage> {
         if m.frag_count <= 1 {
             return Some(m);
+        }
+        if m.frag_count > MAX_FRAGS {
+            return None;
         }
         if m.frag_id >= m.frag_count {
             return None;

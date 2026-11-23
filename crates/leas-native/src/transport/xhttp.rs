@@ -900,26 +900,29 @@ fn xhttp_mode(ctx: &LinkContext) -> Result<&'static str, NativeError> {
 /// multiplexed streams). The h3 mode is NOT reached here: it is a different
 /// dial ([`connect_quic`]) that replaces this upgrade step (spec §5.2).
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    // Dispatch on the transport's OWN version table, not on TLS presence: a
+    // TLS row whose ALPN is exactly `http/1.1` is an h1 row (issue 010).
+    let h1 = http_version(ctx.security()) == "1.1";
     match xhttp_mode(ctx)? {
         "stream-one" => {
-            if ctx.is_tls() {
-                stream_one_h2(ctx, stream).await
-            } else {
+            if h1 {
                 stream_one_h1(ctx, stream).await
+            } else {
+                stream_one_h2(ctx, stream).await
             }
         }
         "stream-up" => {
-            if ctx.is_tls() {
-                stream_up_h2(ctx, stream).await
-            } else {
+            if h1 {
                 stream_up_h1(ctx, stream).await
+            } else {
+                stream_up_h2(ctx, stream).await
             }
         }
         _ => {
-            if ctx.is_tls() {
-                packet_up_h2(ctx, stream).await
-            } else {
+            if h1 {
                 packet_up_h1(ctx, stream).await
+            } else {
+                packet_up_h2(ctx, stream).await
             }
         }
     }
@@ -988,8 +991,11 @@ async fn packet_up_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let resp = send_200(&mut get_sender, get_req, "xhttp download GET").await?;
     let reader = resp.reader;
 
-    // Second raw TCP dial for uploads.
+    // Second dial for uploads. `security::wrap` is the identity on a
+    // plaintext row, so an h1-over-TLS row gets its TLS session too — the
+    // version table now routes exactly those rows here (review, 2026-11-23).
     let post_stream = crate::transport::tcp::connect(ctx, None).await?;
+    let post_stream = crate::security::wrap(ctx, post_stream).await?;
     let post_sender = h1_client(post_stream).await?;
 
     let (tx, rx) = mpsc::channel::<Bytes>(16);
@@ -1068,6 +1074,7 @@ async fn stream_up_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let reader = resp.reader;
 
     let post_stream = crate::transport::tcp::connect(ctx, None).await?;
+    let post_stream = crate::security::wrap(ctx, post_stream).await?;
     let mut post_sender = h1_client(post_stream).await?;
     let (wt, wrx) = mpsc::channel::<Bytes>(16);
     let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::Pipe(wrx));

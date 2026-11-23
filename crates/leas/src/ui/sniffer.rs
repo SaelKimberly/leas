@@ -37,9 +37,12 @@ pub fn reset_scroll() {
     SCROLL.store(0, Ordering::Relaxed);
 }
 
-/// The current offset, clamped to a table of `len` rows.
-fn scroll_offset(len: usize) -> usize {
-    let max = len.saturating_sub(1);
+/// The current offset, clamped so the LAST page stays full.
+///
+/// Clamping to `len - 1` (issue 023) let `End` scroll the table down to a
+/// single visible row while the pane still had room for a full page.
+fn scroll_offset(len: usize, visible: usize) -> usize {
+    let max = len.saturating_sub(visible.max(1));
     SCROLL.fetch_min(max, Ordering::Relaxed).min(max)
 }
 
@@ -199,6 +202,10 @@ fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
     ])
     .style(ThemeStyles::table_header(theme));
 
+    // Issue 024 (build only the painted rows) is deferred: `Table` takes
+    // owned `Row`s, and a cached row set would be deep-cloned every frame
+    // anyway, so the allocation is not removable without changing the
+    // widget's ownership shape. Recorded in the plan's deviations.
     let rows: Vec<Row> = snapshot
         .hosts
         .iter()
@@ -228,8 +235,11 @@ fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &opaline
     .header(header)
     .column_spacing(1);
 
-    let mut table_state =
-        ratatui::widgets::TableState::default().with_offset(scroll_offset(snapshot.hosts.len()));
+    // Rows the table can actually paint: `area` is already the block's inner
+    // rect, so only the header row is not data (review, 2026-11-23).
+    let visible = usize::from(area.height.saturating_sub(1));
+    let mut table_state = ratatui::widgets::TableState::default()
+        .with_offset(scroll_offset(snapshot.hosts.len(), visible));
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
@@ -258,7 +268,8 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
         .latest
         .as_ref()
         .map_or(0, |snapshot| snapshot.hosts.len());
-    let current = scroll_offset(len);
+    // The raw intended offset: the render clamps it to the last FULL page.
+    let current = SCROLL.load(Ordering::Relaxed);
     let next = match key.code {
         KeyCode::Up => current.saturating_sub(1),
         KeyCode::Down => current.saturating_add(1),
@@ -268,7 +279,7 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
         KeyCode::End => usize::MAX,
         _ => return,
     };
-    SCROLL.store(next.min(len.saturating_sub(1)), Ordering::Relaxed);
+    SCROLL.store(next.min(len), Ordering::Relaxed);
 }
 
 /// `format_bytes` takes `i64`; a counter past `i64::MAX` clamps, never wraps.

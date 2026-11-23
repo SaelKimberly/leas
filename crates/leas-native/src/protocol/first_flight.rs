@@ -38,7 +38,11 @@ const FIRST_PAYLOAD_MAX: usize = 16 * 1024;
 pub struct HeaderFirst<S> {
     inner: S,
     /// The header, followed by whatever the first write added.
-    pending: Vec<u8>,
+    ///
+    /// `Zeroizing`: the header carries the request credential for the families
+    /// whose request is keyed (trojan's hex auth, vless's uuid), and a plain
+    /// `Vec` left that copy in memory after the send (issue 008).
+    pending: zeroize::Zeroizing<Vec<u8>>,
     /// How much of `pending` the carrier has taken.
     pos: usize,
     /// True once a first payload was accepted.
@@ -47,10 +51,10 @@ pub struct HeaderFirst<S> {
 
 impl<S> HeaderFirst<S> {
     /// Wrap `inner`, holding `header` back until the first write or the timer.
-    pub const fn new(inner: S, header: Vec<u8>) -> Self {
+    pub fn new(inner: S, header: Vec<u8>) -> Self {
         Self {
             inner,
-            pending: header,
+            pending: zeroize::Zeroizing::new(header),
             pos: 0,
             released: false,
         }
@@ -99,8 +103,12 @@ impl<S> HeaderFirst<S> {
                 Poll::Pending => return Poll::Pending,
             }
         }
-        // The header is on the carrier; the buffer is small and stays allocated
-        // so a retry cannot make this path allocate.
+        // The header is on the carrier; wipe the credential copy before the
+        // buffer is kept for reuse (issue 008).
+        {
+            use zeroize::Zeroize as _;
+            self.pending.zeroize();
+        }
         self.pending.clear();
         self.pos = 0;
         Poll::Ready(Ok(()))

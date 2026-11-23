@@ -153,7 +153,11 @@ impl ReadState {
             PacketMode::Raw => Ok(Some((None, frame))),
             PacketMode::PacketAddr => {
                 let (dest, payload) = packetaddr::decode_dest(&frame)?;
-                Ok(Some((Some(dest), Bytes::copy_from_slice(payload))))
+                // Slice the frame the reader already handed up instead of
+                // copying the payload (issue 007): one refcount, no 64 KiB
+                // memcpy per datagram.
+                let header_len = frame.len() - payload.len();
+                Ok(Some((Some(dest), frame.slice(header_len..))))
             }
             PacketMode::XUdp => unreachable!("XUdp rides the mux session, not the frame codec"),
         }
