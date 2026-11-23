@@ -8,14 +8,14 @@
 //! allocator (a tracing allocator for a profile run, say) has to be put.
 //!
 //! Version: `rustfs-mimalloc` 0.7.4 (mimalloc 3.6.2). Its sys crate compiles
-//! `static.c` with `cc` on every target, so `windows-gnu` builds without CMake;
-//! `mimalloc-safe` 0.1.70 (3.6.1) took the CMake path everywhere except
+//! `static.c` with `cc` on every target, so `windows-gnu` builds without `CMake`;
+//! `mimalloc-safe` 0.1.70 (3.6.1) took the `CMake` path everywhere except
 //! windows-msvc and could not install there. The older `mimalloc` 0.1.52 crate
 //! (3.3.2) was 2-4x slower on the allocator lab's batch shape (`alloc/lab.rs`),
 //! and its `mi_collect(true)` left abandoned blocking-thread heaps resident
 //! (41 MiB after 262 threads vs 8 MiB here).
 //!
-//! The numbers quoted below were measured on 3.6.1 built by CMake; the `cc`
+//! The numbers quoted below were measured on 3.6.1 built by `CMake`; the `cc`
 //! build of 3.6.2 has not been re-measured, and its compile-time defines differ.
 //!
 //! Purging: do NOT override `purge_delay`. 3.6.x purges a page on its own free

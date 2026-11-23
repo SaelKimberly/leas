@@ -42,13 +42,10 @@ rustls = { workspace = true, features = ["ring"] }
 anyhow.workspace = true
 futures-util.workspace = true
 
-# ============ Observability ============
-tracing.workspace = true
 leas-hakari = { version = "0.1", path = "../leas-hakari" }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
