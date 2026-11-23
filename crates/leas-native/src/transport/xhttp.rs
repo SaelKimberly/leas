@@ -957,27 +957,43 @@ pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
     // exactly as long as the tunnel — when the last `SendRequest` clone
     // drops, the connection closes with H3_NO_ERROR, `poll_close` resolves,
     // and the endpoint goes with it.
+    // Keep a closer for the failure paths: the driver task below holds the
+    // connection open by design, so an error returned from the splithttp arm
+    // would otherwise leave the endpoint (and the cached rustls config it
+    // carries) alive until quinn's 300 s idle timeout. A feed-wide probe dials
+    // these links hundreds of times a second.
+    let closer = conn.clone();
     let h3_quic = h3_quinn::Connection::new(conn);
-    let (mut h3_conn, send_request) = {
-        let limit = timeouts::TRANSPORT;
-        tokio::time::timeout(limit, h3::client::new(h3_quic))
-            .await
-            .map_err(|_| NativeError::Timeout {
-                step: "xhttp h3 open",
-                limit,
-            })?
-            .map_err(|e| NativeError::Transport(format!("xhttp h3 open: {e}")))?
-    };
+    let limit = timeouts::TRANSPORT;
+    let (mut h3_conn, send_request) =
+        match tokio::time::timeout(limit, h3::client::new(h3_quic)).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                closer.close(0_u32.into(), b"xhttp h3 open failed");
+                return Err(NativeError::Transport(format!("xhttp h3 open: {e}")));
+            }
+            Err(_) => {
+                closer.close(0_u32.into(), b"xhttp h3 open timed out");
+                return Err(NativeError::Timeout {
+                    step: "xhttp h3 open",
+                    limit,
+                });
+            }
+        };
     tokio::spawn(async move {
         let _ = std::future::poll_fn(|cx| h3_conn.poll_close(cx)).await;
         drop(endpoint);
     });
 
-    match mode {
+    let result = match mode {
         "packet-up" => packet_up_h3(ctx, send_request).await,
         "stream-one" => stream_one_h3(ctx, send_request).await,
         _ => stream_up_h3(ctx, send_request).await,
+    };
+    if result.is_err() {
+        closer.close(0_u32.into(), b"xhttp h3 transport failed");
     }
+    result
 }
 
 /// packet-up over HTTP/1.1 (no TLS): GET on the primary stream, upload POSTs

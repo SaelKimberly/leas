@@ -64,6 +64,13 @@ const REAL_CONCURRENCY_DEFAULT: u32 = 100;
 /// results/s at 5 (3,381 results in 23 min), i.e. ~4 h for a 34k-link plan.
 const REAL_CONCURRENCY_WARN_BELOW: u32 = 50;
 
+/// Ceiling on the batch's parsed-protocol memo. A feed-wide plan is nearly
+/// one unique config per link, and the memo otherwise fixes every parsed
+/// config for the run's life (175 MiB measured at 215 s into a full-feed
+/// Real Test). The cap covers the real sharing case — a config carried by
+/// many endpoints — and costs a reload for a protocol revisited after a clear.
+const PROTOCOL_CACHE_CAP: usize = 1024;
+
 /// Prefix of the persisted marker text for a row the native engine cannot test.
 ///
 /// The marker is a [`leas_db::models::ProfileErr::Real`] — the only failure
@@ -1140,6 +1147,12 @@ pub(crate) struct BatchShared {
     /// 0.6–1.1 s over the 9k-link reference feed and 2.3–4.1 s over a 34k-link
     /// plan. A load FAILURE is not cached, so a transient read error cannot
     /// poison the protocol for the rest of the run.
+    ///
+    /// BOUNDED, because a feed-wide run has nearly one unique config per link
+    /// (the identity ignores host/port, not the uuid): memoizing all of them
+    /// held 175 MiB of parsed configs at 215 s into a full-feed Real Test
+    /// (`ops::ping` live, measured). Clearing past [`PROTOCOL_CACHE_CAP`] costs
+    /// a reload only for the rare protocol that recurs after the clear.
     protocols: DashMap<ProtocolId, Arc<LoadedProtocol>>,
     /// Links the native engine cannot serve (kind-level gate, no config load),
     /// keyed by identity and carrying the persisted marker text. The fast half
@@ -1165,7 +1178,14 @@ pub(crate) struct BatchShared {
     /// `finish_batch`. The counters say when work is *settled*; a chain is also
     /// running between its fast settle and its real dispatch, which no counter
     /// covers — the join is what makes the batch's end a hard boundary.
+    ///
+    /// Finished handles are pruned as work settles (see [`Self::note_settled`]):
+    /// a completed task's allocation is only released when its handle is
+    /// dropped, and a feed-wide plan would hold one per link until the batch
+    /// ended.
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Settles since the last finished-handle prune.
+    settle_ticks: AtomicUsize,
     // ── rate sampling (1 Hz, for the ETA) ─────────────────────────────
     /// The one level's rate sample (the ETA's denominator).
     rate_main: Mutex<(Instant, u32)>,
@@ -1207,7 +1227,13 @@ pub(crate) struct BatchShared {
     /// real-success rate is 0.03%–1.7%, so a 74k-endpoint run holds tens of
     /// ids) and a membership test must be exact — a false positive would
     /// silently drop a working config.
-    deferred_siblings: Mutex<RapidHashMap<i64, Vec<ProfileStats>>>,
+    ///
+    /// The verdicts live in the SAME lock as the held links: the dispatch is
+    /// throttled by the probe permit, so a group's first protocol can settle
+    /// before the page finished publishing its siblings. Recording the verdict
+    /// makes a late publish apply it instead of stranding the siblings (which
+    /// would leave their `main.done` uncounted and hang the batch's waiter).
+    siblings: Mutex<SiblingGate>,
     /// DNS resolution requests already emitted by this batch. The plan walk
     /// dispatches pages sequentially, but the set belongs to the batch: a DNS
     /// endpoint can span page boundaries while its first request is still
@@ -1270,6 +1296,17 @@ impl Half {
 struct FastDedupInner {
     cache: RapidHashMap<(String, u16), ProbeOutcome>,
     in_flight: RapidHashMap<(String, u16), Arc<Notify>>,
+}
+
+/// One group's held siblings plus the verdicts already decided for a group.
+///
+/// Both maps share one lock so "record the verdict" and "publish the
+/// siblings" are atomic with respect to each other — the dispatch throttle
+/// lets a group settle before its page published the siblings.
+#[derive(Default)]
+struct SiblingGate {
+    held: RapidHashMap<i64, Vec<ProfileStats>>,
+    verdicts: RapidHashMap<i64, bool>,
 }
 
 /// Parameters for one batch run. Built by the entry points from `AppState`;
@@ -1351,6 +1388,7 @@ impl BatchShared {
             pending_deferred: AtomicUsize::new(0),
             settled: Notify::new(),
             tasks: Mutex::new(Vec::new()),
+            settle_ticks: AtomicUsize::new(0),
             rate_main: Mutex::new((Instant::now(), 0)),
             fast_dedup: Mutex::new(FastDedupInner {
                 cache: RapidHashMap::new(),
@@ -1363,7 +1401,7 @@ impl BatchShared {
             started_ms: AtomicU32::new(0),
             ended_ms: AtomicU32::new(0),
             completed_endpoints: Mutex::new(RapidHashSet::new()),
-            deferred_siblings: Mutex::new(RapidHashMap::new()),
+            siblings: Mutex::new(SiblingGate::default()),
             resolve_requested: Mutex::new(RapidHashSet::new()),
         }
     }
@@ -1955,7 +1993,9 @@ async fn run_task_chain(
     link: ProfileStats,
     mut id: u16,
     mut kind: TaskKind,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
+    let mut permit = permit;
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             shared.sched.complete(&link, id, kind).await;
@@ -1967,13 +2007,13 @@ async fn run_task_chain(
         }
         match kind {
             TaskKind::FastPing => {
-                // One concurrency limit (spec D14). The fast ONLY half takes
-                // the `real_ping_concurrency` permit further below, at the
-                // probe itself: a feed-wide batch used to dispatch every link
-                // at once (measured 1,475-4,928 sockets, 315-539 MiB peak,
-                // and it exhausted a default `ulimit -n`). The merged real
-                // phase needs no fast permit — its transport stage IS the
-                // native probe and already rides the same limit.
+                // One concurrency limit (spec D14) for BOTH batch kinds: the
+                // chain was spawned only after `dispatch_fast_link` took the
+                // `real_ping_concurrency` permit, and it keeps it for this
+                // half. A feed-wide batch used to dispatch every link at once
+                // (measured 1,475-4,928 sockets, 315-539 MiB peak, and it
+                // exhausted a default `ulimit -n`); a real-phase batch did the
+                // same with one future per planned link (213 MiB live).
                 shared.mark_started(&shared.started_ms);
                 // The MERGED pipeline (spec D1): in a real-phase batch there is
                 // NO separate TCP ping. The probe's own TRANSPORT stage
@@ -2007,7 +2047,10 @@ async fn run_task_chain(
                         //
                         // The denominator was already counted at plan time
                         // (`dispatch_page`), so nothing is added here.
-                        if !shared.dispatch_real_probe(link.clone(), true).await {
+                        if !shared
+                            .dispatch_real_probe(link.clone(), true, permit.take())
+                            .await
+                        {
                             shared.spawn_defer_retry(link.clone(), Half::Real);
                         }
                     }
@@ -2221,13 +2264,52 @@ impl BatchShared {
     }
 
     /// Hold a page's deferred siblings until their group's verdict lands.
-    fn hold_siblings(&self, siblings: RapidHashMap<i64, Vec<ProfileStats>>) {
+    fn hold_siblings(self: &Arc<Self>, siblings: RapidHashMap<i64, Vec<ProfileStats>>) {
         if siblings.is_empty() {
             return;
         }
-        let mut held = self.deferred_siblings.lock();
-        for (endpoint_id, links) in siblings {
-            held.entry(endpoint_id).or_default().extend(links);
+        let mut settled: Vec<(Vec<ProfileStats>, bool)> = Vec::new();
+        {
+            let mut gate = self.siblings.lock();
+            for (endpoint_id, links) in siblings {
+                match gate.verdicts.get(&endpoint_id).copied() {
+                    Some(succeeded) => settled.push((links, succeeded)),
+                    None => gate.held.entry(endpoint_id).or_default().extend(links),
+                }
+            }
+        }
+        for (links, succeeded) in settled {
+            self.settle_siblings(links, succeeded);
+        }
+    }
+
+    /// Apply a group's verdict to its siblings: drop them when the endpoint
+    /// succeeded, dispatch them otherwise.
+    fn settle_siblings(self: &Arc<Self>, siblings: Vec<ProfileStats>, succeeded: bool) {
+        if succeeded {
+            // The endpoint is known good: the whole group is dropped. The
+            // siblings write NOTHING — no probe, no marker, no delay.
+            //
+            // They were counted into `main.total` at plan time, so they must
+            // be counted into `main.done` here: the denominator and the
+            // numerator have to meet, or the batch's waiter waits out the
+            // whole deferral budget for a link that will never settle.
+            self.counters.group_dropped.fetch_add(1, Ordering::Relaxed);
+            self.meters
+                .main
+                .done
+                .fetch_add(siblings.len() as u32, Ordering::Relaxed);
+            return;
+        }
+        // The endpoint did not succeed: the siblings are probed. They are
+        // dispatched on their own task, so the release does not block the
+        // settle path.
+        self.counters.group_released.fetch_add(1, Ordering::Relaxed);
+        for link in siblings {
+            let shared = Arc::clone(self);
+            self.spawn_tracked(async move {
+                shared.dispatch_fast_link(link).await;
+            });
         }
     }
 
@@ -2240,30 +2322,26 @@ impl BatchShared {
     /// would depend on `task_queue_limit` and a `DnsDeferred` link has no gate
     /// entry to queue behind (`schedule` answers before the lock).
     async fn dispatch_fast_link(self: &Arc<Self>, link: ProfileStats) -> bool {
-        // One concurrency limit (spec D14): a fast ONLY batch takes the same
-        // `real_ping_concurrency` permit the real phase uses, and it takes it
-        // HERE so the walk stops at the limit. Acquiring it inside the spawned
-        // chain instead still spawned one future per link (13.8 k of them) and
-        // that queue was most of the run's live heap. A real-phase batch needs
-        // no fast permit: its transport stage IS the native probe, bounded by
-        // `dispatch_real_probe`.
-        let permit = if self.real_phase {
-            None
-        } else {
-            // A closed semaphore must NOT degrade the bound to "unlimited":
-            // hand the link back to the deferral path instead.
-            let Ok(permit) = Arc::clone(&self.real_sem).acquire_owned().await else {
-                return false;
-            };
-            Some(permit)
+        // One concurrency limit (spec D14) for BOTH batch kinds, taken HERE so
+        // the walk stops at the limit. Acquiring it inside the spawned chain
+        // still spawned one future per link (13.8 k of them) and that queue was
+        // most of the run's live heap — a real-phase feed batch dispatched all
+        // 104 k links before the first probe settled, holding every link's
+        // `ProfileStats` (measured 213 MiB live in `ops::ping`) plus the
+        // deferred-sibling backlog. The real half reuses this permit instead of
+        // acquiring a second one.
+        //
+        // A closed semaphore must NOT degrade the bound to "unlimited": hand
+        // the link back to the deferral path instead.
+        let Ok(permit) = Arc::clone(&self.real_sem).acquire_owned().await else {
+            return false;
         };
         match self.sched.schedule(&link, TaskKind::FastPing).await {
             ScheduleOutcome::Started(id) => {
                 self.pending_fast.fetch_add(1, Ordering::Relaxed);
                 let shared = Arc::clone(self);
                 self.spawn_tracked(async move {
-                    let _permit = permit;
-                    run_task_chain(shared, link, id, TaskKind::FastPing).await;
+                    run_task_chain(shared, link, id, TaskKind::FastPing, Some(permit)).await;
                 });
                 true
             }
@@ -2375,7 +2453,7 @@ impl BatchShared {
         // A candidate is known: every path out of `dispatch_real_probe` counts
         // it exactly once into `main.done` (probe, sibling retire, stop retire,
         // queue-full). The denominator was counted at plan time.
-        if !self.dispatch_real_probe(link.clone(), true).await {
+        if !self.dispatch_real_probe(link.clone(), true, None).await {
             self.spawn_defer_retry(link.clone(), Half::Real);
         }
     }
@@ -2389,9 +2467,19 @@ impl BatchShared {
     /// `counted` says this half's candidate is already in `real.total`; a
     /// deferral retry passes `false` so a retried half is never counted twice.
     /// Returns `false` only for `DnsDeferred` (the caller re-enters later).
-    async fn dispatch_real_probe(self: &Arc<Self>, link: ProfileStats, counted: bool) -> bool {
-        let Ok(permit) = Arc::clone(&self.real_sem).acquire_owned().await else {
-            return true;
+    async fn dispatch_real_probe(
+        self: &Arc<Self>,
+        link: ProfileStats,
+        counted: bool,
+        held: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> bool {
+        let permit = if let Some(permit) = held {
+            permit
+        } else {
+            let Ok(permit) = Arc::clone(&self.real_sem).acquire_owned().await else {
+                return true;
+            };
+            permit
         };
         if self.stop.load(Ordering::Relaxed) {
             if counted {
@@ -2505,37 +2593,16 @@ impl BatchShared {
     /// failure marker.
     fn release_siblings(self: &Arc<Self>, endpoint_id: i64, succeeded: bool) {
         let siblings = {
-            let mut held = self.deferred_siblings.lock();
-            held.remove(&endpoint_id).unwrap_or_default()
+            let mut gate = self.siblings.lock();
+            gate.verdicts.insert(endpoint_id, succeeded);
+            gate.held.remove(&endpoint_id).unwrap_or_default()
         };
         if siblings.is_empty() {
+            // The verdict is still recorded: the page's dispatch may be
+            // throttled and publish these siblings after this settle.
             return;
         }
-        if succeeded {
-            // The endpoint is known good: the whole group is dropped. The
-            // siblings write NOTHING — no probe, no marker, no delay.
-            //
-            // They were counted into `main.total` at plan time, so they must
-            // be counted into `main.done` here: the denominator and the
-            // numerator have to meet, or the batch's waiter waits out the
-            // whole deferral budget for a link that will never settle.
-            self.counters.group_dropped.fetch_add(1, Ordering::Relaxed);
-            self.meters
-                .main
-                .done
-                .fetch_add(siblings.len() as u32, Ordering::Relaxed);
-            return;
-        }
-        // The endpoint did not succeed: the siblings are probed. They are
-        // dispatched on their own task, so the release does not block the
-        // settle path.
-        self.counters.group_released.fetch_add(1, Ordering::Relaxed);
-        for link in siblings {
-            let shared = Arc::clone(self);
-            self.spawn_tracked(async move {
-                shared.dispatch_fast_link(link).await;
-            });
-        }
+        self.settle_siblings(siblings, succeeded);
     }
 
     /// Spawn the one retry task a deferred half gets.
@@ -2615,7 +2682,7 @@ impl BatchShared {
             }
             let reached_gate = match half {
                 Half::Fast => self.dispatch_fast_link(link.clone()).await,
-                Half::Real => self.dispatch_real_probe(link.clone(), false).await,
+                Half::Real => self.dispatch_real_probe(link.clone(), false, None).await,
             };
             if reached_gate {
                 break;
@@ -2830,6 +2897,11 @@ impl BatchShared {
             // second source.
             fp: row.security.fp.clone(),
         });
+        // Bound the memo (see the field doc). A clear is cheap and keeps the
+        // common case — one protocol row shared by several endpoints — cached.
+        if self.protocols.len() >= PROTOCOL_CACHE_CAP {
+            self.protocols.clear();
+        }
         self.protocols.insert(id, Arc::clone(&loaded));
         Ok(loaded)
     }
@@ -3162,6 +3234,17 @@ impl BatchShared {
     /// One task settled: the level's `done` advances (with a rate sample for the
     /// ETA) and the waiter is woken when nothing of that level is outstanding.
     fn note_settled(&self, kind: TaskKind) {
+        // A completed task's allocation lives until its `JoinHandle` drops.
+        // Prune occasionally instead of holding one header per link for the
+        // whole run; `run_batch`'s final join still sees every unfinished one.
+        const PRUNE_EVERY: usize = 256;
+        if self
+            .settle_ticks
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(PRUNE_EVERY)
+        {
+            self.tasks.lock().retain(|handle| !handle.is_finished());
+        }
         match kind {
             TaskKind::FastPing => {
                 self.mark_settled(&self.ended_ms);
@@ -4549,6 +4632,57 @@ mod tests {
             "one load for the one protocol row the two links share"
         );
     }
+
+    /// A real-phase feed batch must not dispatch the whole plan before the
+    /// first probe settles: every dispatched link is a live chain holding its
+    /// `ProfileStats` (and its endpoint's deferred siblings), which measured
+    /// 213 MiB of live heap in `ops::ping` on a feed-wide run. The dispatch
+    /// now takes the one probe permit, so the plan walk advances only as
+    /// probes settle.
+    #[tokio::test]
+    async fn real_phase_dispatch_stops_at_the_probe_bound() {
+        let rows: Vec<_> = (1..=6)
+            .map(|i| fake_row(i, &format!("10.0.{i}.1"), 1))
+            .collect();
+        let mut h = harness(rows.clone()).await;
+        let gate = Arc::new(Notify::new());
+        *h.runner.real_gate.lock() = Some(gate.clone());
+        let plan = plan_from_rows(&rows);
+        // One slot: the first probe parks on the gate and holds the only
+        // permit, so the walk cannot dispatch link 2.
+        let handle = start_test_batch_with(&mut h, plan, true, false, 1);
+
+        for _ in 0..300 {
+            if h.runner.real_calls.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let planned = h
+            .state
+            .batch_progress
+            .as_ref()
+            .expect("batch meters published")
+            .main
+            .total
+            .load(Ordering::Relaxed);
+        assert!(
+            planned <= 2,
+            "the walk stops at the probe bound (measured {planned} planned of 6)"
+        );
+
+        // Clear the gate first: `notify_waiters` only wakes waiters registered
+        // at that instant, and the permits turn over one probe at a time.
+        *h.runner.real_gate.lock() = None;
+        gate.notify_waiters();
+        handle.await.expect("batch");
+        await_batch_done(&mut h.state).await;
+        assert_eq!(
+            h.runner.real_calls.load(Ordering::Relaxed),
+            6,
+            "every link is probed once the permits turn over"
+        );
+    }
     #[tokio::test]
     async fn dns_resolution_request_is_claimed_once_per_batch() {
         let row = fake_row(1, "example.test", 1);
@@ -4961,7 +5095,14 @@ mod tests {
         shared
             .endpoints
             .insert(link.endpoint_id, Arc::new(rows[0].endpoint.clone()));
-        run_task_chain(Arc::clone(&shared), link.clone(), 0, TaskKind::FastPing).await;
+        run_task_chain(
+            Arc::clone(&shared),
+            link.clone(),
+            0,
+            TaskKind::FastPing,
+            None,
+        )
+        .await;
 
         assert_eq!(
             shared.counters.unreachable.load(Ordering::Relaxed),

@@ -374,6 +374,12 @@ where
         );
     }
 
+    // The import is the app's burst-shaped workload: the parse buffers, the
+    // per-window row families and the write-behind staging are all free by
+    // here, but the allocator keeps their pages because an idle session never
+    // allocates enough to fire its purge timer. Hand them back now.
+    crate::alloc::job_boundary("import");
+
     ImportOutcome {
         // STORED, not staged: the "only what was STORED" invariant the
         // `links` doc comment names.

@@ -172,7 +172,17 @@ pub(super) async fn dial(
     )
     .await?;
 
-    let auth = runtime_auth(&conn, &endpoint, &cfg.auth, cc_rx_bps(cfg)).await?;
+    let auth = match runtime_auth(&conn, &endpoint, &cfg.auth, cc_rx_bps(cfg)).await {
+        Ok(auth) => auth,
+        Err(error) => {
+            // The h3 driver task spawned inside `runtime_auth` holds the
+            // endpoint and a connection clone until `poll_close` resolves;
+            // without an explicit close that is quinn's 300 s idle timeout.
+            // A feed-wide probe hits this path hundreds of times a second.
+            conn.close(0_u32.into(), b"hysteria2 auth failed");
+            return Err(error);
+        }
+    };
     Ok((conn, auth))
 }
 
@@ -362,10 +372,19 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
                     continue;
                 }
                 // Copy the datagram out first: source and destination alias
-                // the same `IoSliceMut`.
-                let mut scratch = vec![0u8; len];
-                scratch.copy_from_slice(&bufs[i][..len]);
-                let plain = self.sal.deobfuscate_into(&scratch, &mut bufs[i][..]);
+                // the same `IoSliceMut`. The scratch is per thread — the
+                // endpoint driver is the only caller — so a live session does
+                // not allocate once per received datagram.
+                thread_local! {
+                    static RECV_SCRATCH: std::cell::RefCell<Vec<u8>> =
+                        const { std::cell::RefCell::new(Vec::new()) };
+                }
+                let plain = RECV_SCRATCH.with(|scratch| {
+                    let mut scratch = scratch.borrow_mut();
+                    scratch.resize(len, 0);
+                    scratch.copy_from_slice(&bufs[i][..len]);
+                    self.sal.deobfuscate_into(&scratch, &mut bufs[i][..])
+                });
                 meta[i].len = plain;
             }
         }

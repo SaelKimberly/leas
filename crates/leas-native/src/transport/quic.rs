@@ -101,6 +101,24 @@ pub fn quic_tls_config(
         .flatten()
         .and_then(|o| o.insecure)
         .unwrap_or(false);
+    // One `ClientConfig` per (trust mode, ALPN) for the process. Building one
+    // parses the whole webpki root store — ~40 KiB of allocations — and every
+    // feed-wide probe dial did it again: 13 670 failed QUIC dials held 541 MiB
+    // live under `transport::quic`, because a failed handshake retains its
+    // endpoint for the 300 s idle timeout this transport config sets.
+    //
+    // Test/e2e builds keep the per-call build: the harness CA is a
+    // thread-local that changes between tests.
+    #[cfg(not(any(test, feature = "e2e-support")))]
+    let key = (insecure, alpn.to_vec());
+    #[cfg(not(any(test, feature = "e2e-support")))]
+    if let Some(cached) = tls_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(cached.clone());
+    }
     let mut tls = if insecure {
         let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
         rustls::ClientConfig::builder()
@@ -124,7 +142,22 @@ pub fn quic_tls_config(
     };
     tls.alpn_protocols = vec![alpn.to_vec()];
     tls.enable_early_data = true;
+    #[cfg(not(any(test, feature = "e2e-support")))]
+    tls_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, tls.clone());
     Ok(tls)
+}
+
+/// Build-once cache behind [`quic_tls_config`].
+#[cfg(not(any(test, feature = "e2e-support")))]
+fn tls_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<(bool, Vec<u8>), rustls::ClientConfig>> {
+    static CACHE: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<(bool, Vec<u8>), rustls::ClientConfig>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    &CACHE
 }
 
 /// Convert the rustls config into a quinn `ClientConfig` with a long idle
@@ -153,14 +186,48 @@ pub(crate) fn quinn_client_config(tls: rustls::ClientConfig) -> quinn::ClientCon
 }
 
 /// Bind a QUIC client endpoint on the same address family as the server.
+///
+/// ONE endpoint per family, shared by every dial. A fresh `Endpoint::client`
+/// allocates a ~188 KiB receive buffer (quinn sizes it
+/// `max_udp_payload_size × GRO segments × BATCH_SIZE`), and a feed-wide probe
+/// runs these dials hundreds per second: the h3-only lab peaked at 202 MiB
+/// live in `client_endpoint`, and the full-feed run held 541 MiB under
+/// `transport::quic`. One UDP socket multiplexes every connection (quinn
+/// routes by connection id), so the buffer is paid once instead of per dial.
+/// The obfuscated hysteria2 socket is a different wrapper and still binds per
+/// dial (see `protocol::hysteria2::quic::client_endpoint`).
+///
+/// Test and e2e builds bind per dial: the shared endpoint's driver task lives
+/// on the runtime that created it, and those harnesses create one runtime per
+/// case.
 #[must_use]
 pub(crate) fn client_endpoint(server_addr: SocketAddr) -> quinn::Endpoint {
-    let bind: SocketAddr = if server_addr.is_ipv6() {
-        "[::]:0".parse().expect("static ipv6 bind addr")
-    } else {
-        "0.0.0.0:0".parse().expect("static ipv4 bind addr")
-    };
-    quinn::Endpoint::client(bind).expect("quic client endpoint bind")
+    #[cfg(any(test, feature = "e2e-support"))]
+    {
+        let bind: SocketAddr = if server_addr.is_ipv6() {
+            "[::]:0".parse().expect("static ipv6 bind addr")
+        } else {
+            "0.0.0.0:0".parse().expect("static ipv4 bind addr")
+        };
+        quinn::Endpoint::client(bind).expect("quic client endpoint bind")
+    }
+    #[cfg(not(any(test, feature = "e2e-support")))]
+    {
+        use std::sync::LazyLock;
+        static V4: LazyLock<quinn::Endpoint> = LazyLock::new(|| {
+            quinn::Endpoint::client("0.0.0.0:0".parse().expect("static ipv4 bind addr"))
+                .expect("quic client endpoint bind")
+        });
+        static V6: LazyLock<quinn::Endpoint> = LazyLock::new(|| {
+            quinn::Endpoint::client("[::]:0".parse().expect("static ipv6 bind addr"))
+                .expect("quic client endpoint bind")
+        });
+        if server_addr.is_ipv6() {
+            V6.clone()
+        } else {
+            V4.clone()
+        }
+    }
 }
 
 /// Complete a QUIC client handshake to `addr` with `server_name` SNI,
