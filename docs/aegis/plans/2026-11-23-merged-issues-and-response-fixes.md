@@ -398,3 +398,31 @@ Deviations from the task text, each with its reason:
 | T8 | `attempts = 1`; the resolve gate is sized from `real_ping_concurrency`; a starved host is deferred without a verdict; cache hits no longer re-stamp the TTL; the UDP association's DNS cache carries a 300 s TTL and invalidates a failed address; the `seen` list is capped at 64. The 8 s lookup budget is unchanged (decision D2). |
 | T9 | Unknown routing tokens now fail the row closed (`ips` with no usable entry, `network`, `protocols`); a UDP association caches its routing decision for 30 s per (host, port). |
 | T10 | Landed: xhttp dispatches from `http_version()`; the `HeaderFirst` header copy is zeroized; the hysteria2 defragger caps `frag_count`; the packetaddr receive slices the frame instead of copying; the Sniffer's scroll clamps to a full page. **Deferred with reasons:** 011 (the h2/h1 upload dial bypasses a multi-hop chain — the chain links are not on `LinkContext`; fixing it is an architecture change, not a one-liner) and 024 (a cached row set would be deep-cloned per frame because `Table` takes owned `Row`s). The hysteria2 half of 007 needs `UdpMessage.data` to become `Bytes` across the protocol seam and is deferred with it. |
+
+## 11. Live verification — the 2026-11-23 post-fix run
+
+`Real Test (All Profiles)` finished 2026-11-23 11:57:12 UTC (wall 8 924 s, started
+09:28:27), i.e. after every commit above. The run is the proof that the fixes are
+live: the exact batch window is `updated_at BETWEEN 1795426127 AND 1795435032`,
+which holds **15 098** `profile_stats` rows. The batch's own summary
+(`links=146 531 … deferred=134 974 | ok=40 failed=146 257`) counts *deferred*
+links inside `failed`, so ~11 k links were actually probed; read every share
+against the 15 098 written rows, not the summary's 146 k.
+
+| Claim | 2026-11-20 baseline | 2026-11-23 run | Verdict |
+| --- | --- | ---: | --- |
+| WS early-data HTTP rejection keeps the status class | 4 650 rows as `transport/alert`, 0 `status` | **173 `transport/status`**, 70 `alert` (all genuine TLS: `2 40` ×66, RST ×4) | fixed |
+| Double-wrapped type-loss signature (`TLS error: I/O error: transport error: ws: …`) | 4 650 | **0** | fixed |
+| `0x48` (server answered `HTTP/`) | 685 `transport/alert` + 79 none | **76 `protocol/framing`, 0 `alert`** | fixed |
+| Fast-probe typed pair | 8 416 pair-less rows | **15 pair-less / 7 726 paired (99.8 %)** | fixed |
+| Real-probe typed pair | — | 72 pair-less / 7 265 (99.0 %); residual texts are unclassified (`timeout on probe attempt`, `tunnel closed: …`, `early eof`, REALITY cert) | accepted residual |
+| Pair-less rows carrying an old text | 5 115 | 0 in-window (the 2 625 seen on a wider bound are legacy error columns bumped by the 12:0x import restamps) | not a writer gap |
+| Failed write statements / lost chunks | 375 / 226 | **12 / 0** (`staged-left=0`) | fixed |
+| `last_seen_at` moved by a failed probe | 132 029 (whole feed, one import) | **0**; stamps in window track the 37 source claims | fixed |
+| Relay idle reaps | 3 792 at the old 30 s cap | 469, **416 in the 60–65 s bucket** | cap honored |
+| Unresolvable hosts surfacing as probe verdicts | 18 484 `dial/io` rows, 9 436 starved hosts | **665 rows over 108 hosts**; starved hosts defer with no verdict | fixed |
+
+Residual observation, not a regression: the batch deferred 134 974 of 146 531
+links (2026-11-20: 101 318) and returned 40 successes. Deferral is what keeps a
+starved host from becoming a failure verdict; the deferred share itself is a
+feed-quality fact, not a client defect, and no fix in this plan targets it.
