@@ -332,6 +332,8 @@ Still open (not behaviour, reader-facing):
   stage-conditional: `fast` ⇔ `dial`) and does not re-key the column. Promote to
   a task only if a UI/report consumer needs the real-test scope.
 - **D8 — probe budget (F5).** Not raised; 0/680 rescued at 15 s.
+Files: `crates/leas-db/src/{database,write_behind}.rs`,
+`crates/leas/src/state.rs`, `crates/leas/src/ops/{ping,events}.rs`.
 
 ## 7. Verification
 

@@ -68,6 +68,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     state.disconnect_tx = Some(stop_tx);
     state.connecting = true;
     state.connected_protocol_id = Some(endpoint_id);
+    state.pending_link_alive = Some((protocol_id.get(), endpoint_id));
     state.connection_error = None;
 
     // Deferred-resolution trigger: connect does real networking, so resolve
@@ -75,8 +76,9 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     crate::ops::enrich::spawn_dns_resolve(state, endpoint.id.get(), true);
 
     // "Last Used" = connect initiation: DB write + in-memory row so the
-    // sub-table refreshes without a reload. `update_last_used` sets both
-    // `last_used_at` and `last_seen_at` to the same ts (old semantics).
+    // sub-table refreshes without a reload. Only `last_used_at` moves here —
+    // initiation is INTENT, not proof. The liveness stamp (`last_seen_at`)
+    // waits for `CoreEvent::Connected` (spec 2026-11-23 T11).
     let now = leas_db::models::now_epoch();
     let lu_endpoint_id = EndpointId::new(endpoint.id.get());
     let lu_db = state.db.clone();
@@ -95,9 +97,6 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         && let Some(link) = r.links.iter_mut().find(|l| l.protocol_id == protocol_id)
     {
         link.last_used_at = Some(now);
-        // Mirror the DB write so the sub-table's displayed last_seen matches
-        // the DB staleness classification between reloads.
-        link.last_seen_at = now;
     }
     let tx = if let Some(tx) = &state.core_event_tx {
         tx.clone()
@@ -269,6 +268,7 @@ pub fn disconnect(state: &mut AppState) {
     state.connected = false;
     state.live_proxy.clear();
     state.connected_protocol_id = None;
+    state.pending_link_alive = None;
     state.connecting = false;
     // Session state: drop the error marker and the actions-log traffic
     // deltas so a disconnected session renders as "Disconnected", never as a
@@ -382,6 +382,10 @@ mod tests {
         state.endpoints = vec![row];
         state.filter_cache_valid.set(false);
         state.selected_index = 0;
+        let seen_before = read_link(&state.db, pid.get(), 100)
+            .await
+            .expect("seeded link")
+            .last_seen_at;
         state.connect_to_profile(100);
 
         // Connect initiation bookkeeping: `connecting` in flight, the
@@ -390,12 +394,17 @@ mod tests {
         assert!(state.connecting, "connecting flag set during connect");
         assert_eq!(state.connected_protocol_id, Some(100));
         let link = &state.endpoints[0].links[0];
-        let used_at = link
+        let _used_at = link
             .last_used_at
             .expect("in-memory last_used_at set at initiation");
         assert_eq!(
-            link.last_seen_at, used_at,
-            "last_used mirrors last_seen (old semantics)"
+            link.last_seen_at, seen_before,
+            "initiation is intent: the liveness clock must not move"
+        );
+        assert_eq!(
+            state.pending_link_alive,
+            Some((pid.get(), 100)),
+            "the proof target is remembered until the session reports Connected"
         );
 
         // Drain until the connect task's error event lands (config build
@@ -433,7 +442,8 @@ mod tests {
         );
 
         // Persisted consistency: the spawned update_last_used write lands
-        // with the same timestamp the in-memory patch used.
+        // with the same timestamp the in-memory patch used — and it writes
+        // ONLY the intent column.
         let mut stored = None;
         for _ in 0..100 {
             stored = read_link(&state.db, pid.get(), 100).await;
@@ -445,8 +455,8 @@ mod tests {
         let stored = stored.expect("link persisted");
         let stored_used = stored.last_used_at.expect("last_used_at persisted");
         assert_eq!(
-            stored.last_seen_at, stored_used,
-            "DB write sets both columns"
+            stored.last_seen_at, seen_before,
+            "the DB write leaves the liveness clock alone until a build succeeds"
         );
         assert_eq!(
             state.endpoints[0].links[0].last_used_at,

@@ -427,11 +427,12 @@ pub fn spawn_dns_retry(state: &mut AppState) {
         {
             Ok(rows) => rows,
             Err(e) => {
+                // A DNS-retry task is ended by `MaintenanceDone`; reporting
+                // `CompactFinished` left the scheduler's running task in place
+                // and wedged the queue for the session (issue 021).
+                tracing::warn!(%e, "DNS retry scan failed");
                 if let Some(tx) = &tx {
-                    let _ = tx.try_send(crate::types::CoreEvent::CompactFinished {
-                        merged: 0,
-                        text: format!("DNS retry scan failed: {e}"),
-                    });
+                    let _ = tx.try_send(crate::types::CoreEvent::MaintenanceDone);
                 }
                 return;
             }

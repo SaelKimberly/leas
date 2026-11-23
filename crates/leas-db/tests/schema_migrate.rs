@@ -64,6 +64,14 @@ async fn fresh_open_creates_tables_and_raw_ddl() {
     .await
     .expect("count indexes");
     assert_eq!(first_i64(&rows), Some(3), "the three raw indexes exist");
+    // The feed-search prefix indexes (issue 019).
+    let rows = toasty::sql::query(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'          AND name IN ('endpoint_rank_domain', 'endpoint_rank_sub_domain')",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("count search indexes");
+    assert_eq!(first_i64(&rows), Some(2), "the feed-search indexes exist");
 }
 
 /// Reopening a CURRENT file is a no-op: the rows survive, and the runner does

@@ -4,7 +4,8 @@ use std::sync::atomic::Ordering;
 use leas_core::speed_test::TestType;
 use leas_db::LinkGroups;
 use leas_db::models::{
-    EndpointId, EndpointRow, ErrorInfo, ProfileErr, ProfileStats, PurgeReason, TrafficStats,
+    EndpointId, EndpointRow, ErrorInfo, ProfileErr, ProfileStats, ProtocolId, PurgeReason,
+    TrafficStats,
 };
 
 use crate::AppState;
@@ -450,6 +451,35 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // would otherwise linger into this one.
                 state.reset_native_activity();
                 state.connected = true;
+                // The session built: THAT is the client's proof the link is
+                // alive. Initiation alone only recorded intent (T11).
+                if let Some((protocol_id, endpoint_id)) = state.pending_link_alive.take() {
+                    let now = leas_db::models::now_epoch();
+                    let db = Arc::clone(&state.db);
+                    tokio::spawn(async move {
+                        if let Err(e) = db
+                            .record_link_alive(
+                                ProtocolId::new(protocol_id),
+                                EndpointId::new(endpoint_id),
+                                now,
+                            )
+                            .await
+                        {
+                            tracing::warn!(%e, "record_link_alive failed");
+                        }
+                    });
+                    if let Some(row) = state
+                        .endpoints
+                        .iter_mut()
+                        .find(|r| r.endpoint.id.get() == endpoint_id)
+                        && let Some(link) = row
+                            .links
+                            .iter_mut()
+                            .find(|l| l.protocol_id.get() == protocol_id)
+                    {
+                        link.last_seen_at = now;
+                    }
+                }
                 let port = state.config.inbound.local_port();
                 if port == 0 {
                     state.live_proxy.clear();
@@ -490,6 +520,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 state.connection_error = Some(err.clone());
                 state.connecting = false;
                 state.connected = false;
+                state.pending_link_alive = None;
                 state.live_proxy.clear();
                 state.log_trace(
                     "error",

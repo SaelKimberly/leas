@@ -111,6 +111,16 @@ pub const ENDPOINT_RANK_ADD_COLUMNS: &[&str] = &[
     "ALTER TABLE endpoint_rank ADD COLUMN rank_alive INTEGER NOT NULL DEFAULT 0",
 ];
 
+/// Prefix indexes for the feed search (issue 019).
+///
+/// The search's `LIKE 'prefix%'` terms ran over the whole rank table on every
+/// keystroke. Additive and idempotent, so `ensure_raw_ddl` re-applies them with
+/// no cursor bump.
+pub const ENDPOINT_RANK_PREFIX_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS endpoint_rank_domain ON endpoint_rank (rank_domain)",
+    "CREATE INDEX IF NOT EXISTS endpoint_rank_sub_domain ON endpoint_rank (rank_sub_domain)",
+];
+
 /// Indexes and tables created AFTER the ALTERs above (the covering index names
 /// `band`, so it cannot run before the column exists). All idempotent.
 pub const V18_AFTER_ALTERS: &[&str] = &[

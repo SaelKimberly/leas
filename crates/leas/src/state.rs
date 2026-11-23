@@ -252,6 +252,11 @@ pub struct AppState {
     /// Cached update status for both backends.
     pub actions_compact: bool,
     pub connected_protocol_id: Option<i64>,
+    /// The `(protocol_id, endpoint_id)` a connect attempt is dialing. Written
+    /// at initiation, consumed by `CoreEvent::Connected` (the liveness proof)
+    /// and cleared by a failure: initiation alone must not move
+    /// `last_seen_at` (spec 2026-11-23 T11).
+    pub pending_link_alive: Option<(i64, i64)>,
     /// Shared stop flag for batch speed tests.
     pub speed_test_stop: Arc<AtomicBool>,
     pub last_test_tcp: Option<u64>,
@@ -875,6 +880,7 @@ impl AppState {
             testing_details: HashMap::new(),
             actions_compact: false,
             connected_protocol_id: None,
+            pending_link_alive: None,
             last_test_tcp: None,
             last_test_real: None,
             last_test_speed: None,

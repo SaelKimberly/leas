@@ -1449,7 +1449,12 @@ impl Database {
         if patches.is_empty() {
             return Ok(0);
         }
-        retry_on_busy(|| self.apply_link_patches_once(patches), 5).await
+        // The result writer is the one path whose loss is DATA (a 400-row
+        // chunk of probe results), and the 2026-11-20 run lost 226 of them at
+        // the old five attempts while background DNS writes held the busy
+        // timeout (spec 2026-11-23 T6 / F4). More attempts here, not globally:
+        // a background scan may give up sooner than a test result.
+        retry_on_busy(|| self.apply_link_patches_once(patches), 8).await
     }
 
     /// The write half of [`Self::apply_link_patches_once`], scoped to a
@@ -1508,15 +1513,21 @@ impl Database {
         let mut conn = self.conn().await?;
         let now = now_epoch();
 
+        let mut touched: Vec<EndpointId> = patches.iter().map(|p| p.link.endpoint_id).collect();
+        touched.sort_unstable();
+        touched.dedup();
+
         let mut tx = conn.transaction().await?;
         Self::apply_link_patches_tx(&mut tx, patches, now).await?;
+        // The upsert INSERTS a row whose endpoint was deleted mid-batch (its
+        // contract), so the orphan must be removed in the SAME transaction —
+        // the purge-time sweep cannot see a link that lands after it ran
+        // (review, 2026-11-23).
+        Self::sweep_orphan_links_for(&mut tx, &touched).await?;
         tx.commit().await?;
 
         // Derived state: the patched endpoints' ordering keys follow their
         // links. Done after the commit (the page is read later, never here).
-        let mut touched: Vec<EndpointId> = patches.iter().map(|p| p.link.endpoint_id).collect();
-        touched.sort_unstable();
-        touched.dedup();
         if let Err(e) = crate::endpoint_rank::refresh(&mut conn, &touched).await {
             tracing::warn!(target: "leas_db", "endpoint_rank refresh: {e}");
         }
@@ -1583,9 +1594,12 @@ impl Database {
 
     // ── Activity ─────────────────────────────────────────────────────────
 
-    /// Record active use of a link: sets `last_used_at` AND `last_seen_at`
-    /// to `ts`, so active use keeps a profile out of Stale/purge (old
-    /// `update_last_used` semantics).
+    /// Record the USER'S INTENT to use a link: sets `last_used_at` only.
+    ///
+    /// `last_seen_at` is the liveness clock ("the source listed it, or the
+    /// client proved it"), and connect initiation is not proof — the tunnel
+    /// may never come up. The proof write is [`Self::record_link_alive`],
+    /// issued when the session reports `Connected` (spec 2026-11-23 T11).
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn update_last_used(
         &self,
@@ -1600,6 +1614,36 @@ impl Database {
                 ProfileStats::filter_by_protocol_id_and_endpoint_id(protocol_id, endpoint_id)
                     .update()
                     .last_used_at(Some(at))
+                    .exec(&mut conn)
+                    .await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
+    }
+
+    /// Record CLIENT PROOF that a link is alive: a session built on it, or a
+    /// data-carrying probe result. Moves `last_seen_at` (the purge/band
+    /// clock) and refreshes the derived ordering keys.
+    ///
+    /// The stamp is written with the plain typed update rather than
+    /// `LinkGroups::SEEN`'s raw `MAX`; a connect proof racing a probe result
+    /// can move the value by the seconds between them, which changes no
+    /// decision the clock feeds.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+    pub async fn record_link_alive(
+        &self,
+        protocol_id: ProtocolId,
+        endpoint_id: EndpointId,
+        at: i64,
+    ) -> Result<()> {
+        let db = self;
+        retry_on_busy(
+            move || async move {
+                let mut conn = db.conn().await?;
+                ProfileStats::filter_by_protocol_id_and_endpoint_id(protocol_id, endpoint_id)
+                    .update()
                     .last_seen_at(at)
                     .exec(&mut conn)
                     .await?;
@@ -1907,6 +1951,16 @@ impl Database {
             .delete()
             .exec(&mut tx)
             .await?;
+            // No foreign key exists (docs/reference/database.md), so an
+            // orphan link would survive the cascade forever. Sweep BEFORE the
+            // protocol cascade: a protocol whose only link is swept here must
+            // be collected by the same pass (review, 2026-11-23).
+            toasty::sql::statement(
+                "DELETE FROM profile_stats WHERE NOT EXISTS \
+                 (SELECT 1 FROM endpoints e WHERE e.id = profile_stats.endpoint_id)",
+            )
+            .exec(&mut tx)
+            .await?;
             Self::purge_orphan_protocols(&mut tx).await?;
             crate::endpoint_ip::delete_for(&mut tx, &ids).await?;
             Endpoint::filter(toasty::stmt::in_list(Endpoint::fields().id(), ids.clone()))
@@ -1974,6 +2028,16 @@ impl Database {
         .delete()
         .exec(&mut tx)
         .await?;
+        // A link staged for one of these endpoints between the two deletes
+        // would orphan here; the delete path runs the same anti-join as the
+        // purge (review, 2026-11-23).
+        toasty::sql::statement(
+            "DELETE FROM profile_stats WHERE NOT EXISTS \
+             (SELECT 1 FROM endpoints e WHERE e.id = profile_stats.endpoint_id)",
+        )
+        .exec(&mut tx)
+        .await?;
+        Self::purge_orphan_protocols(&mut tx).await?;
         crate::endpoint_rank::prune(&mut tx, endpoint_ids).await?;
         tx.commit().await?;
         Ok(endpoint_ids.len())
@@ -2570,6 +2634,30 @@ impl Database {
     /// per merged endpoint inside the merge transaction, where that 5 s is
     /// what the 2026-11-16 production dump's 556 s compact pass was made of.
     /// The same convention as `purge_expired_once`'s candidate scan.
+    /// Remove links whose endpoint no longer exists, for the endpoints a
+    /// flush touched. Same anti-join as the purge; ids inlined like every
+    /// other raw statement here.
+    async fn sweep_orphan_links_for(
+        tx: &mut dyn toasty::Executor,
+        ids: &[EndpointId],
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let list = ids
+            .iter()
+            .map(|id| id.get().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        toasty::sql::statement(format!(
+            "DELETE FROM profile_stats WHERE endpoint_id IN ({list}) AND NOT EXISTS \
+             (SELECT 1 FROM endpoints e WHERE e.id = profile_stats.endpoint_id)"
+        ))
+        .exec(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn purge_orphan_protocols(tx: &mut dyn toasty::Executor) -> Result<()> {
         toasty::sql::statement(
             "DELETE FROM protocols WHERE NOT EXISTS \
@@ -5112,8 +5200,74 @@ mod tests {
             .expect("loaded protocol upserts");
     }
 
+    /// No foreign key exists, so a link whose endpoint vanished (a staged
+    /// patch landing after the delete) would otherwise live forever. The purge
+    /// pass that deletes anything sweeps them in the same transaction
+    /// (issue 020).
     #[tokio::test]
-    async fn update_last_used_refreshes_both_columns() {
+    async fn a_purge_pass_sweeps_orphan_links() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        // One stale endpoint the purge will delete…
+        seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
+        // …and a link for an endpoint that does not exist.
+        toasty::sql::statement(
+            "INSERT INTO profile_stats (protocol_id, endpoint_id, last_seen_at, \
+             created_at, updated_at, version, stab_mask, stab_len, \
+             traffic_today_up, traffic_today_down, traffic_total_up, traffic_total_down) \
+             VALUES (1001, 999, 10, 0, 0, 1, 0, 0, 0, 0, 0, 0)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("orphan link");
+
+        let deleted = db.purge_expired(100).await.expect("purge");
+        assert_eq!(deleted, 1, "the stale endpoint is purged");
+
+        let rows = toasty::sql::query("SELECT COUNT(*) FROM profile_stats WHERE endpoint_id = 999")
+            .exec(&mut conn)
+            .await
+            .expect("count orphans");
+        let count = rows.iter().find_map(|row| match row {
+            toasty_core::stmt::Value::Record(r) => r.fields.first().cloned(),
+            _ => None,
+        });
+        assert!(
+            matches!(count, Some(toasty_core::stmt::Value::I64(0))),
+            "the orphan link is swept: {count:?}"
+        );
+    }
+
+    /// A flush whose endpoint was deleted mid-batch must not recreate the
+    /// orphan: the upsert inserts what it cannot update, so the sweep runs in
+    /// the same transaction (review, 2026-11-23).
+    #[tokio::test]
+    async fn a_patch_for_a_deleted_endpoint_does_not_leave_a_link() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        db.apply_link_patches(&[LinkPatch {
+            link: link_struct(1001, 999, 10),
+            groups: LinkGroups::RESULT,
+        }])
+        .await
+        .expect("patch");
+
+        let rows = toasty::sql::query("SELECT COUNT(*) FROM profile_stats WHERE endpoint_id = 999")
+            .exec(&mut conn)
+            .await
+            .expect("count");
+        let count = rows.iter().find_map(|row| match row {
+            toasty_core::stmt::Value::Record(r) => r.fields.first().cloned(),
+            _ => None,
+        });
+        assert!(
+            matches!(count, Some(toasty_core::stmt::Value::I64(0))),
+            "no orphan row: {count:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_last_used_sets_only_the_intent_column() {
         let db = Database::in_memory().await.expect("in-memory db");
         let mut conn = db.connection().await.expect("connection");
         seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
@@ -5132,10 +5286,28 @@ mod tests {
         .expect("read")
         .expect("row");
         assert_eq!(link.last_used_at, Some(ts(500)));
-        assert_eq!(
+        assert_ne!(
             link.last_seen_at,
             ts(500),
-            "active use keeps the link out of Stale"
+            "initiation is intent, not proof: the liveness clock must not move"
+        );
+
+        db.record_link_alive(ProtocolId::new(1001), EndpointId::new(1), ts(600))
+            .await
+            .expect("record proof");
+        let link = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(1001),
+            EndpointId::new(1),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read")
+        .expect("row");
+        assert_eq!(
+            link.last_seen_at,
+            ts(600),
+            "a built session is proof and moves the liveness clock"
         );
     }
 

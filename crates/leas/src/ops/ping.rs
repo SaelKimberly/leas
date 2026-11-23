@@ -213,7 +213,7 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
         };
         let fmgr = leas_core::FastPingManager::new(timeout_dur);
         let result = fmgr.ping(config_type, &addr, port).await;
-        let (latency_ms, transport_ms, error) = match result {
+        let (latency_ms, transport_ms, error, failure) = match result {
             // The fast probe IS a transport measurement (spec D2), so its span
             // IS the transport span. The batch's fast runner says the same
             // thing (it writes `transport_ms`), and two writers of one column
@@ -225,8 +225,20 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 Some(dur.as_millis() as u64),
                 Some(dur.as_millis() as u64),
                 None,
+                None,
             ),
-            Err(e) => (None, None, Some(e.to_string())),
+            // The fast probe has a TYPED error, so it can persist a real
+            // `(stage, cause)` pair instead of text with NULLs (issue F8): a
+            // dial failure is a dial fact, and "no adapter for this family"
+            // is a capability fact.
+            Err(e) => {
+                // One classifier with the batch: the hand-rolled match here
+                // disagreed on WSA_HOST_NOT_FOUND, NetworkDown and
+                // `PingError::Other` (review, 2026-11-23).
+                let (class, transport_failed) = classify_fast_failure(&e);
+                let pair = Some(ping_native::failure_pair(class, None, transport_failed));
+                (None, None, Some(e.to_string()), pair)
+            }
         };
         try_send_or_warn(
             &tx,
@@ -242,7 +254,7 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 purge: None,
                 marker_kind: None,
                 auth_ack: None,
-                failure: None,
+                failure,
             },
             "tcp_ping_result",
         );

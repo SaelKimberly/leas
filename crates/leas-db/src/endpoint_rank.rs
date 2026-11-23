@@ -1095,6 +1095,25 @@ pub(crate) async fn protocol_weights(
         .collect())
 }
 
+/// Weights for the protocols a caller already names.
+///
+/// A merge knows the only protocol ids its comparison can touch (the links of
+/// the two endpoints), so it must not pay `Protocol::all()`'s whole-table read
+/// (~0.47 s at 6 111 rows) per merged pair (issue 018).
+pub(crate) async fn protocol_weights_for(
+    conn: &mut impl toasty::Executor,
+    ids: &[ProtocolId],
+) -> crate::Result<HashMap<ProtocolId, ConfigWeight>> {
+    let protocols: Vec<Protocol> =
+        Protocol::filter(toasty::stmt::in_list(Protocol::fields().id(), ids.to_vec()))
+            .exec(conn)
+            .await?;
+    Ok(protocols
+        .iter()
+        .map(|p| (p.id, weight_of_protocol(p)))
+        .collect())
+}
+
 /// Backfill rank rows for endpoints that have links but no row yet.
 pub(crate) async fn repair_missing(conn: &mut impl toasty::Executor) -> crate::Result<usize> {
     let rows = toasty::sql::query(

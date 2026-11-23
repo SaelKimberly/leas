@@ -106,6 +106,9 @@ async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<()> {
     for statement in ddl::V23_DNS_INDEXES {
         toasty::sql::query(*statement).exec(conn).await?;
     }
+    for statement in ddl::ENDPOINT_RANK_PREFIX_INDEXES {
+        toasty::sql::query(*statement).exec(conn).await?;
+    }
     Ok(())
 }
 

@@ -171,7 +171,24 @@ pub(crate) async fn merge_in(
     .await?;
     // Weights per protocol id: the collision comparison needs the CONFIG
     // weight, and both colliding links share the same protocol row.
-    let weights = crate::endpoint_rank::protocol_weights(&mut *tx).await?;
+    // Only these links' protocols can reach the comparison; the whole-table
+    // read cost ~0.47 s per merged pair (issue 018).
+    let protocol_ids: Vec<ProtocolId> = {
+        let mut seen: Vec<ProtocolId> = Vec::with_capacity(links.len());
+        for link in &links {
+            if !seen.contains(&link.protocol_id) {
+                seen.push(link.protocol_id);
+            }
+        }
+        seen
+    };
+    // No links ⇒ nothing to compare weights for; an empty `IN ()` list is not
+    // a statement worth sending.
+    let weights = if protocol_ids.is_empty() {
+        HashMap::new()
+    } else {
+        crate::endpoint_rank::protocol_weights_for(&mut *tx, &protocol_ids).await?
+    };
     let weight_of = |pid: i64| -> ConfigWeight {
         weights
             .get(&ProtocolId::new(pid))

@@ -94,6 +94,17 @@ pub struct TaskScheduler {
     dns_defer_secs: AtomicI64,
     /// Endpoints whose DNS failed recently, by last failure time.
     dns_failures: DashMap<EndpointId, Timestamp>,
+    /// Endpoints whose lookup was STARVED on the resolve gate, by time.
+    ///
+    /// Not a resolver verdict (no `resolved_at`, no error): the host simply
+    /// was not asked, so the link must be deferred instead of dialed and
+    /// booked as a dial timeout (spec 2026-11-23 T8 / F5).
+    dns_deferred: DashMap<EndpointId, Timestamp>,
+    /// Unix seconds of the last full deferral sweep. Sweeping on EVERY failure
+    /// made a burst pay O(F²) under the shard locks the dispatch path needs
+    /// (issue 022); one sweep per second bounds the stale window without
+    /// changing any decision (the window is whole seconds).
+    dns_swept_at: std::sync::atomic::AtomicI64,
     /// Endpoints with a resolution lookup IN FLIGHT, by start time.
     ///
     /// Separate from `dns_failures` because the two windows are different
@@ -153,6 +164,8 @@ impl TaskScheduler {
             // purpose, and there is no lookup deadline to outlive in a test.
             dns_defer_secs: AtomicI64::new(dns_defer_secs),
             dns_failures: DashMap::new(),
+            dns_deferred: DashMap::new(),
+            dns_swept_at: std::sync::atomic::AtomicI64::new(0),
             dns_pending: DashMap::new(),
             gate: tokio::sync::Mutex::new(()),
         }
@@ -339,7 +352,18 @@ impl TaskScheduler {
     pub fn mark_dns_failure(&self, endpoint: EndpointId) {
         let now = Timestamp::now();
         self.dns_failures.insert(endpoint, now);
-        self.sweep_dns_failures(now);
+        // Sweep at most once per second: a burst of failures shares one pass,
+        // and the deferral window is measured in whole seconds anyway.
+        let second = now.as_second();
+        let last = self.dns_swept_at.load(Ordering::Relaxed);
+        if second > last
+            && self
+                .dns_swept_at
+                .compare_exchange(last, second, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.sweep_dns_failures(now);
+        }
     }
 
     /// The link's gate state (the default when this process has never touched
@@ -379,6 +403,13 @@ impl TaskScheduler {
         self.dns_pending.remove(&endpoint);
     }
 
+    /// Defer `endpoint` WITHOUT a resolver verdict: its lookup never ran
+    /// (the resolve gate starved it), so it must not be dialed this round and
+    /// must not be recorded as a DNS failure.
+    pub fn defer_unresolved(&self, endpoint: EndpointId) {
+        self.dns_deferred.insert(endpoint, Timestamp::now());
+    }
+
     /// Whether `endpoint` cannot be probed yet: a lookup for it is in flight,
     /// or it failed inside the deferral window. Expired failure entries are
     /// dropped lazily. `dns_defer_secs <= 0` disables the FAILURE window only —
@@ -391,6 +422,13 @@ impl TaskScheduler {
         let defer_secs = self.dns_defer_secs.load(Ordering::Relaxed);
         if defer_secs <= 0 {
             return false;
+        }
+        if let Some(entry) = self.dns_deferred.get(&endpoint) {
+            if now.as_second() - entry.as_second() < defer_secs {
+                return true;
+            }
+            drop(entry);
+            self.dns_deferred.remove(&endpoint);
         }
         let Some(entry) = self.dns_failures.get(&endpoint) else {
             return false;
@@ -413,12 +451,14 @@ impl TaskScheduler {
     /// the second failure existed. `None` when the endpoint carries no DNS
     /// state at all (not deferred by DNS).
     pub fn dns_state_stamp(&self, endpoint: EndpointId) -> Option<i64> {
-        if let Some(pending) = self.dns_pending.get(&endpoint) {
-            return Some(pending.as_second());
-        }
-        self.dns_failures
-            .get(&endpoint)
-            .map(|entry| entry.as_second())
+        // Every re-arm must move the stamp, including a STARVED lookup: a
+        // fresh deferral that left the stamp unchanged let `defer_retry` book
+        // the link unprobed against a budget that had already run out
+        // (review, 2026-11-23).
+        let pending = self.dns_pending.get(&endpoint).map(|e| e.as_second());
+        let failed = self.dns_failures.get(&endpoint).map(|e| e.as_second());
+        let deferred = self.dns_deferred.get(&endpoint).map(|e| e.as_second());
+        [pending, failed, deferred].into_iter().flatten().max()
     }
 
     /// Drop all DNS-failure entries older than the deferral window.
@@ -426,9 +466,12 @@ impl TaskScheduler {
         let defer_secs = self.dns_defer_secs.load(Ordering::Relaxed);
         if defer_secs <= 0 {
             self.dns_failures.clear();
+            self.dns_deferred.clear();
             return;
         }
         self.dns_failures
+            .retain(|_, ts| now.as_second() - ts.as_second() < defer_secs);
+        self.dns_deferred
             .retain(|_, ts| now.as_second() - ts.as_second() < defer_secs);
     }
 }
@@ -677,6 +720,33 @@ mod tests {
     }
 
     // ── DNS deferral ───────────────────────────────────────────────────
+
+    /// A STARVED lookup is not a resolver failure, but the link must still be
+    /// deferred instead of dialed and booked as a dial timeout (F5).
+    #[tokio::test]
+    async fn a_starved_lookup_defers_without_a_failure_verdict() {
+        let s = TaskScheduler::new(3, 30);
+        let l = link(1, 10);
+        s.defer_unresolved(l.endpoint_id);
+        assert_eq!(
+            s.schedule(&l, TaskKind::FastPing).await,
+            ScheduleOutcome::DnsDeferred
+        );
+        // No failure is recorded: clearing failures does not un-defer it…
+        s.clear_dns_failure(l.endpoint_id);
+        assert_eq!(
+            s.schedule(&l, TaskKind::FastPing).await,
+            ScheduleOutcome::DnsDeferred,
+            "a starved host stays deferred for its window"
+        );
+        // …and the window still expires.
+        let s = TaskScheduler::new(3, 0);
+        s.defer_unresolved(l.endpoint_id);
+        assert!(matches!(
+            s.schedule(&l, TaskKind::FastPing).await,
+            ScheduleOutcome::Started(_)
+        ));
+    }
 
     #[tokio::test]
     async fn dns_failure_defers_then_expires() {
