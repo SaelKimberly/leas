@@ -41,6 +41,11 @@ const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
 static POOL_OPTS: std::sync::LazyLock<ResolverOpts> = std::sync::LazyLock::new(|| {
     let mut opts = ResolverOpts::default();
     opts.timeout = Duration::from_millis(500);
+    // ONE send per nameserver: hickory's fixed 5 s TCP/TLS CONNECT_TIMEOUT
+    // multiplied by `attempts + 1`, so the default 2 made a wedged resolver
+    // cost 15 s — longer than any caller deadline — while the other pool
+    // members are the failover (issue 013, decided 2026-11-23).
+    opts.attempts = 1;
     opts.server_ordering_strategy = ServerOrderingStrategy::RoundRobin;
     opts
 });

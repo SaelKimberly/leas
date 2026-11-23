@@ -612,6 +612,7 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
             .resolve_cache
             .as_ref()
             .and_then(|c| c.lock().get_fresh(&host, now).map(<[IpAddr]>::to_vec));
+        let cache_hit = cached.is_some();
         let outcome = match cached {
             Some(ips) => Ok(ips),
             // Borrowed host: the sink's boxed future holds the `&str` and
@@ -636,7 +637,10 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
             Some((failed, Some(host.as_str()))),
             &engine.event_sink,
         );
-        if let Ok(ips) = outcome
+        // Only a MISS stores: re-storing a hit re-stamped its TTL, so a host
+        // in use was pinned to its first answer forever (issue 015).
+        if !cache_hit
+            && let Ok(ips) = outcome
             && !ips.is_empty()
             && let Some(cache) = &engine.resolve_cache
         {

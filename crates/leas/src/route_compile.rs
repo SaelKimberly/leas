@@ -39,7 +39,7 @@ pub fn rule_from_row(row: &RoutingRule, index: usize) -> Result<Rule, RouteError
             "balancers deferred — see routing spec §1",
         ));
     }
-    let items = match_items(row);
+    let items = match_items(row, index)?;
     if items.is_empty() {
         return Err(RouteError::Parse {
             rule_index: index,
@@ -159,9 +159,15 @@ pub fn warnings_from_row(row: &RoutingRule) -> Vec<String> {
 }
 
 /// Builds match items in the fixed contract order; only non-empty fields
-/// produce items. Unparseable `ips` entries and unknown protocols/network
-/// tokens are skipped here and reported by [`warnings_from_row`].
-fn match_items(row: &RoutingRule) -> Vec<MatchItem> {
+/// produce items.
+///
+/// An UNREPRESENTABLE token is a verdict, not a warning (issue 017): when a
+/// field's tokens would all vanish, the condition silently disappears and the
+/// rule then matches MORE traffic than the user wrote — a leak, not a
+/// degradation. Unknown `network`/`protocols` tokens and an `ips` field with
+/// no usable entry are `Err`, which the caller turns into a skipped row that
+/// names the rule.
+fn match_items(row: &RoutingRule, rule_index: usize) -> Result<Vec<MatchItem>, RouteError> {
     let mut items = Vec::new();
 
     if !row.domains.is_empty() {
@@ -206,6 +212,17 @@ fn match_items(row: &RoutingRule) -> Vec<MatchItem> {
             cidrs.push(c);
         }
     }
+    if !row.ips.is_empty() && cidrs.is_empty() && !private && geo_country.is_empty() {
+        return Err(RouteError::Parse {
+            rule_index,
+            field: "ips",
+            message: format!(
+                "none of {} ip entries is a CIDR, geoip:<cc> or geoip:private — \
+                 the field would vanish and the rule would match more traffic",
+                row.ips.len()
+            ),
+        });
+    }
     if !cidrs.is_empty() || private || !geo_country.is_empty() {
         items.push(MatchItem::IpCidr {
             cidrs,
@@ -241,18 +258,40 @@ fn match_items(row: &RoutingRule) -> Vec<MatchItem> {
             match tok {
                 "tcp" => mask.tcp = true,
                 "udp" => mask.udp = true,
-                _ => {}
+                other => {
+                    return Err(RouteError::Parse {
+                        rule_index,
+                        field: "network",
+                        message: format!(
+                            "unknown network token `{other}` — rejecting beats matching both"
+                        ),
+                    });
+                }
             }
         }
-        if mask.tcp || mask.udp {
-            items.push(MatchItem::Network(mask));
+        if !mask.tcp && !mask.udp {
+            return Err(RouteError::Parse {
+                rule_index,
+                field: "network",
+                message: "network field has no tcp/udp token — rejecting beats matching both"
+                    .to_owned(),
+            });
         }
+        items.push(MatchItem::Network(mask));
     }
 
     for p in &row.protocols {
-        if let Some(sp) = sniffed(p) {
-            items.push(MatchItem::Protocol(sp));
-        }
+        let Some(sp) = sniffed(p) else {
+            return Err(RouteError::Parse {
+                rule_index,
+                field: "protocols",
+                message: format!(
+                    "unknown protocol token `{p}` — the field would vanish and the rule \
+                     would match every protocol"
+                ),
+            });
+        };
+        items.push(MatchItem::Protocol(sp));
     }
 
     if !row.inbound_tags.is_empty() {
@@ -268,7 +307,7 @@ fn match_items(row: &RoutingRule) -> Vec<MatchItem> {
         });
     }
 
-    items
+    Ok(items)
 }
 
 /// Strips every leading `!`, flipping the reverse flag for each.
@@ -640,11 +679,13 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_ip_entry_warns_not_errors() {
+    fn a_field_with_no_usable_ip_entry_is_refused() {
+        // Fail-closed (issue 017): a vanished `ips` condition would make the
+        // rule match MORE traffic than the user wrote.
         let mut r = row();
         r.ips = vec!["not-a-cidr".to_string()];
-        let rule = rule_from_row(&r, 0).unwrap();
-        assert_eq!(items_of(&rule).len(), 1, "only the Domain item survives");
+        let err = rule_from_row(&r, 0).expect_err("no usable ip entry");
+        assert!(err.to_string().contains("ips"), "{err}");
         let ws = warnings_from_row(&r);
         assert_eq!(ws.len(), 1);
         assert!(ws[0].contains("not-a-cidr"), "warning: {}", ws[0]);
@@ -671,8 +712,15 @@ mod tests {
         assert!(ws.iter().any(|w| w.contains("snmp")));
         assert!(ws.iter().any(|w| w.contains("999.1.2.3/8")));
         assert!(ws.iter().any(|w| w.contains("banana")));
-        // "tcp" still parses out of the mixed network field.
-        let rule = rule_from_row(&r, 0).unwrap();
+        // Such a row is REFUSED, not silently narrowed (issue 017)…
+        assert!(
+            rule_from_row(&r, 0).is_err(),
+            "unknown tokens must fail the rule closed"
+        );
+        // …while a clean `tcp` network field still compiles.
+        let mut clean = row();
+        clean.network = Some("tcp".to_string());
+        let rule = rule_from_row(&clean, 0).unwrap();
         assert!(items_of(&rule).contains(&MI::Network(NetworkMask {
             tcp: true,
             udp: false

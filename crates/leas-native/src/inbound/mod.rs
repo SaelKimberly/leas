@@ -750,6 +750,7 @@ async fn run_udp_relay(
         hijack_warned: false,
         seen: SmallVec::new(),
         row: None,
+        route_cache: std::collections::HashMap::new(),
     };
 
     // Eager: a datagram needs a buffer to land in, so this 64 KiB is paid by
@@ -980,7 +981,19 @@ struct UdpRelay {
     seen: SmallVec<[CompactString; 4]>,
     /// The association's activity row, opened on the first forwarded datagram.
     row: Option<UdpRow>,
+    /// Recent routing decisions by `(host, port)`: a UDP flow sends one
+    /// datagram per packet, and every datagram used to run the full router
+    /// (two DNS caches + a payload copy) for the same answer (issue 016).
+    /// Bounded, short TTL: a settings save builds a new engine, and a stale
+    /// decision must age out instead of pinning the old policy.
+    route_cache: std::collections::HashMap<(CompactString, u16), (Decision, Instant)>,
 }
+
+/// How long one association may reuse a routing decision.
+const UDP_ROUTE_TTL: Duration = Duration::from_secs(30);
+/// Most decisions one association keeps; past this the map is cleared (a
+/// datagram flow that talks to 64 destinations has no hot 5-tuple anyway).
+const UDP_ROUTE_CACHE_MAX: usize = 64;
 
 impl UdpRelay {
     /// Open the association's activity row on its first forwarded datagram:
@@ -1025,7 +1038,16 @@ impl UdpRelay {
 
     /// Count this host once per association — the Sniffer `conns` column.
     fn note_conn(&mut self, host: &str, outbound: &str) {
+        // The list exists to count each host ONCE; its length was unbounded and
+        // every datagram scanned it linearly, so a QUIC flow could grow it
+        // without limit (issue 027). Past the cap, a new host is not counted
+        // individually — the counter is telemetry, the association's memory is
+        // not.
+        const MAX_SEEN_CONNS: usize = 64;
         if self.seen.iter().any(|seen| seen == host) {
+            return;
+        }
+        if self.seen.len() >= MAX_SEEN_CONNS {
             return;
         }
         self.seen.push(CompactString::new(host));
@@ -1156,9 +1178,20 @@ impl UdpRelay {
             sni_host: None,
             resolved_host_ips: Vec::new(),
         };
-        let decision = decide_async(&self.config.engine, &mut meta).await;
-
         let requested = host_key(&target.host);
+        let cache_key = (CompactString::new(&requested), target.port);
+        let decision = match self.route_cache.get(&cache_key) {
+            Some((decision, at)) if at.elapsed() < UDP_ROUTE_TTL => decision.clone(),
+            _ => {
+                let decision = decide_async(&self.config.engine, &mut meta).await;
+                if self.route_cache.len() >= UDP_ROUTE_CACHE_MAX {
+                    self.route_cache.clear();
+                }
+                self.route_cache
+                    .insert(cache_key, (decision.clone(), Instant::now()));
+                decision
+            }
+        };
         let (tag, override_addr) = match decision {
             Decision::Route { tag, override_addr } => (tag, override_addr),
             Decision::Reject { .. } => {
@@ -1246,6 +1279,9 @@ impl UdpRelay {
                 if let Some(addr) = cached_domain(&self.dns_cache, &domain, dest.port) {
                     let Some(socket) = self.socket_for(addr) else {
                         tracing::debug!(%addr, "socks5 inbound: no upstream socket for family");
+                        // Drop the unusable family from the cache, or every
+                        // datagram for this host fails on it for the whole TTL.
+                        invalidate_addr(&self.dns_cache, &domain, dest.port, addr);
                         self.drop_datagram(Some(host), payload.len());
                         return;
                     };
@@ -1257,6 +1293,7 @@ impl UdpRelay {
                                 %addr,
                                 "socks5 inbound: direct udp send dropped"
                             );
+                            invalidate_addr(&self.dns_cache, &domain, dest.port, addr);
                             self.drop_datagram(Some(host), payload.len());
                         }
                     }
@@ -1291,6 +1328,7 @@ impl UdpRelay {
                     let socket = if addr.is_ipv4() { v4 } else { v6 };
                     let Some(socket) = socket else {
                         tracing::debug!(%addr, "socks5 inbound: no upstream socket for family");
+                        invalidate_addr(&cache, &domain, port, addr);
                         if let Some(trace) = &trace {
                             trace
                                 .telemetry
@@ -1684,7 +1722,15 @@ async fn run_proxy_leg(
 /// A short `Vec` rather than a `HashMap`: a probe borrows the domain instead
 /// of allocating a `String` key for every datagram, and the cap bounds an
 /// association that keeps naming new hosts (the map grew without limit).
-type DnsCache = parking_lot::Mutex<Vec<(Box<str>, u16, SocketAddr)>>;
+/// How long one association trusts a cached answer: the same 300 s the
+/// engine's `ResolvedCache` uses. The association used to pin its FIRST
+/// answer for its whole life, so a rotated record was never picked up
+/// (issue 028).
+const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// `(domain, port, answers, stored_at)`; the answers keep the resolver's
+/// order, so a family the host cannot reach costs one send before the next.
+type DnsCache = parking_lot::Mutex<Vec<(Box<str>, u16, Vec<SocketAddr>, Instant)>>;
 
 /// Cache entries kept per association; the oldest is dropped when full.
 const DNS_CACHE_MAX: usize = 64;
@@ -1697,33 +1743,56 @@ async fn resolve_cached(cache: &DnsCache, target: &TargetAddr) -> Option<SocketA
     }
 }
 
-/// Look up `domain` in the association cache without allocating.
+/// Look up `domain` in the association cache without allocating. An entry
+/// past [`DNS_CACHE_TTL`] is dropped, not returned.
 fn cached_domain(cache: &DnsCache, domain: &str, port: u16) -> Option<SocketAddr> {
-    cache
-        .lock()
+    let mut entries = cache.lock();
+    let idx = entries
         .iter()
-        .find(|(d, p, _)| *p == port && &**d == domain)
-        .map(|(_, _, addr)| *addr)
+        .position(|(d, p, _, _)| *p == port && &**d == domain)?;
+    if entries[idx].3.elapsed() >= DNS_CACHE_TTL {
+        entries.remove(idx);
+        return None;
+    }
+    entries[idx].2.first().copied()
 }
 
-/// Resolve a domain, caching the answer for the association's lifetime.
+/// Drop `addr` from a cached answer after a send failed on it; an entry with
+/// no answers left disappears, so the next datagram re-resolves.
+fn invalidate_addr(cache: &DnsCache, domain: &str, port: u16, addr: SocketAddr) {
+    let mut entries = cache.lock();
+    let Some(idx) = entries
+        .iter()
+        .position(|(d, p, _, _)| *p == port && &**d == domain)
+    else {
+        return;
+    };
+    entries[idx].2.retain(|a| *a != addr);
+    if entries[idx].2.is_empty() {
+        entries.remove(idx);
+    }
+}
+
+/// Resolve a domain, caching every answer with a TTL (issue 028).
 async fn resolve_domain(cache: &DnsCache, domain: &str, port: u16) -> Option<SocketAddr> {
     if let Some(cached) = cached_domain(cache, domain, port) {
         return Some(cached);
     }
-    let addrs = tokio::time::timeout(timeouts::DIAL, tokio::net::lookup_host((domain, port)))
-        .await
-        .ok()?
-        .ok()?;
-    let addr = addrs.into_iter().next()?;
+    let addrs: Vec<SocketAddr> =
+        tokio::time::timeout(timeouts::DIAL, tokio::net::lookup_host((domain, port)))
+            .await
+            .ok()?
+            .ok()?
+            .collect();
+    let first = *addrs.first()?;
     {
         let mut entries = cache.lock();
         if entries.len() >= DNS_CACHE_MAX {
             entries.remove(0);
         }
-        entries.push((Box::from(domain), port, addr));
+        entries.push((Box::from(domain), port, addrs, Instant::now()));
     }
-    Some(addr)
+    Some(first)
 }
 
 /// Reverse an IPv4-mapped IPv6 address to plain IPv4 (clients do not expect

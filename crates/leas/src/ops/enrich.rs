@@ -331,8 +331,20 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
 /// hickory resolver's sockets, so without this the whole fan-out opens at once.
 /// Acquired INSIDE the spawned task: taking a permit in `poll_core_events` would
 /// stall the UI tick on DNS.
-static RESOLVE_SEM: std::sync::LazyLock<Arc<Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(64)));
+static RESOLVE_SEM: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+
+/// The gate's width. 64 was a guess; the batch's own concurrency is the real
+/// bound on how many lookups one plan wants in flight (46 006 hosts starved on
+/// the fixed 64 during the 2026-11-20 run). Clamped so a hand-edited config
+/// cannot open an unbounded fan-out or close the gate.
+///
+/// The size is frozen at the FIRST lookup: a live `real_ping_concurrency`
+/// edit applies on the next launch (the old gate never resized either).
+fn resolve_sem(concurrency: usize) -> Arc<Semaphore> {
+    RESOLVE_SEM
+        .get_or_init(|| Arc::new(Semaphore::new(concurrency.clamp(8, 256))))
+        .clone()
+}
 
 /// How a permit acquisition ended. Only [`Self::Acquired`] permits a lookup and
 /// therefore a resolver verdict; the other two are bookkeeping outcomes and must
@@ -393,7 +405,14 @@ fn settle_starved(
     scheduler: &crate::ops::scheduler::TaskScheduler,
 ) {
     bump_resolve_progress();
-    release_waiters(waiters_key, endpoint_id, scheduler);
+    // No lookup ran, so there is no verdict — and EVERY endpoint that deduped
+    // onto this hostname must not be dialed this round either, not just the
+    // leader (review, 2026-11-23).
+    for id in take_waiters(waiters_key, endpoint_id) {
+        let endpoint = leas_db::models::EndpointId::new(id);
+        scheduler.defer_unresolved(endpoint);
+        scheduler.end_dns_lookup(endpoint);
+    }
 }
 
 /// Who asked for a lookup — the three knobs (`TTL` gate, `RESOLVE_SEM`
@@ -498,6 +517,7 @@ pub fn spawn_dns_resolve_host(
     }
 
     let dns = state.dns_resolver.clone();
+    let resolve_sem = resolve_sem(state.config.speed_test.real_ping_concurrency);
     let geo = state.geo_ip.clone();
     let checker = state.host_features.clone();
     // No `db` clone: the country write is QUEUED (see `queue_country`), so this
@@ -578,7 +598,7 @@ pub fn spawn_dns_resolve_host(
                             let _permit = if trigger == ResolveTrigger::Forced {
                                 None
                             } else {
-                                match acquire_permit(&RESOLVE_SEM).await {
+                                match acquire_permit(&resolve_sem).await {
                                     // The semaphore closed (the runtime is going
                                     // away): release the waiters so their
                                     // endpoints do not defer forever.
@@ -1543,8 +1563,9 @@ mod tests {
             "the retry bar must count a starved lookup as reported"
         );
         assert!(
-            sched.dns_state_stamp(id).is_none(),
-            "a starved queue must leave no failure stamp and no in-flight marker"
+            sched.dns_state_stamp(id).is_some(),
+            "a starved lookup leaves a DEFERRAL stamp (never a resolver verdict), \
+             so the link is deferred instead of dialed"
         );
     }
 }
