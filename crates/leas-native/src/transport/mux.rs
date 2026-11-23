@@ -328,6 +328,29 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
     // meta worst case: sid(2) + status(1) + opt(1) + net(1) + port(2) +
     // atyp(1) + domain(1+255) + GlobalID(8) = 272; data adds 2 + payload.
     let mut out = BytesMut::with_capacity(2 + 272 + 2 + f.payload.len());
+    encode_frame(&mut out, f)?;
+    w.write_all(&out).await
+}
+
+/// Append one frame's wire bytes to `out`.
+///
+/// Split from [`write_frame`] so the batched writer can encode several frames
+/// into one buffer (one allocation, one carrier write) without re-deriving the
+/// wire layout. `out` may already hold earlier frames: `meta_len` is patched
+/// relative to this frame's start.
+fn encode_frame(out: &mut BytesMut, f: &Frame) -> io::Result<()> {
+    let start = out.len();
+    let encoded = encode_frame_body(out, f);
+    if encoded.is_err() {
+        // A rejected frame must not leave a partial frame in a batch the
+        // caller may still write: the frames encoded before it are valid.
+        out.truncate(start);
+    }
+    encoded
+}
+
+fn encode_frame_body(out: &mut BytesMut, f: &Frame) -> io::Result<()> {
+    let start = out.len();
     out.extend_from_slice(&[0, 0]); // meta_len placeholder
     out.extend_from_slice(&f.session_id.to_be_bytes());
     out.put_u8(f.status);
@@ -339,7 +362,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
                 "vless mux new frame requires a target",
             )
         })?;
-        encode_target_meta(&mut out, target)?;
+        encode_target_meta(out, target)?;
         // UDP New frames carry the tunnel GlobalID after the target
         // (xray `frame.go` `WriteTo`: `b.Write(f.GlobalID[:])` for user
         // proxy requests — the client's TCP sessions have no per-packet
@@ -355,7 +378,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
         // target.
         if let Some(target) = &f.target {
             match target {
-                MuxTarget::Udp(_) => encode_target_meta(&mut out, target)?,
+                MuxTarget::Udp(_) => encode_target_meta(out, target)?,
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -365,7 +388,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
             }
         }
     }
-    let meta_len = out.len() - 2;
+    let meta_len = out.len() - start - 2;
     let meta_len_u16 = u16::try_from(meta_len).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -378,7 +401,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
             format!("vless mux metadata exceeds the {MAX_META}-byte limit"),
         ));
     }
-    out[0..2].copy_from_slice(&meta_len_u16.to_be_bytes());
+    out[start..start + 2].copy_from_slice(&meta_len_u16.to_be_bytes());
     if f.option & OPT_DATA != 0 {
         let data_len = u16::try_from(f.payload.len()).map_err(|_| {
             io::Error::new(
@@ -396,7 +419,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
             "vless mux frame with payload requires the data option",
         ));
     }
-    w.write_all(&out).await
+    Ok(())
 }
 
 /// Writes a frame target as the port-first address bytes into any byte
@@ -791,16 +814,49 @@ fn session_error() -> io::Error {
     )
 }
 
+/// Plaintext the writer hands the carrier in one call: batching stops once a
+/// burst reaches 16 KiB, the TLS record ceiling, so a batch is normally one
+/// record and never more than two (the frame that crosses the cap still goes
+/// in whole). Frames are length-prefixed, so the peer's decoder does not care
+/// where a carrier write ends.
+const WRITE_BATCH: usize = 16 * 1024;
+
 /// Drains frames from the channel and writes them to the tunnel in order.
 /// Exits on a write error or when every sender is gone; dropping the
 /// `writer_done` sender tells the demux the write side is dead.
+///
+/// A wake-up drains every frame ALREADY queued into one carrier write: one
+/// `write` syscall and one TLS record cover a burst instead of one each per
+/// frame, and the batch buffer is reused so a steady mux write stops
+/// allocating per frame. Only `try_recv` is used, so a lone interactive frame
+/// is never held waiting for company.
 async fn writer_loop<W: AsyncWrite + Unpin>(
     mut write_half: W,
     mut frames: mpsc::Receiver<Frame>,
     writer_done: watch::Sender<()>,
 ) {
-    while let Some(frame) = frames.recv().await {
-        if let Err(e) = write_frame(&mut write_half, &frame).await {
+    let mut batch = BytesMut::new();
+    'outer: while let Some(frame) = frames.recv().await {
+        batch.clear();
+        if let Err(e) = encode_frame(&mut batch, &frame) {
+            tracing::debug!(error = %e, "vless mux: tunnel write failed");
+            break;
+        }
+        while batch.len() < WRITE_BATCH {
+            match frames.try_recv() {
+                Ok(next) => {
+                    if let Err(e) = encode_frame(&mut batch, &next) {
+                        // The frames encoded before it are complete and were
+                        // queued first: write them, then end the tunnel.
+                        tracing::debug!(error = %e, "vless mux: tunnel write failed");
+                        let _ = write_half.write_all(&batch).await;
+                        break 'outer;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if let Err(e) = write_half.write_all(&batch).await {
             tracing::debug!(error = %e, "vless mux: tunnel write failed");
             break;
         }
@@ -1568,6 +1624,121 @@ mod tests {
         assert_eq!(got.option, frame.option);
         assert_eq!(got.target, frame.target);
         assert_eq!(&got.payload[..], &frame.payload[..]);
+    }
+
+    /// Counts carrier writes and keeps the bytes, so a batching test can
+    /// assert how many writes a run of frames cost.
+    struct CountingWriter {
+        out: Vec<u8>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.out.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn keep_frame(id: u16, len: usize) -> Frame {
+        Frame {
+            session_id: id,
+            status: STATUS_KEEP,
+            option: OPT_DATA,
+            target: None,
+            global_id: None,
+            payload: Bytes::from(vec![
+                u8::try_from(id).expect("test session id fits a byte");
+                len
+            ]),
+        }
+    }
+
+    /// Drive `writer_loop` over `frames` already queued, then return the
+    /// carrier's write count and the frames the peer decodes back.
+    async fn run_writer(frames: Vec<Frame>) -> (usize, Vec<Frame>) {
+        let (tx, rx) = mpsc::channel(64);
+        for frame in frames {
+            tx.send(frame).await.unwrap();
+        }
+        drop(tx);
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sink = CountingWriter {
+            out: Vec::new(),
+            writes: Arc::clone(&writes),
+        };
+        let (done_tx, _done_rx) = watch::channel(());
+        writer_loop(&mut sink, rx, done_tx).await;
+        let count = writes.load(std::sync::atomic::Ordering::Relaxed);
+        let mut peer = PieceReader {
+            data: sink.out,
+            pos: 0,
+            piece: 4096,
+        };
+        let mut decoded = Vec::new();
+        while let Some(frame) = read_frame(&mut peer).await.unwrap() {
+            decoded.push(frame);
+        }
+        (count, decoded)
+    }
+
+    #[tokio::test]
+    async fn writer_coalesces_queued_frames_into_one_carrier_write() {
+        let frames: Vec<Frame> = (10..14).map(|id| keep_frame(id, 600)).collect();
+        let (writes, decoded) = run_writer(frames).await;
+        assert_eq!(
+            writes, 1,
+            "four queued frames should share one carrier write"
+        );
+        assert_eq!(decoded.len(), 4);
+        for (id, frame) in (10..14).zip(&decoded) {
+            assert_eq!(frame.session_id, id);
+            assert_eq!(frame.payload.len(), 600);
+            let byte = u8::try_from(id).expect("test session id fits a byte");
+            assert!(frame.payload.iter().all(|&b| b == byte));
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_batch_stops_at_one_record_of_plaintext() {
+        let frames: Vec<Frame> = (0..20).map(|id| keep_frame(id, 1024)).collect();
+        let (writes, decoded) = run_writer(frames).await;
+        assert_eq!(
+            writes, 2,
+            "20 KiB of frames must not ride one unbounded write"
+        );
+        assert_eq!(decoded.len(), 20);
+        let ids: Vec<u16> = decoded.iter().map(|f| f.session_id).collect();
+        assert_eq!(ids, (0..20).collect::<Vec<u16>>());
+    }
+
+    #[tokio::test]
+    async fn writer_ends_the_tunnel_on_a_rejected_frame_without_corrupting_the_batch() {
+        // A Keep frame with a TCP target is rejected by the encoder (only a
+        // UDP Keep carries one). The frames queued before it are complete and
+        // must still be written; the rejected frame's partial bytes must not.
+        let mut bad = keep_frame(2, 8);
+        bad.target = Some(MuxTarget::Tcp("127.0.0.1:80".parse().unwrap()));
+        let frames = vec![keep_frame(1, 16), bad, keep_frame(3, 16)];
+        let (writes, decoded) = run_writer(frames).await;
+        assert_eq!(writes, 1);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].session_id, 1);
+        assert_eq!(decoded[0].payload.len(), 16);
     }
 
     #[tokio::test]
