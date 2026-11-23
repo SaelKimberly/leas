@@ -235,6 +235,10 @@ Builder gates (`proto_spec/core_mapping.rs`):
 
 `proto_kind_for_method` returns `Shadowsocks2022` (`ss-2022`) for `2022-blake3-*` and `Shadowsocks` (`ss`) otherwise. Both share `SsConfig`. This is the only kind whose core depends on a field.
 
+### Multi-user PSK lists (EIH)
+
+A `2022-blake3-aes-*` password may be xray's `iPSK1:…:uPSK` list. The last PSK is the session key; each earlier PSK writes one extensible identity header (`ss/eih.rs`) between the salt and the sealed request header, naming the next key's `blake3` hash. TCP derives the header key as `blake3::derive_key("shadowsocks 2022 identity subkey", iPSK ‖ salt)`; UDP uses the iPSK directly as an AES-ECB key and XORs the hash with the plaintext `session_id ‖ packet_id`. Responses never carry EIH. `2022-blake3-chacha20-poly1305` refuses a list (no AES block; xray and sing-box both refuse it). A single PSK is the list of length one and writes no header.
+
 ### Plugin
 
 `PluginSpec` is total by construction: `name` (verbatim, may be empty), `family` (`Obfs`, `V2Ray`, `Unknown`), `mode` (`Unset`, `Http`, `Tls`, `Websocket`, `Quic`, `Invalid`), `host`, `port`, `path`, `tls` (`Unset`/`On`), `mux` (`Unset`, `Off`, `On(n)`, `Invalid`), and a sorted `extra` map for keys it preserves but does not interpret (`obfs-uri`, unknown keys).

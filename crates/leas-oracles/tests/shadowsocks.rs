@@ -19,6 +19,7 @@ mod common;
 use common::{Cores, certs, cores, echo, fp, no_tls, pick, tls_echo};
 use leas_native::PacketMode;
 use leas_oracles::e2e::AppKind;
+use leas_oracles::e2e::config::{SS_2022_USER_KEY, SS_2022_USER_KEY_128};
 use leas_oracles::e2e::{
     CaseSpec, Certs, CoreKind, E2eCase, EchoServer, TlsEchoServer, run_against,
 };
@@ -53,6 +54,31 @@ fn ss(method: &'static str) -> CaseSpec {
 // sing-box serves both by default.
 #[case::udp_aead(ss("aes-128-gcm").with_app(AppKind::Udp).with_udp(PacketMode::Raw))]
 #[case::udp_2022(ss("2022-blake3-aes-256-gcm").with_app(AppKind::Udp).with_udp(PacketMode::Raw))]
+// Multi-user EIH: the client password is `serverPSK:userPSK`, the server
+// carries the user PSK in `users[]`. SING-BOX ONLY: xray's 2022 inbound
+// parses a single key and mihomo has no multi-user inbound. Both key lengths
+// and both carriers, so the TCP identity subkey and the UDP XOR form are each
+// proven against a real server.
+#[case::ss2022_multiuser_aes128(
+    ss("2022-blake3-aes-128-gcm").with_ss_user(SS_2022_USER_KEY_128).with_single_core(CoreKind::SingBox)
+)]
+#[case::ss2022_multiuser_aes256(
+    ss("2022-blake3-aes-256-gcm").with_ss_user(SS_2022_USER_KEY).with_single_core(CoreKind::SingBox)
+)]
+#[case::udp_2022_multiuser_aes128(
+    ss("2022-blake3-aes-128-gcm")
+        .with_ss_user(SS_2022_USER_KEY_128)
+        .with_app(AppKind::Udp)
+        .with_udp(PacketMode::Raw)
+        .with_single_core(CoreKind::SingBox)
+)]
+#[case::udp_2022_multiuser_aes256(
+    ss("2022-blake3-aes-256-gcm")
+        .with_ss_user(SS_2022_USER_KEY)
+        .with_app(AppKind::Udp)
+        .with_udp(PacketMode::Raw)
+        .with_single_core(CoreKind::SingBox)
+)]
 // The 16-byte 2022 key length on the UDP carrier too: its session subkey is
 // the same BLAKE3 XOF truncation (`udp_session_subkey`), so both key lengths
 // are proven on both carriers.

@@ -38,7 +38,8 @@ use leas_proto::proto_spec::{
     ss_plugin::{OBFS_KEYS, V2RAY_KEYS},
 };
 
-use crate::protocol::ss::method::{SsFamily, password_key};
+use crate::crypto::aead::SsAead;
+use crate::protocol::ss::method::{SsFamily, password_chain};
 use crate::protocol::ss::resolve_method;
 
 /// The protocols with a native implementation, in canonical order.
@@ -404,7 +405,8 @@ const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
 /// Refusals, in check order: `"shadowsocks method is not implemented"`,
 /// `"shadowsocks method family does not match the protocol kind"`,
 /// `"shadowsocks SIP003 plugin is not implemented"`, `"shadowsocks 2022
-/// password key is malformed"`.
+/// multi-user PSK list is not supported for chacha20-poly1305"`,
+/// `"shadowsocks 2022 password key is malformed"`.
 ///
 /// Every refusal below is a dead native dial the subprocess would have
 /// served:
@@ -425,11 +427,13 @@ const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
 ///   (spec §8): the parse/store layer never refuses, so every verdict lives here
 ///   and reaches the row as the `[untestable]` marker — which is also what keeps
 ///   `remove_failed_servers` from deleting a row we merely cannot serve.
-/// - `password_key`: a 2022 PSK that is neither standard base64 nor an exact
+/// - `password_chain`: a 2022 PSK that is neither standard base64 nor an exact
 ///   raw-length key is a fatal `NativeError::Config` in the connect path, so
 ///   refusing at gate time keeps Auto resolution on the subprocess. The shape
 ///   rule is xray's `ParseKey` ([`leas_proto::proto_spec::ss2022_key`]), and
-///   the import funnel drops such a row before it is ever stored.
+///   the import funnel drops such a row before it is ever stored. A
+///   `:`-separated list is served (EIH, `ss::eih`) except on `ChaCha`, which
+///   every core refuses a list for.
 ///
 /// A fingerprint id is no longer a refusal here: `security::wrap` resolves
 /// every id, approximating one with no roster row rather than failing.
@@ -447,19 +451,19 @@ fn ss_reason(kind: ProtocolKind, cfg: &SsConfig) -> Option<Cow<'static, str>> {
     {
         return Some(reason);
     }
-    // A `:`-separated list is xray's multi-user client form: a VALID config we
-    // do not serve (no extensible identity header, single-user PSK only). It is
-    // named as unimplemented, not as a malformed key — the import funnel keeps
-    // such a row precisely because it is valid.
+    // A `:`-separated list is xray's multi-user client form. AES methods carry
+    // it through the extensible identity headers; `ChaCha` has no AES block
+    // and xray/sing-box both refuse a list, so the row is irreparable rather
+    // than a malformed key.
     if method.family() == SsFamily::Blake3_2022
         && cfg.password.contains(':')
-        && leas_proto::proto_spec::ss2022_password_usable(&cfg.method, &cfg.password)
+        && method.aead() == SsAead::ChaCha20Poly1305
     {
         return Some(Cow::Borrowed(
-            "shadowsocks 2022 multi-user PSK list is not implemented",
+            "shadowsocks 2022 multi-user PSK list is not supported for chacha20-poly1305",
         ));
     }
-    if password_key(method, &cfg.password).is_err() {
+    if password_chain(method, &cfg.password).is_err() {
         return Some(Cow::Borrowed("shadowsocks 2022 password key is malformed"));
     }
     None
@@ -1597,17 +1601,25 @@ mod tests {
             kind,
             ss_cfg("2022-blake3-aes-128-gcm", "r@w-key-01234567")
         ));
-        // A valid `:`-separated multi-user list: refused as unimplemented.
+        // A valid `:`-separated multi-user list is served by the EIH codec.
+        assert!(ss_row(
+            kind,
+            ss_cfg(
+                "2022-blake3-aes-128-gcm",
+                "AAAAAAAAAAAAAAAAAAAAAA==:AAAAAAAAAAAAAAAAAAAAAA=="
+            )
+        ));
+        // `ChaCha` has no AES block; every core refuses a list here.
         assert_eq!(
             support_reason(
                 kind,
                 &ProtocolConfig::Ss(ss_cfg(
-                    "2022-blake3-aes-128-gcm",
-                    "AAAAAAAAAAAAAAAAAAAAAA==:AAAAAAAAAAAAAAAAAAAAAA=="
+                    "2022-blake3-chacha20-poly1305",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
                 ))
             )
             .as_deref(),
-            Some("shadowsocks 2022 multi-user PSK list is not implemented")
+            Some("shadowsocks 2022 multi-user PSK list is not supported for chacha20-poly1305")
         );
         // Neither base64 nor the method's raw length: malformed.
         assert_eq!(

@@ -139,8 +139,8 @@ pub fn profile_user_id(config: &ProtocolConfig) -> Option<String> {
 /// 1. **Malformed 2022 PSK.** xray's `ParseKey` accepts standard base64 or the
 ///    literal bytes at the exact method length; every core refuses anything
 ///    else at build/start. A `:`-separated list (xray's multi-user client
-///    form) is a VALID config and passes — this client cannot serve it, but
-///    that is a capability question, not a malformed key.
+///    form) is a VALID config and passes — the native EIH codec serves it
+///    (AES methods only).
 /// 2. **`none` on a cleartext wire.** No cipher means the destination and
 ///    payload travel in the clear. A row whose outer layer is TLS
 ///    (`security` tls/reality, or the plugin's real `tls`) is not cleartext

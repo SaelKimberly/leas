@@ -30,8 +30,10 @@
 //! client sent; the salt and BOTH request header chunks must leave in ONE
 //! write (anti-DPI); and a request with no initial payload MUST carry
 //! non-zero random padding, at most `MaxPaddingLength` (spec §3.1.3) — this
-//! client never sends an initial payload, so it always pads. There is no
-//! extensible identity header: single-user PSK only.
+//! client never sends an initial payload, so it always pads. A multi-user
+//! password (`iPSK1:…:uPSK`) prepends one extensible identity header per
+//! iPSK between the salt and the sealed fixed header
+//! ([`super::eih::write_tcp_headers`]); a single-key row writes none.
 //!
 //! As in `protocol::ss::stream`, every partial-read state lives in
 //! [`Ss2022Stream`], so a cancelled `poll_read` resumes on the byte it
@@ -53,7 +55,8 @@ use crate::error::{NativeError, timeouts};
 use crate::protocol::ss::consts::{
     MAX_PADDING, TIMESTAMP_TOLERANCE_SECS, now_unix_secs, s2022_error,
 };
-use crate::protocol::ss::method::{SsFamily, SsMethod, password_key, stream_subkey};
+use crate::protocol::ss::eih::write_tcp_headers;
+use crate::protocol::ss::method::{SsFamily, SsMethod, password_chain, stream_subkey};
 
 /// Request header type: client → server stream.
 const HEADER_TYPE_CLIENT_STREAM: u8 = 0;
@@ -331,6 +334,9 @@ pub struct Ss2022Stream<S> {
     /// Method of both directions, kept to derive the reader half once the
     /// server's salt arrives.
     method: SsMethod,
+    /// The row's PSK chain (`iPSK1:…:uPSK`, or one key): the last element is
+    /// the session key, the earlier ones write the identity headers.
+    keys: Vec<Zeroizing<Vec<u8>>>,
     /// Master key — needed until the server salt derives the reader half,
     /// then dropped (zeroized). `None` once both halves exist.
     key: Option<Zeroizing<Vec<u8>>>,
@@ -390,7 +396,7 @@ impl<S> Ss2022Stream<S> {
         Self::with_ack_slot(
             inner,
             method,
-            key,
+            vec![key],
             salt,
             target,
             crate::protocol::AuthAckSlot::default(),
@@ -398,25 +404,34 @@ impl<S> Ss2022Stream<S> {
     }
 
     /// [`Self::new`] reporting the validated response header into `ack_slot`
-    /// (the probe's channel, spec D3).
+    /// (the probe's channel, spec D3). `keys` is the PSK chain; its last
+    /// element is the session key.
     pub(crate) fn with_ack_slot(
         inner: S,
         method: SsMethod,
-        key: Zeroizing<Vec<u8>>,
+        keys: Vec<Zeroizing<Vec<u8>>>,
         salt: Vec<u8>,
         target: TargetAddr,
         ack_slot: crate::protocol::AuthAckSlot,
     ) -> Self {
+        let key = keys
+            .last()
+            .expect("the PSK chain always has at least one key")
+            .clone();
         let write = Half::new(method, &key, &salt);
         // The handshake is the only write whose size is known up front;
         // sizing `out` for it avoids an early realloc without reserving a
         // 0xFFFF chunk (~65 KiB) for every connection that never sends one.
-        let capacity =
-            salt.len() + REQUEST_FIXED_LEN + MAX_VARIABLE_HEADER + 2 * method.aead().tag_len();
+        let capacity = salt.len()
+            + super::eih::EIH_LEN * keys.len().saturating_sub(1)
+            + REQUEST_FIXED_LEN
+            + MAX_VARIABLE_HEADER
+            + 2 * method.aead().tag_len();
         Self {
             inner,
             aead: method.aead(),
             method,
+            keys,
             key: Some(key),
             write,
             read: None,
@@ -527,6 +542,10 @@ impl<S: AsyncWrite + Unpin> Ss2022Stream<S> {
         self.out.clear();
         self.out_pos = 0;
         self.out.extend_from_slice(&self.request_salt);
+        write_tcp_headers(&mut self.out, self.aead, &self.keys, &self.request_salt)?;
+        // The chain is dead after the headers: keep only the session half the
+        // reader derives from, and wipe every iPSK now.
+        self.keys.clear();
         // Our own key, nonce and plaintext widths: a seal failure is a
         // programmer error, never a wire condition.
         self.aead
@@ -806,11 +825,11 @@ pub async fn connect_to(
             cfg.method
         )));
     }
-    let key = password_key(method, &cfg.password)?;
+    let keys = password_chain(method, &cfg.password)?;
     let mut salt = Zeroizing::new(vec![0u8; method.aead().salt_len()]);
     crate::rand::fill_nonsecret(&mut salt);
     let mut stream =
-        Ss2022Stream::with_ack_slot(stream, method, key, salt.to_vec(), target.clone(), ack);
+        Ss2022Stream::with_ack_slot(stream, method, keys, salt.to_vec(), target.clone(), ack);
     let timeout = timeouts::PROTOCOL;
     tokio::time::timeout(timeout, stream.write_handshake())
         .await
@@ -884,6 +903,74 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A multi-user row emits one identity header per iPSK between the salt
+    /// and the fixed header. The server-side check is hand-written from the
+    /// spec: decrypt each header with the PREVIOUS key's identity subkey and
+    /// expect the NEXT key's `blake3` hash; the session key is the last PSK.
+    #[tokio::test]
+    async fn multi_user_handshake_emits_one_identity_header_per_ips_k() {
+        use crate::protocol::ss::eih::aes_ecb_decrypt;
+
+        let method = SsMethod::from_method("2022-blake3-aes-128-gcm").unwrap();
+        let ips1 = [0x11u8; 16];
+        let ips2 = [0x22u8; 16];
+        let upsk = [0x33u8; 16];
+        let salt = [0x07u8; 16];
+        let target = TargetAddr::new(Host::Ip(IpAddr::from([127, 0, 0, 1])), 8080);
+        let (client, mut server) = duplex(4096);
+        let mut s = Ss2022Stream::with_ack_slot(
+            client,
+            method,
+            vec![
+                Zeroizing::new(ips1.to_vec()),
+                Zeroizing::new(ips2.to_vec()),
+                Zeroizing::new(upsk.to_vec()),
+            ],
+            salt.to_vec(),
+            target,
+            crate::protocol::AuthAckSlot::default(),
+        );
+        s.write_handshake().await.unwrap();
+
+        // salt | EIH(ips1) | EIH(ips2) | sealed fixed header
+        let fixed_len = REQUEST_FIXED_LEN + method.aead().tag_len();
+        let mut wire = vec![0u8; 16 + 2 * 16 + fixed_len];
+        server.read_exact(&mut wire).await.unwrap();
+        assert_eq!(&wire[..16], &salt);
+
+        let identity_subkey = |psk: &[u8; 16]| {
+            let material = [&psk[..], &salt[..]].concat();
+            crate::protocol::vless::encryption::derive_key_bytes(
+                b"shadowsocks 2022 identity subkey",
+                &material,
+            )[..16]
+                .to_vec()
+        };
+        let hash16 = |psk: &[u8]| {
+            let mut out = [0u8; 16];
+            out.copy_from_slice(&blake3::hash(psk).as_bytes()[..16]);
+            out
+        };
+
+        let mut eih0: [u8; 16] = wire[16..32].try_into().unwrap();
+        aes_ecb_decrypt(method.aead(), &identity_subkey(&ips1), &mut eih0).unwrap();
+        assert_eq!(eih0, hash16(&ips2), "layer 1 names iPSK2");
+        let mut eih1: [u8; 16] = wire[32..48].try_into().unwrap();
+        aes_ecb_decrypt(method.aead(), &identity_subkey(&ips2), &mut eih1).unwrap();
+        assert_eq!(eih1, hash16(&upsk), "layer 2 names the user PSK");
+
+        let fixed = method
+            .aead()
+            .open(
+                &reference_subkey(method, &upsk, &salt),
+                &nonce(0),
+                b"",
+                &wire[48..],
+            )
+            .expect("fixed header opens with the LAST PSK at counter 0");
+        assert_eq!(fixed[0], HEADER_TYPE_CLIENT_STREAM);
     }
 
     #[tokio::test]
@@ -1072,7 +1159,7 @@ mod tests {
         let mut stream = Ss2022Stream::with_ack_slot(
             client,
             method,
-            Zeroizing::new(key.to_vec()),
+            vec![Zeroizing::new(key.to_vec())],
             ours.to_vec(),
             TargetAddr::new(Host::Ip(IpAddr::from([127, 0, 0, 1])), 443),
             slot.clone(),

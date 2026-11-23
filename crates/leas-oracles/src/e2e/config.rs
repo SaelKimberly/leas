@@ -986,6 +986,10 @@ pub const SS_PASSWORD: &str = "ss-test-password";
 pub const SS_2022_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 /// The 2022-blake3 PSK for `2022-blake3-aes-128-gcm` (16-byte key length).
 pub const SS_2022_KEY_128: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
+/// Multi-user EIH: the user PSK (the client's LAST list element, the
+/// server's `users[].password`), distinct from the server identity PSK.
+pub const SS_2022_USER_KEY: &str = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=";
+pub const SS_2022_USER_KEY_128: &str = "EREREREREREREREREREREQ==";
 
 /// The password a Shadowsocks row must carry for `method`: the method's key
 /// length is fixed by the 2022 spec (16 B AES-128, 32 B AES-256/ChaCha20), so
@@ -1237,9 +1241,45 @@ pub fn ss_inbound(
     method: &str,
     udp: bool,
 ) -> String {
+    ss_inbound_with_user(core, env, tls, network, method, udp, None)
+}
+
+/// [`ss_inbound`] for a 2022 multi-user row: `password` stays the server
+/// identity PSK and `user` becomes the single entry of `users[]`.
+#[must_use]
+pub fn ss_inbound_multi(
+    env: &ServerEnv,
+    network: &str,
+    method: &str,
+    udp: bool,
+    user: &str,
+) -> String {
+    ss_inbound_with_user(
+        CoreKind::SingBox,
+        env,
+        &super::variant::NoTls,
+        network,
+        method,
+        udp,
+        Some(user),
+    )
+}
+
+fn ss_inbound_with_user(
+    core: CoreKind,
+    env: &ServerEnv,
+    tls: &dyn TlsVariant,
+    network: &str,
+    method: &str,
+    udp: bool,
+    user: Option<&str>,
+) -> String {
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
     let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
     let password = ss_password(method);
+    if user.is_some() && core != CoreKind::SingBox {
+        panic!("only sing-box's shadowsocks inbound serves multi-user EIH");
+    }
     if core == CoreKind::Mihomo {
         // mihomo's shadowsocks listener has no plain-TLS layer (it offers
         // `shadow-tls`, a different protocol); the TLS SS row stays xray-only.
@@ -1295,6 +1335,11 @@ pub fn ss_inbound(
                 "type": "shadowsocks", "listen": "127.0.0.1", "listen_port": env.port,
                 "method": method, "password": password
             });
+            if let Some(user) = user {
+                inbound["users"] = serde_json::json!([
+                    { "name": "oracle", "password": user }
+                ]);
+            }
             if tls.tls_enabled() {
                 inbound["tls"] = serde_json::json!({
                     "enabled": true,
@@ -1327,10 +1372,44 @@ pub fn client_params_ss(
     network: &str,
     method: &str,
 ) -> NativeConnectParams {
+    client_params_ss_with_user(port, target, tls, network, method, None)
+}
+
+/// [`client_params_ss`] for a 2022 multi-user row: the password becomes
+/// `serverPSK:userPSK`.
+#[must_use]
+pub fn client_params_ss_multi(
+    port: u16,
+    target: SocketAddr,
+    method: &str,
+    user: &str,
+) -> NativeConnectParams {
+    client_params_ss_with_user(
+        port,
+        target,
+        &super::variant::NoTls,
+        "tcp",
+        method,
+        Some(user),
+    )
+}
+
+fn client_params_ss_with_user(
+    port: u16,
+    target: SocketAddr,
+    tls: &dyn TlsVariant,
+    network: &str,
+    method: &str,
+    user: Option<&str>,
+) -> NativeConnectParams {
+    let password = match user {
+        Some(user) => format!("{}:{user}", ss_password(method)),
+        None => ss_password(method).to_owned(),
+    };
     let mut protocol_value = serde_json::json!({
         "schema": "Ss",
         "method": method,
-        "password": ss_password(method)
+        "password": password
     });
     if tls.tls_enabled() {
         protocol_value["security"] = client_security(tls, network);

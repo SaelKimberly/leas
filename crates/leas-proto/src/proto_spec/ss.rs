@@ -366,8 +366,8 @@ pub fn ss2022_key(password: &str, key_len: usize) -> Option<Ss2022Key<'_>> {
 /// True when every `:`-separated PSK in `password` is usable for `method`.
 ///
 /// A single key is the common case; a list is xray's multi-user client form
-/// (`ParsePSKList` splits on `:`), so such a row is a VALID config even where
-/// this client cannot serve it. Non-2022 methods are not this rule's business
+/// (`ParsePSKList` splits on `:`), served natively through the EIH codec for
+/// the AES methods. Non-2022 methods are not this rule's business
 /// and always answer `true`; an UNKNOWN `2022-blake3-*` variant answers
 /// `false` — no core can name its key length, so the row can never dial.
 #[must_use]
@@ -1518,8 +1518,9 @@ mod key_rule_tests {
         assert_eq!(ss2022_key_len(method), want);
     }
 
-    /// A `:`-separated list is xray's multi-user form: a VALID config that this
-    /// client cannot serve — it must not be mistaken for a malformed key.
+    /// A `:`-separated list is xray's multi-user form: a VALID config the
+    /// native EIH codec serves for AES methods — it must not be mistaken for a
+    /// malformed key.
     #[rstest]
     #[case::single("AAAAAAAAAAAAAAAAAAAAAA==", true)]
     #[case::list("AAAAAAAAAAAAAAAAAAAAAA==:AAAAAAAAAAAAAAAAAAAAAA==", true)]

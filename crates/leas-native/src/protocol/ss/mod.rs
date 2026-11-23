@@ -12,6 +12,7 @@
 //! handshake and returns the tunnel.
 
 pub mod consts;
+pub(crate) mod eih;
 pub mod method;
 pub mod mux;
 pub mod stream;

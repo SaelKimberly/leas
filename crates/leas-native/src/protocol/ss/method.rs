@@ -265,7 +265,8 @@ pub(crate) fn stream_subkey_into(method: SsMethod, key: &[u8], salt: &[u8], out:
 /// Classic: OpenSSL `EVP_BytesToKey` (MD5) — unconditional.
 /// 2022: the password IS a PSK; the shape rule is [`leas_proto::proto_spec::ss2022_key`]
 /// (xray's `ParseKey`: standard base64, else the literal bytes), so a raw key
-/// xray serves is not refused here.
+/// xray serves is not refused here. A `:`-separated multi-user list is not a
+/// single key: use [`password_chain`] where the identity headers matter.
 pub fn password_key(method: SsMethod, password: &str) -> Result<Zeroizing<Vec<u8>>, NativeError> {
     match method.family() {
         // Legacy stream ciphers use the same `EVP_BytesToKey` key as the 2017
@@ -273,30 +274,56 @@ pub fn password_key(method: SsMethod, password: &str) -> Result<Zeroizing<Vec<u8
         SsFamily::Classic | SsFamily::Stream => {
             Ok(evp_bytes_to_key_md5(password.as_bytes(), method.key_len()))
         }
-        SsFamily::Blake3_2022 => {
-            use leas_proto::proto_spec::Ss2022Key;
-            let key_len = method.key_len();
-            let Some(shape) = leas_proto::proto_spec::ss2022_key(password, key_len) else {
-                return Err(NativeError::Config(format!(
-                    "shadowsocks-2022 key is neither base64 nor {key_len} raw bytes"
-                )));
-            };
-            match shape {
-                Ss2022Key::Raw(raw) => Ok(Zeroizing::new(raw.as_bytes().to_vec())),
-                // `Zeroizing` BEFORE the length check: a wrong-length PSK is
-                // still real key material and must not be dropped unwiped.
-                Ss2022Key::Base64(text) => Ok(Zeroizing::new(
-                    base64::engine::general_purpose::STANDARD
-                        .decode(text)
-                        .map_err(|e| {
-                            NativeError::Config(format!(
-                                "shadowsocks-2022 password is not base64: {e}"
-                            ))
-                        })?,
-                )),
-            }
-        }
+        SsFamily::Blake3_2022 => ss2022_key_bytes(method, password),
     }
+}
+
+/// Decode one `2022-blake3` PSK (base64, else the literal bytes).
+fn ss2022_key_bytes(method: SsMethod, password: &str) -> Result<Zeroizing<Vec<u8>>, NativeError> {
+    use leas_proto::proto_spec::Ss2022Key;
+    let key_len = method.key_len();
+    let Some(shape) = leas_proto::proto_spec::ss2022_key(password, key_len) else {
+        return Err(NativeError::Config(format!(
+            "shadowsocks-2022 key is neither base64 nor {key_len} raw bytes"
+        )));
+    };
+    match shape {
+        Ss2022Key::Raw(raw) => Ok(Zeroizing::new(raw.as_bytes().to_vec())),
+        // `Zeroizing` BEFORE the length check: a wrong-length PSK is
+        // still real key material and must not be dropped unwiped.
+        Ss2022Key::Base64(text) => Ok(Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(|e| {
+                    NativeError::Config(format!("shadowsocks-2022 password is not base64: {e}"))
+                })?,
+        )),
+    }
+}
+
+/// The row's PSK chain: one key for every non-2022 family, and xray's
+/// `iPSK1:…:uPSK` list for `2022-blake3` (spec §2 of the identity-header
+/// document). The LAST element is always the session key.
+///
+/// `ChaCha` refuses a list: xray (`outbound.go`, "multi-key is not supported
+/// for chacha20-poly1305") and sing-box (`shadowaead_2022.New`) both refuse
+/// it, and the method has no AES block for an identity header.
+pub fn password_chain(
+    method: SsMethod,
+    password: &str,
+) -> Result<Vec<Zeroizing<Vec<u8>>>, NativeError> {
+    if method.family() != SsFamily::Blake3_2022 {
+        return Ok(vec![password_key(method, password)?]);
+    }
+    if password.contains(':') && method.aead() == SsAead::ChaCha20Poly1305 {
+        return Err(NativeError::Config(
+            "shadowsocks-2022 multi-user PSK lists are not supported for chacha20-poly1305".into(),
+        ));
+    }
+    password
+        .split(':')
+        .map(|part| ss2022_key_bytes(method, part))
+        .collect()
 }
 
 #[cfg(test)]
@@ -430,6 +457,33 @@ mod tests {
         }
         let none = SsMethod::from_method("none").unwrap();
         assert!(password_key(none, "password").unwrap().is_empty());
+    }
+
+    /// The 2022 password is a PSK chain: the last key is the session key and
+    /// every earlier one writes an identity header. `ChaCha` has no AES block,
+    /// so it refuses a list exactly as xray and sing-box do.
+    #[test]
+    fn password_chain_splits_2022_lists_and_refuses_chacha() {
+        let aes = SsMethod::from_method("2022-blake3-aes-128-gcm").unwrap();
+        let a = base64::engine::general_purpose::STANDARD.encode([0x11u8; 16]);
+        let b = base64::engine::general_purpose::STANDARD.encode([0x22u8; 16]);
+        let chain = password_chain(aes, &format!("{a}:{b}")).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(&*chain[0], &[0x11u8; 16]);
+        assert_eq!(&*chain[1], &[0x22u8; 16]);
+        assert_eq!(password_chain(aes, &a).unwrap().len(), 1);
+
+        let chacha = SsMethod::from_method("2022-blake3-chacha20-poly1305").unwrap();
+        let k = base64::engine::general_purpose::STANDARD.encode([0x33u8; 32]);
+        assert!(password_chain(chacha, &k).is_ok());
+        assert!(matches!(
+            password_chain(chacha, &format!("{k}:{k}")),
+            Err(NativeError::Config(_))
+        ));
+
+        // A classic password may contain `:`; only 2022 treats it as a list.
+        let classic = SsMethod::from_method("aes-128-gcm").unwrap();
+        assert_eq!(password_chain(classic, "a:b").unwrap().len(), 1);
     }
 
     #[test]

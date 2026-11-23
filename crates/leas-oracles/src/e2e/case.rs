@@ -163,6 +163,9 @@ pub struct CaseSpec {
     /// Shadowsocks cipher method (`None` for every other protocol); selects
     /// the codec family and the server config's method/password.
     ss_method: Option<&'static str>,
+    /// 2022 multi-user user PSK (`Some` = the client password is
+    /// `serverPSK:userPSK` and the sing-box inbound carries `users[]`).
+    ss_user: Option<&'static str>,
     /// Trojan-Go's extra SS layer `(method, password)`; `None` for a plain
     /// Trojan row. Only the TrojanGo oracle serves it.
     trojan_enc: Option<(&'static str, &'static str)>,
@@ -190,6 +193,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: None,
+            ss_user: None,
             trojan_enc: None,
         }
     }
@@ -215,6 +219,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: None,
+            ss_user: None,
             trojan_enc: None,
         }
     }
@@ -242,6 +247,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: None,
+            ss_user: None,
             trojan_enc: None,
         }
     }
@@ -269,6 +275,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: Some(CoreKind::SingBox),
             ss_method: None,
+            ss_user: None,
             trojan_enc: None,
         }
     }
@@ -297,6 +304,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: None,
+            ss_user: None,
             trojan_enc: None,
         }
     }
@@ -330,6 +338,7 @@ impl CaseSpec {
             kcp_mask: None,
             single_core: None,
             ss_method: Some(method),
+            ss_user: None,
             trojan_enc: None,
         }
     }
@@ -424,6 +433,15 @@ impl CaseSpec {
     #[must_use]
     pub const fn with_udp(mut self, mode: PacketMode) -> Self {
         self.udp = Some(mode);
+        self
+    }
+
+    /// Make a 2022 Shadowsocks row multi-user: `user` is the client's LAST PSK
+    /// and the sing-box inbound's `users[].password`. The server identity PSK
+    /// stays the method's [`config::ss_password`]. Sing-box only.
+    #[must_use]
+    pub const fn with_ss_user(mut self, user: &'static str) -> Self {
+        self.ss_user = Some(user);
         self
     }
 
@@ -578,7 +596,14 @@ impl E2eCase for CaseSpec {
             ProtocolKind::AnyTls => "anytls",
         };
         // The SS method is the row's identity: two SS rows differ only by it.
-        let meth = self.ss_method.map_or(String::new(), |m| format!("/{m}"));
+        let meth = self.ss_method.map_or(String::new(), |m| {
+            let multi = if self.ss_user.is_some() {
+                "/multi-user"
+            } else {
+                ""
+            };
+            format!("/{m}{multi}")
+        });
         let flow = self
             .flow
             .map_or_else(String::new, |flow| format!("{}/", flow.as_str()));
@@ -641,14 +666,23 @@ impl E2eCase for CaseSpec {
                 (_, None) => config::trojan_inbound(core, env, self.network),
             },
             ProtocolKind::Hysteria2 => config::hysteria2_inbound(env, self.obfs),
-            ProtocolKind::Shadowsocks => config::ss_inbound(
-                core,
-                env,
-                self.tls(),
-                self.network,
-                self.ss_method.expect("shadowsocks case requires a method"),
-                self.app == AppKind::Udp,
-            ),
+            ProtocolKind::Shadowsocks => match self.ss_user {
+                Some(user) => config::ss_inbound_multi(
+                    env,
+                    self.network,
+                    self.ss_method.expect("shadowsocks case requires a method"),
+                    self.app == AppKind::Udp,
+                    user,
+                ),
+                None => config::ss_inbound(
+                    core,
+                    env,
+                    self.tls(),
+                    self.network,
+                    self.ss_method.expect("shadowsocks case requires a method"),
+                    self.app == AppKind::Udp,
+                ),
+            },
             ProtocolKind::AnyTls => config::anytls_inbound(core, env),
         };
         match self.kcp_mask {
@@ -692,13 +726,21 @@ impl E2eCase for CaseSpec {
                 self.trojan_enc,
             ),
             ProtocolKind::Hysteria2 => config::client_params_hysteria2(port, target, self.obfs),
-            ProtocolKind::Shadowsocks => config::client_params_ss(
-                port,
-                target,
-                self.tls(),
-                self.network,
-                self.ss_method.expect("shadowsocks case requires a method"),
-            ),
+            ProtocolKind::Shadowsocks => match self.ss_user {
+                Some(user) => config::client_params_ss_multi(
+                    port,
+                    target,
+                    self.ss_method.expect("shadowsocks case requires a method"),
+                    user,
+                ),
+                None => config::client_params_ss(
+                    port,
+                    target,
+                    self.tls(),
+                    self.network,
+                    self.ss_method.expect("shadowsocks case requires a method"),
+                ),
+            },
             ProtocolKind::AnyTls => config::client_params_anytls(port, target),
         };
         // pq-enc rows: the VLESS outbound carries the mlkem768x25519plus

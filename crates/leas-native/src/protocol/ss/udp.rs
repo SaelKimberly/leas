@@ -37,8 +37,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
-use aes::{Aes128, Aes256};
 use leas_proto::proto_spec::{ProtocolKind, SsConfig};
 use tokio::net::UdpSocket;
 use zeroize::Zeroizing;
@@ -50,8 +48,9 @@ use crate::error::NativeError;
 use crate::protocol::ss::consts::{
     MAX_PADDING, TIMESTAMP_TOLERANCE_SECS, now_unix_secs, s2022_error,
 };
+use crate::protocol::ss::eih::{aes_ecb_decrypt, aes_ecb_encrypt, write_udp_headers};
 use crate::protocol::ss::method::{
-    SsFamily, SsMethod, password_key, stream_subkey, stream_subkey_into,
+    SsFamily, SsMethod, password_chain, stream_subkey, stream_subkey_into,
 };
 use crate::protocol::ss::stream_legacy::keystream;
 use crate::rand::{fill_nonsecret, u32_below};
@@ -63,13 +62,17 @@ const MAX_DATAGRAM: usize = 64 * 1024;
 /// Largest payload one SS datagram may carry.
 ///
 /// The cap bounds the SEALED datagram, not just the plaintext: the
-/// worst-case overhead a method can add is 326 bytes (2022 `ChaCha`: a 24-byte
-/// nonce, the 16-byte merged id pair, the 11-byte main header, the 259-byte
-/// encoded 255-byte domain address and the 16-byte tag), so
-/// `MAX_PAYLOAD + 326 = 65326` stays under the 65507 bytes an IPv4 UDP payload
-/// can hold. A bigger payload would be refused by the kernel with `EMSGSIZE`
-/// instead of a clean error.
+/// worst-case single-key overhead a method can add is 326 bytes (2022
+/// `ChaCha`: a 24-byte nonce, the 16-byte merged id pair, the 11-byte main
+/// header, the 259-byte encoded 255-byte domain address and the 16-byte tag),
+/// so `MAX_PAYLOAD + 326 = 65326` stays under the 65507 bytes an IPv4 UDP
+/// payload can hold. A multi-user EIH chain adds 16 bytes per iPSK; the sealed
+/// size is checked against [`MAX_UDP_PAYLOAD`] after encoding, so a long chain
+/// is a clean error rather than the kernel's `EMSGSIZE`.
 const MAX_PAYLOAD: usize = 65_000;
+
+/// Largest payload an IPv4 UDP datagram can carry.
+const MAX_UDP_PAYLOAD: usize = 65_507;
 
 /// Spec §3.2.4's rotation gate: keeping one old and one current server session
 /// is only allowed while the client "reject[s] newer server sessions when the
@@ -290,74 +293,24 @@ fn open_stream_datagram(
     )
 }
 
-/// AES-ECB encrypt one 16-byte block under the PSK — the 2022 separate
-/// header's cipher (spec §3.2.1).
-///
-/// 2022 has no AES-192 method, so any other cipher never reaches a separate
-/// header and is a config error, not a silent fallback.
-fn aes_ecb_encrypt(aead: SsAead, psk: &[u8], block: &mut [u8; 16]) -> Result<(), NativeError> {
-    let out = match aead {
-        SsAead::Aes128Gcm => {
-            let cipher = Aes128::new_from_slice(psk)
-                .map_err(|_| NativeError::Config("AES-128 PSK must be 16 bytes".into()))?;
-            let mut out = [0u8; 16];
-            cipher.encrypt_block_b2b((&*block).into(), (&mut out).into());
-            out
-        }
-        SsAead::Aes256Gcm => {
-            let cipher = Aes256::new_from_slice(psk)
-                .map_err(|_| NativeError::Config("AES-256 PSK must be 32 bytes".into()))?;
-            let mut out = [0u8; 16];
-            cipher.encrypt_block_b2b((&*block).into(), (&mut out).into());
-            out
-        }
-        other => {
-            return Err(NativeError::Config(format!(
-                "{other:?} has no Shadowsocks-2022 separate header (AES methods only)"
-            )));
-        }
-    };
-    *block = out;
-    Ok(())
-}
-
-/// [`aes_ecb_encrypt`]'s inverse — used only by tests and by the reader.
-fn aes_ecb_decrypt(aead: SsAead, psk: &[u8], block: &mut [u8; 16]) -> Result<(), NativeError> {
-    let out = match aead {
-        SsAead::Aes128Gcm => {
-            let cipher = Aes128::new_from_slice(psk)
-                .map_err(|_| NativeError::Config("AES-128 PSK must be 16 bytes".into()))?;
-            let mut out = [0u8; 16];
-            cipher.decrypt_block_b2b((&*block).into(), (&mut out).into());
-            out
-        }
-        SsAead::Aes256Gcm => {
-            let cipher = Aes256::new_from_slice(psk)
-                .map_err(|_| NativeError::Config("AES-256 PSK must be 32 bytes".into()))?;
-            let mut out = [0u8; 16];
-            cipher.decrypt_block_b2b((&*block).into(), (&mut out).into());
-            out
-        }
-        other => {
-            return Err(NativeError::Config(format!(
-                "{other:?} has no Shadowsocks-2022 separate header (AES methods only)"
-            )));
-        }
-    };
-    *block = out;
-    Ok(())
+/// The PLAINTEXT separate header: `session_id BE8 ‖ packet_id BE8`.
+fn separate_header_plain(session_id: u64, packet_id: u64) -> [u8; SEPARATE_HEADER_LEN] {
+    let mut header = [0u8; SEPARATE_HEADER_LEN];
+    header[..8].copy_from_slice(&session_id.to_be_bytes());
+    header[8..].copy_from_slice(&packet_id.to_be_bytes());
+    header
 }
 
 /// The wire separate header: `AES-ECB(psk, session_id BE8 ‖ packet_id BE8)`.
+/// Test support: the live writer encrypts the plaintext header in place.
+#[cfg(test)]
 fn separate_header_aes(
     aead: SsAead,
     psk: &[u8],
     session_id: u64,
     packet_id: u64,
 ) -> Result<[u8; SEPARATE_HEADER_LEN], NativeError> {
-    let mut header = [0u8; SEPARATE_HEADER_LEN];
-    header[..8].copy_from_slice(&session_id.to_be_bytes());
-    header[8..].copy_from_slice(&packet_id.to_be_bytes());
+    let mut header = separate_header_plain(session_id, packet_id);
     aes_ecb_encrypt(aead, psk, &mut header)?;
     Ok(header)
 }
@@ -592,7 +545,8 @@ impl ServerSlot {
 /// the reader calls it only after the body authenticated and the header
 /// validated.
 struct ServerSessions {
-    /// The single local client session (single-user PSK).
+    /// The local client session id (one per association, whatever the PSK
+    /// chain length).
     client_session_id: u64,
     method: SsMethod,
     key: Arc<Zeroizing<Vec<u8>>>,
@@ -629,7 +583,7 @@ impl ServerSessions {
             .find(|slot| slot.server_id == server_id)
     }
 
-    /// The client session id this table belongs to (single-user PSK: one id).
+    /// The client session id this table belongs to.
     const fn client_session_id(&self) -> u64 {
         self.client_session_id
     }
@@ -715,23 +669,34 @@ impl ServerSessions {
 struct Ss2022WriterState {
     /// UDP body cipher ([`udp_cipher`]).
     aead: SsAead,
-    /// The PSK: the AES-ECB key for the separate header, and the AEAD key for
-    /// the `ChaCha` method (which uses the PSK directly).
-    key: Arc<Zeroizing<Vec<u8>>>,
+    /// The row's PSK chain: `keys[0]` is the separate header's AES-ECB key,
+    /// the last is the session key (and the `ChaCha` AEAD key).
+    keys: Arc<Vec<Zeroizing<Vec<u8>>>>,
     client_session_id: u64,
     packet_id: u64,
     subkey: Zeroizing<Vec<u8>>,
 }
 
 impl Ss2022WriterState {
+    /// Test support: one key, no identity headers. The live path uses
+    /// [`Self::with_keys`] so a multi-user row can emit its chain.
+    #[cfg(test)]
+    #[allow(clippy::needless_pass_by_value)]
     fn new(method: SsMethod, key: Arc<Zeroizing<Vec<u8>>>) -> Self {
+        Self::with_keys(method, Arc::new(vec![(*key).clone()]))
+    }
+
+    fn with_keys(method: SsMethod, keys: Arc<Vec<Zeroizing<Vec<u8>>>>) -> Self {
         let mut id = [0u8; 8];
         fill_nonsecret(&mut id);
         let client_session_id = u64::from_be_bytes(id);
-        let subkey = udp_session_subkey(method, &key, client_session_id);
+        let last = keys
+            .last()
+            .expect("the PSK chain always has at least one key");
+        let subkey = udp_session_subkey(method, last, client_session_id);
         Self {
             aead: udp_cipher(method),
-            key,
+            keys,
             client_session_id,
             packet_id: 0,
             subkey,
@@ -752,9 +717,17 @@ impl Ss2022WriterState {
                 // The nonce comes from the PLAINTEXT separate header; the
                 // wire block is that header encrypted afterwards.
                 let nonce = separate_header_nonce(self.client_session_id, packet_id);
-                let header =
-                    separate_header_aes(self.aead, &self.key, self.client_session_id, packet_id)?;
-                buf.packet.extend_from_slice(&header);
+                let header = separate_header_plain(self.client_session_id, packet_id);
+                let mut wire_header = header;
+                aes_ecb_encrypt(self.aead, &self.keys[0], &mut wire_header)?;
+                buf.packet.extend_from_slice(&wire_header);
+                write_udp_headers(
+                    &mut buf.packet,
+                    self.aead,
+                    &self.keys,
+                    self.client_session_id,
+                    packet_id,
+                )?;
                 client_body(buf, dest, payload)?;
                 self.aead
                     .seal_into(&self.subkey, &nonce, b"", &buf.body, &mut buf.packet)?;
@@ -769,8 +742,15 @@ impl Ss2022WriterState {
                     .extend_from_slice(&self.client_session_id.to_be_bytes());
                 buf.body.extend_from_slice(&packet_id.to_be_bytes());
                 client_body(buf, dest, payload)?;
-                self.aead
-                    .seal_into(&self.key, &nonce, b"", &buf.body, &mut buf.packet)?;
+                self.aead.seal_into(
+                    self.keys
+                        .last()
+                        .expect("the PSK chain always has at least one key"),
+                    &nonce,
+                    b"",
+                    &buf.body,
+                    &mut buf.packet,
+                )?;
             }
             other => {
                 return Err(NativeError::Config(format!(
@@ -1005,6 +985,18 @@ fn oversize(len: usize) -> io::Error {
     )
 }
 
+/// Refuse a sealed datagram the socket cannot carry (a long EIH chain on a
+/// near-cap payload), with a clean error instead of `EMSGSIZE`.
+fn sealed_fits(len: usize) -> io::Result<()> {
+    if len > MAX_UDP_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("shadowsocks udp datagram too large ({len} bytes, max {MAX_UDP_PAYLOAD})"),
+        ));
+    }
+    Ok(())
+}
+
 /// The SS UDP carrier: the connected socket to the SS server, the codec key,
 /// the session destination, and the 2022 send/receive states.
 ///
@@ -1046,6 +1038,7 @@ impl SsUdpTunnel {
             &mut self.send_buf,
         )
         .map_err(carrier_error)?;
+        sealed_fits(self.send_buf.packet.len())?;
         self.socket.send(&self.send_buf.packet).await.map(|_| ())
     }
 
@@ -1160,6 +1153,7 @@ impl SsUdpWriter {
             &mut self.send_buf,
         )
         .map_err(carrier_error)?;
+        sealed_fits(self.send_buf.packet.len())?;
         self.socket.send(&self.send_buf.packet).await.map(|_| ())
     }
 }
@@ -1216,7 +1210,12 @@ pub async fn connect_udp(
             plugin.name
         )));
     }
-    let key = Arc::new(password_key(method, &cfg.password)?);
+    let keys = Arc::new(password_chain(method, &cfg.password)?);
+    let key = Arc::new(
+        keys.last()
+            .expect("the PSK chain always has at least one key")
+            .clone(),
+    );
     let server = ctx.server_socket().await?;
     let bind: SocketAddr = if server.is_ipv4() {
         "0.0.0.0:0"
@@ -1236,7 +1235,7 @@ pub async fn connect_udp(
         // Both stateless families keep no per-association sender state.
         SsFamily::Classic | SsFamily::Stream => (None, None),
         SsFamily::Blake3_2022 => {
-            let writer = Ss2022WriterState::new(method, Arc::clone(&key));
+            let writer = Ss2022WriterState::with_keys(method, Arc::clone(&keys));
             let reader = Ss2022ReaderState::new(method, Arc::clone(&key), writer.client_session_id);
             (Some(writer), Some(reader))
         }
@@ -1267,6 +1266,7 @@ mod tests {
     use super::*;
     use crate::addr::encode_addr_port_last;
     use crate::context::NativeConnectParams;
+    use crate::protocol::ss::method::password_key;
     use crate::protocol::ss::resolve_method;
     use crate::protocol::vless::encryption::derive_key_bytes;
 
@@ -2064,6 +2064,74 @@ mod tests {
         let (_, packet_id, _, _) = open_client_aes_datagram(method, &psk, &second).unwrap();
         assert_eq!(packet_id, 1);
         assert_ne!(&wire[..SEPARATE_HEADER_LEN], &second[..SEPARATE_HEADER_LEN]);
+    }
+
+    /// A multi-user AES datagram: the separate header is encrypted with the
+    /// FIRST PSK, each EIH carries the next PSK's hash, XOR-masked with the plaintext
+    /// id pair, and the body is sealed with the LAST PSK's session subkey.
+    #[test]
+    fn aes_2022_multi_user_writer_emits_the_identity_chain() {
+        let method = SsMethod::from_method("2022-blake3-aes-128-gcm").unwrap();
+        let ips1 = [0x11u8; 16];
+        let ips2 = [0x22u8; 16];
+        let upsk = [0x33u8; 16];
+        let mut writer = Ss2022WriterState::with_keys(
+            method,
+            Arc::new(vec![
+                Zeroizing::new(ips1.to_vec()),
+                Zeroizing::new(ips2.to_vec()),
+                Zeroizing::new(upsk.to_vec()),
+            ]),
+        );
+        let dest = TargetAddr::new(Host::Ip(IpAddr::from([203, 0, 113, 5])), 443);
+        let wire = seal_with(&mut writer, &dest, b"ping");
+
+        // Plaintext ids, recovered with the first PSK.
+        let mut raw: [u8; 16] = wire[..16].try_into().unwrap();
+        aes_ecb_decrypt(method.aead(), &ips1, &mut raw).unwrap();
+        assert_eq!(
+            u64::from_be_bytes(raw[..8].try_into().unwrap()),
+            writer.client_session_id
+        );
+        assert_eq!(u64::from_be_bytes(raw[8..].try_into().unwrap()), 0);
+
+        let hash16 = |psk: &[u8]| {
+            let mut out = [0u8; 16];
+            out.copy_from_slice(&blake3::hash(psk).as_bytes()[..16]);
+            out
+        };
+        let mut eih0: [u8; 16] = wire[16..32].try_into().unwrap();
+        aes_ecb_decrypt(method.aead(), &ips1, &mut eih0).unwrap();
+        let mut want = hash16(&ips2);
+        for (byte, mask) in want.iter_mut().zip(raw) {
+            *byte ^= mask;
+        }
+        assert_eq!(eih0, want, "layer 1 names iPSK2");
+        let mut eih1: [u8; 16] = wire[32..48].try_into().unwrap();
+        aes_ecb_decrypt(method.aead(), &ips2, &mut eih1).unwrap();
+        let mut want = hash16(&upsk);
+        for (byte, mask) in want.iter_mut().zip(raw) {
+            *byte ^= mask;
+        }
+        assert_eq!(eih1, want, "layer 2 names the user PSK");
+
+        let body = method
+            .aead()
+            .open(
+                &reference_subkey(method, &upsk, writer.client_session_id),
+                &separate_header_nonce(writer.client_session_id, 0),
+                b"",
+                &wire[48..],
+            )
+            .expect("body opens with the LAST PSK");
+        let (&kind, rest) = body.split_first().unwrap();
+        assert_eq!(kind, HEADER_TYPE_CLIENT_PACKET);
+        let (_, rest) = read_u64(rest).unwrap();
+        let (pad_len, rest) = read_u16(rest).unwrap();
+        let (decoded, payload) =
+            decode_addr_port_last(rest.get(usize::from(pad_len)..).unwrap()).unwrap();
+        assert_eq!(decoded, dest);
+        assert_eq!(payload, b"ping");
     }
 
     #[test]
