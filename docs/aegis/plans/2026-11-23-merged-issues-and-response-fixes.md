@@ -332,8 +332,6 @@ Still open (not behaviour, reader-facing):
   stage-conditional: `fast` ⇔ `dial`) and does not re-key the column. Promote to
   a task only if a UI/report consumer needs the real-test scope.
 - **D8 — probe budget (F5).** Not raised; 0/680 rescued at 15 s.
-Files: `crates/leas-db/src/{database,write_behind}.rs`,
-`crates/leas/src/state.rs`, `crates/leas/src/ops/{ping,events}.rs`.
 
 ## 7. Verification
 
@@ -374,3 +372,29 @@ its crate suite — and, for T1/T3, the oracle rows — are green.
 `User confirmation required: no (decisions D1-D6 answered 2026-11-23). The
 real-test run after T1/T2 is the user's to launch; the agent's part is the
 export + taxonomy query, and it is a handoff, not a gate.`
+
+## 10. Execution record (2026-11-23)
+
+Landed in six commits: docs `3295f9dc`, Phase A `a365f398`, Phase B `0a628caf`,
+Phase C `86f3e747`, Phase D `395fda9e`, Phase E `bd6643e4`. Each phase was
+reviewed by an independent reviewer before its commit, and every finding was
+fixed (A: 1 regression + 2 test gaps; B: UDP permits, honest buffers, SS cap,
+surplus accessor; C: sweep ordering and the staged-writer race, the fast-pair
+classifier duplication, the missing `dns_deferred` stamp; D/E: the h1-over-TLS
+upload dial, starved waiters, the unbindable-family cache hole, blank `network`
+fields, the sniffer's over-subtraction, the disabled-window residue).
+
+Deviations from the task text, each with its reason:
+
+| Task | Outcome |
+| --- | --- |
+| T1 | Landed + a pinned-core `?ed=` oracle row (xray-only: sing-box closes an upgrade that carries the subprotocol). Reviewer found and the fix covers a flush/shutdown regression (an unpolled upgrade future) plus two missing seam tests (read-before-write waker, partial capture). |
+| T2 | Landed; the `0x48` path boxes a typed `NativeError::Protocol`. |
+| T3 | Landed; strict group check + constant-time MAC compares in TLS 1.3 and 1.2. The drive-level test the reviewer asked for is covered by the helper test plus the real-core TLS oracle rows. |
+| T4 | Landed; the reviewer caught that UDP associations released the permit (relay now awaited) and that the client datagram buffer cannot honestly be deferred (eager, documented). |
+| T5 | Cap, spill split, fallback registration, key-once landed. The build gate stays pool-wide: a session carries one profile, so per-key buys nothing until the pool is shared (comment left at the site). |
+| T6 | Landed: orphan sweep inside the purge transaction, per-merge protocol weights (the whole-table read was the cost, not the anti-join), two search prefix indexes, result-writer retries 5 → 8. |
+| T7 | 021 landed (DNS-retry failure reports `MaintenanceDone`); 022 sweeps at most once per second; F8 persists a typed fast pair. F6 was already fixed by `f4dc7ce6` (256 MiB default) — only the message/key-name complaint remained, and the shipped default no longer truncates the observed feeds. |
+| T8 | `attempts = 1`; the resolve gate is sized from `real_ping_concurrency`; a starved host is deferred without a verdict; cache hits no longer re-stamp the TTL; the UDP association's DNS cache carries a 300 s TTL and invalidates a failed address; the `seen` list is capped at 64. The 8 s lookup budget is unchanged (decision D2). |
+| T9 | Unknown routing tokens now fail the row closed (`ips` with no usable entry, `network`, `protocols`); a UDP association caches its routing decision for 30 s per (host, port). |
+| T10 | Landed: xhttp dispatches from `http_version()`; the `HeaderFirst` header copy is zeroized; the hysteria2 defragger caps `frag_count`; the packetaddr receive slices the frame instead of copying; the Sniffer's scroll clamps to a full page. **Deferred with reasons:** 011 (the h2/h1 upload dial bypasses a multi-hop chain — the chain links are not on `LinkContext`; fixing it is an architecture change, not a one-liner) and 024 (a cached row set would be deep-cloned per frame because `Table` takes owned `Row`s). The hysteria2 half of 007 needs `UdpMessage.data` to become `Bytes` across the protocol seam and is deferred with it. |
