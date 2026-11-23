@@ -807,6 +807,8 @@ mod tests {
             disable_fallback: false,
             client_ip: None,
             cache_ttl_secs: None,
+            resolver_pool_size: None,
+            resolver_test_domain: None,
         };
         let config = build_dns(&dns);
         assert_eq!(json!(config.servers), json!(["1.1.1.1", "tls://8.8.8.8"]));

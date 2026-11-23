@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Context as TaskCx, Poll};
+use std::task::{Context, Context as TaskCx, Poll, ready};
 
 use bytes::{Buf, Bytes};
 use futures_core::Stream;
@@ -83,9 +83,8 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
 /// `Sec-WebSocket-Protocol` carrying URL-safe base64 of the first bytes.
 ///
 /// Xray's server decodes it, feeds those bytes to the tunnel BEFORE the first
-/// frame, and echoes the same header back; we send them as the first binary
-/// frame, which is equivalent on the wire (the server accepts both — see
-/// `hub.go:55-59`).
+/// frame, and echoes the same header back. The bytes travel in the header and
+/// NOWHERE else: any frame copy duplicates the first flight (issue 012).
 fn early_data_request(
     cfg: &WebSocketConfig,
     host: &str,
@@ -113,10 +112,15 @@ pub struct EarlyDataDial {
         BoxFuture<'static, Result<tokio_tungstenite::WebSocketStream<BoxStream>, NativeError>>,
     >,
     ws: Option<WsStream>,
-    /// Bytes captured from the caller's first write, sent as the first frame
-    /// once the upgrade lands.
+    /// Bytes captured from the caller's first write. They travel in the
+    /// `Sec-WebSocket-Protocol` header and nowhere else: the capture branch
+    /// reports them consumed, so the buffer is only alive long enough to
+    /// build the upgrade request.
     early: Vec<u8>,
-    early_pos: usize,
+    /// The reader parked before the first write started the upgrade: nothing
+    /// would poll it again otherwise (the upgrade future is created by the
+    /// writer).
+    read_waker: Option<std::task::Waker>,
     max_early: usize,
 }
 
@@ -129,8 +133,31 @@ impl EarlyDataDial {
             upgrading: None,
             ws: None,
             early: Vec::new(),
-            early_pos: 0,
+            read_waker: None,
             max_early,
+        }
+    }
+
+    /// Drive a pending upgrade to completion. `Ready(Ok)` also means "there
+    /// was none", so flush/shutdown can chain it unconditionally.
+    fn poll_pending_upgrade(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.ws.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        let Some(fut) = self.upgrading.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(ws)) => {
+                self.ws = Some(WsStream::new(ws));
+                self.upgrading = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                self.upgrading = None;
+                Poll::Ready(Err(io::Error::other(e)))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -146,7 +173,9 @@ impl AsyncRead for EarlyDataDial {
         if this.ws.is_none() {
             let Some(fut) = this.upgrading.as_mut() else {
                 // No first write yet, and a read cannot start the upgrade:
-                // the early bytes come from that write.
+                // the early bytes come from that write. Park WITH a waker so
+                // the writer that starts the upgrade can wake this read.
+                this.read_waker = Some(cx.waker().clone());
                 return Poll::Pending;
             };
             match fut.as_mut().poll(cx) {
@@ -179,8 +208,13 @@ impl AsyncWrite for EarlyDataDial {
         if this.ws.is_none() {
             if this.upgrading.is_none() {
                 // First write: capture up to `max_early` bytes and start
-                // the upgrade with them in the header.
+                // the upgrade with them in the header. Reporting `take`
+                // consumed is the whole contract: those bytes leave via the
+                // header, so they must never be written again as a frame.
                 let take = data.len().min(this.max_early.max(1));
+                if take == 0 {
+                    return Poll::Ready(Ok(0));
+                }
                 this.early.extend_from_slice(&data[..take]);
                 let Some(stream) = this.stream.take() else {
                     return Poll::Ready(Err(io::Error::other("ws early-data: no stream")));
@@ -189,8 +223,14 @@ impl AsyncWrite for EarlyDataDial {
                     Ok(req) => req,
                     Err(e) => return Poll::Ready(Err(io::Error::other(e))),
                 };
+                // The captured bytes live in the request now; the buffer is
+                // dead weight past this point.
+                this.early.clear();
                 this.upgrading = Some(Box::pin(upgrade_with(req, stream, "ws")));
-                return Poll::Pending;
+                if let Some(waker) = this.read_waker.take() {
+                    waker.wake();
+                }
+                return Poll::Ready(Ok(take));
             }
             let Some(fut) = this.upgrading.as_mut() else {
                 return Poll::Ready(Err(io::Error::other("ws early-data: no upgrade")));
@@ -209,37 +249,29 @@ impl AsyncWrite for EarlyDataDial {
                 Poll::Pending => return Poll::Pending,
             }
         }
-        // Send the early bytes as the first frame, then the caller's.
-        while this.early_pos < this.early.len() {
-            let ws = this.ws.as_mut().expect("checked above");
-            let remaining = &this.early[this.early_pos..];
-            match Pin::new(ws).poll_write(cx, remaining) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero)));
-                }
-                Poll::Ready(Ok(n)) => this.early_pos += n,
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            }
-        }
+        // The early prefix already left in the header; only the caller's
+        // current buffer goes on the wire.
         let ws = this.ws.as_mut().expect("checked above");
-        match Pin::new(ws).poll_write(cx, data) {
-            Poll::Ready(Ok(n)) => {
-                let early_len = this.early.len();
-                Poll::Ready(Ok(n.max(early_len.min(data.len()))))
-            }
-            other => other,
-        }
+        Pin::new(ws).poll_write(cx, data)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.ws
+        let this = &mut *self;
+        // The first flight rides the upgrade request: a flush must DRIVE a
+        // pending upgrade, never report success for bytes still in the header
+        // (the capture branch already reported them consumed).
+        ready!(this.poll_pending_upgrade(cx))?;
+        this.ws
             .as_mut()
             .map_or(Poll::Ready(Ok(())), |ws| Pin::new(ws).poll_flush(cx))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.ws
+        let this = &mut *self;
+        // Same rule for close: dropping an unpolled upgrade future would lose
+        // the request (and its early data) without a trace.
+        ready!(this.poll_pending_upgrade(cx))?;
+        this.ws
             .as_mut()
             .map_or(Poll::Ready(Ok(())), |ws| Pin::new(ws).poll_shutdown(cx))
     }
@@ -399,9 +431,11 @@ mod early_data_tests {
         }
     }
 
-    /// A rejected upgrade leaves its future in the slot; the next poll — the
-    /// relay's half-close after the error — must not poll it a second time
-    /// (`async fn resumed after completion` at `upgrade_with`).
+    /// A rejected upgrade must not be polled a second time by the relay's
+    /// half-close (`async fn resumed after completion` at `upgrade_with`).
+    /// The error surfaces once, through the read; shutdown afterwards is a
+    /// clean no-op because the capture consumed the header and the upgrade
+    /// slot is cleared.
     #[tokio::test]
     async fn shutdown_after_a_rejected_upgrade_does_not_repoll_the_upgrade() {
         use crate::protocol::first_flight::HeaderFirst;
@@ -421,7 +455,10 @@ mod early_data_tests {
         stream.write_all(b"PAYLOAD").await.unwrap();
         let err = stream.read(&mut [0u8; 1]).await.unwrap_err();
         assert!(err.to_string().contains("400"), "{err}");
-        stream.shutdown().await.unwrap_err();
+        stream
+            .shutdown()
+            .await
+            .expect("one terminal error, then a clean close");
         srv.await.unwrap();
     }
 
@@ -457,6 +494,175 @@ mod early_data_tests {
             "the io error boxes the typed transport error: {inner:?} / {err}"
         );
         srv.await.unwrap();
+    }
+
+    /// A read that arrives BEFORE the first write parks with a waker; the
+    /// write that starts the upgrade must wake it, or a server-first peer
+    /// deadlocks (the waker is the only channel between the two halves).
+    #[tokio::test]
+    async fn a_read_before_the_first_write_is_woken_by_it() {
+        use futures_sink::Sink;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut ws = tokio_tungstenite::accept_hdr_async(server, echo_subprotocol)
+                .await
+                .unwrap();
+            std::future::poll_fn(|cx| Pin::new(&mut ws).poll_ready(cx))
+                .await
+                .unwrap();
+            Pin::new(&mut ws)
+                .start_send(Message::Binary(Bytes::from_static(b"REPLY")))
+                .unwrap();
+            std::future::poll_fn(|cx| Pin::new(&mut ws).poll_flush(cx))
+                .await
+                .unwrap();
+        });
+        let dial = EarlyDataDial::new(cfg(Some(8)), "example.com".into(), Box::new(client), 8);
+        let (mut reader, mut writer) = tokio::io::split(dial);
+        // Poll the read first so it parks with the waker installed.
+        let read = tokio::spawn(async move {
+            let mut buf = [0u8; 5];
+            reader.read_exact(&mut buf).await.map(|_| buf)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        writer.write_all(b"PAYLOAD").await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), read)
+            .await
+            .expect("the first write must wake the parked read")
+            .expect("read task")
+            .expect("reply");
+        assert_eq!(&got, b"REPLY");
+        srv.await.unwrap();
+    }
+
+    /// A first write larger than the early window: the prefix rides the
+    /// header, the remainder goes out as frames, each exactly once.
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // tungstenite's callback shape
+    async fn a_partial_early_capture_sends_the_remainder_as_frames() {
+        use base64::Engine as _;
+        use futures_core::Stream;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let seen_header = Arc::new(Mutex::new(None::<String>));
+        let capture = Arc::clone(&seen_header);
+        let srv = tokio::spawn(async move {
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                server,
+                move |req: &tokio_tungstenite::tungstenite::http::Request<()>,
+                      resp: tokio_tungstenite::tungstenite::http::Response<()>| {
+                    if let Some(v) = req.headers().get("sec-websocket-protocol") {
+                        *capture.lock().expect("capture") = v.to_str().ok().map(str::to_owned);
+                    }
+                    echo_subprotocol(req, resp)
+                },
+            )
+            .await
+            .unwrap();
+            let mut frames = Vec::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+            loop {
+                let next = std::future::poll_fn(|cx| Pin::new(&mut ws).poll_next(cx));
+                match tokio::time::timeout_at(deadline, next).await {
+                    Ok(Some(Ok(Message::Binary(b)))) => frames.extend_from_slice(&b),
+                    _ => break,
+                }
+            }
+            frames
+        });
+        let dial = EarlyDataDial::new(cfg(Some(4)), "example.com".into(), Box::new(client), 4);
+        let mut stream = dial;
+        stream.write_all(b"0123456789").await.unwrap();
+        // The upgrade still has to be driven: a flush does it (and is itself
+        // the regression guard for the flush-before-upgrade path).
+        stream.flush().await.unwrap();
+
+        let header = seen_header
+            .lock()
+            .expect("capture")
+            .clone()
+            .expect("header sent");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(header)
+            .expect("base64url");
+        assert_eq!(&decoded, b"0123", "the header carries exactly the window");
+        let frames = srv.await.unwrap();
+        assert_eq!(frames, b"456789", "the remainder goes out once");
+    }
+
+    /// The captured prefix travels in `Sec-WebSocket-Protocol` and nowhere
+    /// else. Asserting only one half cannot tell "sent once, in the header"
+    /// from "sent twice, once as a frame" (issue 012: 26 bytes off the socket
+    /// for a 13-byte write).
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // tungstenite's callback shape
+    async fn early_data_bytes_reach_the_carrier_once() {
+        use crate::protocol::first_flight::HeaderFirst;
+        use base64::Engine as _;
+        use futures_core::Stream;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let seen_header = Arc::new(Mutex::new(None::<String>));
+        let capture = Arc::clone(&seen_header);
+        let srv = tokio::spawn(async move {
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                server,
+                move |req: &tokio_tungstenite::tungstenite::http::Request<()>,
+                      resp: tokio_tungstenite::tungstenite::http::Response<()>| {
+                    if let Some(v) = req.headers().get("sec-websocket-protocol") {
+                        *capture.lock().expect("capture") = v.to_str().ok().map(str::to_owned);
+                    }
+                    echo_subprotocol(req, resp)
+                },
+            )
+            .await
+            .unwrap();
+            let mut got = Vec::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+            loop {
+                let next = std::future::poll_fn(|cx| Pin::new(&mut ws).poll_next(cx));
+                match tokio::time::timeout_at(deadline, next).await {
+                    Ok(Some(Ok(Message::Binary(b)))) => got.extend_from_slice(&b),
+                    _ => break,
+                }
+            }
+            got
+        });
+        let dial = EarlyDataDial::new(cfg(Some(64)), "example.com".into(), Box::new(client), 64);
+        let mut stream = HeaderFirst::new(Box::new(dial), b"HEADER".to_vec());
+        stream.write_all(b"PAYLOAD").await.unwrap();
+        // Drive the upgrade to completion: the carrier's echo arrives only
+        // after both sides finished the handshake.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            stream.read(&mut [0u8; 1]),
+        )
+        .await;
+
+        let header = seen_header
+            .lock()
+            .expect("capture")
+            .clone()
+            .expect("header sent");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(header)
+            .expect("base64url");
+        assert_eq!(
+            &decoded, b"HEADERPAYLOAD",
+            "header must carry the whole buffer"
+        );
+        let got = srv.await.unwrap();
+        assert!(
+            got.is_empty(),
+            "frames must carry nothing, saw {}",
+            String::from_utf8_lossy(&got)
+        );
     }
 
     /// Xray's hub echoes the requested subprotocol (`hub.go:55-59`), and

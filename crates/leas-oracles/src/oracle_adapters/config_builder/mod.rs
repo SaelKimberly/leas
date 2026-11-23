@@ -325,6 +325,8 @@ mod tests {
             disable_fallback: false,
             client_ip: None,
             cache_ttl_secs: None,
+            resolver_pool_size: None,
+            resolver_test_domain: None,
         };
         (params, rules, dns)
     }

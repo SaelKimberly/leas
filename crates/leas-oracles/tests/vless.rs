@@ -215,6 +215,13 @@ async fn vless_against_cores(
 /// it). Each row names its core explicitly instead of `#[values]`.
 #[rstest]
 #[case::ws_reality_singbox(vless_tls("ws", reality()), CoreKind::SingBox)]
+// Early data: the first payload bytes ride `Sec-WebSocket-Protocol` and must
+// reach the server exactly once (issue 012). A corrupted first flight fails
+// the echo probe, so this row is the end-to-end proof of the wire fix.
+// Xray-only: `?ed=` is an Xray client convention and the pinned sing-box
+// server closes an upgrade that carries the subprotocol (it implements no
+// early data), which says nothing about our wire.
+#[case::ws_early_data(vless("ws").with_ws_early_data(2560), CoreKind::Xray)]
 // xray-core refuses REALITY over httpupgrade inbounds — "REALITY only
 // supports RAW, XHTTP and gRPC" — so the reality row runs on sing-box only.
 #[case::httpupgrade_reality_singbox(vless_tls("httpupgrade", reality()), CoreKind::SingBox)]

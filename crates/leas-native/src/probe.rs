@@ -255,12 +255,13 @@ pub async fn fetch_over<S: crate::Stream + 'static>(
 ) -> Result<ProbeResponse, NativeError> {
     let start = Instant::now();
     let stream: BoxStream = if req.https {
-        // The TARGET leg (the probe URL's host), not the proxy leg. It reports
-        // plain `Tls` and must never carry the typed proxy causes: a target
-        // certificate, or a target that answers cleartext, says nothing about
-        // the config being probed. `target_leg_tls_failure_carries_no_evidence`
-        // pins that — an "unify the two TLS mappings" refactor breaks the test
-        // instead of purging healthy configs.
+        // The TARGET leg (the probe URL's host), not the proxy leg. A failure
+        // the DESTINATION caused reports plain `Tls` and must never carry the
+        // typed proxy causes: a target certificate, or a target that answers
+        // cleartext, says nothing about the config being probed
+        // (`target_leg_tls_failure_carries_no_evidence` pins that). A failure
+        // the tunnel UNDER it raised keeps its type — that is a statement
+        // about the proxy, which is what `target_leg_error` forwards.
         let tls = client::connect(Box::new(io) as BoxStream, &tls_config(req.host))
             .await
             .map_err(target_leg_error)?;
@@ -593,9 +594,13 @@ fn host_header_of(host: &str, port: u16, https: bool) -> String {
 /// Classified from the io error's KIND, never its message: re-parsing text is
 /// what the class system exists to avoid.
 ///
-/// The target leg must still never carry the typed PROXY causes (a target
-/// certificate says nothing about the config) — `TunnelClosed` proves nothing
-/// either, so `target_leg_tls_failure_carries_no_evidence` keeps holding.
+/// The target leg must still never carry a cause that belongs to the
+/// DESTINATION (a target certificate says nothing about the config), and
+/// `TunnelClosed` proves nothing either, so
+/// `target_leg_tls_failure_carries_no_evidence` keeps holding for those. A
+/// failure the TUNNEL ITSELF raised — the carrier rejected our upgrade — is a
+/// statement about the proxy and is forwarded with its type (2026-11-20: a
+/// flattened rejection filed every early-data WS refusal as a TLS alert).
 fn target_leg_error(e: TlsError) -> NativeError {
     match e {
         TlsError::Io(io)
@@ -614,6 +619,15 @@ fn target_leg_error(e: TlsError) -> NativeError {
                 detail: format!("the tunnel ended during the target handshake: {io}"),
             }
         }
+        // Any other io failure keeps its concrete cause: the tunnel UNDER the
+        // target TLS may have rejected us (an HTTP status, a config refusal),
+        // and flattening it to text filed those as TLS alerts. Same recovery
+        // as `security::map_tls_err`; a genuine record-layer failure has no
+        // `NativeError` inside and still reads as TLS.
+        TlsError::Io(io) => match io.downcast::<NativeError>() {
+            Ok(inner) => inner,
+            Err(io) => NativeError::Tls(io.to_string()),
+        },
         other => NativeError::Tls(other.to_string()),
     }
 }
@@ -1092,6 +1106,30 @@ mod tests {
             "a target-leg failure proves nothing about the config"
         );
         server.abort();
+    }
+
+    /// A carrier that REJECTED the upgrade (an HTTP status carried in an io
+    /// error) must keep its typed cause when it surfaces through the target
+    /// TLS: flattening it filed every early-data WS rejection as a TLS alert
+    /// on the 2026-11-20 run (4 650 rows).
+    #[test]
+    fn a_carrier_rejection_through_the_target_leg_stays_typed() {
+        let io = std::io::Error::other(crate::error::NativeError::TransportRejected {
+            detail: "ws: HTTP error: 409 Conflict".into(),
+            status: 409,
+        });
+        let mapped = super::target_leg_error(leas_tls::error::TlsError::Io(io));
+        assert!(
+            matches!(
+                mapped,
+                crate::error::NativeError::TransportRejected { status: 409, .. }
+            ),
+            "the carrier's typed rejection survives the target leg: {mapped:?}"
+        );
+        assert_eq!(
+            mapped.evidence(),
+            Some(crate::error::FailureEvidence::HttpRejected(409))
+        );
     }
 
     /// A tunnel that ENDS during the target handshake is a PROTOCOL-stage

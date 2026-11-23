@@ -128,6 +128,10 @@ pub struct CaseSpec {
     mux_wire: Option<leas_proto::proto_spec::MuxWire>,
     /// Whether an sbox row asks the server to pad its handshake.
     mux_padding: bool,
+    /// WS early data (`?ed=N` + `max_early_data`) for ws rows: the first N
+    /// bytes of the first payload ride the `Sec-WebSocket-Protocol` header.
+    /// `None` = no early data.
+    ws_early_data: Option<u32>,
     /// UDP packet mode for UDP rows: `None` = the TCP path (default);
     /// `Some(mode)` selects the VLESS UDP datagram tunnel ([`PacketMode`]
     /// `Raw` = header-dest, `PacketAddr` = per-packet address header
@@ -178,6 +182,7 @@ impl CaseSpec {
             mux: false,
             mux_wire: None,
             mux_padding: false,
+            ws_early_data: None,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -202,6 +207,7 @@ impl CaseSpec {
             mux: false,
             mux_wire: None,
             mux_padding: false,
+            ws_early_data: None,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -228,6 +234,7 @@ impl CaseSpec {
             mux: false,
             mux_wire: None,
             mux_padding: false,
+            ws_early_data: None,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -254,6 +261,7 @@ impl CaseSpec {
             mux: false,
             mux_wire: None,
             mux_padding: false,
+            ws_early_data: None,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -281,6 +289,7 @@ impl CaseSpec {
             mux: false,
             mux_wire: None,
             mux_padding: false,
+            ws_early_data: None,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -313,6 +322,7 @@ impl CaseSpec {
             mux: false,
             mux_wire: None,
             mux_padding: false,
+            ws_early_data: None,
             udp: None,
             vless_enc: None,
             pq_assert: false,
@@ -443,6 +453,13 @@ impl CaseSpec {
     #[must_use]
     pub const fn app(&self) -> AppKind {
         self.app
+    }
+
+    /// Enable WS early data on this row (`?ed=N` plus the typed field).
+    #[must_use]
+    pub const fn with_ws_early_data(mut self, n: u32) -> Self {
+        self.ws_early_data = Some(n);
+        self
     }
 
     /// Select the VLESS mux probe: `run_against` establishes one
@@ -690,6 +707,15 @@ impl E2eCase for CaseSpec {
             && let leas_proto::proto_spec::ProtocolConfig::Vless(cfg) = &mut params.protocol
         {
             cfg.encryption = Some(client.as_str().into());
+        }
+        // WS early data: the first `n` payload bytes ride the subprotocol
+        // header. The request target stays the plain path — `?ed=n` is link
+        // ENCODING that the normalizer hoists away, never a query sent on the
+        // wire (a server matching `/ws` would reject `/ws?ed=n`).
+        if let Some(n) = self.ws_early_data
+            && let Some(TransportConfig::Ws(ws)) = params.protocol.transport_mut()
+        {
+            ws.max_early_data = Some(n);
         }
         // mKCP obfuscation: the dial frames from these two knobs alone.
         if let Some((header, seed)) = self.kcp_mask

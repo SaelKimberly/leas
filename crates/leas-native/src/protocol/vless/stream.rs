@@ -17,6 +17,7 @@ use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use crate::BoxStream;
+use crate::error::NativeError;
 use crate::protocol::vless::header;
 
 /// Response-header peel state machine (private to [`Peel`]).
@@ -113,12 +114,20 @@ impl Peel {
                             // would deliver a wrong endpoint's bytes as
                             // payload instead of failing. Not credential
                             // evidence: the peer is not a VLESS server.
+                            // Typed, not a bare io error: the target TLS layer
+                            // wraps a read failure as `TlsError::Io`, and a
+                            // string payload made that wrap lose the cause —
+                            // a peer that is not VLESS was stored as a TLS
+                            // alert (685 rows, 2026-11-20).
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                format!(
-                                    "vless response version 0x{:02X}: not a VLESS response header",
-                                    tmp[0]
-                                ),
+                                NativeError::Protocol {
+                                    kind: leas_proto::proto_spec::ProtocolKind::Vless,
+                                    detail: format!(
+                                        "vless response version 0x{:02X}: not a VLESS response header",
+                                        tmp[0]
+                                    ),
+                                },
                             ));
                         }
                     }
@@ -318,11 +327,15 @@ mod tests {
         // payload and not an "inapplicable" ack.
         server.write_all(b"HTTP/1.1 200 OK").await.unwrap();
         let mut buf = [0u8; 1];
+        let err = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+            .await
+            .expect_err("a non-zero response version must fail the peel");
         assert!(
-            tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .is_err(),
-            "a non-zero response version must fail the peel"
+            matches!(
+                err.get_ref().and_then(|e| e.downcast_ref::<NativeError>()),
+                Some(NativeError::Protocol { .. })
+            ),
+            "the io error boxes the typed protocol failure: {err}"
         );
         assert_eq!(
             slot.get(),

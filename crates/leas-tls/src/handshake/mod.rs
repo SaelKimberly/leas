@@ -29,6 +29,7 @@
 //! traffic secrets are derived over `ClientHello..server Finished`
 //! (RFC 8446 §4.4.4, §7.1).
 
+use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
@@ -380,6 +381,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut current_sid = offered_session_id.to_vec();
     let mut first_hello: Option<Vec<u8>> = None;
     let mut retry_message: Option<Vec<u8>> = None;
+    let mut hrr_selected: Option<u16> = None;
     let server_hello = loop {
         stream.write_all(&to_record(&wire_hello)).await?;
         match read_server_hello(&mut stream, &current_sid).await? {
@@ -409,6 +411,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         "server sent a second HelloRetryRequest; RFC 8446 §4.1.4 allows one".into(),
                     ));
                 }
+                hrr_selected = hrr.selected_group;
                 let (rebuilt, new_keypair, new_sk) = retry.rebuild(&hrr)?;
                 retry_message = Some(hrr.raw);
                 first_hello = Some(std::mem::take(&mut current_hello));
@@ -426,6 +429,13 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
         }
     };
+    // RFC 8446 §4.2.8: the selected `key_share` group must be one this hello
+    // offered (or exactly the HRR's choice). Checked before any key schedule
+    // work, so a non-conforming group can never be mixed in.
+    if let Some(wire) = server_hello.key_share_group {
+        ensure_offered_key_share(&current_hello, hrr_selected, wire)?;
+    }
+
     // RFC 9849 §7.2.1: with ECH the server confirms acceptance by replacing
     // the last 8 bytes of `ServerHello.random`. A mismatch means it decrypted
     // nothing and answered the OUTER hello — the SNI the user asked to hide
@@ -599,7 +609,10 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     ks.add_transcript(&flight.cv_raw);
     let server_finished_key = ks.finished_key(&server_hs_ts[..hash_len])?;
-    if ks.finished_mac(&server_finished_key[..hash_len]) != flight.sf_verify_data {
+    if !bool::from(
+        ks.finished_mac(&server_finished_key[..hash_len])
+            .ct_eq(&flight.sf_verify_data),
+    ) {
         return Err(TlsError::Handshake(
             "server Finished MAC mismatch — possible MITM or wrong key".into(),
         ));
@@ -948,6 +961,73 @@ pub(crate) fn ensure_offered_sigalg(hello: &[u8], scheme: u16) -> Result<()> {
     )))
 }
 
+/// Reject a `ServerHello` `key_share` group the client never offered, and any
+/// group that disagrees with the `HelloRetryRequest`'s `selected_group`.
+///
+/// RFC 8446 §4.2.8: the server selects one of the groups the hello listed and
+/// answers the share the client sent — or, after an HRR, the group the HRR
+/// selected. Accepting anything else lets a hybrid hello complete classically.
+pub(crate) fn ensure_offered_key_share(
+    hello: &[u8],
+    hrr_selected: Option<u16>,
+    wire: u16,
+) -> Result<()> {
+    if let Some(group) = hrr_selected {
+        if group != wire {
+            return Err(TlsError::Handshake(format!(
+                "ServerHello key_share group 0x{wire:04X} disagrees with the HelloRetryRequest's selected_group 0x{group:04X}"
+            )));
+        }
+        return Ok(());
+    }
+    if !hello_lists_u16(hello, 0x000A, wire) {
+        return Err(TlsError::Handshake(format!(
+            "ServerHello key_share group 0x{wire:04X} was not in the ClientHello's supported_groups (RFC 8446 §4.2.8)"
+        )));
+    }
+    if !key_share_lists_group(hello, wire) {
+        return Err(TlsError::Handshake(format!(
+            "ServerHello key_share group 0x{wire:04X} had no share in the ClientHello"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a `ClientHello` extension whose body is `len(2) || u16*` lists
+/// `value`.
+fn hello_lists_u16(hello: &[u8], ext_type: u16, value: u16) -> bool {
+    let Some(body) = client_hello_extension(hello, ext_type) else {
+        return false;
+    };
+    let Some(list) = body.get(2..) else {
+        return false;
+    };
+    list.as_chunks::<2>()
+        .0
+        .iter()
+        .any(|c| u16::from_be_bytes(*c) == value)
+}
+
+/// Whether the `key_share` extension carries an entry for `wire`.
+fn key_share_lists_group(hello: &[u8], wire: u16) -> bool {
+    let Some(body) = client_hello_extension(hello, 0x0033) else {
+        return false;
+    };
+    let Some(list) = body.get(2..) else {
+        return false;
+    };
+    let mut pos = 0;
+    while pos + 4 <= list.len() {
+        let group = u16::from_be_bytes([list[pos], list[pos + 1]]);
+        let len = usize::from(u16::from_be_bytes([list[pos + 2], list[pos + 3]]));
+        if group == wire {
+            return true;
+        }
+        pos += 4 + len;
+    }
+    false
+}
+
 /// Parse a `ServerHello` body:
 /// `version(2) || random(32) || sid_len(1) || sid || cipher(2) || comp(1) ||
 /// ext_list_len(2) || extensions`.
@@ -1022,6 +1102,7 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
     let mut version_negotiated = 0u16;
     let mut peer_key = None;
     let mut mlkem_ciphertext = None;
+    let mut key_share_wire = None;
     let mut ems = false;
     // HRR-only fields (RFC 8446 §4.1.4).
     let mut hrr_group = None;
@@ -1086,9 +1167,11 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
                 let key_len = usize::from(u16::from_be_bytes([ext_data[2], ext_data[3]]));
                 match (group, key_len, ext_data.len()) {
                     (0x001D, 32, n) if n == 4 + key_len => {
+                        key_share_wire = Some(0x001D);
                         peer_key = Some(ext_data[4..36].try_into().expect("32 bytes"));
                     }
                     (0x11EC, 1120, n) if n == 4 + key_len => {
+                        key_share_wire = Some(0x11EC);
                         mlkem_ciphertext = Some(
                             Ciphertext::from_bytes(&ext_data[4..4 + 1088])
                                 .map_err(|e| TlsError::Handshake(e.to_string()))?,
@@ -1169,6 +1252,7 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
             suite12: None,
             peer_key: Some(peer_key),
             mlkem_ciphertext,
+            key_share_group: key_share_wire,
             ems: false,
         })));
     }
@@ -1215,6 +1299,7 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
         suite12: Some(suite12),
         peer_key: None,
         mlkem_ciphertext: None,
+        key_share_group: None,
         ems,
     })))
 }
@@ -1343,6 +1428,49 @@ mod tests {
             super::compressed_algorithms(&hello.handshake_bytes),
             expected
         );
+    }
+
+    /// A `ServerHello` may only select a group the hello listed AND sent a
+    /// share for; after an HRR it must be exactly the selected group. Without
+    /// this, a hybrid hello could be completed with a classical group the
+    /// server invented (2026-11-20 review, issue 026).
+    #[test]
+    fn a_server_key_share_group_must_be_offered_and_expected() {
+        let spec = ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Random32,
+            extensions: vec![
+                ExtensionSpec::ServerName,
+                ExtensionSpec::SupportedGroups(vec![0x001D, 0x11EC]),
+                ExtensionSpec::KeyShare(vec![KeyShareGroup::X25519]),
+                ExtensionSpec::SupportedVersions(vec![0x0304]),
+            ],
+        };
+        let rng = ring::rand::SystemRandom::new();
+        let hello = crate::hello::build_hello(
+            &spec,
+            &crate::hello::BuildParams {
+                server_name: "example.com",
+                alpn: None,
+                x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+        )
+        .expect("build hello")
+        .handshake_bytes;
+
+        // Offered and shared: accepted.
+        assert!(super::ensure_offered_key_share(&hello, None, 0x001D).is_ok());
+        // Listed but no share was sent: rejected.
+        assert!(super::ensure_offered_key_share(&hello, None, 0x11EC).is_err());
+        // Not listed at all: rejected.
+        assert!(super::ensure_offered_key_share(&hello, None, 0x0017).is_err());
+        // After an HRR, the share must be exactly its selected_group.
+        assert!(super::ensure_offered_key_share(&hello, Some(0x001D), 0x001D).is_ok());
+        assert!(super::ensure_offered_key_share(&hello, Some(0x11EC), 0x001D).is_err());
     }
 
     /// RFC 8446 §4.4.1: after a retry the transcript starts with the synthetic

@@ -25,6 +25,10 @@ pub struct ServerHelloData {
     /// The ML-KEM ciphertext from the server's hybrid key share (TLS 1.3),
     /// validated at parse so the handshake decapsulates it with no re-copy.
     pub mlkem_ciphertext: Option<Ciphertext>,
+    /// The `key_share` group the server selected (RFC 8446 §4.2.8); `None`
+    /// when the server sent no share (TLS 1.2). Validated against the hello
+    /// before it is used.
+    pub key_share_group: Option<u16>,
     /// The cipher suite the server selected (TLS 1.3).
     pub suite: CipherSuiteId,
     /// The cipher suite the server selected (TLS 1.2).
@@ -42,6 +46,11 @@ pub struct ParsedServerHello {
     pub suite12: Option<Tls12Suite>,
     pub peer_key: Option<[u8; 32]>,
     pub mlkem_ciphertext: Option<Ciphertext>,
+    /// The `key_share` group the server selected (RFC 8446 §4.2.8). Checked
+    /// against what the client offered (and the HRR's `selected_group`); a
+    /// server answering with a group the hello never listed is a protocol
+    /// error, never a silent classical fallback.
+    pub key_share_group: Option<u16>,
     pub ems: bool,
 }
 
@@ -109,6 +118,7 @@ where
             server_random: parsed.server_random,
             peer_key: parsed.peer_key,
             mlkem_ciphertext: parsed.mlkem_ciphertext,
+            key_share_group: parsed.key_share_group,
             suite: parsed.suite,
             suite12: parsed.suite12,
             ems: parsed.ems,

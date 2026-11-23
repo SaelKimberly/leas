@@ -528,7 +528,11 @@ pub(crate) async fn drive12<S: AsyncRead + AsyncWrite + Unpin + Send>(
             "TLS 1.2 expected server Finished (0x14), got 0x{sf_type:02X}"
         )));
     }
-    if sf_body != expected_sf.as_slice() {
+    let mac_ok = {
+        use subtle::ConstantTimeEq as _;
+        bool::from(sf_body.ct_eq(expected_sf.as_slice()))
+    };
+    if !mac_ok {
         return Err(TlsError::Handshake(
             "TLS 1.2 server Finished MAC mismatch — possible MITM or wrong key".into(),
         ));
