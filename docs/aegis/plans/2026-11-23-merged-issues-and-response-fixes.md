@@ -409,6 +409,13 @@ which holds **15 098** `profile_stats` rows. The batch's own summary
 links inside `failed`, so ~11 k links were actually probed; read every share
 against the 15 098 written rows, not the summary's 146 k.
 
+The 12:04–12:12 burst (~120 k rows) is NOT this batch draining: the summary
+prints `staged-left=0` at 11:57:11, the burst carries 322 distinct `updated_at`
+stamps (per-chunk import `now()`), `last_used_at` is NULL on ~99 % of it, and no
+row anywhere holds the legacy double-wrap text — it is the source refresh
+restamping `last_seen_at`/`updated_at` over the feed. A verdict write happens
+inside the batch, so the bounded slice holds every verdict this run wrote.
+
 | Claim | 2026-11-20 baseline | 2026-11-23 run | Verdict |
 | --- | --- | ---: | --- |
 | WS early-data HTTP rejection keeps the status class | 4 650 rows as `transport/alert`, 0 `status` | **173 `transport/status`**, 70 `alert` (all genuine TLS: `2 40` ×66, RST ×4) | fixed |
