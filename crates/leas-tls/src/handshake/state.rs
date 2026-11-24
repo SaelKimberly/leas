@@ -129,6 +129,11 @@ impl<'a> Handshake<'a> {
         }
     }
 
+    /// Emit the first `ClientHello` (the named start transition).
+    pub(crate) fn start(&mut self) -> Result<()> {
+        self.pump()
+    }
+
     /// Feed wire bytes. Processes every complete record available.
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<()> {
         self.inbuf.extend_from_slice(bytes);
@@ -663,7 +668,7 @@ mod tests {
             Some(&retry),
             None,
         );
-        state.feed(&[]).unwrap();
+        state.start().unwrap();
         let mut out = Vec::new();
         assert!(state.poll_transmit(&mut out), "ClientHello must be queued");
         let record = tls12_server_hello(hello.session_id());
@@ -784,7 +789,7 @@ mod tests {
             Some(&retry),
             Some((&outer, &ech)),
         );
-        state.feed(&[]).unwrap();
+        state.start().unwrap();
         let mut out = Vec::new();
         state.poll_transmit(&mut out);
         let mut body = Vec::new();
@@ -839,7 +844,7 @@ mod tests {
             Some(&retry),
             None,
         );
-        state.feed(&[]).unwrap();
+        state.start().unwrap();
         let mut out = Vec::new();
         state.poll_transmit(&mut out);
         let mut body = Vec::new();

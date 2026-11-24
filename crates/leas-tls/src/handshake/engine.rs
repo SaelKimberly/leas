@@ -45,7 +45,7 @@ where
         Some(&retry),
         ech,
     );
-    state.feed(&[])?;
+    state.start()?;
     let mut out = Vec::new();
     loop {
         out.clear();

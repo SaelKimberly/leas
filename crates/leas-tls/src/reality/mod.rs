@@ -474,7 +474,7 @@ async fn connect_reality_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         // does not compose with it — the capability gate refuses the pair.
         None,
     );
-    state.feed(&[])?;
+    state.start()?;
     let mut out = Vec::new();
     let (tls, outcome) = loop {
         out.clear();
