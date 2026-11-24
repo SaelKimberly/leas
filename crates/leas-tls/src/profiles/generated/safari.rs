@@ -18,7 +18,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 16,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: safari_16_macos_desktop,
-        caps: HelloCaps { ext: 0x6_3fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0x2e },
+        caps: HelloCaps { ext: 0x6_3fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0x2e, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_26_macos_desktop",
@@ -28,7 +28,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 26,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: safari_26_macos_desktop,
-        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0x2e },
+        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0x2e, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_12_macos_desktop",
@@ -38,7 +38,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 12,
         ja4: "t13d170900_5b57614c22b0_97f8aa674fd9",
         spec_fn: safari_12_macos_desktop,
-        caps: HelloCaps { ext: 0xe5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0x2e },
+        caps: HelloCaps { ext: 0xe5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0x2e, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_12_windows_desktop",
@@ -48,7 +48,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 12,
         ja4: "t13d1716h2_5b57614c22b0_eeeea6562960",
         spec_fn: safari_12_windows_desktop,
-        caps: HelloCaps { ext: 0x26_9bff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0x2e },
+        caps: HelloCaps { ext: 0x26_9bff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0x2e, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_12_windows_desktop_2",
@@ -58,7 +58,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 12,
         ja4: "t13d201100_314f1408a5a6_e5728521abd4",
         spec_fn: safari_12_windows_desktop_2,
-        caps: HelloCaps { ext: 0x84_0e5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0x2e },
+        caps: HelloCaps { ext: 0x84_0e5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0x2e, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_5_windows_desktop",
@@ -68,7 +68,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 5,
         ja4: "t13d301000_1d37bd780c83_a29327ec888c",
         spec_fn: safari_5_windows_desktop,
-        caps: HelloCaps { ext: 0x15_015f, ciphers: 0x7, sigalgs: 0x0381_ffff, groups: 0x2e },
+        caps: HelloCaps { ext: 0x15_015f, ciphers: 0x7, sigalgs: 0x0381_ffff, groups: 0x2e, keyshare: 0x2, session_id_len: 0 },
     },
 ];
 

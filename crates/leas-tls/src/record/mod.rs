@@ -63,7 +63,7 @@ pub struct TlsRecord {
 /// `record too large: 20527 bytes` (0x502F) on every such link.
 ///
 /// Returns the printable header text when the peer is speaking cleartext.
-fn cleartext_hello_answer(header: [u8; 5]) -> Option<String> {
+pub(crate) fn cleartext_hello_answer(header: [u8; 5]) -> Option<String> {
     let printable = |b: u8| (0x20..0x7f).contains(&b) || matches!(b, b'\r' | b'\n' | b'\t');
     if !header.iter().copied().all(printable) {
         return None;

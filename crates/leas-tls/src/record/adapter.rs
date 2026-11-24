@@ -228,6 +228,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
             this.hdr_filled = 0;
             let content_type = this.hdr[0];
             let len = usize::from(u16::from_be_bytes([this.hdr[3], this.hdr[4]]));
+            if let Some(cleartext) = super::cleartext_hello_answer(this.hdr) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "peer does not speak TLS: it answered in cleartext ({cleartext:?}) — \
+                         the endpoint's port or its `security` setting is wrong"
+                    ),
+                )));
+            }
             if len > MAX_RECORD_PAYLOAD {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,

@@ -55,6 +55,8 @@ pub const CHROME_130_CAPS: crate::spec::caps::HelloCaps = crate::spec::caps::Hel
     ciphers: 0xf,
     sigalgs: 0x1fb,
     groups: 0xf,
+    keyshare: 0x3,
+    session_id_len: 32,
 };
 
 /// Declared-profile capability mask for `edge_106`.
@@ -63,4 +65,6 @@ pub const EDGE_106_CAPS: crate::spec::caps::HelloCaps = crate::spec::caps::Hello
     ciphers: 0xf,
     sigalgs: 0x1fb,
     groups: 0xf,
+    keyshare: 0x3,
+    session_id_len: 32,
 };

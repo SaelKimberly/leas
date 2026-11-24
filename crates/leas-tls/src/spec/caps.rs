@@ -119,8 +119,12 @@ pub struct HelloCaps {
     pub ciphers: u8,
     /// `SigKind` bits.
     pub sigalgs: u32,
-    /// `GroupKind` bits.
+    /// `GroupKind` bits from `supported_groups`.
     pub groups: u64,
+    /// `GroupKind` bits from `key_share`.
+    pub keyshare: u64,
+    /// Declared legacy session-id length (32 for the TLS 1.3 default).
+    pub session_id_len: u8,
 }
 
 /// A profile with no advertised extension, suite, scheme or group.
@@ -129,6 +133,8 @@ pub const EMPTY: HelloCaps = HelloCaps {
     ciphers: 0,
     sigalgs: 0,
     groups: 0,
+    keyshare: 0,
+    session_id_len: 0,
 };
 
 impl HelloCaps {
@@ -166,6 +172,13 @@ impl HelloCaps {
         self
     }
 
+    /// Add `key_share` group bits.
+    #[must_use]
+    pub const fn with_keyshare(mut self, bits: u64) -> Self {
+        self.keyshare |= bits;
+        self
+    }
+
     /// Whether the declared profile carries `kind`.
     #[must_use]
     pub const fn has_ext(self, kind: ExtKind) -> bool {
@@ -182,6 +195,12 @@ impl HelloCaps {
     #[must_use]
     pub const fn offers_group(self, kind: GroupKind) -> bool {
         self.groups & kind.bit() != 0
+    }
+
+    /// Whether the declared profile sends a `key_share` for `kind`.
+    #[must_use]
+    pub const fn shares_group(self, kind: GroupKind) -> bool {
+        self.keyshare & kind.bit() != 0
     }
 
     /// Whether the declared profile advertises a TLS 1.3 AEAD suite.

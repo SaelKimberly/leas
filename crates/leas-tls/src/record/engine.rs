@@ -307,6 +307,21 @@ impl Engine {
             ));
         }
         if self.keys.read.is_tls13() {
+            if content_type == CONTENT_ALERT {
+                let level = body.first().copied().unwrap_or(2);
+                let Some(&description) = body.get(1) else {
+                    return Err(TlsError::Handshake(
+                        "truncated plaintext TLS alert record".into(),
+                    ));
+                };
+                if description == 0 {
+                    self.closed = true;
+                    self.events.push(RecordEvent::Closed);
+                } else {
+                    self.events.push(RecordEvent::Alert { level, description });
+                }
+                return Ok(());
+            }
             if content_type != CONTENT_APPLICATION_DATA {
                 return Ok(());
             }
@@ -319,13 +334,19 @@ impl Engine {
                     self.append_plain(&body[..content_len]);
                 }
                 CONTENT_ALERT => {
-                    let level = body.first().copied().unwrap_or(2);
-                    let description = body.get(1).copied().unwrap_or(0);
-                    if description == 0 {
+                    let [level, description, ..] = content else {
+                        return Err(TlsError::Handshake(
+                            "TLS alert body must be level || description (RFC 8446 §6)".into(),
+                        ));
+                    };
+                    if *description == 0 {
                         self.closed = true;
                         self.events.push(RecordEvent::Closed);
                     } else {
-                        self.events.push(RecordEvent::Alert { level, description });
+                        self.events.push(RecordEvent::Alert {
+                            level: *level,
+                            description: *description,
+                        });
                     }
                 }
                 CONTENT_HANDSHAKE => {

@@ -42,93 +42,14 @@ pub struct ServerFlight {
 pub async fn read_server_hs_messages<S>(
     stream: &mut S,
     server_hs_key: &AeadKey,
-    // RFC 8879 `compress_certificate` algorithms the ClientHello offered.
     offered_compress: &[u16],
 ) -> Result<ServerFlight>
 where
     S: AsyncRead + Unpin,
 {
-    let mut ee_raw: Option<Vec<u8>> = None;
-    let mut negotiated_alpn: Option<Vec<u8>> = None;
-    let mut cert_raw: Option<Vec<u8>> = None;
-    let mut cv_raw: Option<Vec<u8>> = None;
-    let mut finished_data: Option<Vec<u8>> = None;
-    let mut chain: Option<Vec<Vec<u8>>> = None;
-    let mut signature_scheme = 0u16;
-    let mut cert_verify_body = Vec::new();
+    let mut acc = FlightAccumulator::new(offered_compress);
     let mut seq = 0u64;
-    // The reassembly buffer is pre-sized to one full record (like
-    // `TlsStream::rec_buf`): single-record flights never regrow it, and
-    // multi-record flights amortize into the same allocation.
-    let mut buf: Vec<u8> = Vec::with_capacity(MAX_RECORD_PAYLOAD);
-
     loop {
-        // Consume every complete handshake message buffered so far.
-        let mut consumed = 0usize;
-        while buf.len() >= consumed + 4 {
-            let msg_len = u24(&buf[consumed + 1..consumed + 4]);
-            let total = 4 + msg_len;
-            if buf.len() < consumed + total {
-                break; // body incomplete — wait for the next record
-            }
-            let msg_type = buf[consumed];
-            // One copy: the raw message already sits contiguous in `buf`
-            // (`type || len || body`), so slice it out directly instead of
-            // copying the body and re-encoding the header.
-            let raw = buf[consumed..consumed + total].to_vec();
-            let body = &raw[4..];
-            consumed += total;
-            match msg_type {
-                HS_ENCRYPTED_EXTENSIONS => {
-                    negotiated_alpn = parse_encrypted_extensions(body)?;
-                    ee_raw = Some(raw);
-                }
-                HS_CERTIFICATE => {
-                    chain = Some(parse_certificate_message(body)?);
-                    cert_raw = Some(raw);
-                }
-                HS_COMPRESSED_CERTIFICATE => {
-                    // RFC 8879 §4: the compressed Certificate replaces the
-                    // plain one; the decompressed payload is the Certificate
-                    // BODY (rustls parses it the same way — no 4-byte
-                    // handshake header inside).
-                    let cert_body = decompress_certificate_message(body, offered_compress)?;
-                    chain = Some(parse_certificate_message(&cert_body)?);
-                    // The transcript carries the message AS SENT: the server
-                    // hashed the `CompressedCertificate`, not a re-built
-                    // `Certificate` (hashing a rebuilt one fails its Finished
-                    // MAC — verified against Cloudflare's edge).
-                    cert_raw = Some(raw);
-                }
-                HS_CERTIFICATE_VERIFY => {
-                    signature_scheme = parse_certificate_verify(body)?;
-                    cert_verify_body = body.to_vec();
-                    cv_raw = Some(raw);
-                }
-                HS_FINISHED => finished_data = Some(body.to_vec()),
-                _ => {} // unknown handshake messages are skipped
-            }
-
-            if finished_data.is_some() {
-                // The server flight ends with Finished; any later messages
-                // (e.g. NewSessionTicket) are not part of the flight, and a
-                // buffered remainder is intentionally left unconsumed.
-                return Ok(ServerFlight {
-                    ee_raw: ee_raw
-                        .ok_or_else(|| TlsError::Handshake("missing EncryptedExtensions".into()))?,
-                    cert_raw: cert_raw.unwrap_or_else(|| make_hs_msg(HS_CERTIFICATE, &[])),
-                    cv_raw: cv_raw.unwrap_or_else(|| make_hs_msg(HS_CERTIFICATE_VERIFY, &[])),
-                    sf_verify_data: finished_data
-                        .ok_or_else(|| TlsError::Handshake("missing server Finished".into()))?,
-                    chain: chain.unwrap_or_default(),
-                    signature_scheme,
-                    cert_verify_body,
-                    negotiated_alpn,
-                });
-            }
-        }
-        buf.drain(..consumed);
-
         let rec = skip_ccs(stream).await?;
         if rec.content_type != CONTENT_APPLICATION_DATA {
             return Err(TlsError::Handshake(format!(
@@ -136,22 +57,123 @@ where
                 rec.content_type
             )));
         }
-
         let aad = aead_aad(rec.payload.len());
         let mut payload = rec.payload;
         let plain_len = server_hs_key.open_in_place(seq, &aad, &mut payload)?;
         seq += 1;
-
         let (content_type, hs_data) = strip_padding(&payload[..plain_len])?;
         if content_type != CONTENT_HANDSHAKE {
             continue;
         }
-        if buf.len() + hs_data.len() > MAX_FLIGHT_BUFFER {
+        if let Some(flight) = acc.push_plain(hs_data)? {
+            return Ok(flight);
+        }
+    }
+}
+
+/// Incremental parser for the encrypted server flight.
+///
+/// The async reader and the sans-I/O handshake state machine share this: feed
+/// decrypted handshake plaintext, get the flight once `Finished` is complete.
+pub struct FlightAccumulator {
+    buf: Vec<u8>,
+    ee_raw: Option<Vec<u8>>,
+    negotiated_alpn: Option<Vec<u8>>,
+    cert_raw: Option<Vec<u8>>,
+    cv_raw: Option<Vec<u8>>,
+    finished_data: Option<Vec<u8>>,
+    chain: Option<Vec<Vec<u8>>>,
+    signature_scheme: u16,
+    cert_verify_body: Vec<u8>,
+    offered_compress: Vec<u16>,
+}
+
+impl FlightAccumulator {
+    /// New accumulator for a hello that offered `offered_compress`.
+    #[must_use]
+    pub fn new(offered_compress: &[u16]) -> Self {
+        Self {
+            buf: Vec::with_capacity(MAX_RECORD_PAYLOAD),
+            ee_raw: None,
+            negotiated_alpn: None,
+            cert_raw: None,
+            cv_raw: None,
+            finished_data: None,
+            chain: None,
+            signature_scheme: 0,
+            cert_verify_body: Vec::new(),
+            offered_compress: offered_compress.to_vec(),
+        }
+    }
+
+    /// Append one decrypted handshake plaintext chunk.
+    pub fn push_plain(&mut self, hs_data: &[u8]) -> Result<Option<ServerFlight>> {
+        if self.buf.len() + hs_data.len() > MAX_FLIGHT_BUFFER {
             return Err(TlsError::Handshake(
                 "server flight exceeds the 512 KiB reassembly bound".into(),
             ));
         }
-        buf.extend_from_slice(hs_data);
+        self.buf.extend_from_slice(hs_data);
+        let mut consumed = 0usize;
+        while self.buf.len() >= consumed + 4 {
+            let msg_len = u24(&self.buf[consumed + 1..consumed + 4]);
+            let total = 4 + msg_len;
+            if self.buf.len() < consumed + total {
+                break;
+            }
+            let msg_type = self.buf[consumed];
+            let raw = self.buf[consumed..consumed + total].to_vec();
+            let body = &raw[4..];
+            consumed += total;
+            match msg_type {
+                HS_ENCRYPTED_EXTENSIONS => {
+                    self.negotiated_alpn = parse_encrypted_extensions(body)?;
+                    self.ee_raw = Some(raw);
+                }
+                HS_CERTIFICATE => {
+                    self.chain = Some(parse_certificate_message(body)?);
+                    self.cert_raw = Some(raw);
+                }
+                HS_COMPRESSED_CERTIFICATE => {
+                    let cert_body = decompress_certificate_message(body, &self.offered_compress)?;
+                    self.chain = Some(parse_certificate_message(&cert_body)?);
+                    self.cert_raw = Some(raw);
+                }
+                HS_CERTIFICATE_VERIFY => {
+                    self.signature_scheme = parse_certificate_verify(body)?;
+                    self.cert_verify_body = body.to_vec();
+                    self.cv_raw = Some(raw);
+                }
+                HS_FINISHED => self.finished_data = Some(body.to_vec()),
+                _ => {}
+            }
+            if self.finished_data.is_some() {
+                return Ok(Some(ServerFlight {
+                    ee_raw: self
+                        .ee_raw
+                        .take()
+                        .ok_or_else(|| TlsError::Handshake("missing EncryptedExtensions".into()))?,
+                    cert_raw: self
+                        .cert_raw
+                        .take()
+                        .unwrap_or_else(|| make_hs_msg(HS_CERTIFICATE, &[])),
+                    cv_raw: self
+                        .cv_raw
+                        .take()
+                        .unwrap_or_else(|| make_hs_msg(HS_CERTIFICATE_VERIFY, &[])),
+                    sf_verify_data: self
+                        .finished_data
+                        .take()
+                        .ok_or_else(|| TlsError::Handshake("missing server Finished".into()))?,
+                    chain: self.chain.take().unwrap_or_default(),
+                    signature_scheme: self.signature_scheme,
+                    cert_verify_body: std::mem::take(&mut self.cert_verify_body),
+                    negotiated_alpn: self.negotiated_alpn.take(),
+                }));
+            }
+        }
+        self.buf.drain(..consumed);
+        Ok(None)
     }
 }
 

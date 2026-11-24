@@ -159,22 +159,33 @@ pub fn reality_candidates() -> Vec<(&'static str, crate::spec::ClientHelloSpec)>
     let mut out: Vec<(&'static str, crate::spec::ClientHelloSpec)> =
         crate::profiles::generated::GENERATED
             .iter()
+            .filter(|g| reality_eligible_caps(g.caps))
             .map(|g| (g.name, (g.spec_fn)()))
-            .filter(|(_, spec)| spec.reality_eligible())
             .collect();
-    for (name, spec_fn) in [
+    for (name, spec_fn, caps) in [
         (
             "chrome_130",
             crate::profiles::hand_selected::chrome_130 as fn() -> crate::spec::ClientHelloSpec,
+            crate::profiles::hand_selected::CHROME_130_CAPS,
         ),
-        ("edge_106", crate::profiles::hand_selected::edge_106),
+        (
+            "edge_106",
+            crate::profiles::hand_selected::edge_106,
+            crate::profiles::hand_selected::EDGE_106_CAPS,
+        ),
     ] {
-        let spec = spec_fn();
-        if spec.reality_eligible() {
-            out.push((name, spec));
+        if reality_eligible_caps(caps) {
+            out.push((name, spec_fn()));
         }
     }
     out
+}
+
+/// REALITY's declared-profile prerequisite, answered from the const mask.
+const fn reality_eligible_caps(caps: crate::spec::caps::HelloCaps) -> bool {
+    caps.offers_tls13_aead()
+        && caps.session_id_len == 32
+        && caps.shares_group(crate::spec::caps::GroupKind::X25519)
 }
 
 /// Uniform random pick over [`reality_candidates`].

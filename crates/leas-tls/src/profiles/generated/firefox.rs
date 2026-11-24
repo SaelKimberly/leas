@@ -18,7 +18,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 150,
         ja4: "t13d131000_f57a46bbacb6_e7c285222651",
         spec_fn: firefox_150_macos_desktop,
-        caps: HelloCaps { ext: 0x4_0e5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0xee },
+        caps: HelloCaps { ext: 0x4_0e5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0xee, keyshare: 0x2, session_id_len: 32 },
     },
     GenEntry {
         name: "firefox_139_windows_desktop",
@@ -28,7 +28,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 139,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: firefox_139_windows_desktop,
-        caps: HelloCaps { ext: 0x6_3fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xee },
+        caps: HelloCaps { ext: 0x6_3fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xee, keyshare: 0x2, session_id_len: 32 },
     },
     GenEntry {
         name: "firefox_148_macos_desktop",
@@ -38,7 +38,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 148,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: firefox_148_macos_desktop,
-        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xee },
+        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xee, keyshare: 0x2, session_id_len: 32 },
     },
     GenEntry {
         name: "firefox_148_windows_desktop",
@@ -48,7 +48,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 148,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: firefox_148_windows_desktop,
-        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xee },
+        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xee, keyshare: 0x2, session_id_len: 32 },
     },
     GenEntry {
         name: "firefox_149_android_desktop_2",
@@ -58,7 +58,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 149,
         ja4: "t13d1715h2_5b57614c22b0_5c2c66f702b0",
         spec_fn: firefox_149_android_desktop_2,
-        caps: HelloCaps { ext: 0x26_8bff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0xee },
+        caps: HelloCaps { ext: 0x26_8bff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0xee, keyshare: 0x2, session_id_len: 32 },
     },
     GenEntry {
         name: "firefox_150_android_desktop",
@@ -68,7 +68,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 150,
         ja4: "t13d1716h2_5b57614c22b0_eeeea6562960",
         spec_fn: firefox_150_android_desktop,
-        caps: HelloCaps { ext: 0x26_9bff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0xee },
+        caps: HelloCaps { ext: 0x26_9bff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0xee, keyshare: 0x2, session_id_len: 32 },
     },
     GenEntry {
         name: "firefox_149_macos_desktop",
@@ -78,7 +78,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 149,
         ja4: "t13d1717h2_5b57614c22b0_3cbfd9057e0d",
         spec_fn: firefox_149_macos_desktop,
-        caps: HelloCaps { ext: 0x26_9fff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0xee },
+        caps: HelloCaps { ext: 0x26_9fff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0xee, keyshare: 0x2, session_id_len: 32 },
     },
     GenEntry {
         name: "firefox_144_android_desktop_5",
@@ -88,7 +88,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 144,
         ja4: "t13d1717h2_5b57614c22b0_3cbfd9057e0d",
         spec_fn: firefox_144_android_desktop_5,
-        caps: HelloCaps { ext: 0x26_9fff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0xee },
+        caps: HelloCaps { ext: 0x26_9fff, ciphers: 0x7, sigalgs: 0x0006_01ff, groups: 0xee, keyshare: 0x2, session_id_len: 32 },
     },
     GenEntry {
         name: "firefox_125_windows_desktop",
@@ -98,7 +98,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 125,
         ja4: "t13d3012h2_1d37bd780c83_b26ce05bbdd6",
         spec_fn: firefox_125_windows_desktop,
-        caps: HelloCaps { ext: 0x55_017f, ciphers: 0x7, sigalgs: 0x0381_ffff, groups: 0xee },
+        caps: HelloCaps { ext: 0x55_017f, ciphers: 0x7, sigalgs: 0x0381_ffff, groups: 0xee, keyshare: 0x2, session_id_len: 32 },
     },
 ];
 

@@ -18,7 +18,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 80,
         ja4: "t13d131000_f57a46bbacb6_e7c285222651",
         spec_fn: opera_80_android_desktop,
-        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf },
+        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_131_android_tablet",
@@ -28,7 +28,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 131,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: chrome_131_android_tablet,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "edge_134_android_desktop",
@@ -38,7 +38,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 134,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: edge_134_android_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "opera_88_android_desktop",
@@ -48,7 +48,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 88,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: opera_88_android_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "samsung_28_android_desktop",
@@ -58,7 +58,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 28,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: samsung_28_android_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_134_android_desktop",
@@ -68,7 +68,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 134,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: chrome_134_android_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "edge_144_android_tablet",
@@ -78,7 +78,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 144,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: edge_144_android_tablet,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "opera_96_android_desktop",
@@ -88,7 +88,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 96,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: opera_96_android_desktop,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "edge_146_android_desktop",
@@ -98,7 +98,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 146,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: edge_146_android_desktop,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_147_android_tablet",
@@ -108,7 +108,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 147,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: chrome_147_android_tablet,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_148_android_desktop",
@@ -118,7 +118,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 148,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: chrome_148_android_desktop,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "samsung_29_android_desktop",
@@ -128,7 +128,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 29,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: samsung_29_android_desktop,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "samsung_17_android_desktop",
@@ -138,7 +138,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 17,
         ja4: "t13d170900_5b57614c22b0_97f8aa674fd9",
         spec_fn: samsung_17_android_desktop,
-        caps: HelloCaps { ext: 0x8_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf },
+        caps: HelloCaps { ext: 0x8_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_141_android_desktop_3",
@@ -148,7 +148,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 141,
         ja4: "t13d171300_5b57614c22b0_43ade6aba3df",
         spec_fn: chrome_141_android_desktop_3,
-        caps: HelloCaps { ext: 0xd_0fdf, ciphers: 0xf, sigalgs: 0x0004_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xd_0fdf, ciphers: 0xf, sigalgs: 0x0004_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "edge_121_android_desktop",
@@ -158,7 +158,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 121,
         ja4: "t13d3012h2_1d37bd780c83_b26ce05bbdd6",
         spec_fn: edge_121_android_desktop,
-        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x0381_ffff, groups: 0xf },
+        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x0381_ffff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_83_android_tablet",
@@ -168,7 +168,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 83,
         ja4: "t13d3013h2_1d37bd780c83_1b3407e2c936",
         spec_fn: chrome_83_android_tablet,
-        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x03c7_ffff, groups: 0xf },
+        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x03c7_ffff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
 ];
 

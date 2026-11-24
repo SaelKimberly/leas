@@ -18,7 +18,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 98,
         ja4: "t13d131000_f57a46bbacb6_e7c285222651",
         spec_fn: opera_98_macos_desktop,
-        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf },
+        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_115_macos_desktop",
@@ -28,7 +28,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 115,
         ja4: "t13d131000_f57a46bbacb6_e7c285222651",
         spec_fn: chrome_115_macos_desktop,
-        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf },
+        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "edge_112_macos_desktop",
@@ -38,7 +38,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 112,
         ja4: "t13d131000_f57a46bbacb6_e7c285222651",
         spec_fn: edge_112_macos_desktop,
-        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf },
+        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "opera_97_windows_desktop",
@@ -48,7 +48,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 97,
         ja4: "t13d131000_f57a46bbacb6_e7c285222651",
         spec_fn: opera_97_windows_desktop,
-        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf },
+        caps: HelloCaps { ext: 0xc_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "brave_126_windows_desktop",
@@ -58,7 +58,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 126,
         ja4: "t13d131100_f57a46bbacb6_e5728521abd4",
         spec_fn: brave_126_windows_desktop,
-        caps: HelloCaps { ext: 0x8c_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf },
+        caps: HelloCaps { ext: 0x8c_0e5f, ciphers: 0xf, sigalgs: 0x0006_11ff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "edge_128_windows_desktop",
@@ -68,7 +68,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 128,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: edge_128_windows_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_122_macos_desktop",
@@ -78,7 +78,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 122,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: chrome_122_macos_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "edge_132_macos_desktop",
@@ -88,7 +88,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 132,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: edge_132_macos_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0x1f },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0x1f, keyshare: 0x13, session_id_len: 32 },
     },
     GenEntry {
         name: "opera_119_macos_desktop",
@@ -98,7 +98,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 119,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: opera_119_macos_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "opera_128_windows_desktop",
@@ -108,7 +108,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 128,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: opera_128_windows_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_143_windows_desktop",
@@ -118,7 +118,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 143,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: chrome_143_windows_desktop,
-        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0x1f },
+        caps: HelloCaps { ext: 0xe_3fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0x1f, keyshare: 0x13, session_id_len: 32 },
     },
     GenEntry {
         name: "opera_130_macos_desktop",
@@ -128,7 +128,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 130,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: opera_130_macos_desktop,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "edge_148_macos_desktop",
@@ -138,7 +138,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 148,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: edge_148_macos_desktop,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0x1f },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0x1f, keyshare: 0x13, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_149_macos_desktop",
@@ -148,7 +148,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 149,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: chrome_149_macos_desktop,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0x1f },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0x1f, keyshare: 0x13, session_id_len: 32 },
     },
     GenEntry {
         name: "opera_130_windows_desktop",
@@ -158,7 +158,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 130,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: opera_130_windows_desktop,
-        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf },
+        caps: HelloCaps { ext: 0xe_5fff, ciphers: 0xf, sigalgs: 0x0000_01fb, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "edge_121_windows_desktop",
@@ -168,7 +168,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 121,
         ja4: "t13d3012h2_1d37bd780c83_b26ce05bbdd6",
         spec_fn: edge_121_windows_desktop,
-        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x0381_ffff, groups: 0xf },
+        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x0381_ffff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "chrome_93_windows_desktop",
@@ -178,7 +178,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 93,
         ja4: "t13d3013h2_1d37bd780c83_1b3407e2c936",
         spec_fn: chrome_93_windows_desktop,
-        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x03c7_ffff, groups: 0xf },
+        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x03c7_ffff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "brave_90_macos_desktop",
@@ -188,7 +188,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 90,
         ja4: "t13d4312ht_36cd39a4fcc1_58ed7828516f",
         spec_fn: brave_90_macos_desktop,
-        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x0286_3fff, groups: 0xf },
+        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x0286_3fff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
     GenEntry {
         name: "brave_89_windows_desktop",
@@ -198,7 +198,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 89,
         ja4: "t13d4312ht_36cd39a4fcc1_58ed7828516f",
         spec_fn: brave_89_windows_desktop,
-        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x0286_3fff, groups: 0xf },
+        caps: HelloCaps { ext: 0x5d_017f, ciphers: 0xf, sigalgs: 0x0286_3fff, groups: 0xf, keyshare: 0x3, session_id_len: 32 },
     },
 ];
 

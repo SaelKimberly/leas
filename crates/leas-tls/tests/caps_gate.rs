@@ -10,6 +10,7 @@ use leas_tls::fingerprints::{Browser, Device, Fingerprint};
 use leas_tls::hello::parse::parse_hello;
 use leas_tls::hello::{BuildParams, build_hello};
 use leas_tls::profiles::generated::GENERATED;
+use leas_tls::profiles::hand_selected::{CHROME_130_CAPS, EDGE_106_CAPS, chrome_130, edge_106};
 use leas_tls::spec::caps::{ExtKind, GroupKind, HelloCaps, SigKind};
 
 struct FixedRng(std::sync::atomic::AtomicU8);
@@ -141,6 +142,8 @@ fn compute(spec: &leas_tls::spec::ClientHelloSpec) -> HelloCaps {
         ciphers: 0,
         sigalgs: 0,
         groups: 0,
+        keyshare: 0,
+        session_id_len: u8::try_from(parsed.session_id.len()).unwrap_or(0),
     };
     for (ty, body) in &parsed.extensions {
         caps.ext |= ext_bits(*ty);
@@ -162,7 +165,7 @@ fn compute(spec: &leas_tls::spec::ClientHelloSpec) -> HelloCaps {
                 while at + 4 <= 2 + len {
                     let g = u16::from_be_bytes([body[at], body[at + 1]]);
                     let klen = usize::from(u16::from_be_bytes([body[at + 2], body[at + 3]]));
-                    caps.groups |= group_bit(g);
+                    caps.keyshare |= group_bit(g);
                     at += 4 + klen;
                 }
             }

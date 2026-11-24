@@ -155,3 +155,21 @@ wire path (P0/P1/P3); their pins are not bumped.
 | C4 | P2 caps + speed | before commit |
 | C5 | P3 fidelity | before commit |
 | C6 | Docs, final review fixes, push | whole scope |
+
+## 9. Execution status (2026-11-24)
+
+| Phase | Status | Evidence |
+|---|---|---|
+| C1 plan | executed | `4087b394` |
+| P0 correctness | executed | `a553d7dc` (ALPN, extension gates, `close_notify`, KeyUpdate cap, 512 KiB flight, scheme boundary, benches) |
+| P1 record Sans-I/O | executed | `7633816e` (`record::engine`, exact-read adapter, legacy path deleted) |
+| P2 batching/spec cache | executed | `d4f7f1fe` (32 KiB batches, shared `Arc` spec) |
+| P2 HelloCaps | executed | `3df30938` (const masks, generator, roster gate, REALITY candidate filter) |
+| P1 differential harness | **not executed** | `tests/engine_differential.rs` was not written; the record refactor landed without a byte-identical old/new replay. |
+| P1 bounded fuzz | **not executed** | `tests/engine_fuzz.rs` was not written; `Engine::feed` has unit tests only. |
+| P1 handshake state machine | **not executed** | The committed Sans-I/O split for the handshake remains open; no facade was shipped. |
+| P2 resumption | **not executed** | Opt-in PSK ticket cache still open. |
+| P3 ALPS / h2 fidelity | **not executed** | Post-handshake ALPS settings and browser-shaped h2 SETTINGS still open. |
+
+The branch is shippable for the executed phases; the remaining committed
+phases are not claimed complete.

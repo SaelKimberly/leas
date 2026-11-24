@@ -18,7 +18,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 17,
         ja4: "t13d131000_f57a46bbacb6_e7c285222651",
         spec_fn: safari_17_ios_tablet,
-        caps: HelloCaps { ext: 0x4_0e5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0xe },
+        caps: HelloCaps { ext: 0x4_0e5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_18_ios_phone",
@@ -28,7 +28,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 18,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: safari_18_ios_phone,
-        caps: HelloCaps { ext: 0x6_3fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x6_3fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "chrome_143_ios_phone",
@@ -38,7 +38,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 143,
         ja4: "t13d1516h2_8daaf6152771_02713d6af862",
         spec_fn: chrome_143_ios_phone,
-        caps: HelloCaps { ext: 0x6_3fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x6_3fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_6_ios_tablet",
@@ -48,7 +48,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 6,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: safari_6_ios_tablet,
-        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_26_ios_phone",
@@ -58,7 +58,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 26,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: safari_26_ios_phone,
-        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "chrome_133_ios_phone",
@@ -68,7 +68,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 133,
         ja4: "t13d1516h2_8daaf6152771_d8a2da3f94cd",
         spec_fn: chrome_133_ios_phone,
-        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x6_5fff, ciphers: 0x7, sigalgs: 0x0000_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_9_ios_phone",
@@ -78,7 +78,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 9,
         ja4: "t13d170900_5b57614c22b0_97f8aa674fd9",
         spec_fn: safari_9_ios_phone,
-        caps: HelloCaps { ext: 0xe5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0xe },
+        caps: HelloCaps { ext: 0xe5f, ciphers: 0x7, sigalgs: 0x0006_11ff, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "firefox_138_ios_phone",
@@ -88,7 +88,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 138,
         ja4: "t13d1712ht_ab0a1bf427ad_b26ce05bbdd6",
         spec_fn: firefox_138_ios_phone,
-        caps: HelloCaps { ext: 0x55_017f, ciphers: 0x7, sigalgs: 0x0381_ffff, groups: 0xe },
+        caps: HelloCaps { ext: 0x55_017f, ciphers: 0x7, sigalgs: 0x0381_ffff, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "chrome_146_ios_tablet",
@@ -98,7 +98,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 146,
         ja4: "t13d1713h2_5b57614c22b0_7f0f34a4126d",
         spec_fn: chrome_146_ios_tablet,
-        caps: HelloCaps { ext: 0x4_1f7f, ciphers: 0x7, sigalgs: 0x0004_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x4_1f7f, ciphers: 0x7, sigalgs: 0x0004_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "chrome_141_ios_tablet",
@@ -108,7 +108,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 141,
         ja4: "t13d1714h2_5b57614c22b0_14788d8d241b",
         spec_fn: chrome_141_ios_tablet,
-        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "edge_131_ios_tablet",
@@ -118,7 +118,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 131,
         ja4: "t13d1714h2_5b57614c22b0_14788d8d241b",
         spec_fn: edge_131_ios_tablet,
-        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "safari_18_ios_tablet",
@@ -128,7 +128,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 18,
         ja4: "t13d1714h2_5b57614c22b0_14788d8d241b",
         spec_fn: safari_18_ios_tablet,
-        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "chrome_144_ios_phone_2",
@@ -138,7 +138,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 144,
         ja4: "t13d1714h2_5b57614c22b0_14788d8d241b",
         spec_fn: chrome_144_ios_phone_2,
-        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "edge_143_ios_phone_2",
@@ -148,7 +148,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 143,
         ja4: "t13d1714h2_5b57614c22b0_14788d8d241b",
         spec_fn: edge_143_ios_phone_2,
-        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "firefox_137_ios_phone",
@@ -158,7 +158,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 137,
         ja4: "t13d1714h2_5b57614c22b0_14788d8d241b",
         spec_fn: firefox_137_ios_phone,
-        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0006_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "chrome_148_ios_tablet",
@@ -168,7 +168,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 148,
         ja4: "t13d1714h2_5b57614c22b0_e42f34c56612",
         spec_fn: chrome_148_ios_tablet,
-        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0004_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0004_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "edge_143_ios_phone_3",
@@ -178,7 +178,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 143,
         ja4: "t13d1714h2_5b57614c22b0_e42f34c56612",
         spec_fn: edge_143_ios_phone_3,
-        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0004_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0004_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "firefox_146_ios_phone_2",
@@ -188,7 +188,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 146,
         ja4: "t13d1714h2_5b57614c22b0_e42f34c56612",
         spec_fn: firefox_146_ios_phone_2,
-        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0004_01fb, groups: 0xe },
+        caps: HelloCaps { ext: 0x5_1f7f, ciphers: 0x7, sigalgs: 0x0004_01fb, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
     GenEntry {
         name: "edge_121_ios_phone",
@@ -198,7 +198,7 @@ pub const GENERATED: &[GenEntry] = &[
         major: 121,
         ja4: "t13d3012h2_1d37bd780c83_b26ce05bbdd6",
         spec_fn: edge_121_ios_phone,
-        caps: HelloCaps { ext: 0x55_017f, ciphers: 0x7, sigalgs: 0x0381_ffff, groups: 0xe },
+        caps: HelloCaps { ext: 0x55_017f, ciphers: 0x7, sigalgs: 0x0381_ffff, groups: 0xe, keyshare: 0x2, session_id_len: 0 },
     },
 ];
 

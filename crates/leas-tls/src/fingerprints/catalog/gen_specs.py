@@ -1198,6 +1198,7 @@ def _caps_text(entry):
     ext = 0
     sig = 0
     groups = 0
+    keyshare = 0
     for e in wire["extensions"]:
         kind = e["kind"]
         if kind == "Raw":
@@ -1210,10 +1211,18 @@ def _caps_text(entry):
             for v in e["args"][0]:
                 if v in _SIG_BITS:
                     sig |= 1 << _SIG_BITS[v]
-        elif kind in ("SupportedGroups", "KeyShare"):
+        elif kind == "SupportedGroups":
             for v in e["args"][0]:
-                if v in _GROUP_BITS:
+                if isinstance(v, int) and is_grease(v):
+                    groups |= 1
+                elif v in _GROUP_BITS:
                     groups |= 1 << _GROUP_BITS[v]
+        elif kind == "KeyShare":
+            for v in e["args"][0]:
+                if v == "Grease":
+                    keyshare |= 1
+                elif v in _GROUP_BITS:
+                    keyshare |= 1 << _GROUP_BITS[v]
     ciphers = 0
     for c in wire["cipher_order"]:
         ciphers |= 8 if is_grease(c) else _CIPHER_BITS.get(c, 0)
@@ -1229,7 +1238,9 @@ def _caps_text(entry):
     sig_hex = f"{sig:08x}"
     sig_hex = f"{sig_hex[:4]}_{sig_hex[4:]}"
     return (f"HelloCaps {{ ext: 0x{sep(ext)}, ciphers: 0x{ciphers:x}, "
-            f"sigalgs: 0x{sig_hex}, groups: 0x{sep(groups)} }}")
+            f"sigalgs: 0x{sig_hex}, groups: 0x{sep(groups)}, "
+            f"keyshare: 0x{sep(keyshare)}, "
+            f"session_id_len: {32 if 'random' in str(wire['session_id']).lower() else 0} }}")
 
 
 def _gen_entry_text(entry):
