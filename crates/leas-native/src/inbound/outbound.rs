@@ -961,7 +961,9 @@ mod tests {
         );
 
         // Past the cap with traffic in neither direction: the relay ends.
-        tokio::time::advance(Duration::from_secs(70)).await;
+        // Relative to the constant: 45 s of silence above already longer than
+        // the old 30 s/60 s caps, and one more full cap cannot be inside it.
+        tokio::time::advance(timeouts::RELAY_IDLE).await;
         let err = relayed
             .await
             .unwrap()
@@ -975,6 +977,7 @@ mod tests {
     /// sockets + both buffers indefinitely (issue 002).
     #[tokio::test(start_paused = true)]
     async fn a_stalled_reader_ends_the_write_half() {
+        let cap = Duration::from_secs(5);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // A real TCP peer, not `duplex` + `split`: the duplex halves share one
@@ -986,9 +989,9 @@ mod tests {
         let relayed = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             let (peer_sock, _) = peer_listener.accept().await.unwrap();
-            // A 5 s cap: the fixture cannot virtual-time its way past the
-            // shipped 90 s reliably once both halves stall at the same stamp.
-            relay_with_cap(sock, Box::new(peer_sock), Duration::from_secs(5)).await
+            // A short cap: the fixture must not virtual-time its way past the
+            // shipped value, and the subject is the bound, not its number.
+            relay_with_cap(sock, Box::new(peer_sock), cap).await
         });
         let peer = tokio::net::TcpStream::connect(peer_addr).await.unwrap();
         let (mut peer_r, mut peer_w) = peer.into_split();
@@ -1024,7 +1027,7 @@ mod tests {
             tokio::time::advance(Duration::from_secs(10)).await;
             tokio::task::yield_now().await;
         }
-        tokio::time::advance(Duration::from_secs(70)).await;
+        tokio::time::advance(cap).await;
 
         let err = relayed
             .await
