@@ -230,3 +230,24 @@ fn reality_caps_match_the_spec_rule() {
         assert_eq!(by_caps, spec.reality_eligible(), "{}", entry.name);
     }
 }
+
+/// Resumption changes the declared hello shape (pre_shared_key); the resumed
+/// JA4 is a separate value and the default roster goldens stay untouched.
+#[test]
+fn resumed_shape_has_its_own_ja4() {
+    use leas_tls::crypto::fingerprint::ja3::Ja3Fields;
+    use leas_tls::crypto::fingerprint::ja4::full_ja4;
+    use leas_tls::spec::ExtensionSpec;
+
+    let base_spec = chrome_130();
+    let mut resumed_spec = base_spec.clone();
+    resumed_spec.extensions.push(ExtensionSpec::Raw {
+        ty: 0x0029,
+        data: Vec::new(),
+    });
+    let base = full_ja4(&Ja3Fields::from_spec(&base_spec));
+    let resumed = full_ja4(&Ja3Fields::from_spec(&resumed_spec));
+    assert_ne!(base, resumed, "pre_shared_key must change the JA4");
+    // Pinned opt-in shape; the default roster value is asserted elsewhere.
+    assert_eq!(resumed, "t13d1517h2_8daaf6152771_6cdcb247c39b");
+}

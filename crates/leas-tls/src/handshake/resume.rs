@@ -58,14 +58,30 @@ pub fn store(server: &str, alpn: &[u8], ticket: ReceivedTicket) {
 }
 
 /// Take `server`'s ticket when one of the offered ALPN protocols matches.
-pub fn take(server: &str, offered_alpn: &[&[u8]]) -> Option<CachedTicket> {
+pub fn take(server: &str, offered_alpn: &[&[u8]], allowed_suites: &[u16]) -> Option<CachedTicket> {
     let mut cache = CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
     cache.retain(|(_, t)| t.expires > now);
     let pos = cache.iter().position(|(host, t)| {
-        host == server && (t.alpn.is_empty() || offered_alpn.iter().any(|p| *p == t.alpn))
+        host == server
+            && allowed_suites.contains(&t.suite.to_u16())
+            && (t.alpn.is_empty() || offered_alpn.iter().any(|p| *p == t.alpn))
     })?;
     Some(cache.remove(pos).1)
+}
+
+#[cfg(test)]
+pub(crate) fn test_ticket(ticket: &[u8], psk: &[u8]) -> CachedTicket {
+    let suite = crate::crypto::CipherSuiteId::Aes128GcmSha256;
+    CachedTicket {
+        ticket: ticket.to_vec(),
+        age_add: 0,
+        suite,
+        psk: Zeroizing::new(psk.to_vec()),
+        alpn: Vec::new(),
+        received: Instant::now(),
+        expires: Instant::now() + Duration::from_secs(60),
+    }
 }

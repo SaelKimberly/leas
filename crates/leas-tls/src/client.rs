@@ -295,11 +295,17 @@ mod tests {
                     }
                 }
                 let mut b = [0u8; 1];
-                if std::io::Read::read(&mut sock, &mut b).is_ok() {
-                    let _ = conn.reader().read(&mut b);
+                // Feed the client's application record through rustls; a raw
+                // read would consume ciphertext and corrupt the connection.
+                let _ = conn.complete_io(&mut sock);
+                if conn.reader().read(&mut b).is_ok() {
+                    let _ = conn.writer().write_all(b"pong");
                 }
-                let _ = conn.writer().write_all(b"pong");
-                let _ = conn.write_tls(&mut sock);
+                while conn.wants_write() {
+                    if conn.write_tls(&mut sock).is_err() {
+                        break;
+                    }
+                }
             }
         });
         addr

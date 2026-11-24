@@ -469,7 +469,10 @@ pub(crate) fn connect_inner_hello<'a>(
         let refs: Vec<&[u8]> = offered.iter().map(Vec::as_slice).collect();
         let can_offer_psk = crate::hello::parse::parse_hello(&hello.handshake_bytes)
             .is_ok_and(|h| h.extension(0x002d).is_some());
-        if can_offer_psk && let Some(ticket) = resume::take(params.server_name, &refs) {
+        if can_offer_psk
+            && let Some(ticket) =
+                resume::take(params.server_name, &refs, &params.spec.cipher_suites)
+        {
             append_psk_extension(&mut hello, &ticket, ticket.age_ms())?;
             psk = Some(ticket);
         }
@@ -1282,6 +1285,9 @@ fn u24(b: &[u8]) -> usize {
 /// Remove TLS 1.3 record padding and extract the inner content type
 #[cfg(test)]
 mod tests {
+    use crate::crypto::X25519KeyPair;
+    use crate::handshake::{append_psk_extension, resume};
+    use crate::hello::build_hello_ordered;
     use std::io::{Read as _, Write as _};
     use std::sync::Arc;
 
@@ -3313,5 +3319,60 @@ mod tests {
             err.to_string().contains("512 KiB"),
             "expected the flight bound, got {err:?}"
         );
+    }
+
+    #[test]
+    fn psk_binder_matches_the_emitted_client_hello() {
+        let rng = ring::rand::SystemRandom::new();
+        let keypair = X25519KeyPair::generate(&rng).unwrap();
+        let mut built = build_hello_ordered(
+            &crate::profiles::hand_selected::chrome_130(),
+            &BuildParams {
+                server_name: "localhost",
+                alpn: None,
+                x25519_pub: &keypair.public_key(),
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+            false,
+        )
+        .unwrap();
+        let psk = [0x42u8; 32];
+        let ticket = resume::test_ticket(b"ticket", &psk);
+        append_psk_extension(&mut built, &ticket, 0).unwrap();
+
+        let hb = &built.handshake_bytes;
+        let mut p = 4 + 2 + 32;
+        let sid_len = usize::from(hb[p]);
+        p += 1 + sid_len;
+        let cs_len = usize::from(u16::from_be_bytes([hb[p], hb[p + 1]]));
+        p += 2 + cs_len;
+        let comp_len = usize::from(hb[p]);
+        p += 1 + comp_len;
+        let ext_len = usize::from(u16::from_be_bytes([hb[p], hb[p + 1]]));
+        p += 2;
+        let end = p + ext_len;
+        let mut psk_ext = None;
+        while p < end {
+            let ty = u16::from_be_bytes([hb[p], hb[p + 1]]);
+            let len = usize::from(u16::from_be_bytes([hb[p + 2], hb[p + 3]]));
+            if ty == 0x0029 {
+                psk_ext = Some(p);
+                break;
+            }
+            p += 4 + len;
+        }
+        let ext = psk_ext.expect("pre_shared_key must be the last extension");
+        let body = ext + 4;
+        let identities_len = usize::from(u16::from_be_bytes([hb[body], hb[body + 1]]));
+        let binders_off = body + 2 + identities_len;
+        let binders_len = usize::from(u16::from_be_bytes([hb[binders_off], hb[binders_off + 1]]));
+        assert_eq!(binders_len, 1 + 32);
+        let sent = &hb[binders_off + 3..binders_off + 3 + 32];
+        let hash = ring::digest::digest(ticket.suite.digest(), &hb[..binders_off]);
+        let expected = KeySchedule::new(ticket.suite)
+            .binder_mac(&psk, hash.as_ref())
+            .unwrap();
+        assert_eq!(sent, expected.as_slice());
     }
 }
