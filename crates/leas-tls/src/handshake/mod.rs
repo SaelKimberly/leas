@@ -467,7 +467,9 @@ pub(crate) fn connect_inner_hello<'a>(
             |list| list.iter().map(|p| p.to_vec()).collect(),
         );
         let refs: Vec<&[u8]> = offered.iter().map(Vec::as_slice).collect();
-        if let Some(ticket) = resume::take(params.server_name, &refs) {
+        let can_offer_psk = crate::hello::parse::parse_hello(&hello.handshake_bytes)
+            .is_ok_and(|h| h.extension(0x002d).is_some());
+        if can_offer_psk && let Some(ticket) = resume::take(params.server_name, &refs) {
             append_psk_extension(&mut hello, &ticket, ticket.age_ms())?;
             psk = Some(ticket);
         }

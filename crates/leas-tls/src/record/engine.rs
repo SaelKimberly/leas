@@ -327,6 +327,11 @@ impl Engine {
 
     fn record(&mut self, content_type: u8, body: &mut [u8]) -> Result<()> {
         if content_type == CONTENT_CHANGE_CIPHER_SPEC {
+            // RFC 8446 §5: a TLS 1.3 endpoint drops unauthenticated CCS
+            // records (middlebox compatibility); TLS 1.2 has no such leniency.
+            if self.keys.read.is_tls13() {
+                return Ok(());
+            }
             return Err(TlsError::Handshake(
                 "unexpected ChangeCipherSpec after the handshake".into(),
             ));

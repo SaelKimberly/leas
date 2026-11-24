@@ -97,6 +97,9 @@ where
 {
     let mut hdr = [0u8; 5];
     tokio::io::AsyncReadExt::read_exact(stream, &mut hdr).await?;
+    if let Some(cleartext) = crate::record::cleartext_hello_answer(hdr) {
+        return Err(TlsError::CleartextPeer(format!("{cleartext:?}")));
+    }
     let len = usize::from(u16::from_be_bytes([hdr[3], hdr[4]]));
     if len > crate::record::MAX_RECORD_PAYLOAD {
         return Err(TlsError::Io(std::io::Error::new(

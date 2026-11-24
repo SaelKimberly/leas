@@ -13,8 +13,8 @@
 //! A record may carry SEVERAL handshake messages (RFC 8446 §5.1); every one is
 //! walked, not just the first.
 //!
-//! - `NewSessionTicket` (0x04) is consumed and DISCARDED: resumption is not
-//!   implemented, so the ticket has no consumer and is never replayed.
+//! - `NewSessionTicket` (0x04) is parsed into the bounded resumption cache;
+//!   a ticket is only replayed when the dial opts into resumption.
 //! - `KeyUpdate` (0x18) rotates the read key (RFC 8446 §4.6.3) and, when the
 //!   peer set `request_update`, queues a reciprocal `update_not_requested`
 //!   acknowledgement on the write side. `poll_write` also sends one
