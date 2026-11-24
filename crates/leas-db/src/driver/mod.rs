@@ -41,6 +41,8 @@
     reason = "vendored driver style; these pedantic lints are not defects"
 )]
 
+pub(crate) mod conn_timing;
+pub use conn_timing::TARGET;
 mod error;
 mod value;
 pub use turso::EncryptionOpts;
@@ -537,10 +539,15 @@ impl Connection {
             sql_str,
             typed_params.iter().map(|tv| &tv.value),
         );
+        // Same span `QueryLog` measures, labelled as EXEC so the audit's
+        // 806/812 s statements can be told apart from a starved checkout.
+        // `finish` stays on every path; the WARN fires only past 1 s.
+        let started = Instant::now();
         let result = self
             .exec_sql_inner(sql_str, typed_params, ret, prepare, &mut log)
             .await;
         log.finish(&result);
+        conn_timing::report_exec(started.elapsed());
         result
     }
 

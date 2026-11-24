@@ -687,12 +687,21 @@ impl Database {
     /// queuing behind the lock holder — the 850-line "database is locked" class
     /// in the dumps.
     async fn conn(&self) -> Result<toasty::Connection> {
+        // The 2026-11-24 audit's 806/812 s statements were unattributable:
+        // toasty's `QueryLog` times the exec but says nothing about the pool
+        // checkout, which is where a single-writer WAL backlog is paid.
+        let started = std::time::Instant::now();
+        // Report BEFORE propagating: a checkout that waited and then failed is
+        // the most pathological case, and `?` below would hide it.
+        let conn = self.db.connection().await;
+        crate::driver::conn_timing::report_checkout(started.elapsed());
+        let conn = conn?;
         // The per-connection settings (`busy_timeout`, `synchronous`,
         // `foreign_keys`) are applied ONCE per physical connection by the
         // driver's pool create hook (`driver/mod.rs::connect`). They used to be
         // re-issued here on every checkout — two statements, measured 20–33 µs
         // per database call — after the first checkout already set them.
-        Ok(self.db.connection().await?)
+        Ok(conn)
     }
 
     /// Public pooled-connection accessor for callers building typed

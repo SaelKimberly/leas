@@ -518,6 +518,32 @@ mod tests {
         );
     }
 
+    /// The G9 timing lines must NOT be folded as queries: they carry no
+    /// `duration_ms` field, so folding one would inject a 0 ms sample and
+    /// dilute `mean_ms`/`p50`/`p99`. They target `leas_db`, which this layer's
+    /// `toasty::query=debug` filter drops.
+    #[tokio::test]
+    async fn timing_events_are_not_folded_as_queries() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let monitor = DbMonitor::new();
+        let subscriber = tracing_subscriber::registry().with(DbMonitorLayer::new(monitor.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        instrumented_op().await;
+        tracing::warn!(
+            target: leas_db::driver::TARGET,
+            "db timing: stage=checkout pool_wait_ms=260.0"
+        );
+        tracing::warn!(
+            target: leas_db::driver::TARGET,
+            "db timing: stage=exec exec_ms=812000.0"
+        );
+
+        let dump = monitor.dump(10).join("\n");
+        assert!(dump.contains("test_method"), "real query kept: {dump}");
+        assert!(!dump.contains("0.0ms"), "timing lines not folded: {dump}");
+    }
+
     #[tokio::test]
     async fn real_toasty_query_events_attribute_to_the_database_method() {
         use tracing_subscriber::layer::SubscriberExt;
