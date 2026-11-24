@@ -65,6 +65,18 @@ The 3 residual entries differ only in the A-part ALPN letter: the corpus renders
 
 The two hand profiles are pinned offline by `crates/leas-tls/tests/tls_peet_ws.rs::local_fingerprints_match_locked_constants` (`chrome_130` JA4 v2 and GREASE-stripped JA3 md5 under the fixed seed) and by the resolver JA4-fidelity tests.
 
+## Signature-scheme boundary
+
+The roster advertises the browser's real `signature_algorithms` list, including schemes the ring-backed verifier cannot check. That is deliberate: dropping them would change the extension and its JA4 hash. Every advertised code point is classified by `verify::scheme_support` and gated roster-wide by `crates/leas-tls/tests/sig_scheme_boundary.rs`:
+
+| Class | Examples | Behaviour if a server selects it |
+| --- | --- | --- |
+| `Tls13` | ECDSA P-256/P-384, RSA-PSS (rsae), Ed25519 | verified in TLS 1.3 `CertificateVerify` and TLS 1.2 SKE |
+| `Tls12Only` | RSA PKCS#1 v1.5 (SHA-256/384/512) | verified in a TLS 1.2 SKE; not legal in TLS 1.3 |
+| `DocumentedUnverifiable` | P-521, Ed448, RSA-PSS-PSS, DSA, SHA-1/SHA-224, ML-DSA | typed `unsupported … signature scheme` failure, never a silent downgrade |
+
+The fix for a `DocumentedUnverifiable` scheme is **not** a second crypto provider: the workspace's `crypto-dependencies.md` names ring as the single provider, and aws-lc-rs is not permitted beside it. A live target that requires one of these schemes is an explicit product decision, not a roster edit. A new profile that introduces an unknown code point fails the gate until it is classified.
+
 **Live sweep** (`cargo run -p leas-tls --example grader -- --roster`) is the empirical confirmation against the real peet.ws API. The grader walks the combined roster (`profiles::combined_roster`, the 69 generated entries plus the 2 hand profiles).
 
 ## Live sweep methodology

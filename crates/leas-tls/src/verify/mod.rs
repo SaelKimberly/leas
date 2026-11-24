@@ -344,6 +344,60 @@ fn tls12_algorithms(
     }
 }
 
+// ── Scheme boundary ────────────────────────────────────────────────────────
+
+/// What the engine can do with a `signature_algorithms` code point.
+///
+/// The roster must stay honest about this boundary: a profile may advertise a
+/// browser-real scheme the ring-backed verifier cannot check (P-521, Ed448,
+/// RSA-PSS-PSS, DSA, SHA-1). Such a scheme is a typed, documented failure if a
+/// server selects it — never a silent downgrade and never a reason to add a
+/// second crypto provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemeSupport {
+    /// Verifiable in both TLS 1.3 `CertificateVerify` and TLS 1.2 SKE.
+    Tls13,
+    /// Verifiable in a TLS 1.2 `ServerKeyExchange` only (PKCS#1 v1.5).
+    Tls12Only,
+    /// Advertised by a real browser, not verifiable by this engine; a server
+    /// selecting it fails the handshake with a typed error.
+    DocumentedUnverifiable,
+}
+
+/// Classify a `signature_algorithms` code point.
+///
+/// `None` means the value is not in the roster's vocabulary at all: a new
+/// profile that introduces one must extend this table and its documentation
+/// deliberately, which a roster-wide test enforces.
+#[must_use]
+pub const fn scheme_support(scheme: u16) -> Option<SchemeSupport> {
+    match scheme {
+        // ring verifies these in both versions.
+        0x0403 | 0x0503 | 0x0804 | 0x0805 | 0x0806 | 0x0807 => Some(SchemeSupport::Tls13),
+        // PKCS#1 v1.5 signatures are legal in TLS 1.2 only.
+        0x0401 | 0x0501 | 0x0601 => Some(SchemeSupport::Tls12Only),
+        // Browser-real but outside ring's verifier surface: P-521, Ed448,
+        // RSA-PSS-PSS, DSA, SHA-1/SHA-224 legacy, ML-DSA.
+        0x0201 | 0x0202 | 0x0203 | 0x0301 | 0x0302 | 0x0303 | 0x0402 | 0x0502 | 0x0602 | 0x0603
+        | 0x0808 | 0x0809 | 0x080A | 0x080B | 0x0904 | 0x0905 => {
+            Some(SchemeSupport::DocumentedUnverifiable)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `tls13_algorithm` accepts this code point (roster-test seam).
+#[must_use]
+pub fn tls13_verifier_available(scheme: u16) -> bool {
+    tls13_algorithm(scheme).is_ok()
+}
+
+/// Whether `tls12_algorithms` accepts this code point (roster-test seam).
+#[must_use]
+pub fn tls12_verifier_available(scheme: u16) -> bool {
+    tls12_algorithms(scheme).is_ok()
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

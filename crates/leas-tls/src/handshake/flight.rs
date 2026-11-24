@@ -148,7 +148,7 @@ where
         }
         if buf.len() + hs_data.len() > MAX_FLIGHT_BUFFER {
             return Err(TlsError::Handshake(
-                "server flight exceeds the 16 MiB reassembly bound".into(),
+                "server flight exceeds the 512 KiB reassembly bound".into(),
             ));
         }
         buf.extend_from_slice(hs_data);

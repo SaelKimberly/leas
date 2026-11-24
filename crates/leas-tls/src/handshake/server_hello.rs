@@ -35,6 +35,9 @@ pub struct ServerHelloData {
     pub suite12: Option<Tls12Suite>,
     /// Whether the server echoed `extended_master_secret` (TLS 1.2).
     pub ems: bool,
+    /// The ALPN protocol the server selected in its `ServerHello`
+    /// (TLS 1.2; TLS 1.3 carries it in `EncryptedExtensions`).
+    pub alpn: Option<Vec<u8>>,
 }
 
 /// The `ServerHello` body fields the engine needs.
@@ -52,6 +55,8 @@ pub struct ParsedServerHello {
     /// error, never a silent classical fallback.
     pub key_share_group: Option<u16>,
     pub ems: bool,
+    /// The ALPN protocol selected in the `ServerHello` (TLS 1.2), or `None`.
+    pub alpn: Option<Vec<u8>>,
 }
 
 /// A parsed `HelloRetryRequest` (RFC 8446 §4.1.4): the server wants a
@@ -78,7 +83,11 @@ pub enum ServerReply {
 
 /// Read and parse the `ServerHello` record, skipping CCS records. The
 /// server must echo the offered legacy session id (RFC 8446 §4.1.3).
-pub async fn read_server_hello<S>(stream: &mut S, offered_session_id: &[u8]) -> Result<ServerReply>
+pub async fn read_server_hello<S>(
+    stream: &mut S,
+    offered_session_id: &[u8],
+    offered_exts: &[u16],
+) -> Result<ServerReply>
 where
     S: AsyncRead + Unpin,
 {
@@ -100,7 +109,7 @@ where
                 "expected ServerHello (0x02), got 0x{msg_type:02X}"
             )));
         }
-        let parsed = parse_server_hello(body, offered_session_id)?;
+        let parsed = parse_server_hello(body, offered_session_id, Some(offered_exts))?;
         // TLS 1.2 may pack subsequent handshake messages after the
         // ServerHello in the same record; preserve those bytes for the
         // flight reader.
@@ -122,6 +131,7 @@ where
             suite: parsed.suite,
             suite12: parsed.suite12,
             ems: parsed.ems,
+            alpn: parsed.alpn,
         }))),
     }
 }

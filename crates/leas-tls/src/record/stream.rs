@@ -347,7 +347,19 @@ pub struct TlsStream<S> {
     /// The protocol the server selected in `EncryptedExtensions`
     /// (RFC 7301), if it offered ALPN.
     negotiated_alpn: Option<Vec<u8>>,
+    /// Consecutive authenticated `KeyUpdate` messages since the last
+    /// application-data record. RFC 8446 §4.6.3 permits them at any time, so
+    /// the engine bounds the work an unauthenticated-but-legal peer can force.
+    consecutive_key_updates: u16,
+    /// `close_notify` already queued (a second `shutdown` must not seal another
+    /// alert under the next sequence number).
+    close_sent: bool,
 }
+
+/// A peer may legally send `KeyUpdate` repeatedly; this many consecutive
+/// updates without an application-data record is a protocol-abuse bound, not
+/// an RFC limit.
+const MAX_CONSECUTIVE_KEY_UPDATES: u16 = 128;
 
 /// Incremental state of reading one TLS record off the wire. The bytes live
 /// in [`TlsStream::hdr`] and [`TlsStream::rec_buf`]; this only tracks how
@@ -380,6 +392,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
             negotiated_hybrid: false,
             secrets: None,
             negotiated_alpn: None,
+            consecutive_key_updates: 0,
+            close_sent: false,
         }
     }
 
@@ -459,6 +473,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                 "KeyUpdate in a TLS 1.2 session is illegal (RFC 5246 §7.4.1)",
             ));
         }
+        self.consecutive_key_updates = self.consecutive_key_updates.saturating_add(1);
+        if self.consecutive_key_updates > MAX_CONSECUTIVE_KEY_UPDATES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "peer sent more than {MAX_CONSECUTIVE_KEY_UPDATES} consecutive TLS KeyUpdate messages"
+                ),
+            ));
+        }
         let Some(secrets) = self.secrets.as_mut() else {
             return Err(io::Error::other(
                 "KeyUpdate received but no application secrets were installed",
@@ -508,6 +531,61 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
         )
         .map_err(to_io_error)?;
         *write_seq = seq + 1;
+        Ok(())
+    }
+
+    /// Frame and seal a TLS alert with the CURRENT write key, appended to the
+    /// pending output. Used for the RFC 8446 §6.1 `close_notify` on graceful
+    /// shutdown; the direct (Vision) path owns its own close.
+    fn queue_alert(&mut self, description: u8) -> io::Result<()> {
+        if self.close_sent {
+            return Ok(());
+        }
+        let start = self.pending.len();
+        let AppKeys {
+            write, write_seq, ..
+        } = &mut self.keys;
+        let seq = *write_seq;
+        match write {
+            RecordCipher::Tls13(key) => {
+                self.pending
+                    .extend_from_slice(&[CONTENT_APPLICATION_DATA, 0x03, 0x03, 0, 0]);
+                self.pending
+                    .extend_from_slice(&[1, description, CONTENT_ALERT]);
+                let record_len = self.pending.len() - start - RECORD_HEADER_LEN + AEAD_TAG_LEN;
+                let len = u16::try_from(record_len).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "close_notify record too long")
+                })?;
+                self.pending[start + 3..start + RECORD_HEADER_LEN]
+                    .copy_from_slice(&len.to_be_bytes());
+                key.seal_in_place(
+                    seq,
+                    &aead_aad(record_len),
+                    &mut self.pending,
+                    start + RECORD_HEADER_LEN,
+                )
+                .map_err(to_io_error)?;
+            }
+            RecordCipher::Tls12(key, aead) => {
+                let explicit = aead.explicit_nonce(seq);
+                let nonce = aead.nonce(seq, explicit.as_slice())?;
+                let plaintext_len = 2usize;
+                let record_len = explicit.as_slice().len() + plaintext_len + AEAD_TAG_LEN;
+                let len = u16::try_from(record_len).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "close_notify record too long")
+                })?;
+                self.pending.extend_from_slice(&[CONTENT_ALERT, 0x03, 0x03]);
+                self.pending.extend_from_slice(&len.to_be_bytes());
+                self.pending.extend_from_slice(explicit.as_slice());
+                let seal_start = self.pending.len();
+                self.pending.extend_from_slice(&[1, description]);
+                let additional = aead_aad_12(seq, CONTENT_ALERT, plaintext_len);
+                key.seal_in_place_with_nonce(nonce, &additional, &mut self.pending, seal_start)
+                    .map_err(to_io_error)?;
+            }
+        }
+        *write_seq = seq + 1;
+        self.close_sent = true;
         Ok(())
     }
 
@@ -895,6 +973,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
             }
             match decrypt_record(&mut this.keys, content_type, &mut this.rec_buf[..len]) {
                 Ok(DecryptedRecord::Data(plain)) => {
+                    this.consecutive_key_updates = 0;
                     this.plain = plain;
                 }
                 Ok(DecryptedRecord::CloseNotify) => {
@@ -1046,6 +1125,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
         let this = self.get_mut();
         if this.write_direct {
             return Pin::new(&mut this.inner).poll_shutdown(cx);
+        }
+        // RFC 8446 §6.1: a graceful close is a `close_notify` alert followed
+        // by the transport close. Direct/Vision callers keep their own close.
+        if let Err(e) = this.queue_alert(0) {
+            return Poll::Ready(Err(e));
         }
         match this.flush_pending(cx) {
             Poll::Pending => return Poll::Pending,
@@ -1684,5 +1768,48 @@ mod tests {
         );
         assert_eq!(got, payload);
         assert_eq!(tail, b"RAW-TAIL");
+    }
+
+    /// RFC 8446 §6.1: a graceful shutdown sends `close_notify` before the
+    /// transport close, so the peer can distinguish an ending from a
+    /// truncation.
+    #[tokio::test]
+    async fn shutdown_sends_close_notify() {
+        let (a, mut peer) = duplex(4096);
+        let keys = test_keys();
+        let mut client = TlsStream::new(a, keys.duplicate());
+        client.shutdown().await.unwrap();
+
+        let mut hdr = [0u8; 5];
+        peer.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(&hdr[..3], &[CONTENT_APPLICATION_DATA, 0x03, 0x03]);
+        let len = usize::from(u16::from_be_bytes([hdr[3], hdr[4]]));
+        let mut body = vec![0u8; len];
+        peer.read_exact(&mut body).await.unwrap();
+        let plain = tls13_key(&keys.write)
+            .open_in_place(0, &aead_aad(len), &mut body)
+            .unwrap();
+        assert_eq!(&body[..plain], &[1, 0, CONTENT_ALERT]);
+    }
+
+    /// A peer that never sends application data can still legally emit
+    /// `KeyUpdate`; the engine bounds the resulting work.
+    #[tokio::test]
+    async fn consecutive_key_updates_are_bounded() {
+        let (a, _peer) = duplex(64);
+        let mut stream = TlsStream::new(a, test_keys());
+        stream.set_app_secrets(AppSecrets::new(
+            CipherSuiteId::Aes128GcmSha256,
+            &[0x22; 32],
+            &[0x33; 32],
+        ));
+        for _ in 0..MAX_CONSECUTIVE_KEY_UPDATES {
+            stream.apply_key_update(false).unwrap();
+        }
+        let err = stream.apply_key_update(false).unwrap_err();
+        assert!(
+            err.to_string().contains("consecutive TLS KeyUpdate"),
+            "expected the flood bound, got {err:?}"
+        );
     }
 }

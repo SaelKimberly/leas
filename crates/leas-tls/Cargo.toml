@@ -98,6 +98,14 @@ criterion = { workspace = true }
 name = "record"
 harness = false
 
+[[bench]]
+name = "handshake"
+harness = false
+
+[[bench]]
+name = "relay"
+harness = false
+
 [[example]]
 name = "grader"
 path = "examples/grader.rs"

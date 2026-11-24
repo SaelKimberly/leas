@@ -39,6 +39,7 @@ use crate::SecureRandom;
 use crate::crypto::mlkem::{Ciphertext, Mlkem768, SecretKey as MlkemSecretKey};
 use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair, tls12::Tls12Suite};
 use crate::error::{Result, TlsError};
+use crate::hello::parse::parse_hello;
 use crate::hello::{BuildParams, build_hello_ordered, to_record};
 use crate::record::stream::{AppKeys, TlsStream};
 use crate::record::{
@@ -170,11 +171,11 @@ const AEAD_TAG_LEN: usize = 16;
 
 /// Maximum accumulated plaintext for the encrypted server flight, in bytes.
 ///
-/// A single handshake message is at most `4 + 0xFF_FFFF` (type(1) +
-/// length(3) + a uint24 body, RFC 8446 §4), so this cap admits every legal
-/// message while bounding cross-record accumulation (RFC 8446 §5.1) against
-/// unbounded growth.
-pub(crate) const MAX_FLIGHT_BUFFER: usize = 4 + 0xFF_FFFF;
+/// RFC 8446 §4 allows a handshake message up to `4 + 0xFF_FFFF`, but no real
+/// Certificate chain approaches it; 512 KiB admits every practical chain
+/// (Cloudflare's is tens of KiB) while bounding what a malicious server can
+/// make one dial hold. An oversized flight is a protocol error, not a panic.
+pub(crate) const MAX_FLIGHT_BUFFER: usize = 512 * 1024;
 
 // ── Handshake driver ───────────────────────────────────────────────────────
 
@@ -383,17 +384,21 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut retry_message: Option<Vec<u8>> = None;
     let mut hrr_selected: Option<u16> = None;
     let server_hello = loop {
+        // Parse the hello we are about to send ONCE: its extension types feed
+        // the RFC 8446 §4.2 offered-set check and its cipher suites feed the
+        // selected-suite check after the reply.
+        let sent_hello = parse_hello(&current_hello)?;
+        let offered_exts: Vec<u16> = sent_hello.extensions.iter().map(|(ty, _)| *ty).collect();
         stream.write_all(&to_record(&wire_hello)).await?;
-        match read_server_hello(&mut stream, &current_sid).await? {
+        match read_server_hello(&mut stream, &current_sid, &offered_exts).await? {
             ServerReply::Hello(sh) => {
                 // RFC 8446 §4.1.3 / RFC 5246 §7.4.1.2: the server MUST select
                 // a suite the client offered. Parse the hello we actually
                 // sent (GREASE values included as drawn), not the spec.
-                let offered = crate::hello::parse::parse_hello(&current_hello)?.cipher_suites;
                 let selected = sh
                     .suite12
                     .map_or_else(|| sh.suite.to_u16(), Tls12Suite::to_u16);
-                ensure_offered_suite(&offered, selected)?;
+                ensure_offered_suite(&sent_hello.cipher_suites, selected)?;
                 break *sh;
             }
             ServerReply::Retry(hrr) => {
@@ -460,6 +465,15 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
         }
     }
 
+    // RFC 7301 §3.1: a selected protocol must be one this hello offered.
+    // TLS 1.2 carries ALPN in the ServerHello; TLS 1.3 must not (see below).
+    ensure_offered_alpn(&current_hello, server_hello.alpn.as_deref())?;
+    if server_hello.version == TlsVersion::Tls13 && server_hello.alpn.is_some() {
+        return Err(TlsError::Handshake(
+            "TLS 1.3 ServerHello carried ALPN; RFC 7301 puts it in EncryptedExtensions".into(),
+        ));
+    }
+
     // TLS 1.2: dispatch to the separate 1.2 handshake driver.
     // REALITY (ServerAuth::Reality) is TLS 1.3 only — error if a REALITY
     // server negotiates 1.2.
@@ -479,7 +493,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
             ServerAuth::Verifier(verifier) => {
                 let client_random: [u8; 32] = current_hello[6..38].try_into().expect("32 bytes");
                 let pre_buffer = server_hello.pre_buffer.clone();
-                return tls12::drive12(
+                let (mut tls, outcome) = tls12::drive12(
                     stream,
                     &current_hello,
                     &client_random,
@@ -489,7 +503,9 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     server_name,
                     verifier,
                 )
-                .await;
+                .await?;
+                tls.set_negotiated_alpn(server_hello.alpn.clone());
+                return Ok((tls, outcome));
             }
         }
     }
@@ -542,6 +558,9 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // actually sent (the retried one), never from a caller's belief about it.
     let offered_compress = compressed_algorithms(&current_hello);
     let flight = read_server_hs_messages(&mut stream, &server_hs_key, &offered_compress).await?;
+    // RFC 7301: the ALPN choice rides EncryptedExtensions in TLS 1.3, and it
+    // must be one the hello offered.
+    ensure_offered_alpn(&current_hello, flight.negotiated_alpn.as_deref())?;
 
     // The key schedule already accumulates `ClientHello .. Certificate`
     // verbatim — feeding it here (before the auth dispatch) makes its
@@ -940,6 +959,48 @@ pub(crate) fn client_hello_extension(hello: &[u8], ty: u16) -> Option<&[u8]> {
     None
 }
 
+/// Reject an ALPN protocol the `ClientHello` never offered (RFC 7301 §3.1).
+///
+/// `selected == None` means the server answered no ALPN, which is legal.
+pub(crate) fn ensure_offered_alpn(hello: &[u8], selected: Option<&[u8]>) -> Result<()> {
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+    let body = client_hello_extension(hello, 0x0010).ok_or_else(|| {
+        TlsError::Handshake(
+            "server selected an ALPN protocol but the ClientHello offered no ALPN extension".into(),
+        )
+    })?;
+    // `ProtocolNameList`: list_len(2) || len(1) || name ...
+    let (list_len, rest) = body
+        .split_first_chunk::<2>()
+        .ok_or_else(|| TlsError::Handshake("ClientHello ALPN too short".into()))?;
+    let list_len = usize::from(u16::from_be_bytes(*list_len));
+    if list_len != rest.len() {
+        return Err(TlsError::Handshake(
+            "ClientHello ALPN list length does not match its body".into(),
+        ));
+    }
+    let mut at = 0usize;
+    while at < rest.len() {
+        let len = usize::from(*rest.get(at).ok_or_else(|| {
+            TlsError::Handshake("ClientHello ALPN truncated at name length".into())
+        })?);
+        at += 1;
+        let name = rest.get(at..at + len).ok_or_else(|| {
+            TlsError::Handshake("ClientHello ALPN truncated at protocol name".into())
+        })?;
+        if name == selected {
+            return Ok(());
+        }
+        at += len;
+    }
+    Err(TlsError::Handshake(format!(
+        "server selected ALPN {:?}, which the ClientHello did not offer",
+        String::from_utf8_lossy(selected)
+    )))
+}
+
 /// Reject a server signature algorithm the `ClientHello` never offered.
 ///
 /// RFC 5246 §7.4.3 and RFC 8446 §4.4.3 both require the server to sign with
@@ -1040,7 +1101,11 @@ enum ParsedReply {
     Retry(HrrData),
 }
 
-fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedReply> {
+fn parse_server_hello(
+    body: &[u8],
+    offered_session_id: &[u8],
+    offered_exts: Option<&[u16]>,
+) -> Result<ParsedReply> {
     if body.len() < 38 {
         return Err(TlsError::Handshake("ServerHello body too short".into()));
     }
@@ -1104,12 +1169,15 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
     let mut mlkem_ciphertext = None;
     let mut key_share_wire = None;
     let mut ems = false;
+    let mut alpn: Option<Vec<u8>> = None;
     // HRR-only fields (RFC 8446 §4.1.4).
     let mut hrr_group = None;
     let mut hrr_cookie = None;
 
     // Scan the extension list body (relative to `pos`, which already points
     // past the 2-byte list-length field).
+    let mut seen_ext: [u16; 16] = [0; 16];
+    let mut seen_len = 0usize;
     let mut scan_pos = 0usize;
     while scan_pos + 4 <= ext_list_len {
         let ext_type = u16::from_be_bytes([body[pos + scan_pos], body[pos + scan_pos + 1]]);
@@ -1122,6 +1190,32 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
             return Err(TlsError::Handshake(
                 "ServerHello extension overruns list".into(),
             ));
+        }
+        // RFC 8446 §4.2: no extension may appear twice in one message.
+        if seen_ext[..seen_len].contains(&ext_type) {
+            return Err(TlsError::Handshake(format!(
+                "duplicate ServerHello extension 0x{ext_type:04X}"
+            )));
+        }
+        if seen_len == seen_ext.len() {
+            // A 17th distinct type cannot be tracked; refuse the shape rather
+            // than silently stop enforcing the duplicate rule (RFC 8446 §4.2).
+            return Err(TlsError::Handshake(
+                "ServerHello carries more extensions than the duplicate gate tracks".into(),
+            ));
+        }
+        seen_ext[seen_len] = ext_type;
+        seen_len += 1;
+        // RFC 8446 §4.2: a server MUST NOT respond with an extension the
+        // client did not offer. `cookie` is the HRR exception (the client's
+        // first hello has none), and the check is skipped for the parser-only
+        // unit tests that do not carry a ClientHello.
+        if offered_exts
+            .is_some_and(|offered| ext_type != EXT_COOKIE && !offered.contains(&ext_type))
+        {
+            return Err(TlsError::Handshake(format!(
+                "ServerHello carried unsolicited extension 0x{ext_type:04X}"
+            )));
         }
         let ext_data = &body[pos + scan_pos..pos + scan_pos + ext_len];
         scan_pos += ext_len;
@@ -1201,6 +1295,26 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
                 }
                 ems = true;
             }
+            0x0010 => {
+                // ALPN (RFC 7301 §3.1): the server selects exactly one
+                // protocol from the client's list.
+                let (list_len, rest) = ext_data
+                    .split_first_chunk::<2>()
+                    .ok_or_else(|| TlsError::Handshake("ServerHello ALPN too short".into()))?;
+                let list_len = usize::from(u16::from_be_bytes(*list_len));
+                if list_len != rest.len() || rest.is_empty() {
+                    return Err(TlsError::Handshake(
+                        "ServerHello ALPN list length does not match its body".into(),
+                    ));
+                }
+                let proto_len = usize::from(rest[0]);
+                if proto_len + 1 != rest.len() {
+                    return Err(TlsError::Handshake(
+                        "ServerHello ALPN must name exactly one protocol".into(),
+                    ));
+                }
+                alpn = Some(rest[1..].to_vec());
+            }
             _ => {}
         }
     }
@@ -1254,6 +1368,7 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
             mlkem_ciphertext,
             key_share_group: key_share_wire,
             ems: false,
+            alpn,
         })));
     }
     // TLS 1.2: no supported_versions, or one naming a pre-1.3 version.
@@ -1301,6 +1416,7 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedRe
         mlkem_ciphertext: None,
         key_share_group: None,
         ems,
+        alpn,
     })))
 }
 
@@ -1346,11 +1462,11 @@ mod tests {
     use super::{
         AEAD_TAG_LEN, AcceptAll, CONTENT_APPLICATION_DATA, HRR_RANDOM, HS_CERTIFICATE,
         HS_CERTIFICATE_VERIFY, HS_COMPRESSED_CERTIFICATE, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED,
-        HS_MESSAGE_HASH, HS_SERVER_HELLO, HandshakeParams, ParsedReply, ParsedServerHello,
-        Tls12Suite, TlsVersion, connect, decompress_bounded, decompress_certificate_message,
-        ensure_offered_sigalg, ensure_offered_suite, make_hs_msg, parse_certificate_message,
-        parse_certificate_verify, parse_encrypted_extensions, parse_server_hello,
-        read_server_hs_messages,
+        HS_MESSAGE_HASH, HS_SERVER_HELLO, HandshakeParams, MAX_FLIGHT_BUFFER, ParsedReply,
+        ParsedServerHello, Tls12Suite, TlsVersion, connect, decompress_bounded,
+        decompress_certificate_message, ensure_offered_alpn, ensure_offered_sigalg,
+        ensure_offered_suite, make_hs_msg, parse_certificate_message, parse_certificate_verify,
+        parse_encrypted_extensions, parse_server_hello, read_server_hs_messages,
     };
     use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
@@ -1531,7 +1647,7 @@ mod tests {
     /// `parse_server_hello` for the ServerHello-only unit tests (an HRR
     /// where a `ServerHello` is expected is a test bug, not a result).
     fn parse_sh(body: &[u8], sid: &[u8]) -> crate::error::Result<Box<ParsedServerHello>> {
-        match parse_server_hello(body, sid)? {
+        match parse_server_hello(body, sid, None)? {
             ParsedReply::Hello(sh) => Ok(sh),
             ParsedReply::Retry(_) => panic!("expected a ServerHello, got a HelloRetryRequest"),
         }
@@ -1799,7 +1915,7 @@ mod tests {
     #[test]
     fn parse_server_hello_recognises_a_hint_bearing_hrr() {
         let msg = hrr_message(&[0x11; 32], Some(0x11EC), Some(b"c00k13"));
-        match parse_server_hello(&msg[4..], &[0x11; 32]) {
+        match parse_server_hello(&msg[4..], &[0x11; 32], None) {
             Ok(ParsedReply::Retry(hrr)) => {
                 assert_eq!(hrr.selected_group, Some(0x11EC));
                 assert_eq!(hrr.cookie.as_deref(), Some(b"c00k13".as_slice()));
@@ -1816,7 +1932,7 @@ mod tests {
     #[test]
     fn parse_server_hello_recognises_a_cookie_only_hrr() {
         let msg = hrr_message(&[0x22; 32], None, Some(b"only-cookie"));
-        match parse_server_hello(&msg[4..], &[0x22; 32]) {
+        match parse_server_hello(&msg[4..], &[0x22; 32], None) {
             Ok(ParsedReply::Retry(hrr)) => {
                 assert_eq!(hrr.selected_group, None);
                 assert_eq!(hrr.cookie.as_deref(), Some(b"only-cookie".as_slice()));
@@ -1830,7 +1946,7 @@ mod tests {
     #[test]
     fn parse_server_hello_rejects_an_hrr_that_does_not_echo_the_session_id() {
         let msg = hrr_message(&[0x33; 32], Some(0x001D), None);
-        let Err(err) = parse_server_hello(&msg[4..], &[0x44; 32]) else {
+        let Err(err) = parse_server_hello(&msg[4..], &[0x44; 32], None) else {
             panic!("a mismatched session-id echo must be rejected");
         };
         assert!(
@@ -1855,7 +1971,7 @@ mod tests {
         body.extend_from_slice(&u16::try_from(exts.len()).unwrap().to_be_bytes());
         body.extend_from_slice(&exts);
         assert!(
-            parse_server_hello(&body, &[]).is_err(),
+            parse_server_hello(&body, &[], None).is_err(),
             "a non-HRR ServerHello with a 2-byte key_share must stay an error"
         );
     }
@@ -3254,5 +3370,111 @@ mod tests {
         // 0x0403 is in tls12_spec's signature_algorithms; 0x0203 (SHA-1) is not.
         ensure_offered_sigalg(&hello.handshake_bytes, 0x0403).unwrap();
         assert!(ensure_offered_sigalg(&hello.handshake_bytes, 0x0203).is_err());
+    }
+
+    /// RFC 7301 §3.1: a server that selects a protocol the hello never
+    /// offered must abort the handshake, not be trusted.
+    #[test]
+    fn alpn_selection_must_be_offered() {
+        let rng = ring::rand::SystemRandom::new();
+        let hello = build_hello(
+            &tls12_spec(),
+            &BuildParams {
+                server_name: "localhost",
+                alpn: None,
+                x25519_pub: &[0x33u8; 32],
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+        )
+        .unwrap();
+        ensure_offered_alpn(&hello.handshake_bytes, Some(b"h2")).unwrap();
+        ensure_offered_alpn(&hello.handshake_bytes, Some(b"http/1.1")).unwrap();
+        assert!(ensure_offered_alpn(&hello.handshake_bytes, Some(b"h3")).is_err());
+        ensure_offered_alpn(&hello.handshake_bytes, None).unwrap();
+    }
+
+    /// One extension may not appear twice (RFC 8446 §4.2).
+    #[test]
+    fn duplicate_server_hello_extension_is_rejected() {
+        let body = server_hello_body(&[(0x002b, vec![0x03, 0x04]), (0x002b, vec![0x03, 0x04])]);
+        let Err(err) = parse_server_hello(&body, &[], None) else {
+            panic!("duplicate extension must fail");
+        };
+        assert!(
+            err.to_string().contains("duplicate"),
+            "expected duplicate rejection, got {err:?}"
+        );
+    }
+
+    /// A server may not answer with an extension the hello did not carry
+    /// (RFC 8446 §4.2), except the HRR `cookie`.
+    #[test]
+    fn unsolicited_server_hello_extension_is_rejected() {
+        let body = server_hello_body(&[(0x1234, Vec::new())]);
+        let Err(err) = parse_server_hello(&body, &[], Some(&[0x002b, 0x0033])) else {
+            panic!("unsolicited extension must fail");
+        };
+        assert!(
+            err.to_string().contains("unsolicited"),
+            "expected unsolicited rejection, got {err:?}"
+        );
+    }
+
+    /// Minimal `ServerHello` body carrying `exts`, for the parser gates.
+    fn server_hello_body(exts: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x11u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(0);
+        let mut encoded = Vec::new();
+        for (ty, data) in exts {
+            encoded.extend_from_slice(&ty.to_be_bytes());
+            encoded.extend_from_slice(
+                &u16::try_from(data.len())
+                    .expect("test extension fits u16")
+                    .to_be_bytes(),
+            );
+            encoded.extend_from_slice(data);
+        }
+        body.extend_from_slice(
+            &u16::try_from(encoded.len())
+                .expect("test extension list fits u16")
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(&encoded);
+        body
+    }
+
+    /// A malicious server cannot make one dial accumulate an unbounded
+    /// handshake flight: past 512 KiB the reader fails, before the message is
+    /// complete.
+    #[tokio::test]
+    async fn oversized_server_flight_is_bounded() {
+        let suite = CipherSuiteId::Aes128GcmSha256;
+        let key = AeadKey::from_key_bytes(suite, &[0x11; 16]).unwrap();
+        let writer_key = key.clone_key();
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            let body_len = MAX_FLIGHT_BUFFER + 1;
+            let mut msg = Vec::with_capacity(4 + body_len);
+            msg.push(HS_CERTIFICATE);
+            msg.extend_from_slice(&u32::try_from(body_len).unwrap().to_be_bytes()[1..]);
+            msg.resize(4 + body_len, 0x5a);
+            for (seq, chunk) in msg.chunks(16 * 1024).enumerate() {
+                write_encrypted_flight_chunk(&mut server, &writer_key, seq as u64, chunk).await;
+            }
+        });
+        let Err(err) = read_server_hs_messages(&mut client, &key, &[]).await else {
+            panic!("an oversized flight must be rejected");
+        };
+        writer.abort();
+        let _ = writer.await;
+        assert!(
+            err.to_string().contains("512 KiB"),
+            "expected the flight bound, got {err:?}"
+        );
     }
 }
