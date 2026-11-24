@@ -48,3 +48,19 @@ spec! {
           appsettings["h2"],
           grease, padding
 }
+
+/// Declared-profile capability mask for `chrome_130` (see `spec::caps`).
+pub const CHROME_130_CAPS: crate::spec::caps::HelloCaps = crate::spec::caps::HelloCaps {
+    ext: 0xd3fff,
+    ciphers: 0xf,
+    sigalgs: 0x1fb,
+    groups: 0xf,
+};
+
+/// Declared-profile capability mask for `edge_106`.
+pub const EDGE_106_CAPS: crate::spec::caps::HelloCaps = crate::spec::caps::HelloCaps {
+    ext: 0xd3fff,
+    ciphers: 0xf,
+    sigalgs: 0x1fb,
+    groups: 0xf,
+};

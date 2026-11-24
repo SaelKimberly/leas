@@ -636,6 +636,7 @@ mod roster {
             major: 130,
             ja4: super::CHROME130_JA4,
             spec_fn: leas_tls::profiles::hand_selected::chrome_130,
+            caps: leas_tls::profiles::hand_selected::CHROME_130_CAPS,
         });
         entries.push(GenEntry {
             name: "edge_106",
@@ -645,6 +646,7 @@ mod roster {
             major: 106,
             ja4: super::EDGE106_JA4,
             spec_fn: leas_tls::profiles::hand_selected::edge_106,
+            caps: leas_tls::profiles::hand_selected::EDGE_106_CAPS,
         });
         entries
     }

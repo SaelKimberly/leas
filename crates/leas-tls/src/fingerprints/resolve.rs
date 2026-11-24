@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::spec::ClientHelloSpec;
+use crate::spec::caps::HelloCaps;
 
 /// Process-wide cache of built specs, keyed by the resolved roster row.
 /// A spec is immutable once built; only the per-connection key share and
@@ -47,6 +48,8 @@ pub(crate) struct Row {
     /// kept major (its smallest `min_version`).
     pub min_version: u16,
     pub spec: fn() -> ClientHelloSpec,
+    /// Compile-time declared-profile capability mask.
+    pub caps: HelloCaps,
 }
 
 use crate::profiles::hand_selected;
@@ -62,6 +65,7 @@ static HAND_ROWS: &[Row] = &[
         max_version: 130,
         min_version: 0,
         spec: hand_selected::chrome_130,
+        caps: hand_selected::CHROME_130_CAPS,
     },
     Row {
         name: "edge_106",
@@ -71,6 +75,7 @@ static HAND_ROWS: &[Row] = &[
         max_version: 106,
         min_version: 0,
         spec: hand_selected::edge_106,
+        caps: hand_selected::EDGE_106_CAPS,
     },
 ];
 /// The merged resolution table: [`HAND_ROWS`] then the derived generated
@@ -115,6 +120,7 @@ fn generated_rows() -> Vec<Row> {
             max_version: e.major,
             min_version: e.major,
             spec: e.spec_fn,
+            caps: e.caps,
         })
         .collect()
 }
@@ -254,6 +260,7 @@ impl Fingerprint {
             name: row.name,
             fingerprint,
             spec,
+            caps: row.caps,
         })
     }
 
@@ -309,6 +316,8 @@ pub struct ResolvedShared {
     pub name: &'static str,
     pub fingerprint: Fingerprint,
     pub spec: Arc<ClientHelloSpec>,
+    /// O(1) declared-profile predicates; never describes a mutated spec.
+    pub caps: HelloCaps,
 }
 
 impl Resolved {

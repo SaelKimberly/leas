@@ -1164,6 +1164,74 @@ def _spec_text(entry):
     return "\n".join(lines)
 
 
+# Compile-time HelloCaps bit positions (spec/caps.rs). Kept explicit so a
+# roster entry can answer declared-profile predicates without a Vec scan.
+_EXT_BITS = {
+    "ServerName": 0, "SignatureAlgorithms": 1, "SupportedGroups": 2,
+    "KeyShare": 3, "SupportedVersions": 4, "Alpn": 5,
+    "EcPointFormats": 6, "SessionTicket": 7, "PskKeyExchangeModes": 8,
+    "StatusRequest": 9, "SignedCertificateTimestamp": 10,
+    "RenegotiationInfo": 11, "CompressCertificate": 12,
+    "RecordSizeLimit": 15, "Padding": 16, "EchGrease": 17, "Grease": 19,
+    "EncryptThenMac": 20, "DelegatedCredentials": 21,
+    "PostHandshakeAuth": 22, "SignatureAlgorithmsCert": 23,
+}
+_RAW_EXT_BITS = {0x0016: 20, 0x0017: 18, 0x0022: 21, 0x0031: 22,
+                 0x0032: 23, 0x4469: 13, 0x44CD: 14}
+_SIG_BITS = {
+    0x0403: 0, 0x0503: 1, 0x0603: 2, 0x0401: 3, 0x0501: 4, 0x0601: 5,
+    0x0804: 6, 0x0805: 7, 0x0806: 8, 0x0809: 9, 0x080A: 10, 0x080B: 11,
+    0x0807: 12, 0x0808: 13, 0x0402: 14, 0x0502: 15, 0x0602: 16,
+    0x0203: 17, 0x0201: 18, 0x0904: 19, 0x0905: 20, 0x0906: 21,
+    0x0202: 22, 0x0301: 23, 0x0302: 24, 0x0303: 25,
+}
+_GROUP_BITS = {"Grease": 0, "X25519": 1, 0x001D: 1, "p256": 2, 0x0017: 2,
+               "p384": 3, 0x0018: 3, "X25519Mlkem768": 4, 0x11EC: 4,
+               "p521": 5, 0x0019: 5, "ffdhe2048": 6, 0x0100: 6,
+               "ffdhe3072": 7, 0x0101: 7}
+_CIPHER_BITS = {0x1301: 1, 0x1302: 2, 0x1303: 4}
+
+
+def _caps_text(entry):
+    """The `HelloCaps { .. }` literal for one manifest entry."""
+    wire = entry["wire"]
+    ext = 0
+    sig = 0
+    groups = 0
+    for e in wire["extensions"]:
+        kind = e["kind"]
+        if kind == "Raw":
+            ext |= 1 << _RAW_EXT_BITS.get(e.get("ty", 0), 0) if e.get("ty") in _RAW_EXT_BITS else 0
+        elif kind == "ApplicationSettings":
+            ext |= 1 << (13 if e.get("ty") == 0x4469 else 14)
+        elif kind in _EXT_BITS:
+            ext |= 1 << _EXT_BITS[kind]
+        if kind == "SignatureAlgorithms":
+            for v in e["args"][0]:
+                if v in _SIG_BITS:
+                    sig |= 1 << _SIG_BITS[v]
+        elif kind in ("SupportedGroups", "KeyShare"):
+            for v in e["args"][0]:
+                if v in _GROUP_BITS:
+                    groups |= 1 << _GROUP_BITS[v]
+    ciphers = 0
+    for c in wire["cipher_order"]:
+        ciphers |= 8 if is_grease(c) else _CIPHER_BITS.get(c, 0)
+    def sep(value):
+        raw = f"{value:x}"
+        parts = []
+        while len(raw) > 4:
+            parts.append(raw[-4:])
+            raw = raw[:-4]
+        parts.append(raw)
+        return "_".join(reversed(parts))
+
+    sig_hex = f"{sig:08x}"
+    sig_hex = f"{sig_hex[:4]}_{sig_hex[4:]}"
+    return (f"HelloCaps {{ ext: 0x{sep(ext)}, ciphers: 0x{ciphers:x}, "
+            f"sigalgs: 0x{sig_hex}, groups: 0x{sep(groups)} }}")
+
+
 def _gen_entry_text(entry):
     """One `GenEntry { ... }` registry literal (generated/mod.rs struct)."""
     name = entry["name"]
@@ -1183,6 +1251,7 @@ def _gen_entry_text(entry):
             f"        major: {entry['browser_major']},\n"
             f"        ja4: {json.dumps(entry['ja4'])},\n"
             f"        spec_fn: {name},\n"
+            f"        caps: {_caps_text(entry)},\n"
             "    },")
 
 
@@ -1198,6 +1267,7 @@ def _render_family_module(module, entries):
     )
     if entries:
         header += "use crate::fingerprints::{Browser, Device, Os};\n"
+        header += "use crate::spec::caps::HelloCaps;\n"
     if not entries:
         return (header + "\n" +
                 "// No corpus entries for this family yet; the registry\n"
@@ -1235,6 +1305,7 @@ def _render_mod(by_family):
         "\n"
         "use crate::fingerprints::{Browser, Device, Os};\n"
         "use crate::spec::ClientHelloSpec;\n"
+        "use crate::spec::caps::HelloCaps;\n"
         "\n"
         "/// One generated roster entry: identity, registered source JA4 and\n"
         "/// the spec builder. `name` doubles as the spec function id.\n"
@@ -1247,6 +1318,8 @@ def _render_mod(by_family):
         "    pub major: u16,\n"
         "    pub ja4: &'static str,\n"
         "    pub spec_fn: fn() -> ClientHelloSpec,\n"
+        "    /// Compile-time declared-profile capability mask.\n"
+        "    pub caps: HelloCaps,\n"
         "}\n"
         "\n"
         "/// Every generated profile, family by family (module order).\n"

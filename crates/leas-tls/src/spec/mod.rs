@@ -5,6 +5,7 @@
 //! Browser fingerprint profiles (built by later tasks) are expressed in
 //! terms of these types.
 
+pub mod caps;
 pub mod grease;
 
 use crate::error::TlsError;

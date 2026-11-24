@@ -17,6 +17,7 @@ pub mod safari_ios;
 
 use crate::fingerprints::{Browser, Device, Os};
 use crate::spec::ClientHelloSpec;
+use crate::spec::caps::HelloCaps;
 
 /// One generated roster entry: identity, registered source JA4 and
 /// the spec builder. `name` doubles as the spec function id.
@@ -29,6 +30,8 @@ pub struct GenEntry {
     pub major: u16,
     pub ja4: &'static str,
     pub spec_fn: fn() -> ClientHelloSpec,
+    /// Compile-time declared-profile capability mask.
+    pub caps: HelloCaps,
 }
 
 /// Every generated profile, family by family (module order).

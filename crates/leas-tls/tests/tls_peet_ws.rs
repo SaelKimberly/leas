@@ -271,6 +271,7 @@ fn combined_roster() -> Vec<GenEntry> {
         major: 130,
         ja4: CHROME130_JA4,
         spec_fn: leas_tls::profiles::hand_selected::chrome_130,
+        caps: leas_tls::profiles::hand_selected::CHROME_130_CAPS,
     });
     entries.push(GenEntry {
         name: "edge_106",
@@ -280,6 +281,7 @@ fn combined_roster() -> Vec<GenEntry> {
         major: 106,
         ja4: CHROME130_JA4, // same expected JA4 as chrome_130 (hand-captured)
         spec_fn: leas_tls::profiles::hand_selected::edge_106,
+        caps: leas_tls::profiles::hand_selected::EDGE_106_CAPS,
     });
     entries
 }
