@@ -231,7 +231,7 @@ fn reality_caps_match_the_spec_rule() {
     }
 }
 
-/// Resumption changes the declared hello shape (pre_shared_key); the resumed
+/// Resumption changes the declared hello shape (`pre_shared_key`); the resumed
 /// JA4 is a separate value and the default roster goldens stay untouched.
 #[test]
 fn resumed_shape_has_its_own_ja4() {

@@ -73,7 +73,8 @@ pub fn take(server: &str, offered_alpn: &[&[u8]], allowed_suites: &[u16]) -> Opt
 }
 
 #[cfg(test)]
-pub(crate) fn test_ticket(ticket: &[u8], psk: &[u8]) -> CachedTicket {
+#[allow(unreachable_pub, reason = "test-only ticket constructor")]
+pub fn test_ticket(ticket: &[u8], psk: &[u8]) -> CachedTicket {
     let suite = crate::crypto::CipherSuiteId::Aes128GcmSha256;
     CachedTicket {
         ticket: ticket.to_vec(),
