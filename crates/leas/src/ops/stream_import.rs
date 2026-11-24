@@ -73,22 +73,55 @@ pub trait UrlSource: Send {
 /// HTTP-backed source: one response body, streamed.
 pub struct HttpSource {
     response: reqwest::Response,
+    /// `scheme://host[:port]/path` of the final response URL, so a body-read
+    /// failure names WHICH feed broke (2026-11-24 audit G7). Query/fragment
+    /// dropped: a subscription URL can carry a token.
+    source: String,
+    bytes: usize,
 }
 
 impl HttpSource {
     #[must_use]
-    pub const fn new(response: reqwest::Response) -> Self {
-        Self { response }
+    pub fn new(response: reqwest::Response) -> Self {
+        let source = source_label(response.url());
+        Self {
+            response,
+            source,
+            bytes: 0,
+        }
     }
+}
+
+/// Cap for [`source_label`]: long enough for origin + path, short enough that a
+/// pasted multi-kilobyte path cannot flood the log store.
+const SOURCE_LABEL_MAX: usize = 96;
+
+/// `scheme://host[:port]/path`, query and fragment dropped, capped.
+fn source_label(url: &reqwest::Url) -> String {
+    let mut out = url.origin().ascii_serialization();
+    out.push_str(url.path());
+    if out.chars().count() > SOURCE_LABEL_MAX {
+        out = out.chars().take(SOURCE_LABEL_MAX - 1).collect();
+        out.push('…');
+    }
+    out
+}
+
+/// One body-read failure's text: source, bytes already served, cause.
+fn body_read_error(source: &str, bytes: usize, cause: &impl std::fmt::Display) -> String {
+    format!("body read failed for {source} after {bytes} bytes: {cause}")
 }
 
 impl UrlSource for HttpSource {
     fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<SourceBatch>> + Send + '_>> {
         Box::pin(async {
             match self.response.chunk().await {
-                Ok(Some(chunk)) => Some(Ok(chunk)),
+                Ok(Some(chunk)) => {
+                    self.bytes = self.bytes.saturating_add(chunk.len());
+                    Some(Ok(chunk))
+                }
                 Ok(None) => None,
-                Err(e) => Some(Err(e.to_string())),
+                Err(e) => Some(Err(body_read_error(&self.source, self.bytes, &e))),
             }
         })
     }
@@ -263,7 +296,7 @@ where
                     if let Err(e) = batcher.feed(&chunk) {
                         tracing::error!(
                             target: "tui::ops::subscriptions",
-                            "Source data could not be decoded: {e} — keeping already-stored batches"
+                            "Source data could not be decoded after {feed_bytes} bytes: {e} — keeping already-stored batches"
                         );
                         ended_early = Some(format!("undecodable source data: {e}"));
                         break None;
@@ -659,8 +692,8 @@ async fn flush_import(
 ///
 /// # Errors
 ///
-/// The failure text, already logged, when the proxy or the client cannot be
-/// built.
+/// The failure text when the proxy or the client cannot be built; logging is
+/// the caller's (it travels in `ended_early`, one line per event).
 pub(crate) fn http_client(
     user_agent: &str,
     proxy: Option<&ProxyEndpoint>,
@@ -680,7 +713,8 @@ pub(crate) fn http_client(
         builder = builder.proxy(configured);
     }
     builder.build().map_err(|e| {
-        tracing::error!(target: "tui::ops::subscriptions", "HTTP client build failed: {e}");
+        // No `tracing::error!`: the caller's INCOMPLETE line owns this text
+        // (`ended_early` carries it) — one event, one line (audit G8).
         format!("HTTP client build failed: {e}")
     })
 }
@@ -712,8 +746,11 @@ pub async fn import_http_subscription(
             // reqwest's Display is "error sending request for url (…)" — the
             // stage (DNS, TLS, timeout, disk) is only in the source chain, and
             // the 2026-11-19/20 run left 24 such lines with no cause.
+            // No `tracing::error!` here: the import pipeline's INCOMPLETE
+            // line and the `Subscription update failed` event are the single
+            // owners of this text (`ended_early` carries it), so one network
+            // failure used to be logged twice (2026-11-24 audit G8).
             let why = describe_error(&e);
-            tracing::error!(target: "tui::ops::subscriptions", "HTTP fetch failed: {why}");
             return ImportOutcome {
                 ended_early: Some(format!("HTTP fetch failed: {why}")),
                 ..ImportOutcome::default()
@@ -760,6 +797,65 @@ mod tests {
     use leas_config::import_export::ValidationSettings;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn source_label_keeps_origin_and_path_without_query() {
+        let url =
+            reqwest::Url::parse("https://feed.example:8443/sub/token?key=secret#frag").unwrap();
+        assert_eq!(source_label(&url), "https://feed.example:8443/sub/token");
+        let long = format!("https://h.example/{}", "a".repeat(200));
+        let label = source_label(&reqwest::Url::parse(&long).unwrap());
+        assert!(label.chars().count() <= SOURCE_LABEL_MAX, "{label}");
+        assert!(label.ends_with('…'), "{label}");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_body_names_the_source_and_served_bytes() {
+        leas_core::ensure_tls_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("feed bind");
+        let port = listener.local_addr().expect("feed addr").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("feed accept");
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.expect("request");
+                head.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5000\r\n\r\n")
+                .await
+                .expect("head");
+            stream.write_all(&[b'a'; 100]).await.expect("partial body");
+            stream.shutdown().await.expect("truncate");
+        });
+
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            import_http_subscription(
+                &format!("http://127.0.0.1:{port}/feed"),
+                "leas-test",
+                &db,
+                None,
+                &ValidationSettings::default(),
+                leas_config::app_config::ImportConfig::default(),
+                None,
+            ),
+        )
+        .await
+        .expect("import timed out");
+        server.await.expect("feed task");
+
+        let reason = outcome
+            .ended_early
+            .expect("a truncated body must end early");
+        assert!(
+            reason.contains(&format!("for http://127.0.0.1:{port}/feed")),
+            "{reason}"
+        );
+        assert!(reason.contains("after 100 bytes"), "{reason}");
+    }
 
     fn valid_vmess_url(host: &str) -> String {
         let qr = serde_json::json!({

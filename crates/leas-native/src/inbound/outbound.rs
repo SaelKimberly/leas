@@ -303,13 +303,18 @@ struct Idle {
     base: tokio::time::Instant,
     /// Nanoseconds since `base` at the last byte moved in either direction.
     last_ns: AtomicU64,
+    /// Inactivity cap. Injectable so a timeout test does not have to virtual-
+    /// time its way past the shipped 90 s (a constant bump must not red a
+    /// test whose subject is the bound, not its value).
+    cap: Duration,
 }
 
 impl Idle {
-    fn new() -> Self {
+    fn new(cap: Duration) -> Self {
         Self {
             base: tokio::time::Instant::now(),
             last_ns: AtomicU64::new(0),
+            cap,
         }
     }
 
@@ -321,9 +326,7 @@ impl Idle {
 
     /// The instant the tunnel becomes idle, given the last activity seen.
     fn deadline(&self) -> tokio::time::Instant {
-        self.base
-            + Duration::from_nanos(self.last_ns.load(Ordering::Relaxed))
-            + timeouts::RELAY_IDLE
+        self.base + Duration::from_nanos(self.last_ns.load(Ordering::Relaxed)) + self.cap
     }
 }
 
@@ -331,12 +334,22 @@ impl Idle {
 /// half-closing each direction on EOF and failing the tunnel once NEITHER
 /// direction has moved bytes for [`timeouts::RELAY_IDLE`].
 pub(crate) async fn relay(client: TcpStream, upstream: BoxStream) -> Result<(), NativeError> {
+    relay_with_cap(client, upstream, timeouts::RELAY_IDLE).await
+}
+
+/// [`relay`] with an injectable inactivity cap (tests only; production passes
+/// [`timeouts::RELAY_IDLE`]).
+async fn relay_with_cap(
+    client: TcpStream,
+    upstream: BoxStream,
+    cap: Duration,
+) -> Result<(), NativeError> {
     // Owned halves for the client: `tokio::io::split` puts the stream behind
     // an `Arc<Mutex<..>>` that is locked on every poll. The upstream is a
     // trait object with no owned split, so it keeps the locking form.
     let (client_r, client_w) = client.into_split();
     let (up_r, up_w) = tokio::io::split(upstream);
-    let idle = Arc::new(Idle::new());
+    let idle = Arc::new(Idle::new(cap));
     // One future per direction instead of one `select!` over both: an error
     // still tears the peer direction down, but a write in flight is never
     // cancelled by the *other* direction completing.
@@ -371,7 +384,7 @@ where
     // Write progress gets its OWN deadline: the shared idle stamp is slid by
     // the other direction, so a peer that stops reading would otherwise pin
     // this half forever while a live downlink keeps the tunnel "alive".
-    let stall = tokio::time::sleep(timeouts::RELAY_IDLE);
+    let stall = tokio::time::sleep(idle.cap);
     tokio::pin!(stall);
     loop {
         let deadline = idle.deadline();
@@ -405,9 +418,7 @@ where
         let chunk = &buf.as_mut_slice()[..n];
         let mut off = 0usize;
         while off < chunk.len() {
-            stall
-                .as_mut()
-                .reset(tokio::time::Instant::now() + timeouts::RELAY_IDLE);
+            stall.as_mut().reset(tokio::time::Instant::now() + idle.cap);
             let written = tokio::select! {
                 // `write` is cancel-safe between bytes: a cancelled arm keeps
                 // the count and the loop resumes at `off`.
@@ -966,12 +977,21 @@ mod tests {
     async fn a_stalled_reader_ends_the_write_half() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (upstream_side, peer) = tokio::io::duplex(64 * 1024);
+        // A real TCP peer, not `duplex` + `split`: the duplex halves share one
+        // BiLock, so a blocked downlink write stalls the drain that keeps the
+        // uplink moving, and both timers expire together (the assertion below
+        // then depends on poll order). Production halves are independent.
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap();
         let relayed = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            relay(sock, Box::new(upstream_side)).await
+            let (peer_sock, _) = peer_listener.accept().await.unwrap();
+            // A 5 s cap: the fixture cannot virtual-time its way past the
+            // shipped 90 s reliably once both halves stall at the same stamp.
+            relay_with_cap(sock, Box::new(peer_sock), Duration::from_secs(5)).await
         });
-        let (mut peer_r, mut peer_w) = tokio::io::split(peer);
+        let peer = tokio::net::TcpStream::connect(peer_addr).await.unwrap();
+        let (mut peer_r, mut peer_w) = peer.into_split();
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
 
         // Uplink stays alive for the whole test: this is the masking case.
@@ -989,8 +1009,10 @@ mod tests {
             while matches!(peer_r.read(&mut sink).await, Ok(n) if n > 0) {}
         });
         let downlink = tokio::spawn(async move {
+            // 64 MiB, not 4: a real TCP socket buffers several MiB, so a
+            // smaller push can all fit and the write never stalls.
             let block = vec![0xCD; 64 * 1024];
-            for _ in 0..64 {
+            for _ in 0..1024 {
                 if peer_w.write_all(&block).await.is_err() {
                     break;
                 }
@@ -1008,9 +1030,14 @@ mod tests {
             .await
             .expect("relay task must finish once the write half is stalled")
             .expect_err("a stalled reader must end the tunnel");
+        // The uplink's touches lag the virtual advances here, so both timers
+        // can fire inside one step and either may win; what the tunnel must
+        // NOT do is hang. The isolated test below pins that the write bound
+        // alone fires while the shared stamp moves.
+        let text = err.to_string();
         assert!(
-            err.to_string().contains("relay write timed out"),
-            "the WRITE half must be the one that fires: {err}"
+            text.contains("relay write timed out") || text.contains("relay read timed out"),
+            "a stalled reader must end the tunnel: {err}"
         );
         uplink.abort();
         drain.abort();
@@ -1081,6 +1108,42 @@ mod tests {
         );
     }
 
+    /// The write bound is what stops a peer that refuses to read from pinning
+    /// this half forever while the shared stamp is kept alive by the other
+    /// direction (issue 002). Drive `copy_half` alone so the shared read
+    /// timer is never polled: only the write stall can end it.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_write_fires_while_the_shared_stamp_moves() {
+        let cap = Duration::from_secs(5);
+        let idle = Arc::new(Idle::new(cap));
+        let (feed, mut feeder) = tokio::io::duplex(64 * 1024);
+        // Nobody ever reads the sink: the first chunk fills its 64 bytes and
+        // the write blocks.
+        let (sink, sink_reader) = tokio::io::duplex(64);
+        let push = tokio::spawn(async move {
+            let _ = feeder.write_all(&[0xCD; 4096]).await;
+            std::future::pending::<()>().await;
+        });
+        // The mask: the tunnel stamp keeps sliding under the blocked write.
+        let keep = {
+            let idle = Arc::clone(&idle);
+            tokio::spawn(async move {
+                loop {
+                    idle.touch();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        let mut buf = RelayBuf::new();
+        let err = copy_half(feed, sink, &mut buf, &idle)
+            .await
+            .expect_err("a blocked write must time out");
+        assert!(err.to_string().contains("relay write timed out"), "{err}");
+        push.abort();
+        keep.abort();
+        drop(sink_reader);
+    }
+
     /// The promotion has to be observable through the function that owns the
     /// read/write loop, not only through `RelayBuf` directly: a regression that
     /// stops calling `filled` must fail something.
@@ -1093,9 +1156,14 @@ mod tests {
                 let _ = server.write_all(&payload).await;
             });
             let mut buf = RelayBuf::new();
-            copy_half(client, tokio::io::sink(), &mut buf, &Idle::new())
-                .await
-                .expect("copy half");
+            copy_half(
+                client,
+                tokio::io::sink(),
+                &mut buf,
+                &Idle::new(timeouts::RELAY_IDLE),
+            )
+            .await
+            .expect("copy half");
             feeder.await.expect("feeder");
             buf.capacity()
         }

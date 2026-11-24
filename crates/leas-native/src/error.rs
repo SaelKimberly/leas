@@ -248,9 +248,12 @@ pub mod timeouts {
     /// longer than 30 s; the 2026-11-19/20 run reaped 652 of 661
     /// `gateway.discord.gg` connections and 8 760 of 10 217 in total, producing
     /// a reconnect loop with no transport fault (log study,
-    /// `docs/research/2026-11-20-log-review-real-test.md` §3). The CONNECT
-    /// budget is [`Self::CONNECT`] and is unaffected.
-    pub const RELAY_IDLE: Duration = Duration::from_secs(60);
+    /// `docs/research/2026-11-20-log-review-real-test.md` §3). 60 s still
+    /// reaped long-poll sessions (2026-11-24 audit: 2 985 reaps, 2 930 after
+    /// traffic, 947.8 MB — `mtalk.google.com:5228` 964, Telegram web 276,
+    /// GitHub alive 196), so the cap is 90 s; the CONNECT budget is
+    /// [`Self::CONNECT`] and is unaffected.
+    pub const RELAY_IDLE: Duration = Duration::from_secs(90);
     /// One carrier build's aggregate ceiling, per chain link (spec 2026-11-17 §6).
     ///
     /// The four stage limits above bound each step; this bounds their sum
