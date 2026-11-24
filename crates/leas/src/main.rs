@@ -360,6 +360,15 @@ async fn run_app() -> Result<()> {
         let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
     }
     let db = Database::open(&db_path).await?;
+    // A native-support upgrade must invalidate the persisted "not testable"
+    // verdicts; the revision is owned by the capability table, not this crate.
+    if let Err(e) = db
+        .clear_stale_capability_verdicts(leas_native::capability::SUPPORT_REVISION)
+        .await
+    {
+        // No subscriber exists yet at this step; eprintln is the only channel.
+        eprintln!("leas: capability-verdict clear: {e}");
+    }
     // The driver creates data.db-wal (and data.db-shm) with its own open,
     // which passes no create-time mode, so they inherit the umask and land
     // 0644 at umask 022 unless tightened here, after the driver has created

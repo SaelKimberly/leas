@@ -55,7 +55,7 @@ Startup order in `main`:
 
 1. `install_tls_provider()` installs the ring `CryptoProvider` process-wide, before any TLS consumer (reqwest, QUIC ping, hickory DoH).
 2. `AppConfig::load()` reads `~/.config/leas/config.json`.
-3. `Database::open()` opens `~/.config/leas/data.db`; the directory is tightened to `0700` and the database plus `-wal`/`-shm` sidecars to `0600` on Unix, because the file holds cleartext proxy credentials. A failed open (another instance's lock, an IO error, a corrupt file) PROPAGATES and leaves the file untouched; only an unknown schema cursor wipes it.
+3. `Database::open()` opens `~/.config/leas/data.db`; the directory is tightened to `0700` and the database plus `-wal`/`-shm` sidecars to `0600` on Unix, because the file holds cleartext proxy credentials. A failed open (another instance's lock, an IO error, a corrupt file) PROPAGATES and leaves the file untouched; only an unknown schema cursor wipes it. After it, `clear_stale_capability_verdicts(SUPPORT_REVISION)` clears the persisted `not testable by the native engine:` verdicts once per native-support revision (`app_meta.capability_version`).
 4. `HeedLogStorage::new()` opens `~/.config/leas/logs.lmdb`; a `spawn_blocking` writer drains a bounded 4096-message channel in batches of up to 100 per heed transaction, polling every 200 ms so it can notice `shutdown_token` at quit. The persisted half is the message plus a bounded, non-secret allowlist (`error`, `target`, `tag`, `kind`, `endpoint_id`); every other field, `db.params` above all, stays session-only because a bind value can be `protocols.config`.
 5. `AppState::new()` builds the shared state, then `ui::run(&mut state)` owns the terminal and the event loop.
 

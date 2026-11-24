@@ -14,6 +14,13 @@ pub use models_toasty as models;
 pub use models_toasty::EndpointRank;
 pub use models_toasty::RouteProbes;
 pub use retry::{is_busy_error, retry_on_busy};
+/// Persisted discriminator for a link the native engine cannot serve
+/// (`profile_stats.error_text`).
+///
+/// The storage owner defines it so the binary's writer/readers and the
+/// one-time capability clear cannot drift.
+pub const UNTESTABLE_PREFIX: &str = "not testable by the native engine: ";
+
 pub use write_behind::{
     CacheSpec, Coalesced, CountryPatch, CountryRow, CountrySpec, LinkRow, LinkSpec, LinkStageKey,
     SourceBatch, SourcePatch, SourceSpec, WriteBehind,

@@ -536,6 +536,67 @@ impl Database {
         Ok(())
     }
 
+    /// One-time clear of the `not testable by the native engine: …` verdicts
+    /// when the native engine gains a shape (audit §D4). The caller owns the
+    /// revision (`leas-native::capability::SUPPORT_REVISION`): this crate
+    /// cannot see the capability table, so it cannot derive the version.
+    ///
+    /// Marker-gated (`app_meta.capability_version`). Only a live row whose
+    /// error is the untestable marker is cleared; a real probe failure and a
+    /// purge verdict are facts about the link and stay. The cleared endpoint
+    /// ranks are refreshed because a real-error tier change moves them.
+    pub async fn clear_stale_capability_verdicts(&self, version: i64) -> Result<()> {
+        const MARKER: &str = "capability_version";
+        let mut conn = self.conn().await?;
+        if crate::schema::rekey::marker_value(&mut conn, MARKER).await? >= version {
+            return Ok(());
+        }
+        let pattern = format!("{}%", crate::UNTESTABLE_PREFIX);
+        let rows = toasty::sql::query(format!(
+            "SELECT DISTINCT endpoint_id FROM profile_stats WHERE error_kind = 'real' \
+             AND error_text LIKE {} AND purge_reason IS NULL",
+            sql_lit(&pattern)
+        ))
+        .exec(&mut conn)
+        .await?;
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|row| match row {
+                toasty_core::stmt::Value::Record(f) => match f.first() {
+                    Some(toasty_core::stmt::Value::I64(id)) => Some(*id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let mut endpoints: Vec<EndpointId> = Vec::new();
+        for chunk in ids.chunks(400) {
+            let list = chunk
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            toasty::sql::query(format!(
+                "UPDATE profile_stats SET error = NULL, error_kind = NULL, \
+                 error_text = NULL, error_stage = NULL, error_cause = NULL, \
+                 updated_at = {} WHERE endpoint_id IN ({list}) AND error_kind = 'real' \
+                 AND error_text LIKE {} AND purge_reason IS NULL",
+                crate::models_toasty::now_epoch(),
+                sql_lit(&pattern)
+            ))
+            .exec(&mut conn)
+            .await?;
+            endpoints.extend(chunk.iter().map(|id| EndpointId::new(*id)));
+        }
+        drop(conn);
+        if !endpoints.is_empty() {
+            let _ = self.refresh_endpoint_ranks(&endpoints).await;
+        }
+        let mut conn = self.conn().await?;
+        crate::schema::rekey::stamp_marker(&mut conn, MARKER, version).await?;
+        Ok(())
+    }
+
     /// True when this handle reads the page through the long-lived direct
     /// turso connection (T13) — a file-backed database. False for an in-memory
     /// one, which uses the toasty execution path.
@@ -3928,6 +3989,185 @@ mod tests {
             2,
             "two distinct addresses, however many links name them"
         );
+    }
+
+    /// A capability upgrade invalidates the persisted "not testable" verdict
+    /// once: the marker gates the clear, an ordinary failure and a purge
+    /// verdict survive, and the same revision does not re-clear a fresh marker.
+    #[tokio::test]
+    async fn stale_capability_verdicts_clear_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capability.db");
+        let now = crate::models_toasty::now_epoch();
+        {
+            let db = Database::open(&path).await.expect("fresh open");
+            let mut conn = db.connection().await.expect("connection");
+            for (ep, pid) in [(1, 1001), (2, 2001), (3, 3001)] {
+                toasty::create!(Endpoint {
+                    created_at: 0,
+                    id: EndpointId::new(ep),
+                    domain: Endpoint::derive_domain(&format!("10.0.3.{ep}"), HostType::Ipv4).0,
+                    sub_domain: Endpoint::derive_domain(&format!("10.0.3.{ep}"), HostType::Ipv4).1,
+                    port: 443,
+                    ports: Vec::<u16>::new(),
+                })
+                .exec(&mut conn)
+                .await
+                .expect("create endpoint");
+                toasty::create!(Protocol {
+                    created_at: 0,
+                    id: ProtocolId::new(pid),
+                    sig: pid,
+                    proto_kind: ProtocolKind::Vless,
+                    transport: tcp_transport(),
+                    security: no_security(),
+                    config: Deferred::from(Json(
+                        serde_json::from_value(serde_json::json!({
+                            "schema": "Vless",
+                            "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d",
+                            "transport": {"type": "tcp"}
+                        }))
+                        .expect("config"),
+                    )),
+                })
+                .exec(&mut conn)
+                .await
+                .expect("create protocol");
+                toasty::create!(ProfileStats {
+                    created_at: 0,
+                    updated_at: 0,
+                    protocol_id: ProtocolId::new(pid),
+                    endpoint_id: EndpointId::new(ep),
+                    last_seen_at: ts(now),
+                    stab_mask: 0,
+                    stab_len: 0,
+                    traffic: zero_traffic(),
+                    latency: Latency::default(),
+                })
+                .exec(&mut conn)
+                .await
+                .expect("create link");
+            }
+            for (ep, text, purge) in [
+                (
+                    1,
+                    "not testable by the native engine: old gap",
+                    None::<&str>,
+                ),
+                (
+                    2,
+                    "not testable by the native engine: old gap",
+                    Some("config_invalid"),
+                ),
+                (3, "transport error: ws: 500", None),
+            ] {
+                let purge_sql = purge.map_or_else(|| "NULL".to_owned(), sql_lit);
+                toasty::sql::query(format!(
+                    "UPDATE profile_stats SET error = 1, error_kind = 'real', \
+                     error_text = {}, purge_reason = {purge_sql} WHERE endpoint_id = {ep}",
+                    sql_lit(text)
+                ))
+                .exec(&mut conn)
+                .await
+                .expect("seed verdict");
+            }
+        }
+
+        let db = Database::open(&path).await.expect("reopen");
+        db.clear_stale_capability_verdicts(1).await.expect("clear");
+        let mut conn = db.connection().await.expect("connection");
+        let texts = capability_texts(&mut conn).await;
+        assert_eq!(texts[&1], None, "the stale marker must be cleared");
+        let rows = toasty::sql::query(
+            "SELECT error, error_kind, error_text, error_stage, error_cause \
+             FROM profile_stats WHERE endpoint_id = 1",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("read cleared columns");
+        for row in &rows {
+            let toasty_core::stmt::Value::Record(f) = row else {
+                continue;
+            };
+            for (i, value) in f.iter().take(5).enumerate() {
+                assert!(
+                    matches!(value, toasty_core::stmt::Value::Null),
+                    "cleared column {i} must be NULL, got {value:?}"
+                );
+            }
+        }
+        assert_eq!(
+            texts[&2].as_deref(),
+            Some("not testable by the native engine: old gap"),
+            "a purge verdict outranks the capability marker"
+        );
+        assert_eq!(
+            texts[&3].as_deref(),
+            Some("transport error: ws: 500"),
+            "a real failure is not a capability verdict"
+        );
+        let rows =
+            toasty::sql::query("SELECT value FROM app_meta WHERE key = 'capability_version'")
+                .exec(&mut conn)
+                .await
+                .expect("marker");
+        let mut marker: Option<String> = None;
+        for row in &rows {
+            if let toasty_core::stmt::Value::Record(f) = row
+                && let Some(toasty_core::stmt::Value::String(v)) = f.first()
+            {
+                marker = Some(v.clone());
+            }
+        }
+        assert_eq!(marker.as_deref(), Some("1"));
+
+        // The marker gates a second run: a marker written after the upgrade is
+        // a current verdict, not a stale one.
+        toasty::sql::query(
+            "UPDATE profile_stats SET error = 1, error_kind = 'real', \
+             error_text = 'not testable by the native engine: later' WHERE endpoint_id = 1",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("seed post-upgrade marker");
+        drop(conn);
+        db.clear_stale_capability_verdicts(1)
+            .await
+            .expect("second clear");
+        let mut conn = db.connection().await.expect("connection");
+        assert_eq!(
+            capability_texts(&mut conn).await[&1].as_deref(),
+            Some("not testable by the native engine: later"),
+            "the same revision must not re-clear"
+        );
+    }
+
+    async fn capability_texts(
+        conn: &mut toasty::Connection,
+    ) -> std::collections::BTreeMap<i64, Option<String>> {
+        let rows = toasty::sql::query(
+            "SELECT endpoint_id, error_text FROM profile_stats ORDER BY endpoint_id",
+        )
+        .exec(conn)
+        .await
+        .expect("read verdicts");
+        let mut out = std::collections::BTreeMap::new();
+        for row in &rows {
+            let toasty_core::stmt::Value::Record(f) = row else {
+                continue;
+            };
+            let Some(toasty_core::stmt::Value::I64(id)) = f.first() else {
+                continue;
+            };
+            out.insert(
+                *id,
+                match f.get(1) {
+                    Some(toasty_core::stmt::Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                },
+            );
+        }
+        out
     }
 
     /// S5: the stored shapes no codec can dial get `config_invalid` exactly

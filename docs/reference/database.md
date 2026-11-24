@@ -339,8 +339,11 @@ routing engine must resolve.
 endpoints), `stability_seeded_v2` (the day-one stability seed has run), and one
 `tg_watermark:<group id>:<channel>` row per Telegram-channel group — the lowest message id
 that group has imported, which bounds the next crawl
-(`crates/leas/src/ops/telegram.rs`). `identity_version` is the re-key marker,
-documented under the identity steps below.
+(`crates/leas/src/ops/telegram.rs`). Two one-time DATA steps stamp here too:
+`invalid_shapes_purged` (version 2, the ingest-gate sweep) and
+`capability_version` (`leas-native::capability::SUPPORT_REVISION`, which clears
+the persisted `not testable by the native engine:` verdicts once per revision).
+`identity_version` is the re-key marker, documented under the identity steps below.
 
 ### Derived state
 

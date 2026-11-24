@@ -314,9 +314,17 @@ fn build_request(
     )
     .expect("write! to String cannot fail");
     let target = super::request_target(url_path);
+    // h2 fills `:authority` from the URI only (`h2`'s `Pseudo::request`), so a
+    // Host header leaves it empty and a CDN answers 421 Misdirected Request.
+    // h1 keeps origin-form; h3 rewrites later from `path_and_query`.
+    let uri = if http_version(ctx.security()) == "2" {
+        format!("{scheme}://{host}{}", target.as_ref())
+    } else {
+        target.into_owned()
+    };
     let mut builder = http::Request::builder()
         .method(method)
-        .uri(target.as_ref())
+        .uri(uri)
         .header(HOST, host)
         .header("Referer", referer_value);
     if let Some(headers) = ctx.transport_xhttp().and_then(|c| c.headers.as_ref()) {
@@ -1653,6 +1661,15 @@ mod tests {
             let handler = tokio::spawn(async move {
                 let (parts, mut body) = req.into_parts();
                 assert_eq!(parts.method, http::Method::POST);
+                // h2 carries the authority as a pseudo-header; the server's
+                // Uri rebuilds it from `:scheme`/`:authority`/`:path`, so this
+                // is the wire assertion for D1 (a Host header alone leaves
+                // `:authority` empty).
+                assert_eq!(parts.uri.scheme_str(), Some("https"));
+                assert_eq!(
+                    parts.uri.authority().map(http::uri::Authority::as_str),
+                    Some("localhost")
+                );
                 assert_eq!(parts.uri.path(), "/x/", "no session/seq in the path");
                 let headers = &parts.headers;
                 assert_eq!(
@@ -1764,6 +1781,17 @@ mod tests {
         }
         // Content varies: a constant string is its own signature.
         assert!(seen.len() > 1, "padding content must vary");
+    }
+
+    #[test]
+    fn h1_request_target_keeps_origin_form() {
+        let ctx = ctx_mode("auto", None, None);
+        let req = build_request(&ctx, "GET", "/a b", "example.com").unwrap();
+        assert!(
+            req.uri().authority().is_none(),
+            "h1 request-target must stay origin-form"
+        );
+        assert_eq!(req.uri().path(), "/a%20b");
     }
 
     #[test]

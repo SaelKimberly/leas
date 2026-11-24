@@ -78,7 +78,7 @@ const PROTOCOL_CACHE_CAP: usize = 1024;
 /// wipe, decision 4) — so the TEXT is the discriminator. One writer
 /// ([`untestable_marker_text`]) and one reader ([`is_untestable_marker`], used
 /// by the Test-cell precedence and by the Remove-Bad-Servers guard).
-pub const UNTESTABLE_PREFIX: &str = "not testable by the native engine: ";
+pub use leas_db::UNTESTABLE_PREFIX;
 
 /// The persisted marker text for a link the native engine cannot test.
 #[must_use]

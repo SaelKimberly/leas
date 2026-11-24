@@ -42,6 +42,13 @@ use crate::crypto::aead::SsAead;
 use crate::protocol::ss::method::{SsFamily, password_chain};
 use crate::protocol::ss::resolve_method;
 
+/// Revision of the native support decision.
+///
+/// Bump it in the same change as any `NATIVE_KINDS` or `support_reason` move:
+/// `app_meta.capability_version` clears the persisted "not testable" verdicts
+/// once per revision (`Database::clear_stale_capability_verdicts`).
+pub const SUPPORT_REVISION: i64 = 1;
+
 /// The protocols with a native implementation, in canonical order.
 ///
 /// Must stay exactly `[Vless, Vmess, Trojan, Hysteria2, Shadowsocks,
