@@ -4,6 +4,8 @@
 //! `&mut TcpStream` to any `AsyncRead + Unpin` stream so the engine can run
 //! over the crate's generic `Stream` seam.
 
+pub mod adapter;
+pub mod engine;
 pub mod stream;
 
 use tokio::io::AsyncReadExt;
