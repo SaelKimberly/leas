@@ -262,6 +262,9 @@ fn tls13_label(label: &str) -> Result<&'static [u8]> {
         "s ap traffic" => Ok(b"tls13 s ap traffic"),
         "exp master" => Ok(b"tls13 exp master"),
         "traffic upd" => Ok(b"tls13 traffic upd"),
+        "resumption" => Ok(b"tls13 resumption"),
+        "res master" => Ok(b"tls13 res master"),
+        "res binder" => Ok(b"tls13 res binder"),
         _ => Err(TlsError::Crypto("unknown HKDF-Expand-Label label".into())),
     }
 }
@@ -423,9 +426,22 @@ impl KeySchedule {
     /// `handshake_secret` = `HKDF-Extract(Derive-Secret(early_secret,
     /// "derived", ""), shared_secret)`. Only `secret[..hash_len]` is valid.
     pub fn handshake_secret(&self, shared_secret: &[u8]) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
+        self.handshake_secret_with_psk(shared_secret, None)
+    }
+
+    /// `handshake_secret` with a resumption PSK (RFC 8446 §7.1): the early
+    /// secret is `HKDF-Extract(0, PSK)` instead of `Extract(0, 0)`.
+    pub fn handshake_secret_with_psk(
+        &self,
+        shared_secret: &[u8],
+        psk: Option<&[u8]>,
+    ) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
         let hash_len = self.suite.hash_len();
         let zeros = [0u8; MAX_HASH_LEN];
-        let early = self.hkdf_extract(&zeros[..hash_len], &zeros[..hash_len])?;
+        let early = match psk {
+            Some(psk) => self.hkdf_extract(&zeros[..hash_len], psk)?,
+            None => self.hkdf_extract(&zeros[..hash_len], &zeros[..hash_len])?,
+        };
         let (empty, empty_len) = empty_hash(self.suite);
         let derived = self.hkdf_expand_label_stack(
             &early[..hash_len],
@@ -463,11 +479,46 @@ impl KeySchedule {
         Ok((c, s))
     }
 
+    /// The resumption PSK from a `NewSessionTicket` nonce
+    /// (RFC 8446 §4.6.1): `HKDF-Expand-Label(resumption_master_secret,
+    /// "resumption", ticket_nonce, hash_len)`.
+    pub fn resumption_psk(
+        &self,
+        resumption_master_secret: &[u8],
+        nonce: &[u8],
+    ) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
+        self.hkdf_expand_label_stack(
+            resumption_master_secret,
+            "resumption",
+            nonce,
+            self.suite.hash_len(),
+        )
+    }
+
+    /// The PSK binder key: `Derive-Secret(HKDF-Extract(0, PSK),
+    /// "res binder", "")` over the empty transcript.
+    pub fn binder_key(&self, psk: &[u8]) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
+        let hash_len = self.suite.hash_len();
+        let zeros = [0u8; MAX_HASH_LEN];
+        let early = self.hkdf_extract(&zeros[..hash_len], psk)?;
+        self.derive_secret(&early[..hash_len], "res binder")
+    }
+
     /// `KeyUpdate`: the next generation of a traffic secret =
     /// `HKDF-Expand-Label(secret, "traffic upd", "", hash_len)` (RFC 8446
     /// §7.2). Only `secret[..hash_len]` is valid.
     pub fn update_traffic_secret(&self, secret: &[u8]) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
         self.hkdf_expand_label_stack(secret, "traffic upd", &[], self.suite.hash_len())
+    }
+
+    /// The PSK binder MAC (RFC 8446 §4.2.11.2): `HMAC(finished_key,
+    /// Transcript-Hash(truncated ClientHello))`.
+    pub fn binder_mac(&self, psk: &[u8], transcript_hash: &[u8]) -> Result<Vec<u8>> {
+        let hash_len = self.suite.hash_len();
+        let binder_key = self.binder_key(psk)?;
+        let finished_key = self.finished_key(&binder_key[..hash_len])?;
+        let key = hmac::Key::new(self.suite.hmac_alg(), &finished_key[..hash_len]);
+        Ok(hmac::sign(&key, transcript_hash).as_ref().to_vec())
     }
 
     /// `Finished` key = `HKDF-Expand-Label(traffic_secret, "finished", "",

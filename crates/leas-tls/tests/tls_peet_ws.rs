@@ -375,6 +375,7 @@ async fn fetch_peet_report_spec(
             verifier: &verifier,
             rng: &ring::rand::SystemRandom::new(),
             ech: None,
+            resumption: false,
         },
     )
     .await?;

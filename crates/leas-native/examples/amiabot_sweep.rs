@@ -254,6 +254,7 @@ async fn sweep_one(entry: GenEntry) -> Result<Row, Box<dyn std::error::Error + S
             verifier: &verifier,
             rng: &ring::rand::SystemRandom::new(),
             ech: None,
+            resumption: false,
         },
     )
     .await?;

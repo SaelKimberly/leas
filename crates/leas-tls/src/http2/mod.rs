@@ -544,6 +544,7 @@ mod tests {
                 verifier: &AcceptAll,
                 rng: &rng,
                 ech: None,
+                resumption: false,
             },
         )
         .await

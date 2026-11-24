@@ -28,6 +28,10 @@ use super::stream::{AppKeys, AppSecrets};
 /// observes EOF). Truncation attacks per RFC 8446 §6.1 are out of scope for
 /// this tunnel semantic; a `close_notify` is still honored as EOF when
 /// present.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "direct read/write, negotiated hybrid/resumed and response flags are independent"
+)]
 pub struct TlsStream<S> {
     inner: S,
     engine: Engine,
@@ -48,6 +52,10 @@ pub struct TlsStream<S> {
     read_direct: bool,
     negotiated_hybrid: bool,
     negotiated_alpn: Option<Vec<u8>>,
+    resumed: bool,
+    /// Server name used to key received session tickets (set by the connect
+    /// adapter right after the handshake).
+    resumption_key: Option<String>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
@@ -67,6 +75,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
             read_direct: false,
             negotiated_hybrid: false,
             negotiated_alpn: None,
+            resumed: false,
+            resumption_key: None,
         }
     }
 
@@ -100,6 +110,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
     /// Record the negotiated ALPN (handshake internal).
     pub(crate) fn set_negotiated_alpn(&mut self, alpn: Option<Vec<u8>>) {
         self.negotiated_alpn = alpn;
+    }
+
+    /// Whether the handshake resumed a cached PSK.
+    #[must_use]
+    pub const fn is_resumed(&self) -> bool {
+        self.resumed
+    }
+
+    /// Record the resumption outcome (handshake internal).
+    pub(crate) const fn set_resumed(&mut self, resumed: bool) {
+        self.resumed = resumed;
+    }
+
+    /// Key received session tickets by this server name.
+    pub(crate) fn set_resumption_key(&mut self, server: String) {
+        self.resumption_key = Some(server);
+    }
+
+    /// Move newly received tickets into the bounded cache.
+    fn drain_tickets(&mut self) {
+        let Some(name) = self.resumption_key.as_deref() else {
+            return;
+        };
+        let alpn = self.negotiated_alpn.clone().unwrap_or_default();
+        while let Some(ticket) = self.engine.take_ticket() {
+            crate::handshake::resume::store(name, &alpn, ticket);
+        }
     }
 
     /// Install the application traffic secrets for `KeyUpdate`.
@@ -195,6 +232,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
                                 return Poll::Ready(Err(to_io_error(e)));
                             }
                             this.stage_output();
+                            this.drain_tickets();
                         }
                     }
                 }

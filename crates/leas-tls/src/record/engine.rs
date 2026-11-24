@@ -11,7 +11,9 @@
 //! reads straight into the buffer the engine parses. Decrypted application
 //! data is copied once into the engine's reused plaintext window.
 
-use crate::crypto::CipherSuiteId;
+use zeroize::Zeroizing;
+
+use crate::crypto::{CipherSuiteId, KeySchedule};
 use crate::error::{Result, TlsError};
 
 use super::stream::{AppKeys, AppSecrets, RecordCipher};
@@ -50,6 +52,17 @@ pub(crate) const fn should_update(seq: u64, suite: CipherSuiteId) -> bool {
     seq >= record_limit(suite)
 }
 
+/// A received `NewSessionTicket` plus its derived resumption PSK.
+pub struct ReceivedTicket {
+    pub ticket: Vec<u8>,
+    pub lifetime: u32,
+    pub age_add: u32,
+    pub nonce: Vec<u8>,
+    pub suite: CipherSuiteId,
+    /// `HKDF-Expand-Label(server_app_secret, "resumption", nonce)`.
+    pub psk: Zeroizing<Vec<u8>>,
+}
+
 /// Encrypt-then-frame state for one TLS connection.
 pub struct Engine {
     keys: AppKeys,
@@ -66,6 +79,7 @@ pub struct Engine {
     close_sent: bool,
     consecutive_key_updates: u16,
     secrets: Option<AppSecrets>,
+    ticket: Option<ReceivedTicket>,
 }
 
 impl Engine {
@@ -84,6 +98,7 @@ impl Engine {
             close_sent: false,
             consecutive_key_updates: 0,
             secrets: None,
+            ticket: None,
         }
     }
 
@@ -138,6 +153,11 @@ impl Engine {
         } else {
             Some(self.events.remove(0))
         }
+    }
+
+    /// The latest received session ticket, if any.
+    pub const fn take_ticket(&mut self) -> Option<ReceivedTicket> {
+        self.ticket.take()
     }
 
     /// Drain sealed bytes into `out`; returns whether any were moved.
@@ -358,7 +378,11 @@ impl Engine {
                     let messages = post_handshake_messages(&body[..content_len])?;
                     for message in messages {
                         match message {
-                            PostHandshake::NewSessionTicket => {}
+                            PostHandshake::NewSessionTicket(body) => {
+                                if let Some(secrets) = self.secrets.as_ref() {
+                                    self.ticket = parse_ticket(&body, secrets);
+                                }
+                            }
                             PostHandshake::KeyUpdate { request_update } => {
                                 self.apply_key_update(request_update)?;
                             }
@@ -543,6 +567,34 @@ impl Engine {
     }
 }
 
+fn parse_ticket(body: &[u8], secrets: &AppSecrets) -> Option<ReceivedTicket> {
+    // lifetime(4) age_add(4) nonce<1> ticket<2> extensions<2>
+    let lifetime = u32::from_be_bytes(body.get(0..4)?.try_into().ok()?);
+    if lifetime == 0 {
+        return None;
+    }
+    let age_add = u32::from_be_bytes(body.get(4..8)?.try_into().ok()?);
+    let nonce_len = usize::from(*body.get(8)?);
+    let nonce = body.get(9..9 + nonce_len)?.to_vec();
+    let mut at = 9 + nonce_len;
+    let ticket_len = usize::from(u16::from_be_bytes(body.get(at..at + 2)?.try_into().ok()?));
+    at += 2;
+    let ticket = body.get(at..at + ticket_len)?.to_vec();
+    let suite = secrets.suite();
+    let psk = KeySchedule::new(suite)
+        .resumption_psk(secrets.resumption_master_secret(), &nonce)
+        .ok()?;
+    let hash_len = suite.hash_len();
+    Some(ReceivedTicket {
+        ticket,
+        lifetime,
+        age_add,
+        nonce,
+        suite,
+        psk: Zeroizing::new(psk[..hash_len].to_vec()),
+    })
+}
+
 fn advance_seq(seq: &mut u64) -> Result<u64> {
     let current = *seq;
     *seq = current
@@ -562,9 +614,9 @@ pub(crate) fn strip_padding(plaintext: &[u8]) -> Result<(u8, &[u8])> {
     Ok((plaintext[end - 1], &plaintext[..end - 1]))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PostHandshake {
-    NewSessionTicket,
+    NewSessionTicket(Vec<u8>),
     KeyUpdate { request_update: bool },
 }
 
@@ -587,7 +639,7 @@ pub(crate) fn post_handshake_messages(body: &[u8]) -> Result<Vec<PostHandshake>>
         };
         pos += 4 + len;
         match msg_type {
-            HS_NEW_SESSION_TICKET => out.push(PostHandshake::NewSessionTicket),
+            HS_NEW_SESSION_TICKET => out.push(PostHandshake::NewSessionTicket(message.to_vec())),
             HS_KEY_UPDATE => {
                 let request_update = match message {
                     [0] => false,
@@ -614,6 +666,7 @@ pub(crate) fn post_handshake_messages(body: &[u8]) -> Result<Vec<PostHandshake>>
 mod tests {
     use super::*;
     use crate::crypto::AeadKey;
+
     use crate::crypto::CipherSuiteId;
     use crate::record::stream::Tls12Aead;
 

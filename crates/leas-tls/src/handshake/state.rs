@@ -35,6 +35,7 @@ pub(crate) struct Established {
     pub alpn: Option<Vec<u8>>,
     pub hybrid: bool,
     pub auth: AuthOutcome,
+    pub resumed: bool,
 }
 
 /// A `TLS 1.2` `ServerHello` plus every byte after it, for the async 1.2 driver.
@@ -74,6 +75,8 @@ pub(crate) struct Handshake<'a> {
     ks: Option<KeySchedule>,
     hash_len: usize,
     hs_secret: Zeroizing<[u8; MAX_HASH_LEN]>,
+    psk: Option<Zeroizing<Vec<u8>>>,
+    resumed: bool,
     server_hs_key: Option<AeadKey>,
     client_hs_key: Option<AeadKey>,
     server_hs_ts: Zeroizing<[u8; MAX_HASH_LEN]>,
@@ -97,6 +100,7 @@ impl<'a> Handshake<'a> {
         auth: ServerAuth<'a>,
         retry: Option<&'a RetrySupport<'a>>,
         ech: Option<(&'a [u8], &'a crate::ech::EchState)>,
+        psk: Option<Zeroizing<Vec<u8>>>,
     ) -> Self {
         Self {
             phase: Phase::SendHello,
@@ -118,6 +122,8 @@ impl<'a> Handshake<'a> {
             ks: None,
             hash_len: 0,
             hs_secret: Zeroizing::new([0; MAX_HASH_LEN]),
+            psk,
+            resumed: false,
             server_hs_key: None,
             client_hs_key: None,
             server_hs_ts: Zeroizing::new([0; MAX_HASH_LEN]),
@@ -211,6 +217,7 @@ impl<'a> Handshake<'a> {
                                 suite12: sh.suite12,
                                 ems: sh.ems,
                                 alpn: sh.alpn,
+                                psk_selected: sh.psk_selected,
                             };
                             let selected = data
                                 .suite12
@@ -267,7 +274,9 @@ impl<'a> Handshake<'a> {
         let Some(retry) = self.retry else {
             return Err(TlsError::HelloRetryRequest);
         };
-        if matches!(self.auth, ServerAuth::Reality { .. }) {
+        if matches!(self.auth, ServerAuth::Reality { .. }) || self.psk.is_some() {
+            // A resumed hello's binder is bound to ClientHello1; retrying it
+            // is a documented non-goal (fail closed rather than drop the PSK).
             return Err(TlsError::HelloRetryRequest);
         }
         if self.first_hello.is_some() {
@@ -360,7 +369,18 @@ impl<'a> Handshake<'a> {
         }
         ks.add_transcript(&self.current_hello);
         ks.add_transcript(&sh.raw);
-        let hs_secret = ks.handshake_secret(&shared)?;
+        if sh.psk_selected && self.psk.is_none() {
+            return Err(TlsError::Handshake(
+                "server selected a PSK the client did not offer".into(),
+            ));
+        }
+        self.resumed = sh.psk_selected;
+        let psk = if sh.psk_selected {
+            self.psk.as_ref().map(|p| p.as_slice())
+        } else {
+            None
+        };
+        let hs_secret = ks.handshake_secret_with_psk(&shared, psk)?;
         let (client_ts, server_ts) = ks.handshake_traffic_secrets(&hs_secret[..hash_len])?;
         self.server_hs_key = Some(AeadKey::new(sh.suite, &server_ts[..hash_len])?);
         self.client_hs_key = Some(AeadKey::new(sh.suite, &client_ts[..hash_len])?);
@@ -387,49 +407,57 @@ impl<'a> Handshake<'a> {
             .ok_or_else(|| TlsError::Handshake("key schedule missing".into()))?;
         ensure_offered_alpn(&self.current_hello, flight.negotiated_alpn.as_deref())?;
         ks.add_transcript(&flight.ee_raw);
-        ks.add_transcript(&flight.cert_raw);
+        if !self.resumed {
+            ks.add_transcript(&flight.cert_raw);
+        }
         let (th, th_len) = ks.transcript_hash();
-        let outcome = match self.auth {
-            ServerAuth::Verifier(verifier) => {
-                let signature = flight.cert_verify_body.get(4..).ok_or_else(|| {
-                    TlsError::Verify("server sent no CertificateVerify signature".into())
-                })?;
-                ensure_offered_sigalg(&self.current_hello, flight.signature_scheme)?;
-                verifier.verify(&VerifyContext {
-                    chain: &flight.chain,
-                    sni: self.server_name,
-                    version: TlsVersion::Tls13,
-                    suite: sh.suite,
-                    signature_scheme: flight.signature_scheme,
-                    signature,
-                    signed: super::SignedData::Tls13Hash(&th[..th_len]),
-                })?;
-                AuthOutcome::Ok
-            }
-            ServerAuth::Reality { auth_key, mldsa65 } => {
-                let Some(cert) = flight.chain.first() else {
-                    return Err(TlsError::Verify(
-                        "REALITY server sent no certificate".into(),
-                    ));
-                };
-                let mldsa = mldsa65.map(|public_key| crate::reality::verify::Mldsa65 {
-                    public_key,
-                    client_hello: &self.current_hello,
-                    server_hello: &sh.raw,
-                });
-                match crate::reality::verify::verify_server(
-                    cert,
-                    &flight.cv_raw,
-                    auth_key,
-                    &th[..th_len],
-                    mldsa.as_ref(),
-                ) {
-                    Ok(()) => AuthOutcome::Ok,
-                    Err(_) => AuthOutcome::RealityFallback,
+        let outcome = if self.resumed {
+            AuthOutcome::Ok
+        } else {
+            match self.auth {
+                ServerAuth::Verifier(verifier) => {
+                    let signature = flight.cert_verify_body.get(4..).ok_or_else(|| {
+                        TlsError::Verify("server sent no CertificateVerify signature".into())
+                    })?;
+                    ensure_offered_sigalg(&self.current_hello, flight.signature_scheme)?;
+                    verifier.verify(&VerifyContext {
+                        chain: &flight.chain,
+                        sni: self.server_name,
+                        version: TlsVersion::Tls13,
+                        suite: sh.suite,
+                        signature_scheme: flight.signature_scheme,
+                        signature,
+                        signed: super::SignedData::Tls13Hash(&th[..th_len]),
+                    })?;
+                    AuthOutcome::Ok
+                }
+                ServerAuth::Reality { auth_key, mldsa65 } => {
+                    let Some(cert) = flight.chain.first() else {
+                        return Err(TlsError::Verify(
+                            "REALITY server sent no certificate".into(),
+                        ));
+                    };
+                    let mldsa = mldsa65.map(|public_key| crate::reality::verify::Mldsa65 {
+                        public_key,
+                        client_hello: &self.current_hello,
+                        server_hello: &sh.raw,
+                    });
+                    match crate::reality::verify::verify_server(
+                        cert,
+                        &flight.cv_raw,
+                        auth_key,
+                        &th[..th_len],
+                        mldsa.as_ref(),
+                    ) {
+                        Ok(()) => AuthOutcome::Ok,
+                        Err(_) => AuthOutcome::RealityFallback,
+                    }
                 }
             }
         };
-        ks.add_transcript(&flight.cv_raw);
+        if !self.resumed {
+            ks.add_transcript(&flight.cv_raw);
+        }
         let server_finished_key = ks.finished_key(&self.server_hs_ts[..self.hash_len])?;
         if !bool::from(
             ks.finished_mac(&server_finished_key[..self.hash_len])
@@ -442,17 +470,18 @@ impl<'a> Handshake<'a> {
         // before the client Finished, and carries the client settings blob
         // (empty for h2). Only after the server acknowledged ALPS.
         let mut hs_write_seq = 0u64;
-        if flight.server_alps.is_some() && flight.negotiated_alpn.is_some() {
-            if let Some((ty, _)) = client_alps(&self.current_hello) {
-                let key = self
-                    .client_hs_key
-                    .as_ref()
-                    .ok_or_else(|| TlsError::Handshake("client handshake key missing".into()))?;
-                let (msg, record) = seal_client_ee(key, ty, &[], hs_write_seq)?;
-                ks.add_transcript(&msg);
-                self.out.extend_from_slice(&record);
-                hs_write_seq += 1;
-            }
+        if flight.server_alps.is_some()
+            && flight.negotiated_alpn.is_some()
+            && let Some((ty, _)) = client_alps(&self.current_hello)
+        {
+            let key = self
+                .client_hs_key
+                .as_ref()
+                .ok_or_else(|| TlsError::Handshake("client handshake key missing".into()))?;
+            let (msg, record) = seal_client_ee(key, ty, &[], hs_write_seq)?;
+            ks.add_transcript(&msg);
+            self.out.extend_from_slice(&record);
+            hs_write_seq += 1;
         }
         let client_finished_key = ks.finished_key(&self.client_hs_ts[..self.hash_len])?;
         let mac = ks.finished_mac(&client_finished_key[..self.hash_len]);
@@ -477,11 +506,15 @@ impl<'a> Handshake<'a> {
         let (client_app_ts, server_app_ts) = ks.app_traffic_secrets(&master[..self.hash_len])?;
         let client_key = AeadKey::new(sh.suite, &client_app_ts[..self.hash_len])?;
         let server_key = AeadKey::new(sh.suite, &server_app_ts[..self.hash_len])?;
+        // `resumption_master_secret` covers ClientHello..client Finished.
+        ks.add_transcript(&make_hs_msg(HS_FINISHED, &mac));
+        let res_master = ks.derive_secret(&master[..self.hash_len], "res master")?;
         let secrets = AppSecrets::new(
             sh.suite,
             &client_app_ts[..self.hash_len],
             &server_app_ts[..self.hash_len],
-        );
+        )
+        .with_resumption_master(&res_master[..self.hash_len]);
         let keys = AppKeys::tls13(server_key, client_key);
         self.established = Some(Established {
             keys,
@@ -489,6 +522,7 @@ impl<'a> Handshake<'a> {
             alpn: flight.negotiated_alpn.clone(),
             hybrid: sh.mlkem_ciphertext.is_some(),
             auth: outcome,
+            resumed: self.resumed,
         });
         self.phase = Phase::Done;
         Ok(())
@@ -667,6 +701,7 @@ mod tests {
             ServerAuth::Verifier(&AcceptAll),
             Some(&retry),
             None,
+            None,
         );
         state.start().unwrap();
         let mut out = Vec::new();
@@ -678,7 +713,7 @@ mod tests {
         state.feed(&record[7..]).unwrap();
         let handoff = state.take_handoff().expect("TLS 1.2 handoff");
         assert!(handoff.server_hello.suite12.is_some());
-        assert!(handoff.pre_buffer.is_empty());
+        assert_eq!(handoff.pre_buffer.len(), 0);
         assert_eq!(handoff.current_hello, hello.handshake_bytes);
     }
 
@@ -703,6 +738,7 @@ mod tests {
             ServerAuth::Verifier(&AcceptAll),
             Some(&retry),
             None,
+            None,
         );
         let mut seed = 0x1234_5678_9abc_def0u64;
         let mut total_out = 0usize;
@@ -716,9 +752,10 @@ mod tests {
             let mut out = Vec::new();
             state.poll_transmit(&mut out);
             total_out += out.len();
-            if total_out > 256 * 1024 {
-                panic!("state machine output grew without bound");
-            }
+            assert!(
+                total_out <= 256 * 1024,
+                "state machine output grew without bound"
+            );
             if state.take_established().is_some() || state.take_handoff().is_some() {
                 break;
             }
@@ -757,9 +794,75 @@ mod tests {
             false,
         )
         .unwrap();
+        let parsed = crate::hello::parse::parse_hello(&hello.handshake_bytes).unwrap();
+        assert!(
+            parsed.extension(0x002d).is_some(),
+            "Chrome hello must offer psk_key_exchange_modes"
+        );
         let (ty, body) = client_alps(&hello.handshake_bytes).expect("chrome offers ALPS");
         assert!(ty == 0x4469 || ty == 0x44cd);
-        assert!(!body.is_empty());
+        assert_ne!(body.len(), 0);
+    }
+
+    #[test]
+    fn server_selecting_an_unoffered_psk_is_rejected() {
+        let (hello, keypair, recording, pubkey) = hello_and_keypair();
+        let retry = RetrySupport {
+            permute_extensions: false,
+            spec: &spec(),
+            server_name: "localhost",
+            alpn: None,
+            x25519_pub: &pubkey,
+            draws: &recording,
+            rng: &SystemRandom::new(),
+        };
+        let mut state = Handshake::new(
+            &hello.handshake_bytes,
+            hello.session_id(),
+            keypair,
+            None,
+            "localhost",
+            ServerAuth::Verifier(&AcceptAll),
+            Some(&retry),
+            None,
+            None,
+        );
+        state.start().unwrap();
+        let mut out = Vec::new();
+        state.poll_transmit(&mut out);
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(u8::try_from(hello.session_id().len()).unwrap());
+        body.extend_from_slice(hello.session_id());
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(0);
+        let key_share = {
+            let mut d = vec![0x00, 0x1D, 0x00, 0x20];
+            d.extend_from_slice(&[0x44; 32]);
+            d
+        };
+        let exts = [
+            (0x002bu16, vec![0x03, 0x04]),
+            (0x0033u16, key_share),
+            (0x0029u16, vec![0x00, 0x00]),
+        ];
+        let mut ext_bytes = Vec::new();
+        for (ty, data) in exts {
+            ext_bytes.extend_from_slice(&ty.to_be_bytes());
+            ext_bytes.extend_from_slice(&u16::try_from(data.len()).unwrap().to_be_bytes());
+            ext_bytes.extend_from_slice(&data);
+        }
+        body.extend_from_slice(&u16::try_from(ext_bytes.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(&ext_bytes);
+        let err = state
+            .feed(&make_handshake_record(HS_SERVER_HELLO, &body))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("did not offer")
+                || err.to_string().contains("unsolicited extension 0x0029"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -788,6 +891,7 @@ mod tests {
             ServerAuth::Verifier(&AcceptAll),
             Some(&retry),
             Some((&outer, &ech)),
+            None,
         );
         state.start().unwrap();
         let mut out = Vec::new();
@@ -842,6 +946,7 @@ mod tests {
             "localhost",
             ServerAuth::Verifier(&AcceptAll),
             Some(&retry),
+            None,
             None,
         );
         state.start().unwrap();

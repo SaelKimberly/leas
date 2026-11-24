@@ -27,7 +27,7 @@ pub struct ServerFlight {
     /// The protocol the server selected in `EncryptedExtensions` (RFC 7301),
     /// if it sent ALPN at all.
     pub negotiated_alpn: Option<Vec<u8>>,
-    /// Server ALPS settings, when its EncryptedExtensions acknowledged ALPS.
+    /// Server ALPS settings, when its `EncryptedExtensions` acknowledged ALPS.
     pub server_alps: Option<Vec<u8>>,
 }
 
@@ -185,7 +185,7 @@ impl FlightAccumulator {
     }
 }
 
-/// The ALPS extension body a server echoed in EncryptedExtensions, if any.
+/// The ALPS extension body a server echoed in `EncryptedExtensions`, if any.
 fn parse_ee_alps(body: &[u8]) -> Option<Vec<u8>> {
     if body.len() < 2 {
         return None;

@@ -30,7 +30,7 @@ pub mod verify;
 
 use std::ops::Range;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::SecureRandom;
 use crate::crypto::X25519KeyPair;
@@ -472,6 +472,7 @@ async fn connect_reality_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         None,
         // REALITY owns the hello shape (its own session-id payload), so ECH
         // does not compose with it — the capability gate refuses the pair.
+        None,
         None,
     );
     state.start()?;

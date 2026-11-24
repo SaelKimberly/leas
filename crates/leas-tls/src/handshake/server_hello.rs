@@ -30,6 +30,8 @@ pub struct ServerHelloData {
     /// The ALPN protocol the server selected in its `ServerHello`
     /// (TLS 1.2; TLS 1.3 carries it in `EncryptedExtensions`).
     pub alpn: Option<Vec<u8>>,
+    /// Whether the server selected the offered PSK.
+    pub psk_selected: bool,
 }
 
 /// The `ServerHello` body fields the engine needs.
@@ -49,6 +51,8 @@ pub struct ParsedServerHello {
     pub ems: bool,
     /// The ALPN protocol selected in the `ServerHello` (TLS 1.2), or `None`.
     pub alpn: Option<Vec<u8>>,
+    /// Whether the server selected the offered PSK.
+    pub psk_selected: bool,
 }
 
 /// A parsed `HelloRetryRequest` (RFC 8446 §4.1.4): the server wants a

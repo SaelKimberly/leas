@@ -32,6 +32,7 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod engine;
+pub(crate) mod resume;
 pub mod state;
 pub mod tls12;
 
@@ -39,7 +40,7 @@ use crate::SecureRandom;
 #[cfg(test)]
 use crate::crypto::AeadKey;
 use crate::crypto::mlkem::{Ciphertext, Mlkem768, SecretKey as MlkemSecretKey};
-use crate::crypto::{CipherSuiteId, X25519KeyPair, tls12::Tls12Suite};
+use crate::crypto::{CipherSuiteId, KeySchedule, X25519KeyPair, tls12::Tls12Suite};
 use crate::error::{Result, TlsError};
 #[cfg(test)]
 use crate::hello::parse::parse_hello;
@@ -81,6 +82,13 @@ pub(crate) use server_hello::*;
 pub trait ServerVerifier: Send + Sync {
     /// Returns `Ok(())` when the server identity is acceptable.
     fn verify(&self, ctx: &VerifyContext<'_>) -> Result<()>;
+
+    /// Whether tickets from this trust configuration may be cached for
+    /// resumption. Only the default `WebPKI` root set opts in; insecure, pinned
+    /// or custom-root verifiers must never share a PSK.
+    fn resumption_allowed(&self) -> bool {
+        false
+    }
 }
 
 /// The negotiated TLS version.
@@ -155,6 +163,8 @@ pub struct HandshakeParams<'a> {
     /// `Some` splits it into an outer hello (public name) and a sealed inner
     /// hello (the real SNI) — see [`crate::ech::build_hellos`].
     pub ech: Option<&'a crate::ech::EchConfigList>,
+    /// Offer a cached session ticket (opt-in; changes the resumed JA4).
+    pub resumption: bool,
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -174,6 +184,8 @@ const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_COOKIE: u16 = 0x002c;
 /// `application_layer_protocol_negotiation` extension type (RFC 7301).
 const EXT_ALPN: u16 = 0x0010;
+/// `pre_shared_key` extension type (RFC 8446 §4.2.11).
+const EXT_PRE_SHARED_KEY: u16 = 0x0029;
 
 /// AEAD tag length for the TLS 1.3 AEADs in this engine (all 16 bytes).
 const AEAD_TAG_LEN: usize = 16;
@@ -381,6 +393,7 @@ pub(crate) struct PreparedHello<'a> {
     pub hello: crate::hello::BuiltHello,
     pub ech: Option<(crate::hello::BuiltHello, crate::ech::EchState)>,
     pub mlkem_sk: Option<MlkemSecretKey>,
+    pub psk: Option<resume::CachedTicket>,
 }
 
 /// Build the `ClientHello`, ECH context, key shares and replay RNG.
@@ -428,13 +441,37 @@ pub(crate) fn connect_inner_hello<'a>(
         }
         None => None,
     };
-    let (hello, ech) = match ech_ctx {
+    let (mut hello, ech) = match ech_ctx {
         Some((outer, inner, state)) => (inner, Some((outer, state))),
         None => (
             build_hello_ordered(params.spec, &build_params, permute_extensions)?,
             None,
         ),
     };
+    let mut psk = None;
+    if params.resumption && ech.is_none() {
+        let offered: Vec<Vec<u8>> = params.alpn.map_or_else(
+            || {
+                params
+                    .spec
+                    .extensions
+                    .iter()
+                    .find_map(|e| match e {
+                        ExtensionSpec::Alpn(list) => {
+                            Some(list.iter().map(|p| p.as_bytes().to_vec()).collect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            },
+            |list| list.iter().map(|p| p.to_vec()).collect(),
+        );
+        let refs: Vec<&[u8]> = offered.iter().map(Vec::as_slice).collect();
+        if let Some(ticket) = resume::take(params.server_name, &refs) {
+            append_psk_extension(&mut hello, &ticket, ticket.age_ms())?;
+            psk = Some(ticket);
+        }
+    }
     Ok(PreparedHello {
         keypair,
         x25519_pub,
@@ -442,7 +479,107 @@ pub(crate) fn connect_inner_hello<'a>(
         hello,
         ech,
         mlkem_sk: mlkem.1,
+        psk,
     })
+}
+
+/// Append a `pre_shared_key` extension with a computed binder.
+pub(crate) fn append_psk_extension(
+    built: &mut crate::hello::BuiltHello,
+    ticket: &resume::CachedTicket,
+    age_ms: u32,
+) -> Result<()> {
+    let existing = crate::hello::parse::parse_hello(&built.handshake_bytes)?;
+    if existing.extension(0x0029).is_some() {
+        return Err(TlsError::Handshake(
+            "spec already carries a pre_shared_key extension".into(),
+        ));
+    }
+    if existing.extension(0x002d).is_none() {
+        return Err(TlsError::Handshake(
+            "spec has no psk_key_exchange_modes to pair with pre_shared_key".into(),
+        ));
+    }
+    let hash_len = ticket.suite.hash_len();
+    let hb = &mut built.handshake_bytes;
+    let mut p = 4 + 2 + 32;
+    let sid_len = usize::from(
+        *hb.get(p)
+            .ok_or_else(|| TlsError::Handshake("ClientHello truncated at session id".into()))?,
+    );
+    p += 1 + sid_len;
+    let cs_len = usize::from(u16::from_be_bytes(
+        hb.get(p..p + 2)
+            .ok_or_else(|| TlsError::Handshake("ClientHello truncated at suites".into()))?
+            .try_into()
+            .expect("2 bytes"),
+    ));
+    p += 2 + cs_len;
+    let comp_len = usize::from(
+        *hb.get(p)
+            .ok_or_else(|| TlsError::Handshake("ClientHello truncated at compression".into()))?,
+    );
+    p += 1 + comp_len;
+    let ext_len_off = p;
+    let old_ext_len = usize::from(u16::from_be_bytes(
+        hb.get(p..p + 2)
+            .ok_or_else(|| TlsError::Handshake("ClientHello truncated at extensions".into()))?
+            .try_into()
+            .expect("2 bytes"),
+    ));
+
+    let identity_len = 2 + ticket.ticket.len() + 4;
+    let mut body = Vec::with_capacity(2 + identity_len + 2 + 1 + hash_len);
+    body.extend_from_slice(
+        &u16::try_from(identity_len)
+            .map_err(|_| TlsError::Handshake("PSK identity too long".into()))?
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(
+        &u16::try_from(ticket.ticket.len())
+            .map_err(|_| TlsError::Handshake("ticket too long".into()))?
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(&ticket.ticket);
+    body.extend_from_slice(&ticket.age_add.wrapping_add(age_ms).to_be_bytes());
+    body.extend_from_slice(
+        &u16::try_from(1 + hash_len)
+            .map_err(|_| TlsError::Handshake("binder too long".into()))?
+            .to_be_bytes(),
+    );
+    body.push(u8::try_from(hash_len).expect("hash length fits u8"));
+    let binder_start = hb.len() + 4 + body.len();
+    body.extend(std::iter::repeat_n(0u8, hash_len));
+
+    hb.extend_from_slice(&0x0029u16.to_be_bytes());
+    hb.extend_from_slice(
+        &u16::try_from(body.len())
+            .map_err(|_| TlsError::Handshake("PSK extension too long".into()))?
+            .to_be_bytes(),
+    );
+    hb.extend_from_slice(&body);
+    let new_ext_len = old_ext_len + 4 + body.len();
+    hb[ext_len_off..ext_len_off + 2].copy_from_slice(
+        &u16::try_from(new_ext_len)
+            .map_err(|_| TlsError::Handshake("extension list too long".into()))?
+            .to_be_bytes(),
+    );
+    let body_len = hb.len() - 4;
+    hb[1..4].copy_from_slice(
+        &u32::try_from(body_len)
+            .map_err(|_| TlsError::Handshake("ClientHello too long".into()))?
+            .to_be_bytes()[1..],
+    );
+    // Truncated ClientHello ends before the binders vector length.
+    let binders_len_off = binder_start - 3;
+    let hash = ring::digest::digest(ticket.suite.digest(), &hb[..binders_len_off]);
+    let binder = KeySchedule::new(ticket.suite).binder_mac(&ticket.psk, hash.as_ref())?;
+    if binder.len() != hash_len {
+        return Err(TlsError::Handshake("binder length mismatch".into()));
+    }
+    hb[binder_start..binder_start + hash_len].copy_from_slice(&binder);
+    built.record_bytes = crate::hello::to_record(hb);
+    Ok(())
 }
 
 /// Finish a TLS 1.2 handoff through the existing 1.2 driver.
@@ -851,6 +988,7 @@ fn parse_server_hello(
     let mut key_share_wire = None;
     let mut ems = false;
     let mut alpn: Option<Vec<u8>> = None;
+    let mut psk_selected = false;
     // HRR-only fields (RFC 8446 §4.1.4).
     let mut hrr_group = None;
     let mut hrr_cookie = None;
@@ -981,6 +1119,20 @@ fn parse_server_hello(
                 }
                 ems = true;
             }
+            EXT_PRE_SHARED_KEY => {
+                if ext_data.len() != 2 {
+                    return Err(TlsError::Handshake(
+                        "ServerHello pre_shared_key must be 2 bytes".into(),
+                    ));
+                }
+                let selected = u16::from_be_bytes([ext_data[0], ext_data[1]]);
+                if selected != 0 {
+                    return Err(TlsError::Handshake(format!(
+                        "server selected PSK identity {selected}, but only identity 0 was offered"
+                    )));
+                }
+                psk_selected = true;
+            }
             0x0010 => {
                 // ALPN (RFC 7301 §3.1): the server selects exactly one
                 // protocol from the client's list.
@@ -1054,6 +1206,7 @@ fn parse_server_hello(
             key_share_group: key_share_wire,
             ems: false,
             alpn,
+            psk_selected,
         })));
     }
     // TLS 1.2: no supported_versions, or one naming a pre-1.3 version.
@@ -1102,6 +1255,7 @@ fn parse_server_hello(
         key_share_group: None,
         ems,
         alpn,
+        psk_selected,
     })))
 }
 
@@ -1413,6 +1567,7 @@ mod tests {
                 verifier: &AcceptAll,
                 rng: &rng,
                 ech: None,
+                resumption: false,
             },
         )
         .await
@@ -1491,6 +1646,7 @@ mod tests {
                 verifier: &AcceptAll,
                 rng: &rng,
                 ech: None,
+                resumption: false,
             },
         )
         .await
@@ -1682,6 +1838,7 @@ mod tests {
                     verifier: &AcceptAll,
                     rng: &rng,
                     ech: None,
+                    resumption: false,
                 },
             )
             .await
@@ -1831,6 +1988,7 @@ mod tests {
                     verifier: &AcceptAll,
                     rng: &rng,
                     ech: None,
+                    resumption: false,
                 },
             )
             .await
@@ -1907,6 +2065,7 @@ mod tests {
                     verifier: &AcceptAll,
                     rng: &rng,
                     ech: None,
+                    resumption: false,
                 },
             )
             .await
@@ -1954,6 +2113,7 @@ mod tests {
                     verifier: &AcceptAll,
                     rng: &rng,
                     ech: None,
+                    resumption: false,
                 },
             )
             .await
@@ -2620,6 +2780,7 @@ mod tests {
                 verifier: &AcceptAll,
                 rng: &rng,
                 ech: None,
+                resumption: false,
             },
         )
         .await
@@ -2787,6 +2948,7 @@ mod tests {
                 verifier: &AcceptAll,
                 rng: &rng,
                 ech: None,
+                resumption: false,
             },
         )
         .await
@@ -2832,6 +2994,7 @@ mod tests {
                 verifier: &verifier,
                 rng: &rng,
                 ech: None,
+                resumption: false,
             },
         )
         .await
@@ -2909,6 +3072,7 @@ mod tests {
                 verifier: &AcceptAll,
                 rng: &rng,
                 ech: None,
+                resumption: false,
             },
         )
         .await
@@ -2945,6 +3109,7 @@ mod tests {
                 verifier: &AcceptAll,
                 rng: &rng,
                 ech: None,
+                resumption: false,
             },
         )
         .await

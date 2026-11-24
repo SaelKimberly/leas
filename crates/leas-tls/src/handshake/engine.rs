@@ -14,6 +14,17 @@ use super::{HandshakeParams, RetrySupport, ServerAuth, connect_inner_hello, driv
 
 /// Drive a plain TLS handshake through the sans-I/O state machine.
 pub async fn connect_state<S>(
+    stream: S,
+    params: HandshakeParams<'_>,
+    permute_extensions: bool,
+) -> Result<TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    Box::pin(connect_state_inner(stream, params, permute_extensions)).await
+}
+
+async fn connect_state_inner<S>(
     mut stream: S,
     params: HandshakeParams<'_>,
     permute_extensions: bool,
@@ -22,6 +33,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let prepared = connect_inner_hello(&params, permute_extensions)?;
+    let psk = prepared
+        .psk
+        .as_ref()
+        .map(|t| zeroize::Zeroizing::new(t.psk.to_vec()));
     let retry = RetrySupport {
         permute_extensions,
         spec: params.spec,
@@ -44,6 +59,7 @@ where
         ServerAuth::Verifier(params.verifier),
         Some(&retry),
         ech,
+        psk,
     );
     state.start()?;
     let mut out = Vec::new();
@@ -60,6 +76,10 @@ where
             }
             tls.set_negotiated_alpn(est.alpn);
             tls.set_negotiated_hybrid(est.hybrid);
+            tls.set_resumed(est.resumed);
+            if params.resumption {
+                tls.set_resumption_key(params.server_name.to_string());
+            }
             return Ok(tls);
         }
         if let Some(handoff) = state.take_handoff() {

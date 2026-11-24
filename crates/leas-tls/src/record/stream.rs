@@ -108,6 +108,8 @@ pub struct AppSecrets {
     suite: CipherSuiteId,
     client: Zeroizing<[u8; MAX_HASH_LEN]>,
     server: Zeroizing<[u8; MAX_HASH_LEN]>,
+    /// `resumption_master_secret` (RFC 8446 §7.1), zero until installed.
+    resumption: Zeroizing<[u8; MAX_HASH_LEN]>,
 }
 
 impl AppSecrets {
@@ -120,6 +122,7 @@ impl AppSecrets {
             suite,
             client: Zeroizing::new([0u8; MAX_HASH_LEN]),
             server: Zeroizing::new([0u8; MAX_HASH_LEN]),
+            resumption: Zeroizing::new([0u8; MAX_HASH_LEN]),
         };
         out.client[..hash_len.min(client.len())]
             .copy_from_slice(&client[..hash_len.min(client.len())]);
@@ -147,6 +150,21 @@ impl AppSecrets {
     #[must_use]
     pub const fn suite(&self) -> CipherSuiteId {
         self.suite
+    }
+
+    /// Install the `resumption_master_secret` derived from the handshake.
+    #[must_use]
+    pub fn with_resumption_master(mut self, secret: &[u8]) -> Self {
+        let hash_len = self.suite.hash_len();
+        let take = secret.len().min(hash_len);
+        self.resumption[..take].copy_from_slice(&secret[..take]);
+        self
+    }
+
+    /// The `resumption_master_secret` (RFC 8446 §7.1).
+    #[must_use]
+    pub fn resumption_master_secret(&self) -> &[u8] {
+        &self.resumption[..self.suite.hash_len()]
     }
 }
 

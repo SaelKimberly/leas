@@ -109,6 +109,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 },
                 ech: ech_config(ctx)?,
                 rng,
+                resumption: false,
             };
             let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
                 .await
@@ -189,6 +190,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 curves: None,
                 ech: ech_config(ctx)?,
                 rng,
+                resumption: false,
             };
             let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
                 .await
@@ -230,6 +232,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 },
                 ech: ech_config(ctx)?,
                 rng,
+                resumption: false,
             };
             let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
                 .await

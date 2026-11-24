@@ -67,6 +67,8 @@ pub struct WebPkiVerifier {
     insecure: bool,
     /// When set, only the leaf SPKI SHA-256 is compared (chain skipped).
     pin_sha256: Option<[u8; 32]>,
+    /// True only for the shipped `webpki-roots` bundle.
+    webpki_default: bool,
 }
 
 impl WebPkiVerifier {
@@ -77,13 +79,16 @@ impl WebPkiVerifier {
             roots,
             insecure: false,
             pin_sha256: None,
+            webpki_default: false,
         }
     }
 
     /// Trusts the Mozilla root program (`webpki-roots`).
     #[must_use]
     pub fn webpki_roots() -> Self {
-        Self::from_roots(webpki_roots::TLS_SERVER_ROOTS.to_vec())
+        let mut verifier = Self::from_roots(webpki_roots::TLS_SERVER_ROOTS.to_vec());
+        verifier.webpki_default = true;
+        verifier
     }
 
     /// Trusts a single CA given as a DER-encoded X.509 certificate.
@@ -120,6 +125,10 @@ impl WebPkiVerifier {
 }
 
 impl ServerVerifier for WebPkiVerifier {
+    fn resumption_allowed(&self) -> bool {
+        self.webpki_default && !self.insecure && self.pin_sha256.is_none()
+    }
+
     fn verify(&self, ctx: &VerifyContext<'_>) -> Result<()> {
         // `insecure` takes precedence over everything, including the pin:
         // no verification at all, not even a leaf-certificate parse.
@@ -613,6 +622,7 @@ mod tests {
                 verifier,
                 rng: &rng,
                 ech: None,
+                resumption: false,
             },
         )
         .await;

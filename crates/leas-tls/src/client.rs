@@ -61,6 +61,8 @@ pub struct TlsConfig {
     /// `Encrypted ClientHello` config list (`RFC 9849`, from the link's `ech=`
     /// value). `None` sends a single hello.
     pub ech: Option<crate::ech::EchConfigList>,
+    /// Offer a cached session ticket (opt-in; changes the resumed JA4).
+    pub resumption: bool,
 }
 
 impl TlsConfig {
@@ -80,6 +82,7 @@ impl TlsConfig {
             curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
             ech: None,
+            resumption: false,
         }
     }
 
@@ -105,6 +108,7 @@ impl TlsConfig {
             curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
             ech: None,
+            resumption: false,
         }
     }
 }
@@ -167,6 +171,7 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
                     verifier: verifier.as_ref(),
                     rng: config.rng.as_ref(),
                     ech: config.ech.as_ref(),
+                    resumption: config.resumption && verifier.resumption_allowed(),
                 },
                 permute,
             )
@@ -234,6 +239,72 @@ mod tests {
             .unwrap()
     }
 
+    /// Test verifier that permits resumption without a PKI chain.
+    struct ResumableTestVerifier;
+    impl ServerVerifier for ResumableTestVerifier {
+        fn verify(&self, _: &crate::handshake::VerifyContext<'_>) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn resumption_allowed(&self) -> bool {
+            true
+        }
+    }
+
+    /// A rustls server config with bounded session storage and TLS 1.3 tickets.
+    fn resumable_server_config(
+        cert: &rcgen::Certificate,
+        key: &rcgen::KeyPair,
+    ) -> rustls::ServerConfig {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.der().to_vec())],
+                PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(256);
+        cfg.send_tls13_tickets = 2;
+        cfg
+    }
+
+    /// Serve two sequential resumable connections, echoing one byte each.
+    fn spawn_resumable_server() -> std::net::SocketAddr {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
+        let cfg = Arc::new(resumable_server_config(
+            &certified.cert,
+            &certified.signing_key,
+        ));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let Ok(mut conn) = rustls::ServerConnection::new(Arc::clone(&cfg)) else {
+                    continue;
+                };
+                while conn.is_handshaking() {
+                    if conn.complete_io(&mut sock).is_err() {
+                        break;
+                    }
+                }
+                let mut b = [0u8; 1];
+                if std::io::Read::read(&mut sock, &mut b).is_ok() {
+                    let _ = conn.reader().read(&mut b);
+                }
+                let _ = conn.writer().write_all(b"pong");
+                let _ = conn.write_tls(&mut sock);
+            }
+        });
+        addr
+    }
+
     /// Spawns a recording rustls TLS server on a blocking thread.
     ///
     /// After the handshake it appends every decrypted plaintext byte to
@@ -291,6 +362,60 @@ mod tests {
     /// The public plain entry with `fingerprint: None` must default to the
     /// latest-Chrome hello, complete the handshake against a real
     /// rustls server, and round-trip application bytes.
+    #[tokio::test]
+    async fn resumption_reuses_a_ticket() {
+        let addr = spawn_resumable_server();
+        let verifier: Arc<dyn ServerVerifier> = Arc::new(ResumableTestVerifier);
+        let mut config = TlsConfig::plain(None, verifier, "resume-test.local");
+        config.resumption = true;
+
+        let first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = connect(first, &config).await.unwrap();
+        conn.write_all(b"a").await.unwrap();
+        let mut pong = [0u8; 4];
+        conn.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+        // Let the post-handshake tickets reach the engine before dropping.
+        let mut extra = [0u8; 64];
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), conn.read(&mut extra))
+            .await;
+        drop(conn);
+
+        let second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut resumed = connect(second, &config).await.unwrap();
+        assert!(resumed.is_resumed(), "the second dial must resume the PSK");
+        resumed.write_all(b"a").await.unwrap();
+        let mut pong = [0u8; 4];
+        resumed.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+    }
+
+    #[tokio::test]
+    async fn resumption_is_not_cached_for_an_untrusted_verifier() {
+        let addr = spawn_resumable_server();
+        let mut config = TlsConfig::plain(None, insecure_verifier(), "resume-test.local");
+        config.resumption = true;
+        let first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = connect(first, &config).await.unwrap();
+        conn.write_all(b"a").await.unwrap();
+        let mut pong = [0u8; 4];
+        conn.read_exact(&mut pong).await.unwrap();
+        let mut extra = [0u8; 64];
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), conn.read(&mut extra))
+            .await;
+        drop(conn);
+
+        let second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut again = connect(second, &config).await.unwrap();
+        assert!(
+            !again.is_resumed(),
+            "an insecure verifier must never feed the resumption cache"
+        );
+        again.write_all(b"a").await.unwrap();
+        let mut pong = [0u8; 4];
+        again.read_exact(&mut pong).await.unwrap();
+    }
+
     #[tokio::test]
     async fn plain_default_profile_connects() {
         let recorded: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -354,6 +479,7 @@ mod tests {
             curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
             ech: None,
+            resumption: false,
         };
         let handshake = tokio::spawn(async move { connect(client, &config).await });
 
