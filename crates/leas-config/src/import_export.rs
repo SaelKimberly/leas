@@ -1016,6 +1016,7 @@ mod tests {
     #[case::space_host(serde_json::json!({"type": "http_upgrade", "host": "a b"}), false)]
     #[case::grpc_authority(serde_json::json!({"type": "grpc", "authority": "例え.jp"}), false)]
     #[case::host_with_port(serde_json::json!({"type": "ws", "host": "example.com:443"}), true)]
+    #[case::sub_delims_are_representable(serde_json::json!({"type": "ws", "host": "foo~bar!baz"}), true)]
     #[case::empty_host(serde_json::json!({"type": "ws"}), true)]
     #[case::space_in_path(serde_json::json!({"type": "ws", "path": "/?ed=2560 PuLaFreeBOT"}), true)]
     fn validate_host_rejects_unrepresentable_transport_host(

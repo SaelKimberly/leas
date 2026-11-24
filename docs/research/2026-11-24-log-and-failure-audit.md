@@ -227,7 +227,7 @@ A/B: the fix is to use an absolute URI
 already rewrites at `xhttp.rs:536-560` — and to align or drop the duplicated
 `Host` header, then assert `:authority == cfg.host` in the fake-h2 harness.
 
-### D2 — WS/xhttp URI construction rejects representable paths (890 rows)
+### D2 — WS/xhttp request targets fail or reach the wire wrong (890 rows)
 
 `transport/ws.rs:26-35` builds `ws://{cfg.host}{cfg.path}` and requires the
 whole string to be a valid `http::Uri`. Xray instead builds its URI from the
@@ -236,17 +236,20 @@ whole string to be a valid `http::Uri`. Xray instead builds its URI from the
 (`v2raywebsocket/client.go:43-61`: `requestURL.Host = serverAddr`, overridden
 only by an explicit `Host`). Consequences:
 
-- **798** rows fail on a non-ASCII **host** (`RFDJCK.سیسی.wOrLd`,
-  `EveRLaSTinG-…`). Go rejects non-ASCII in `Host` too
-  (`net/http.ValidHostHeader`), so Xray cannot dial these either — this is a
-  feed defect, not a client gap, and belongs in the ingest gate (D3).
-- **90** rows fail on a non-ASCII or space **path** (`/?ed=2560&Telegram🇨🇳+…`,
-  `/?ed=Telegram@mtmvpn---…=?ed=2560`). Go's `url.Parse` percent-encodes the
-  path and Xray dials it. Here the client loses a dialable row.
+- **800** rows fail on a non-ASCII or markup **host/authority** (`RFDJCK.سیسی.wOrLd`,
+  `</code>speedtunnel…`). Go rejects non-ASCII in `Host` too
+  (`net/http.ValidHostHeader`), so Xray cannot dial these either — a feed
+  defect, not a client gap, and an ingest-gate job (D3).
+- **90** rows fail on a **space** in the path (`/?ed=2560&Telegram🇨🇳+…`,
+  `/?ed=Telegram@mtmvpn---…=?ed=2560`); a probe of `http::Uri` shows a path
+  that is only non-ASCII is *accepted* (then sent as raw UTF-8), `#` is parsed
+  as a fragment and silently truncates, and `%zz` is accepted. Space/control
+  are the build failures; non-ASCII/`#`/invalid-escape are wire-correctness
+  bugs.
 
 Fix: percent-encode path bytes before `.uri(…)` (Go `EscapedPath` semantics —
-non-ASCII as UTF-8 `%XX`, space as `%20`), and keep the `Host` header as the
-raw config value only when it is ASCII.
+non-ASCII as UTF-8 `%XX`, space as `%20`, `#` as `%23`, valid `%HH` preserved),
+and keep the `Host` header as the raw config value only when it is ASCII.
 
 ### D3 — the ingest gate does not cover URI syntax
 
@@ -504,7 +507,7 @@ TUIC/WireGuard/Hysteria1.
 | --- | --- | --- | --- | --- | --- |
 | G1 | high | xhttp h2 has no `:authority` | 501 × 421, all h2 xhttp; h1 zero | absolute URI for h2 | fake-h2 server asserts `:authority == host`; re-run xhttp rows |
 | G2 | high | plan query starves behind writers (772 s) | batch table; 455 slow statements | batch enrichment writes, move reband, cap total retry | plan ms on the same batch with import running |
-| G3 | medium | WS rejects representable non-ASCII/space paths | 890 URI errors; 90 path-only | percent-encode path | unit test with a non-ASCII path → wire path is %XX |
+| G3 | medium | WS/xhttp request targets fail on a space and send non-ASCII/`#` raw | 890 URI errors; 90 path-space | percent-encode the target | unit test with a space/Unicode/`#` path → ASCII `%XX`, valid `%HH` kept |
 | G4 | medium | ingest gate misses URI syntax | 2 010 links with invalid host/path | `is_undialable_shape` extension | stored rows get `config_invalid`; no probe attempts |
 | G5 | medium | capability verdicts never invalidate | 27 SS-2022 + 5 VLESS stale | `capability_version` marker | reopen DB after bump → those rows re-planned |
 | G6 | medium | 60 s relay idle reaps long-polls | 2 985 reaps, 2 930 with traffic, 947 MB | raise to 90–120 s or exempt hosts | replay mtalk/telegram idle sessions |

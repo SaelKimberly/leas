@@ -48,9 +48,11 @@ pub fn is_undialable_shape(config: &ProtocolConfig) -> bool {
 /// True when a transport carries a `Host`/`:authority` value no HTTP request
 /// can represent.
 ///
-/// Anything outside `[A-Za-z0-9._:\[\]-]` (non-ASCII, whitespace, control,
-/// markup, `/`, `@`, `%`) is refused. An empty value is valid: every Host
-/// consumer falls back to the endpoint name (`transport::host_or`).
+/// The allowed set is Go's `httpguts.ValidHostHeader` byte table (alnum plus
+/// `!$%&'()*+,;=-._~:[]`): a decoy host carrying a sub-delim is representable
+/// and must not be dropped. Non-ASCII, whitespace, control, markup, `/`, `@`
+/// and `?` remain refused. An empty value is valid: every Host consumer falls
+/// back to the endpoint name (`transport::host_or`).
 ///
 /// Callers: the ingest gate (`leas-config::import_export::validate_host`) and
 /// [`is_undialable_shape`] (the stored-row step). Both read
@@ -67,7 +69,28 @@ pub fn transport_host_unrepresentable(config: &ProtocolConfig) -> bool {
         .and_then(common::TransportConfig::host)
         .is_some_and(|host| {
             host.bytes().any(|b| {
-                !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b':' | b'[' | b']'))
+                !(b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'('
+                            | b')'
+                            | b'*'
+                            | b'+'
+                            | b','
+                            | b';'
+                            | b'='
+                            | b'-'
+                            | b'.'
+                            | b':'
+                            | b'['
+                            | b']'
+                            | b'_'
+                            | b'~'
+                    ))
             })
         })
 }
@@ -859,6 +882,14 @@ mod tests {
     #[case::empty_host(
         json!({"schema": "Vless", "uuid": "u", "transport": {"type": "ws"}}),
         false
+    )]
+    #[case::sub_delims_are_representable(
+        json!({"schema": "Vless", "uuid": "u", "transport": {"type": "ws", "host": "foo~bar!a$b&c"}}),
+        false
+    )]
+    #[case::at_is_not_a_host_byte(
+        json!({"schema": "Vless", "uuid": "u", "transport": {"type": "ws", "host": "a@b"}}),
+        true
     )]
     #[case::grpc_authority(
         json!({"schema": "Vless", "uuid": "u", "transport": {"type": "grpc", "authority": "例え.jp"}}),

@@ -4,10 +4,11 @@
 
 Two findings from the 2026-11-24 audit (§D2, §D3):
 
-1. **G3** — `http::Uri` rejects a space (and other non-URI ASCII) in the
-   configured path, so 890 window rows die as `transport/config: invalid uri
-   character`; a non-ASCII path is accepted but sent as raw UTF-8, and a `#`
-   silently truncates the request target.
+1. **G3** — `http::Uri` rejects a space in the configured path, so 890 window
+   rows die as `transport/config: invalid uri character`: 800 on a non-ASCII or
+   markup **authority** (host) and 90 on a space in the **path**. A path that
+   is only non-ASCII is accepted but sent as raw UTF-8, a `#` silently truncates
+   the request target, and an invalid `%` escape passes through.
 2. **G4** — the transport `host`/`authority` (the HTTP `Host` and h2
    `:authority` value) is never validated at ingestion: 1,008 window rows
    carry a non-ASCII host and 2 carry Markdown/HTML punctuation. Every retest
@@ -117,7 +118,9 @@ Files: `crates/leas-proto/src/proto_spec/common.rs`,
 - `TransportConfig::host()` → `Option<&str>`: `Ws/Http/HttpUpgrade/XHttp.host`,
   `Grpc.authority`, else `None`.
 - `pub fn transport_host_unrepresentable(config: &ProtocolConfig) -> bool`:
-  any `host()` value with a byte outside `[A-Za-z0-9._:\[\]-]` is invalid.
+  any `host()` value with a byte outside Go's `ValidHostHeader` table (alnum
+  plus `!$%&'()*+,;=-._~:[]`) is invalid — the reference's own ceiling, so a
+  decoy host carrying a sub-delim is not a false positive.
   Empty stays valid **because the transports implement the fallback**: a
   `?host=` share link stores `Some("")`, and all five Host consumers now use
   `transport::host_or`, which treats empty as unset (the reference grammars'
@@ -217,6 +220,10 @@ Files: `crates/leas-db/src/database.rs`.
 - **Empty host.** The review found that `Some("")` had no fallback; the fix is
   `transport::host_or` at all five Host consumers (ws, plugin ws, httpupgrade,
   xhttp, v2rayhttp), not rejection — the references treat empty as unset.
+- **Review correction.** The first predicate used `[A-Za-z0-9._:[]-]`, which
+  dropped representable decoys (`foo~bar`, `a!b`); it now uses Go's
+  `ValidHostHeader` set. `@` stays refused (Go refuses it; the Rust authority
+  parser would accept it as userinfo).
 - **Census on the audit snapshot** (read-only copy): of the 890 rows whose
   stored error was `invalid uri character`, the new predicate marks **801** as
   `config_invalid` (host) and leaves **89** dialable (the space/non-ASCII path
