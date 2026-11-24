@@ -388,7 +388,14 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
         // the RFC 8446 §4.2 offered-set check and its cipher suites feed the
         // selected-suite check after the reply.
         let sent_hello = parse_hello(&current_hello)?;
-        let offered_exts: Vec<u16> = sent_hello.extensions.iter().map(|(ty, _)| *ty).collect();
+        // Under ECH the server answers the OUTER hello actually written; the
+        // extension set it may echo is the outer one, while the suite choice
+        // is checked against the inner transcript hello.
+        let offered_exts: Vec<u16> = parse_hello(&wire_hello)?
+            .extensions
+            .iter()
+            .map(|(ty, _)| *ty)
+            .collect();
         stream.write_all(&to_record(&wire_hello)).await?;
         match read_server_hello(&mut stream, &current_sid, &offered_exts).await? {
             ServerReply::Hello(sh) => {
@@ -1215,6 +1222,11 @@ fn parse_server_hello(
         {
             return Err(TlsError::Handshake(format!(
                 "ServerHello carried unsolicited extension 0x{ext_type:04X}"
+            )));
+        }
+        if crate::spec::grease::is_grease(ext_type) {
+            return Err(TlsError::Handshake(format!(
+                "ServerHello echoed GREASE extension 0x{ext_type:04X}"
             )));
         }
         let ext_data = &body[pos + scan_pos..pos + scan_pos + ext_len];

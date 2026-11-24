@@ -13,6 +13,12 @@ use leas_tls::profiles::generated::GENERATED;
 use leas_tls::profiles::hand_selected::{CHROME_130_CAPS, EDGE_106_CAPS, chrome_130, edge_106};
 use leas_tls::spec::caps::{ExtKind, GroupKind, HelloCaps, SigKind};
 
+type HandRow = (
+    &'static str,
+    fn() -> leas_tls::spec::ClientHelloSpec,
+    HelloCaps,
+);
+
 struct FixedRng(std::sync::atomic::AtomicU8);
 
 impl FixedRng {
@@ -190,7 +196,7 @@ fn every_generated_cap_matches_its_emitted_hello() {
         assert_eq!(compute(&(entry.spec_fn)()), entry.caps, "{}", entry.name);
     }
     use leas_tls::profiles::hand_selected::{CHROME_130_CAPS, EDGE_106_CAPS, chrome_130, edge_106};
-    let hand: [(&str, fn() -> leas_tls::spec::ClientHelloSpec, HelloCaps); 2] = [
+    let hand: [HandRow; 2] = [
         ("chrome_130", chrome_130, CHROME_130_CAPS),
         ("edge_106", edge_106, EDGE_106_CAPS),
     ];

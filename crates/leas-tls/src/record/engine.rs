@@ -215,6 +215,11 @@ impl Engine {
     /// Seal one application-data record from `plaintext` (split by the
     /// adapter at 16 KiB) into the output buffer.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<usize> {
+        if self.close_sent {
+            return Err(TlsError::Handshake(
+                "application data after close_notify (RFC 8446 §6.1)".into(),
+            ));
+        }
         if self.keys.write.is_tls13() && self.needs_key_update() {
             // Our own limit: ask the peer to rotate too, then switch our
             // sending generation after the KeyUpdate record is sealed.
@@ -650,6 +655,17 @@ mod tests {
         receiver.feed(&wire).unwrap();
         assert!(receiver.is_closed());
         assert_eq!(receiver.poll_event(), Some(RecordEvent::Closed));
+    }
+
+    #[test]
+    fn tls12_close_notify_is_an_authenticated_eof() {
+        let (mut sender, mut receiver) = tls12_pair(Tls12Aead::AesGcm { fixed_iv: [1; 4] });
+        sender.queue_close_notify().unwrap();
+        let wire = transmit(&mut sender);
+        receiver.feed(&wire).unwrap();
+        assert!(receiver.is_closed());
+        assert_eq!(receiver.poll_event(), Some(RecordEvent::Closed));
+        assert!(sender.seal(b"after").is_err());
     }
 
     #[test]
