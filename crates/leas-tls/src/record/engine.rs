@@ -260,6 +260,22 @@ impl Engine {
         Ok(take)
     }
 
+    /// Seal up to 32 KiB of plaintext as consecutive records in one call,
+    /// so a 64 KiB relay write costs two transport writes instead of four.
+    /// A lone small write still produces exactly one record.
+    pub fn seal_batch(&mut self, plaintext: &[u8]) -> Result<usize> {
+        const BATCH: usize = 32 * 1024;
+        let mut consumed = 0usize;
+        while consumed < plaintext.len() && consumed < BATCH {
+            let n = self.seal(&plaintext[consumed..])?;
+            if n == 0 {
+                break;
+            }
+            consumed += n;
+        }
+        Ok(consumed)
+    }
+
     /// Queue a `close_notify` alert if one has not been sent.
     pub fn queue_close_notify(&mut self) -> Result<()> {
         self.queue_alert(0)

@@ -266,7 +266,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let take = match this.engine.seal(buf) {
+        let take = match this.engine.seal_batch(buf) {
             Ok(take) => take,
             Err(e) => return Poll::Ready(Err(to_io_error(e))),
         };
@@ -313,5 +313,91 @@ fn to_io_error(e: TlsError) -> io::Error {
     match e {
         TlsError::Io(io) => io,
         other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::crypto::{AeadKey, CipherSuiteId};
+    use crate::record::stream::AppKeys;
+
+    struct Counting<S> {
+        inner: S,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Counting<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Counting<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    fn keys() -> AppKeys {
+        let key = AeadKey::from_key_bytes(CipherSuiteId::Aes128GcmSha256, &[0x11; 16]).unwrap();
+        AppKeys::tls13(key.clone_key(), key)
+    }
+
+    /// A 64 KiB relay write leaves as two transport writes (two 32 KiB
+    /// batches), not one per 16 KiB record.
+    #[tokio::test]
+    async fn sixty_four_kib_costs_two_transport_writes() {
+        let (a, mut peer) = tokio::io::duplex(256 * 1024);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut stream = TlsStream::new(
+            Counting {
+                inner: a,
+                writes: Arc::clone(&writes),
+            },
+            keys(),
+        );
+        let drain = tokio::spawn(async move {
+            let mut sink = vec![0u8; 16 * 1024];
+            loop {
+                match peer.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let payload = vec![0xABu8; 64 * 1024];
+        stream.write_all(&payload).await.unwrap();
+        stream.flush().await.unwrap();
+        drop(stream);
+        let _ = drain.await;
+        assert!(
+            writes.load(Ordering::Relaxed) <= 2,
+            "expected <=2 transport writes, got {}",
+            writes.load(Ordering::Relaxed)
+        );
     }
 }

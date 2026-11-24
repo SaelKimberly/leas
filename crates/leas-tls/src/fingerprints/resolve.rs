@@ -17,8 +17,16 @@
 use crate::fingerprints::error::FingerprintError;
 use crate::fingerprints::query::{Browser, Device, Fingerprint, Os};
 use crate::profiles::generated::{GENERATED, GenEntry};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
 use crate::spec::ClientHelloSpec;
-use std::sync::LazyLock;
+
+/// Process-wide cache of built specs, keyed by the resolved roster row.
+/// A spec is immutable once built; only the per-connection key share and
+/// session id are filled by the hello builder.
+static SPEC_CACHE: LazyLock<Mutex<HashMap<&'static str, Arc<ClientHelloSpec>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// One resolvable identity row.
 #[derive(Debug, Clone, Copy)]
@@ -215,6 +223,41 @@ impl Fingerprint {
     /// # Errors
     /// [`FingerprintError::Unknown`] when neither pass finds a row.
     pub fn resolve(&self) -> Result<Resolved, FingerprintError> {
+        let (row, fingerprint) = self.row_and_identity()?;
+        Ok(Resolved {
+            name: row.name,
+            fingerprint,
+            spec: (row.spec)(),
+        })
+    }
+
+    /// Like [`Self::resolve`], but the built spec is shared from a
+    /// process-wide cache. The public [`Resolved::spec`] type is unchanged;
+    /// callers on the connect path use this to avoid rebuilding the vec-heavy
+    /// spec per dial.
+    ///
+    /// # Errors
+    /// Same as [`Self::resolve`].
+    pub fn resolve_shared(&self) -> Result<ResolvedShared, FingerprintError> {
+        let (row, fingerprint) = self.row_and_identity()?;
+        let spec = {
+            let mut cache = SPEC_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(
+                cache
+                    .entry(row.name)
+                    .or_insert_with(|| Arc::new((row.spec)())),
+            )
+        };
+        Ok(ResolvedShared {
+            name: row.name,
+            fingerprint,
+            spec,
+        })
+    }
+
+    fn row_and_identity(&self) -> Result<(&'static Row, Self), FingerprintError> {
         let chosen = if self.os.is_some() {
             self.resolve_in_pass(self.os)
                 .or_else(|| self.resolve_in_pass(None))
@@ -227,16 +270,15 @@ impl Fingerprint {
                 available: available_identities(),
             });
         };
-        Ok(Resolved {
-            name: row.name,
-            fingerprint: Self {
+        Ok((
+            row,
+            Self {
                 browser: row.browser,
                 version: Some(self.version.unwrap_or(row.max_version)),
                 os: self.os.or(row.os),
                 device: Some(self.device.unwrap_or(row.device)),
             },
-            spec: (row.spec)(),
-        })
+        ))
     }
 
     /// One resolution pass over both tiers for a fixed query os: hand
@@ -259,6 +301,14 @@ pub struct Resolved {
     pub fingerprint: Fingerprint,
     /// The hello specification.
     pub spec: ClientHelloSpec,
+}
+
+/// A resolved identity whose spec is shared (connect-path variant).
+#[derive(Debug, Clone)]
+pub struct ResolvedShared {
+    pub name: &'static str,
+    pub fingerprint: Fingerprint,
+    pub spec: Arc<ClientHelloSpec>,
 }
 
 impl Resolved {
@@ -310,6 +360,18 @@ mod tests {
             .with_device(device);
         fp.os = os;
         fp
+    }
+
+    #[test]
+    fn resolve_shared_reuses_one_spec() {
+        let query = fp(Browser::Chrome, 131, Some(Os::Windows), Device::Desktop);
+        let a = query.resolve_shared().unwrap();
+        let b = query.resolve_shared().unwrap();
+        assert!(
+            Arc::ptr_eq(&a.spec, &b.spec),
+            "the cached spec must be shared"
+        );
+        assert_eq!(a.name, b.name);
     }
 
     /// Next-modern fallback: a version between kept majors resolves to the

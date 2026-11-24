@@ -138,13 +138,15 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
                 .clone()
                 .unwrap_or_else(|| Fingerprint::default_for(Browser::Chrome));
             let resolved = fp
-                .resolve()
+                .resolve_shared()
                 .map_err(|e| crate::error::TlsError::Handshake(e.to_string()))?;
+            let spec_owned;
             let spec = match config.curves.as_deref() {
                 Some(curves) if !curves.is_empty() => {
-                    crate::spec::apply_curve_preferences(&resolved.spec, curves)
+                    spec_owned = crate::spec::apply_curve_preferences(&resolved.spec, curves);
+                    &spec_owned
                 }
-                _ => resolved.spec,
+                _ => &resolved.spec,
             };
             // ALPN protocol names are opaque bytes (RFC 7301 §3.1) — the
             // config already carries them that way, so no encoding check.
@@ -159,7 +161,7 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
             let tls = handshake::connect_with_permutation(
                 stream,
                 HandshakeParams {
-                    spec: &spec,
+                    spec,
                     server_name: &config.server_name,
                     alpn: alpn.as_deref(),
                     verifier: verifier.as_ref(),
