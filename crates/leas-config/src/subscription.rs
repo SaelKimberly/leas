@@ -470,17 +470,21 @@ fn file_profile(
         // method:password into the log. Classify by KIND instead, and say so.
         Err(other) => {
             summary.other_count += 1;
-            summary.record_error(match &other {
+            let message = match &other {
                 // The variants whose payload can carry the URL or its userinfo.
                 ImportError::UnsupportedScheme => "unsupported URL scheme".to_owned(),
-                ImportError::Parse(_) => {
+                ImportError::Parse { reason, .. } => {
+                    // The CLASS still reaches the operator as a histogram entry;
+                    // only the message is withheld.
+                    summary.record_parse_reason(reason);
                     "parse error (details withheld: the message can carry the URL)".to_owned()
                 }
                 ImportError::Json(_) | ImportError::Url(_) | ImportError::MissingField(_) => {
                     other.to_string()
                 }
                 ImportError::Validation(msg) => msg.clone(),
-            });
+            };
+            summary.record_error(message);
         }
     }
 }
@@ -862,6 +866,45 @@ mod tests {
             !summary.sample_errors.is_empty(),
             "the reason must survive to the summary",
         );
+    }
+
+    /// The audit's 87 339 `other (parse)` rejections were indistinguishable;
+    /// the histogram separates them by class without carrying the URL.
+    #[test]
+    fn parse_rejections_are_histogrammed_by_class() {
+        let settings = crate::import_export::ValidationSettings::default();
+        let urls = [
+            "https://t.me/some_channel".to_owned(),
+            // Empty body: the parser cannot split a userinfo out of `""` and
+            // reports `InvalidUserInfo` — the class whose payload is the raw
+            // value, so it is the one the histogram must NOT reproduce.
+            "vless://".to_owned(),
+        ];
+        let (_, summary) = parse_url_batch(&urls, &settings);
+        assert_eq!(summary.parse_reasons.get("promotion"), Some(&1));
+        assert_eq!(summary.parse_reasons.get("invalid userinfo"), Some(&1));
+        assert_eq!(
+            summary.parse_reasons.values().sum::<usize>(),
+            summary.other_count,
+            "every parse reject counts once, in one class",
+        );
+        let mut tags: Vec<&str> = summary.parse_reasons.keys().copied().collect();
+        tags.sort_unstable();
+        assert_eq!(tags, ["invalid userinfo", "promotion"], "class tags only");
+    }
+
+    /// Chunked imports sum per-batch summaries: the histogram must survive the
+    /// merge, or a large feed reports only its last chunk's classes.
+    #[test]
+    fn merged_summaries_sum_the_parse_histogram() {
+        let mut a = ValidationSummary::default();
+        a.record_parse_reason("promotion");
+        a.record_parse_reason("promotion");
+        let mut b = ValidationSummary::default();
+        b.record_parse_reason("invalid conf");
+        a.merge(&b);
+        assert_eq!(a.parse_reasons.get("promotion"), Some(&2));
+        assert_eq!(a.parse_reasons.get("invalid conf"), Some(&1));
     }
 
     /// The recorded reason must NEVER carry credentials. `ImportError::Parse`'s

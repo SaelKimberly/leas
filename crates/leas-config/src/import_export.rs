@@ -31,8 +31,15 @@ pub struct ParsedProfile {
 pub enum ImportError {
     #[error("unsupported URL scheme")]
     UnsupportedScheme,
-    #[error("parse error: {0}")]
-    Parse(String),
+    #[error("parse error: {text}")]
+    Parse {
+        /// The failure CLASS from [`ParseError::reason`] — a static tag the
+        /// import summary histograms. Never the payload (it can carry the URL).
+        reason: &'static str,
+        /// The parse error's own text. Kept out of the persisted log for this
+        /// variant: several messages embed the URL or its userinfo.
+        text: String,
+    },
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid URL: {0}")]
@@ -47,7 +54,13 @@ impl From<ParseError> for ImportError {
     fn from(e: ParseError) -> Self {
         match e {
             ParseError::UnsupportedScheme(_) => Self::UnsupportedScheme,
-            other => Self::Parse(other.to_string()),
+            other => {
+                let reason = other.reason();
+                Self::Parse {
+                    reason,
+                    text: other.to_string(),
+                }
+            }
         }
     }
 }
@@ -323,9 +336,10 @@ struct UrlComponents<'a> {
 /// Robust URL splitting that handles Trojan `#`-in-password and `@`-in-query edge cases.
 /// Returns components without using `url::Url`.
 fn split_share_url(url: &str) -> Result<UrlComponents<'_>> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| ImportError::Parse("missing scheme in URL".into()))?;
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| ImportError::Parse {
+        reason: "missing scheme",
+        text: "missing scheme in URL".to_owned(),
+    })?;
     let scheme = scheme.to_string();
     let mut unparsed = rest;
 
@@ -891,12 +905,24 @@ pub struct ValidationSummary {
     pub sample_errors: Vec<String>,
     /// Errors not represented in `sample_errors`, because the cap was reached.
     pub sample_errors_omitted: usize,
+    /// Rejections by parse failure CLASS ([`ParseError::reason`]).
+    ///
+    /// The audit's window held 87 339 `other (parse)` rejections that all
+    /// collapse into one withheld-message line, so a parser coverage gap in
+    /// the feed could not be seen from the log. Static tags only — bounded by
+    /// the number of variants, never by the feed, and never the URL.
+    pub parse_reasons: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl ValidationSummary {
     /// Cap on `sample_errors`.
     pub const SAMPLE_ERROR_CAP: usize = 5;
 
+    /// Count one parse rejection by its static class tag. The tag is a
+    /// literal, so no URL can reach the histogram.
+    pub fn record_parse_reason(&mut self, reason: &'static str) {
+        *self.parse_reasons.entry(reason).or_default() += 1;
+    }
     /// Record one failure reason — the **message only**, never the URL, which
     /// carries credentials.
     pub fn record_error(&mut self, reason: impl Into<String>) {
@@ -918,6 +944,9 @@ impl ValidationSummary {
             self.record_error(reason.clone());
         }
         self.sample_errors_omitted += other.sample_errors_omitted;
+        for (reason, count) in &other.parse_reasons {
+            *self.parse_reasons.entry(reason).or_default() += count;
+        }
     }
 }
 

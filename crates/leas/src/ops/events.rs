@@ -655,27 +655,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
             } => {
                 state.updating_groups.remove(&group_id);
                 if summary.total_errors > 0 || summary.security_warning_count > 0 {
-                    let mut msg = format!(
-                        "Subscription validation: {} error(s) (missing fields: {}, host validation: {}, other: {}), {} warning(s) (profiles with insecure=true)",
-                        summary.total_errors,
-                        summary.missing_field_count,
-                        summary.host_validation_count,
-                        summary.other_count,
-                        summary.security_warning_count,
-                    );
-                    // WHY, not just how many. The counters alone left the
-                    // 2026-10-01 run's `1 links, 1 errors` subscription
-                    // undiagnosable — it failed 4/4 with every bucket zero
-                    // except `other`, and the reason was discarded at the parse
-                    // site. Bounded: a 90k-link feed must not become a wall.
-                    if !summary.sample_errors.is_empty() {
-                        msg.push_str(" — first reasons: ");
-                        msg.push_str(&summary.sample_errors.join("; "));
-                        if summary.sample_errors_omitted > 0 {
-                            use std::fmt::Write as _;
-                            let _ = write!(msg, " (+{} more)", summary.sample_errors_omitted);
-                        }
-                    }
+                    let msg = subscription_validation_message(&summary);
                     state.log_trace("warn", "tui::ops::subscriptions", &msg);
                 }
                 if let Some(err) = error {
@@ -1415,6 +1395,46 @@ pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileSt
         }
     }
     touched
+}
+
+/// The subscription-validation log line: counters, the parse-failure classes
+/// and a bounded sample of reasons.
+///
+/// WHY, not just how many. The counters alone left the 2026-10-01 run's
+/// `1 links, 1 errors` subscription undiagnosable — it failed 4/4 with every
+/// bucket zero except `other`, and the reason was discarded at the parse site.
+/// The 2026-11-24 audit then found 87 339 parse rejections collapsed into one
+/// withheld-message line, so the failure CLASS is printed beside the count.
+/// Bounded: the classes are static tags (14 at most) and the sample is capped
+/// — a 90k-link feed must not become a wall.
+fn subscription_validation_message(summary: &leas_config::ValidationSummary) -> String {
+    use std::fmt::Write as _;
+
+    let mut msg = format!(
+        "Subscription validation: {} error(s) (missing fields: {}, host validation: {}, other: {}), {} warning(s) (profiles with insecure=true)",
+        summary.total_errors,
+        summary.missing_field_count,
+        summary.host_validation_count,
+        summary.other_count,
+        summary.security_warning_count,
+    );
+    if !summary.parse_reasons.is_empty() {
+        msg.push_str("; parse reasons: ");
+        for (i, (reason, count)) in summary.parse_reasons.iter().enumerate() {
+            if i > 0 {
+                msg.push_str(", ");
+            }
+            let _ = write!(msg, "{reason} {count}");
+        }
+    }
+    if !summary.sample_errors.is_empty() {
+        msg.push_str(" — first reasons: ");
+        msg.push_str(&summary.sample_errors.join("; "));
+        if summary.sample_errors_omitted > 0 {
+            let _ = write!(msg, " (+{} more)", summary.sample_errors_omitted);
+        }
+    }
+    msg
 }
 
 #[cfg(test)]
@@ -2581,6 +2601,41 @@ mod tests {
         .unwrap();
         assert!(state.poll_core_events().await);
         assert_eq!(state.endpoints.len(), 1, "matching rows applied");
+    }
+
+    /// The audit's 87 339 `other (parse)` rows were one indistinguishable
+    /// line; the classes must reach the operator beside the counters,
+    /// alphabetically (`BTreeMap`) and bounded.
+    #[test]
+    fn the_validation_line_names_the_parse_classes() {
+        let mut summary = leas_config::ValidationSummary {
+            total_errors: 43,
+            other_count: 43,
+            security_warning_count: 0,
+            ..leas_config::ValidationSummary::default()
+        };
+        summary.record_parse_reason("promotion");
+        summary.record_parse_reason("invalid userinfo");
+        summary.record_parse_reason("invalid userinfo");
+        let msg = super::subscription_validation_message(&summary);
+        assert!(
+            msg.contains("; parse reasons: invalid userinfo 2, promotion 1"),
+            "classes missing or out of order: {msg}"
+        );
+        assert!(msg.contains("43 error(s)"), "counters kept: {msg}");
+    }
+
+    /// No histogram, no suffix: a summary that rejected nothing parse-wise
+    /// keeps the pre-audit line shape.
+    #[test]
+    fn the_validation_line_without_parse_reasons_adds_no_suffix() {
+        let summary = leas_config::ValidationSummary {
+            total_errors: 1,
+            host_validation_count: 1,
+            ..leas_config::ValidationSummary::default()
+        };
+        let msg = super::subscription_validation_message(&summary);
+        assert!(!msg.contains("parse reasons"), "unexpected suffix: {msg}");
     }
 
     #[tokio::test]

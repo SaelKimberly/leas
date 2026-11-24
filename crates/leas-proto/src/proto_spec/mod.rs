@@ -186,6 +186,33 @@ pub enum ParseError {
     Unimplemented(&'static str),
 }
 
+impl ParseError {
+    /// A static tag for the failure CLASS, for the import histogram.
+    ///
+    /// Never the payload: several variants carry the raw URL or its userinfo
+    /// (`InvalidConf`, `InvalidUserInfo`, …), and the histogram is written to
+    /// the persisted log. One tag per variant, so the caller's map is bounded
+    /// by this list rather than by the feed size.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::InvalidHost(_) => "invalid host",
+            Self::InvalidPort(_) => "invalid port",
+            Self::MissingHost => "missing host",
+            Self::MissingPort => "missing port",
+            Self::InvalidUserInfo(_) => "invalid userinfo",
+            Self::InvalidHostPort(_) => "invalid hostport",
+            Self::MissingConf(_) => "missing conf",
+            Self::InvalidConf(..) => "invalid conf",
+            Self::Unknown(_) => "unknown",
+            Self::InvalidStructure(_) => "invalid structure",
+            Self::UnsupportedScheme(_) => "unsupported scheme",
+            Self::PromotionUrl => "promotion",
+            Self::Unimplemented(_) => "unimplemented",
+        }
+    }
+}
+
 /// Config-generation target for the oracle adapters.
 ///
 /// This is NOT the client's core choice: the TUI has no core setting and the
