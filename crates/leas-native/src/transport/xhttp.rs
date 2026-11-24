@@ -91,9 +91,11 @@ fn random_post_size() -> usize {
 
 /// Host for the HTTP requests: config `host` > endpoint host.
 fn http_host(ctx: &LinkContext) -> String {
-    ctx.transport_xhttp()
-        .and_then(|c| c.host.as_deref())
-        .map_or_else(|| ctx.params.server.host.clone(), str::to_string)
+    super::host_or(
+        ctx.transport_xhttp().and_then(|c| c.host.as_deref()),
+        &ctx.params.server.host,
+    )
+    .to_string()
 }
 
 /// Base path without session (trailing slash).
@@ -308,12 +310,13 @@ fn build_request(
     write!(
         referer_value,
         "{scheme}://{host}{}?x_padding={padding}",
-        base_path(ctx)
+        super::request_target(&base_path(ctx))
     )
     .expect("write! to String cannot fail");
+    let target = super::request_target(url_path);
     let mut builder = http::Request::builder()
         .method(method)
-        .uri(url_path)
+        .uri(target.as_ref())
         .header(HOST, host)
         .header("Referer", referer_value);
     if let Some(headers) = ctx.transport_xhttp().and_then(|c| c.headers.as_ref()) {
@@ -1792,6 +1795,55 @@ mod tests {
             "len {}",
             decoded.len()
         );
+    }
+
+    #[test]
+    fn empty_host_falls_back_to_the_endpoint() {
+        let cfg = serde_json::from_value::<ProtocolConfig>(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "x_http", "path": "/x", "host": "", "mode": "packet-up" }
+        }))
+        .expect("config parses");
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(
+                cfg,
+                EndpointEssentials::new("127.0.0.1", 1),
+                TargetAddr::new(Host::Domain("dest.test".into()), 80),
+            ),
+            TargetAddr::new(Host::Domain("dest.test".into()), 80),
+        );
+        assert_eq!(http_host(&ctx), "127.0.0.1");
+    }
+
+    #[test]
+    fn request_target_and_referer_escape_nonuri_bytes() {
+        let cfg = serde_json::from_value::<ProtocolConfig>(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "x_http", "path": "/a b/ü", "host": "example.com" },
+            "security": { "type": "tls" }
+        }))
+        .expect("config parses");
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(
+                cfg,
+                EndpointEssentials::new("127.0.0.1", 1),
+                TargetAddr::new(Host::Domain("dest.test".into()), 80),
+            ),
+            TargetAddr::new(Host::Domain("dest.test".into()), 80),
+        );
+        let req = build_request(&ctx, "GET", "/a b/ü/sess", "example.com").unwrap();
+        assert_eq!(
+            req.uri().path_and_query().unwrap().as_str(),
+            "/a%20b/%C3%BC/sess"
+        );
+        let referer = req.headers()["referer"].to_str().unwrap();
+        assert!(
+            referer.starts_with("https://example.com/a%20b/%C3%BC/?x_padding="),
+            "{referer}"
+        );
+        assert!(referer.is_ascii(), "{referer}");
     }
 
     #[test]

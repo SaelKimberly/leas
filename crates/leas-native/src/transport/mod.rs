@@ -87,3 +87,145 @@ pub async fn upgrade(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         }),
     }
 }
+
+/// A configured `Host`/authority, or the fallback when it is absent **or
+/// empty**.
+///
+/// The share-link grammars keep `?host=` as `Some("")`; the references treat
+/// that as "not set" (fall back to the server/endpoint name), so building a
+/// request from the raw option would produce `ws:///path` or an empty
+/// authority.
+pub(crate) fn host_or<'a>(host: Option<&'a str>, fallback: &'a str) -> &'a str {
+    host.filter(|h| !h.is_empty()).unwrap_or(fallback)
+}
+
+/// Percent-encode a configured URI path/query into an ASCII request target.
+///
+/// `http::Uri` rejects a space (and other non-URI ASCII) in the path, while a
+/// non-ASCII path is accepted and then sent as raw UTF-8 — and a `#` is parsed
+/// as a fragment and silently truncates the request target. Go's
+/// `url.EscapedPath` has none of those behaviours: everything outside the
+/// RFC 3986 path/query set is `%XX`, and an existing valid `%HH` is kept.
+///
+/// Borrowed when the input is already a valid target, so the common ASCII
+/// path allocates nothing.
+pub(crate) fn request_target(path: &str) -> std::borrow::Cow<'_, str> {
+    use std::fmt::Write as _;
+
+    let bytes = path.as_bytes();
+    if bytes
+        .iter()
+        .enumerate()
+        .all(|(i, &b)| target_byte_ok(bytes, i, b))
+    {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out = String::with_capacity(path.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' && pct_escape(bytes, i) {
+            out.push_str(&path[i..i + 3]);
+            i += 3;
+            continue;
+        }
+        if target_byte_ok(bytes, i, b) {
+            out.push(char::from(b));
+        } else {
+            write!(out, "%{b:02X}").expect("write! to String cannot fail");
+        }
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// RFC 3986 path/query bytes Go's `url.EscapedPath` leaves alone, plus the
+/// brackets modern browsers also leave alone. `%` is handled separately so a
+/// valid escape is preserved and an invalid one is encoded as `%25`.
+fn target_byte_ok(bytes: &[u8], i: usize, b: u8) -> bool {
+    if b.is_ascii_alphanumeric() {
+        return true;
+    }
+    if matches!(
+        b,
+        b'-' | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b'/'
+            | b':'
+            | b';'
+            | b'='
+            | b'?'
+            | b'@'
+            | b'['
+            | b']'
+    ) {
+        return true;
+    }
+    b == b'%' && pct_escape(bytes, i)
+}
+
+fn pct_escape(bytes: &[u8], i: usize) -> bool {
+    matches!(bytes.get(i + 1), Some(b) if b.is_ascii_hexdigit())
+        && matches!(bytes.get(i + 2), Some(b) if b.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod request_target_tests {
+    use super::request_target;
+    use std::borrow::Cow;
+
+    #[test]
+    fn ascii_path_borrows() {
+        assert!(matches!(
+            request_target("/ws?ed=2048&x=1"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn space_and_unicode_are_escaped() {
+        assert_eq!(request_target("/a b/ü"), "/a%20b/%C3%BC");
+        assert_eq!(
+            request_target("/?ed=Telegram🇨🇳+@WangCai2"),
+            "/?ed=Telegram%F0%9F%87%A8%F0%9F%87%B3+@WangCai2"
+        );
+    }
+
+    #[test]
+    fn fragment_is_escaped_not_truncated() {
+        assert_eq!(request_target("/x#f/more"), "/x%23f/more");
+    }
+
+    #[test]
+    fn valid_pct_is_preserved_and_invalid_is_escaped() {
+        assert_eq!(request_target("/%2Fok"), "/%2Fok");
+        assert_eq!(request_target("/%zz"), "/%25zz");
+    }
+
+    #[test]
+    fn every_target_parses_as_a_request_target() {
+        for raw in [
+            "/a b/ü",
+            "/?ed=Telegram🇨🇳+@WangCai2",
+            "/x#f/more",
+            "/%zz",
+            "/[]{}|\\^`\"<>",
+        ] {
+            let out = request_target(raw);
+            assert!(
+                http::uri::PathAndQuery::try_from(out.as_ref()).is_ok(),
+                "{raw:?} -> {out:?}"
+            );
+        }
+    }
+}

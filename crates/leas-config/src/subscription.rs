@@ -453,6 +453,7 @@ fn file_profile(
                 || lower.starts_with("localhost")
                 || lower.starts_with("unspecified")
                 || lower.starts_with("host has no registrable domain")
+                || lower.starts_with("transport host")
             {
                 summary.host_validation_count += 1;
                 summary.record_error(msg.as_str());
@@ -670,6 +671,21 @@ mod tests {
         assert_eq!(result.len(), 0);
         let result = decoder.finalize().unwrap();
         assert_eq!(result.len(), 0);
+    }
+
+    /// The new transport-host refusal is a HOST validation, not "other":
+    /// the audit's G4 rows must not disappear into the opaque bucket.
+    #[test]
+    fn transport_host_refusal_is_counted_as_host_validation() {
+        let urls = vec![
+            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?type=ws&security=tls&sni=example.com&host=سیسی.wOrLd"
+                .to_string(),
+        ];
+        let settings = crate::import_export::ValidationSettings::default();
+        let (profiles, summary) = parse_url_batch(&urls, &settings);
+        assert!(profiles.is_empty());
+        assert_eq!(summary.host_validation_count, 1);
+        assert_eq!(summary.other_count, 0);
     }
 
     #[test]

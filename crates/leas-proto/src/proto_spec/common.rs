@@ -79,6 +79,24 @@ impl TransportConfig {
         }
     }
 
+    /// The HTTP `Host` / h2 `:authority` value a transport can send, if any.
+    ///
+    /// **The one place that decides which transports carry a host** — the
+    /// ingestion gate and the DB shape predicate both read it, so a new
+    /// transport cannot be gated in one and not the other. `Grpc` spells it
+    /// `authority`; the pathless kinds have none.
+    #[must_use]
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Self::Ws(c) => c.host.as_deref(),
+            Self::Http(c) => c.host.as_deref(),
+            Self::HttpUpgrade(c) => c.host.as_deref(),
+            Self::XHttp(c) => c.host.as_deref(),
+            Self::Grpc(c) => c.authority.as_deref(),
+            Self::Tcp | Self::Quic | Self::Kcp(_) => None,
+        }
+    }
+
     fn recover_transport_type(input: &str) -> Option<&'static str> {
         // Sorted by length descending, so longest prefix matches first
         const KNOWN: &[&str] = &[

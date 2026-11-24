@@ -748,10 +748,24 @@ fn is_valid_hostname(host: &str) -> bool {
 ///
 /// Hostnames are validated against RFC-compliant DNS labels — underscores,
 /// non-ASCII, and other invalid characters are rejected.
+///
+/// The transport `Host`/`:authority` is a separate value (often a decoy) and
+/// is checked only for ASCII representability; it is never IDNA-normalized.
 pub fn validate_host(
     parsed: &ParsedProto,
     settings: &ValidationSettings,
 ) -> Result<(), ImportError> {
+    // The HTTP `Host`/`:authority` is not the endpoint: it can be a decoy, but
+    // it still has to be representable in a request. A non-ASCII, whitespace,
+    // control or markup byte cannot be sent by any HTTP implementation
+    // (Go's `ValidHostHeader` refuses the same bytes), so the row is refused
+    // here rather than retested forever. The endpoint host above is a
+    // different value and is IDNA-normalized by its own checks.
+    if leas_proto::proto_spec::transport_host_unrepresentable(&parsed.protocol.config) {
+        return Err(ImportError::Validation(
+            "transport host is not an ASCII host".into(),
+        ));
+    }
     let Some(endpoint) = parsed.endpoints.first() else {
         return Ok(()); // no address to validate
     };
@@ -910,7 +924,7 @@ impl ValidationSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leas_proto::proto_spec::{ProtoSpec, ProtocolKind};
+    use leas_proto::proto_spec::{ProtoSpec, ProtocolEssentials, ProtocolKind};
     use rstest::rstest;
 
     /// Test settings with private IPs allowed (existing tests use various IPs).
@@ -975,6 +989,72 @@ mod tests {
     }
 
     // ── validate_host ──
+
+    fn parsed_with_transport(transport: &serde_json::Value) -> ParsedProto {
+        let config: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d",
+            "transport": transport,
+            "security": { "type": "tls", "sni": "example.com" }
+        }))
+        .expect("config parses");
+        ParsedProto {
+            endpoints: vec![EndpointEssentials::new("example.com", 443)],
+            protocol: ProtocolEssentials {
+                proto_kind: ProtocolKind::Vless,
+                config,
+            },
+        }
+    }
+
+    /// The transport host/authority is the HTTP `Host` value: it must be
+    /// ASCII-representable. A space in the *path* is not a host problem — the
+    /// request builder percent-encodes it (audit §D2).
+    #[rstest]
+    #[case::non_ascii_host(serde_json::json!({"type": "ws", "host": "RFDJCK.سیسی.wOrLd"}), false)]
+    #[case::markup_host(serde_json::json!({"type": "ws", "host": "</code>speedtunnel<code><br/><br/>"}), false)]
+    #[case::space_host(serde_json::json!({"type": "http_upgrade", "host": "a b"}), false)]
+    #[case::grpc_authority(serde_json::json!({"type": "grpc", "authority": "例え.jp"}), false)]
+    #[case::host_with_port(serde_json::json!({"type": "ws", "host": "example.com:443"}), true)]
+    #[case::empty_host(serde_json::json!({"type": "ws"}), true)]
+    #[case::space_in_path(serde_json::json!({"type": "ws", "path": "/?ed=2560 PuLaFreeBOT"}), true)]
+    fn validate_host_rejects_unrepresentable_transport_host(
+        #[case] transport: serde_json::Value,
+        #[case] accepted: bool,
+    ) {
+        let parsed = parsed_with_transport(&transport);
+        let got = validate_host(&parsed, &ValidationSettings::default());
+        assert_eq!(got.is_ok(), accepted, "{got:?}");
+        if !accepted {
+            assert!(
+                got.unwrap_err().to_string().contains("transport host"),
+                "the refusal names the transport host"
+            );
+        }
+    }
+
+    /// The share-link path reaches the same gate: a non-ASCII `host=` in a
+    /// subscription URL is refused before it can be stored.
+    #[rstest]
+    #[case::non_ascii_ws_host(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?type=ws&security=tls&sni=example.com&host=سیسی.wOrLd",
+        false
+    )]
+    #[case::markup_ws_host(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?type=ws&security=tls&sni=example.com&host=%3C%2Fcode%3Espeedtunnel",
+        false
+    )]
+    #[case::ascii_ws_host(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?type=ws&security=tls&sni=example.com&host=cdn.example.com",
+        true
+    )]
+    fn parse_share_url_rejects_unrepresentable_transport_host(
+        #[case] url: &str,
+        #[case] imports: bool,
+    ) {
+        let got = parse_share_url(url, &permissive_settings()).is_ok();
+        assert_eq!(got, imports, "{url}");
+    }
 
     #[test]
     fn validate_host_rejects_unspecified_ipv4() {

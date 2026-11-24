@@ -25,8 +25,8 @@ use crate::error::{NativeError, timeouts};
 
 /// Build the WS upgrade request. Pure, unit-testable.
 pub fn ws_request(cfg: &WebSocketConfig, server_host: &str) -> Result<Request<()>, NativeError> {
-    let path = cfg.path.as_deref().unwrap_or("/");
-    let host = cfg.host.as_deref().unwrap_or(server_host);
+    let path = super::request_target(cfg.path.as_deref().unwrap_or("/"));
+    let host = super::host_or(cfg.host.as_deref(), server_host);
     let mut req = format!("ws://{host}{path}")
         .into_client_request()
         .map_err(|e| NativeError::Config(format!("ws request: {e}")))?;
@@ -752,6 +752,43 @@ mod tests {
         assert_eq!(req.headers().get("x-custom").unwrap(), "v1");
         assert_eq!(req.headers().get("connection").unwrap(), "Upgrade");
         assert_eq!(req.headers().get("upgrade").unwrap(), "websocket");
+    }
+
+    #[test]
+    fn space_and_unicode_path_are_percent_encoded() {
+        let cfg = WebSocketConfig {
+            path: Some("/?ed=2560 PuLaFreeBOT ü".into()),
+            host: Some("cdn.example.com".into()),
+            ..Default::default()
+        };
+        let req = ws_request(&cfg, "real-server.example").unwrap();
+        assert_eq!(
+            req.uri().path_and_query().unwrap().as_str(),
+            "/?ed=2560%20PuLaFreeBOT%20%C3%BC"
+        );
+        assert!(req.uri().to_string().is_ascii());
+        assert_eq!(req.headers().get("host").unwrap(), "cdn.example.com");
+    }
+
+    #[test]
+    fn empty_host_falls_back_to_the_server() {
+        let cfg = WebSocketConfig {
+            path: Some("/x".into()),
+            host: Some(String::new().into()),
+            ..Default::default()
+        };
+        let req = ws_request(&cfg, "proxy.example.net").unwrap();
+        assert_eq!(req.headers().get("host").unwrap(), "proxy.example.net");
+    }
+
+    #[test]
+    fn fragment_in_path_is_sent_not_truncated() {
+        let cfg = WebSocketConfig {
+            path: Some("/x#frag".into()),
+            ..Default::default()
+        };
+        let req = ws_request(&cfg, "proxy.example.net").unwrap();
+        assert_eq!(req.uri().path_and_query().unwrap().as_str(), "/x%23frag");
     }
 
     #[test]

@@ -48,10 +48,7 @@ pub fn request_head(ctx: &LinkContext) -> Result<(String, String, String), Nativ
         .transport_http()
         .ok_or_else(|| NativeError::Config("http (v2rayhttp) transport config missing".into()))?;
     let method = cfg.method.as_deref().unwrap_or("PUT").to_string();
-    let authority = cfg
-        .host
-        .as_deref()
-        .map_or_else(|| "www.example.com".to_string(), str::to_string);
+    let authority = super::host_or(cfg.host.as_deref(), "www.example.com").to_string();
     let path = cfg
         .path
         .as_deref()
@@ -72,12 +69,7 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
     let mut sender = h2_client_with(stream, crate::transport::http::profile_for(ctx)).await?;
     let (tx, body) = ReqBody::channel();
 
-    let uri = http::Uri::builder()
-        .scheme("https")
-        .authority(authority.as_str())
-        .path_and_query(&path)
-        .build()
-        .map_err(|e| NativeError::Config(format!("v2rayhttp uri build: {e}")))?;
+    let uri = request_uri(&authority, &path)?;
     let req = http::Request::builder()
         .method(method.as_str())
         .uri(uri)
@@ -103,6 +95,18 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
     let (wt, wrx) = mpsc::channel::<Bytes>(4);
     tokio::spawn(forward_pipe(tx, wrx));
     Ok(Box::new(V2rayStream::new(reader, wt)))
+}
+
+/// Build the absolute h2 URI: the authority is a pseudo-header, and the path
+/// is the ASCII request target (a configured space/Unicode byte is escaped).
+fn request_uri(authority: &str, path: &str) -> Result<http::Uri, NativeError> {
+    let target = super::request_target(path);
+    http::Uri::builder()
+        .scheme("https")
+        .authority(authority)
+        .path_and_query(target.as_ref())
+        .build()
+        .map_err(|e| NativeError::Config(format!("v2rayhttp uri build: {e}")))
 }
 
 /// Forward tunnel writes into the request-body pipe.
@@ -262,7 +266,7 @@ mod tests {
 
     use crate::addr::{Host, TargetAddr};
     use crate::context::{LinkContext, NativeConnectParams};
-    use crate::transport::v2rayhttp::request_head;
+    use crate::transport::v2rayhttp::{request_head, request_uri};
 
     fn vless_http(method: Option<&str>, host: Option<&str>) -> ProtocolConfig {
         serde_json::from_value(serde_json::json!({
@@ -294,6 +298,7 @@ mod tests {
     #[rstest]
     #[case::defaults(None, None, "PUT", "www.example.com")]
     #[case::method_and_host_override(Some("POST"), Some("cdn.example"), "POST", "cdn.example")]
+    #[case::empty_host_falls_back(Some("POST"), Some(""), "POST", "www.example.com")]
     fn request_head_method_and_authority(
         #[case] method: Option<&str>,
         #[case] host: Option<&str>,
@@ -306,6 +311,13 @@ mod tests {
         assert_eq!(method, want_method);
         assert_eq!(authority, want_authority);
         assert_eq!(path, "/h2");
+    }
+
+    #[test]
+    fn request_uri_percent_encodes_the_path() {
+        let uri = request_uri("cdn.example.com", "/a b/ü/sess").unwrap();
+        assert_eq!(uri.path_and_query().unwrap().as_str(), "/a%20b/%C3%BC/sess");
+        assert_eq!(uri.authority().unwrap().as_str(), "cdn.example.com");
     }
 
     #[test]

@@ -15,10 +15,11 @@ pub mod ss_method_support;
 /// A shape NO shipped codec can dial, decided by the same predicates the
 /// config-owned writers use (spec `2026-11-19-probe-truth` S5; ADR 0018 D-C).
 ///
-/// Two owners, one rule. The ingest gate (`leas-config`) refuses these rows
-/// before they are stored; the database's one-time step gives the rows that
-/// arrived earlier the `config_invalid` verdict. Both call THIS function, so a
-/// row cannot be "invalid" for one and acceptable to the other.
+/// Two owners, one rule: the ingest gate (`leas-config`) refuses these rows
+/// before they are stored, and the database's one-time step gives the rows
+/// that arrived earlier the `config_invalid` verdict. The transport-host rule
+/// is shared verbatim ([`transport_host_unrepresentable`]); the flow and
+/// SS-method shapes are the same predicates the ingest validators apply first.
 ///
 /// What it is NOT: a deprecation list. A variant some pinned oracle still
 /// serves (non-vision flows over TLS, legacy SS stream ciphers, the `quic`
@@ -26,6 +27,9 @@ pub mod ss_method_support;
 /// row has no layer for XTLS to run over, which no core accepts.
 #[must_use]
 pub fn is_undialable_shape(config: &ProtocolConfig) -> bool {
+    if transport_host_unrepresentable(config) {
+        return true;
+    }
     match config {
         ProtocolConfig::Vless(cfg) => {
             let flow = cfg.flow.as_deref().filter(|f| !f.is_empty());
@@ -40,6 +44,34 @@ pub fn is_undialable_shape(config: &ProtocolConfig) -> bool {
         _ => false,
     }
 }
+
+/// True when a transport carries a `Host`/`:authority` value no HTTP request
+/// can represent.
+///
+/// Anything outside `[A-Za-z0-9._:\[\]-]` (non-ASCII, whitespace, control,
+/// markup, `/`, `@`, `%`) is refused. An empty value is valid: every Host
+/// consumer falls back to the endpoint name (`transport::host_or`).
+///
+/// Callers: the ingest gate (`leas-config::import_export::validate_host`) and
+/// [`is_undialable_shape`] (the stored-row step). Both read
+/// [`common::TransportConfig::host`], so the transport list cannot drift.
+#[must_use]
+pub fn transport_host_unrepresentable(config: &ProtocolConfig) -> bool {
+    let transport = match config {
+        ProtocolConfig::Vless(c) => Some(&c.transport),
+        ProtocolConfig::Vmess(c) => Some(&c.transport),
+        ProtocolConfig::Trojan(c) => Some(&c.transport),
+        _ => None,
+    };
+    transport
+        .and_then(common::TransportConfig::host)
+        .is_some_and(|host| {
+            host.bytes().any(|b| {
+                !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b':' | b'[' | b']'))
+            })
+        })
+}
+
 pub use identity::IDENTITY_VERSION;
 pub mod utils;
 
@@ -802,6 +834,43 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    #[rstest]
+    #[case::nonascii_host(
+        json!({"schema": "Vless", "uuid": "u", "transport": {"type": "ws", "host": "RFDJCK.سیسی.wOrLd"}}),
+        true
+    )]
+    #[case::markup_host(
+        json!({"schema": "Vless", "uuid": "u", "transport": {"type": "ws", "host": "</code>speedtunnel<code><br/><br/>"}}),
+        true
+    )]
+    #[case::backtick_host(
+        json!({"schema": "Vless", "uuid": "u", "transport": {"type": "ws", "host": "`rb24`.`ir`"}}),
+        true
+    )]
+    #[case::space_host(
+        json!({"schema": "Vless", "uuid": "u", "transport": {"type": "http_upgrade", "host": "a b"}}),
+        true
+    )]
+    #[case::port_and_dot(
+        json!({"schema": "Vless", "uuid": "u", "transport": {"type": "ws", "host": "Example.COM.:443"}}),
+        false
+    )]
+    #[case::empty_host(
+        json!({"schema": "Vless", "uuid": "u", "transport": {"type": "ws"}}),
+        false
+    )]
+    #[case::grpc_authority(
+        json!({"schema": "Vless", "uuid": "u", "transport": {"type": "grpc", "authority": "例え.jp"}}),
+        true
+    )]
+    fn transport_host_verdict(#[case] cfg: serde_json::Value, #[case] bad: bool) {
+        let config: ProtocolConfig = serde_json::from_value(cfg).expect("config parses");
+        assert_eq!(transport_host_unrepresentable(&config), bad);
+        // These fixtures carry no flow and no SS method, so the host rule is
+        // the only verdict in play.
+        assert_eq!(is_undialable_shape(&config), bad);
+    }
 
     #[test]
     fn trojan_go_scheme_dispatches_through_the_boundary() {

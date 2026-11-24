@@ -31,10 +31,7 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
     let cfg = ctx
         .transport_httpupgrade()
         .ok_or_else(|| NativeError::Config("httpupgrade transport config missing".into()))?;
-    let host = cfg
-        .host
-        .as_deref()
-        .map_or_else(|| ctx.params.server.host.clone(), str::to_string);
+    let host = super::host_or(cfg.host.as_deref(), &ctx.params.server.host).to_string();
     let path = cfg
         .path
         .as_deref()
@@ -42,9 +39,10 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
 
     let mut sender = h1_client(stream).await?;
 
+    let target = super::request_target(&path);
     let mut builder = http::Request::builder()
         .method("GET")
-        .uri(&path)
+        .uri(target.as_ref())
         .header(HOST, &host)
         .header(CONNECTION, "Upgrade")
         .header(UPGRADE, "websocket");
@@ -168,6 +166,48 @@ mod tests {
         let mut out = [0u8; 5];
         t.read_exact(&mut out).await.unwrap();
         assert_eq!(&out, b"world");
+        server.await.unwrap();
+    }
+
+    fn vless_httpupgrade_path(path: &str) -> ProtocolConfig {
+        serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "http_upgrade", "path": path, "host": "example.com" }
+        }))
+        .expect("config parses")
+    }
+
+    /// The request line is an ASCII request target: a configured space or
+    /// non-ASCII byte is percent-encoded, never sent raw.
+    #[tokio::test]
+    async fn request_line_percent_encodes_the_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                sock.read_exact(&mut buf).await.unwrap();
+                head.push(buf[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(head.starts_with("GET /a%20b/%C3%BC HTTP/1.1"), "{head:?}");
+            sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(
+                vless_httpupgrade_path("/a b/ü"),
+                EndpointEssentials::new(addr.ip().to_string(), addr.port()),
+                TargetAddr::new(Host::Domain("dest.test".into()), 80),
+            ),
+            TargetAddr::new(Host::Domain("dest.test".into()), 80),
+        );
+        let _t = connect(&ctx, Box::new(stream)).await.unwrap();
         server.await.unwrap();
     }
 

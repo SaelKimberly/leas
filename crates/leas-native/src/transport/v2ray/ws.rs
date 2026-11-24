@@ -41,8 +41,9 @@ pub fn plugin_ws_request(
     spec: &leas_proto::proto_spec::PluginSpec,
     endpoint_host: &str,
 ) -> Result<Request<()>, NativeError> {
-    let path = normalize_path(spec.path.as_deref().unwrap_or("/"));
-    let host = spec.host.as_deref().unwrap_or(endpoint_host);
+    let normalized = normalize_path(spec.path.as_deref().unwrap_or("/"));
+    let path = crate::transport::request_target(&normalized);
+    let host = crate::transport::host_or(spec.host.as_deref(), endpoint_host);
     // A relative request target is not a valid HTTP request line, and the
     // plugin path is a path — never a full URL (the reference builds
     // `ws://<host><path>` before handing it to the ws dialer, which the
@@ -143,6 +144,27 @@ mod tests {
         let relative =
             plugin_ws_request(&spec("path=kpnzyxsj"), "server.example").expect("request");
         assert_eq!(relative.uri().path(), "/kpnzyxsj");
+    }
+
+    /// The plugin path is a request target too: a space/Unicode byte is
+    /// percent-encoded before the `ws://` conversion (audit §D2 covers the
+    /// `TransportConfig` ws path; this builder is its twin).
+    #[test]
+    fn the_plugin_path_is_percent_encoded() {
+        let req = plugin_ws_request(&spec("host=cdn.example;path=/a b/ü"), "server.example")
+            .expect("request");
+        assert_eq!(
+            req.uri().path_and_query().expect("target").as_str(),
+            "/a%20b/%C3%BC"
+        );
+    }
+
+    /// An empty `host=` is "not set" in the reference grammars: fall back to
+    /// the endpoint rather than building `ws:///path`.
+    #[test]
+    fn an_empty_host_falls_back_to_the_endpoint() {
+        let req = plugin_ws_request(&spec("host=;path=/x"), "server.example").expect("request");
+        assert_eq!(req.headers().get(HOST).expect("host"), "server.example");
     }
 
     /// The mode is the one this module frames: a row the transport must not

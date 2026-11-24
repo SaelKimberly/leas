@@ -473,8 +473,12 @@ impl Database {
     /// validators the ingest gate uses, never by a second JSON reading here.
     async fn purge_invalid_shapes_once(&self) -> Result<()> {
         const MARKER: &str = "invalid_shapes_purged";
+        // Version 2 added the unrepresentable transport host (the audit's
+        // `invalid uri character` class). An existing DB stamped 1 re-runs
+        // the scan once; the key stays the same, so no schema change.
+        const MARKER_VERSION: i64 = 2;
         let mut conn = self.conn().await?;
-        if crate::schema::rekey::marker_value(&mut conn, MARKER).await? >= 1 {
+        if crate::schema::rekey::marker_value(&mut conn, MARKER).await? >= MARKER_VERSION {
             return Ok(());
         }
         let rows = toasty::sql::query(
@@ -506,7 +510,7 @@ impl Database {
             hits.push((*protocol, *endpoint));
         }
         if hits.is_empty() {
-            crate::schema::rekey::stamp_marker(&mut conn, MARKER, 1).await?;
+            crate::schema::rekey::stamp_marker(&mut conn, MARKER, MARKER_VERSION).await?;
             return Ok(());
         }
         let mut endpoints: Vec<EndpointId> = Vec::new();
@@ -528,7 +532,7 @@ impl Database {
         drop(conn);
         let _ = self.refresh_endpoint_ranks(&endpoints).await;
         let mut conn = self.conn().await?;
-        crate::schema::rekey::stamp_marker(&mut conn, MARKER, 1).await?;
+        crate::schema::rekey::stamp_marker(&mut conn, MARKER, MARKER_VERSION).await?;
         Ok(())
     }
 
@@ -3956,6 +3960,19 @@ mod tests {
                     3001,
                     serde_json::json!({"schema": "Vless", "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d", "transport": {"type": "tcp"}}),
                 ),
+                // A transport host no HTTP request can carry (audit §D3).
+                (
+                    4,
+                    4001,
+                    serde_json::json!({"schema": "Vless", "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d", "transport": {"type": "ws", "host": "RFDJCK.سیسی.wOrLd"}}),
+                ),
+                // A space PATH is dialable (the request builder encodes it):
+                // it must NOT take the config_invalid verdict.
+                (
+                    5,
+                    5001,
+                    serde_json::json!({"schema": "Vless", "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d", "transport": {"type": "ws", "path": "/?ed=2560 PuLaFreeBOT", "host": "example.com"}}),
+                ),
             ] {
                 // The endpoint only: this fixture owns the protocol row (it
                 // carries the shape under test), so `seed_endpoint` would
@@ -4009,10 +4026,15 @@ mod tests {
         {
             let db = Database::open(&path).await.expect("seed-state open");
             let mut conn = db.connection().await.expect("connection");
-            toasty::sql::query("DELETE FROM app_meta WHERE key = 'invalid_shapes_purged'")
-                .exec(&mut conn)
-                .await
-                .expect("clear marker");
+            // An existing DB from before the host rule: stamped version 1.
+            // The step must treat it as stale and re-scan.
+            toasty::sql::query(
+                "INSERT INTO app_meta (key, value) VALUES ('invalid_shapes_purged', '1') \
+                 ON CONFLICT(key) DO UPDATE SET value = '1'",
+            )
+            .exec(&mut conn)
+            .await
+            .expect("seed stale marker");
         }
 
         // Reopen: the one-time step runs and stamps.
@@ -4022,6 +4044,8 @@ mod tests {
             (1, Some("config_invalid")),
             (2, Some("config_invalid")),
             (3, None),
+            (4, Some("config_invalid")),
+            (5, None),
         ] {
             let rows = toasty::sql::query(
                 "SELECT endpoint_id, purge_reason FROM profile_stats ORDER BY endpoint_id",
@@ -4059,7 +4083,20 @@ mod tests {
                 .exec(&mut conn)
                 .await
                 .expect("marker");
-        assert!(!rows.is_empty(), "the step stamps its marker");
+        let stamped = rows.first().and_then(|row| {
+            let toasty_core::stmt::Value::Record(f) = row else {
+                return None;
+            };
+            match f.first() {
+                Some(toasty_core::stmt::Value::String(s)) => Some(s.clone()),
+                _ => None,
+            }
+        });
+        assert_eq!(
+            stamped.as_deref(),
+            Some("2"),
+            "the step stamps the version that makes a second open a no-op"
+        );
     }
 
     /// S4: a resolved host drops its name-class marker, and ONLY that. A real
