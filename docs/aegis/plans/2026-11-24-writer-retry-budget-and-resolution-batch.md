@@ -44,7 +44,9 @@ Out of scope, with reasons:
 2. **G2b** — `Database::update_endpoint_resolutions(rows)` writes a batch of
    `(EndpointId, Vec<IpAddr>, i64)` in ONE transaction per 64-row chunk
    (`resolved_at`, `endpoint_ip::replace`, one `endpoint_rank::refresh` for
-   the chunk's ids, commit) under the same `retry_on_busy`. A failing chunk
+   the chunk's ids, commit) under the same `retry_on_busy`. The connection is
+   checked out per chunk, so a long flush cannot hold one pooled connection
+   for its whole run. A failing chunk
    is logged and skipped — the per-endpoint loop it replaces isolated
    failures per endpoint — and an error is returned once the batch finishes:
    the first BUSY error if any chunk hit one (so the ladder retries the batch),
@@ -56,9 +58,12 @@ Out of scope, with reasons:
 
 - `a_zero_budget_spends_no_retry` (new, `retry.rs`) — with the budget
   exhausted at the first attempt, a busy op is called ONCE, where the old
-  ladder called it `attempts + 1` times. The existing
-  `retries_serialization_failures_then_succeeds` and `gives_up_after_attempts`
-  pin that a normal budget still retries.
+  ladder called it `attempts + 1` times.
+- `the_shipped_budget_stops_a_slow_ladder_at_three_attempts` (new,
+  `retry.rs`, paused time) — the SHIPPED 15 s budget with attempts that each
+  burn the 5 s busy ceiling: three calls, not the five-rung ladder's six.
+  The existing `retries_serialization_failures_then_succeeds` and
+  `gives_up_after_attempts` pin that a normal budget still retries.
 - `resolution_batch_writes_every_endpoint` (new) — three endpoints in one
   call: each gets its `resolved_at`, its address set (key order, not answer
   order), and the empty batch is a no-op.

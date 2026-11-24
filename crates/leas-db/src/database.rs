@@ -1804,11 +1804,17 @@ impl Database {
             move || {
                 let rows = rows.clone();
                 async move {
-                    let mut conn = db.conn().await?;
                     let mut first_err: Option<DatabaseError> = None;
                     let mut busy_err: Option<DatabaseError> = None;
                     for chunk in rows.chunks(RESOLUTION_CHUNK) {
-                        if let Err(err) = Self::write_resolution_chunk(&mut conn, chunk).await {
+                        // Check the connection out per chunk, not per batch: a
+                        // long flush must not hold one pooled connection for
+                        // its whole run while the plan read waits.
+                        let result = match db.conn().await {
+                            Ok(mut conn) => Self::write_resolution_chunk(&mut conn, chunk).await,
+                            Err(err) => Err(err),
+                        };
+                        if let Err(err) = result {
                             tracing::warn!(
                                 target: "leas_db",
                                 "resolution chunk of {} endpoint(s) failed: {err}",

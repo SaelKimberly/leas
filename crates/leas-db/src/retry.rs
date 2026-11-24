@@ -228,6 +228,30 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// The shipped budget, with attempts that each burn the driver's 5 s
+    /// busy ceiling: three attempts already fill 15 s, so the ladder stops
+    /// there instead of exhausting its five rungs (the old code called the op
+    /// six times). Paused time makes the 15 s instant, not a test wait.
+    #[tokio::test(start_paused = true)]
+    async fn the_shipped_budget_stops_a_slow_ladder_at_three_attempts() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = calls.clone();
+        let result = retry_on_busy(
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Err::<(), _>(busy())
+                }
+            },
+            5,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
     #[tokio::test]
     async fn does_not_retry_non_busy_errors() {
         let calls = Arc::new(AtomicU32::new(0));
