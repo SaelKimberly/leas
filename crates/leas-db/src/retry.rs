@@ -60,18 +60,49 @@ fn pick_jitter(ceiling_ms: u64) -> u64 {
     mixed % ceiling_ms.saturating_add(1)
 }
 
+/// Total time ONE operation may spend retrying before it fails.
+///
+/// The attempt count alone does not bound the wait: each attempt carries the
+/// driver's 5 s busy ceiling, so the 5–8 attempt ladders used across
+/// `Database` could hold one caller 25–40 s — and every queued operation sits
+/// behind it on the pool. The 2026-11-23/24 window measured 455 statements
+/// ≥ 1 s and plan queries answering in 772 s while writers laddered. Failing
+/// the OPERATION at a bounded time keeps the UI's read from queueing behind
+/// it: 15 s is already three full busy ceilings, so only a pathologically
+/// contended ladder is cut short. What a refusal costs depends on the caller:
+/// the write-behind driver re-stages its window; the enrichment flush drops
+/// that pass's resolutions, and the session's TTL gate (which reads the
+/// session entry, not the persisted stamp) re-resolves the host when it
+/// expires — the cost is a delay, never a lost row.
+const BUSY_RETRY_BUDGET: Duration = Duration::from_secs(15);
+
 /// Run `op`, retrying up to `attempts` extra times when it fails with `SQLite`
 /// write contention, with exponential backoff and full jitter.
 /// Non-busy errors pass through immediately, unchanged.
-pub async fn retry_on_busy<T, F, Fut>(mut op: F, attempts: u32) -> Result<T>
+pub async fn retry_on_busy<T, F, Fut>(op: F, attempts: u32) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
+    retry_on_busy_within(op, attempts, BUSY_RETRY_BUDGET).await
+}
+
+/// [`retry_on_busy`] with an explicit total budget — the seam a test uses to
+/// pin the bound without waiting for the shipped value.
+pub async fn retry_on_busy_within<T, F, Fut>(
+    mut op: F,
+    attempts: u32,
+    budget: Duration,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let started = tokio::time::Instant::now();
     let mut attempt = 0u32;
     loop {
         match op().await {
-            Err(err) if is_busy_error(&err) && attempt < attempts => {
+            Err(err) if is_busy_error(&err) && attempt < attempts && started.elapsed() < budget => {
                 tokio::time::sleep(jittered_backoff(attempt)).await;
                 attempt += 1;
             }
@@ -172,6 +203,29 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 3); // 1 initial + 2 retries
+    }
+
+    /// The budget is what bounds the WAIT, not the attempt count: the old
+    /// ladder would call this op `attempts + 1` times. Failing the operation
+    /// at the budget is the point — the plan read queues behind it otherwise.
+    #[tokio::test]
+    async fn a_zero_budget_spends_no_retry() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = calls.clone();
+        let result = retry_on_busy_within(
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(busy())
+                }
+            },
+            5,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(result.is_err(), "the busy error must surface, not vanish");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

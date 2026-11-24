@@ -412,7 +412,7 @@ a stale position.
 | `upsert_links_bulk` | inside the caller's transaction |
 | `apply_link_patches` (write-behind `LinkSpec::refresh`) | in the window transaction under WAL; skipped under MVCC and marked dirty instead |
 | `update_last_used` | after the write |
-| `update_endpoint_resolution` | inside the same transaction |
+| `update_endpoint_resolution`, `update_endpoint_resolutions` | inside the same transaction (`update_endpoint_resolutions` refreshes once per chunk) |
 | `set_manual_override` | after the write |
 | `restore_endpoint` | after the write |
 | `clear_all_stats` | wholesale `backfill_all` |
@@ -426,9 +426,11 @@ a stale position.
 rank_newest_seen < threshold`) and `reband_all` (both directions, to apply a
 changed TTL) run at startup and on the retention tick.
 
-`endpoint_ip` has one writer, `update_endpoint_resolution`: delete-then-insert
-of the set, deduped by key, in the same transaction as `resolved_at` and the
-rank refresh. The rewrite carries the countries of the addresses that survive
+`endpoint_ip` has one writer pair: `update_endpoint_resolution` for one
+endpoint, and `update_endpoint_resolutions` for a batch (one transaction per
+`RESOLUTION_CHUNK`, 64 endpoints, a failing chunk logged and skipped, and a busy error preferred as the batch's verdict so the retry ladder runs) — both
+delete-then-insert the set, deduped by key, in the same transaction as
+`resolved_at` and the rank refresh. The rewrite carries the countries of the addresses that survive
 it, so a re-resolution does not discard a lookup that already happened.
 `set_endpoint_ip_country` is the geo step's write: it updates the row or creates
 it when the lookup won the race against the address write. The page seed
@@ -602,10 +604,10 @@ sequenceDiagram
     H-->>E: addresses (or a failure)
     E->>V: CoreEvent::EndpointInfoUpdated{endpoint_id, info}
     V->>V: merge by field group (resolution / whitelist / outbound),<br/>so concurrent events cannot clobber each other
-    V->>D: update_endpoint_resolution(eid, Vec<IpAddr>, at), ONE transaction:
+    V->>D: update_endpoint_resolutions([(eid, Vec<IpAddr>, at)]), ONE transaction per 64 endpoints:
     D->>D: endpoints.resolved_at = at
     D->>D: endpoint_ip: delete the old set, insert the new (deduped by key)
-    D->>D: endpoint_rank::refresh (the endpoint may leave or enter the DNS band)
+    D->>D: endpoint_rank::refresh per chunk (an endpoint may leave or enter the DNS band)
 ```
 
 ### Connect
@@ -629,7 +631,7 @@ flowchart LR
 | `profiles_aggregate` | `COUNT(*)` plus seven `SUM(CASE WHEN ...)` arms | Details panel bucket counts, one statement per scope (`live_alive` computes 0/1 from `rank_newest_seen`; the view arm reads the swept `band`); the partition arms are `PlanScope::predicate` verbatim |
 | `load_page_projection` | one hydration statement, ids inlined | display columns only; the deferred JSON carriers stay unloaded |
 | `load_page_rows` | typed `in_list` reads plus an in-memory join | the parity oracle for the projection |
-| `update_endpoint_resolution` | `UPDATE endpoints` plus the `endpoint_ip` set rewrite plus rank refresh | one transaction, retried on write contention |
+| `update_endpoint_resolution` / `update_endpoint_resolutions` | `UPDATE endpoints` plus the `endpoint_ip` set rewrite plus rank refresh | one transaction per endpoint / per `RESOLUTION_CHUNK` (64), retried on write contention |
 | `apply_link_patches` | one multi-row upsert per chunk and group shape | the write-behind flush path: 512-patch window about 10.0 ms against about 29.0 ms for the retired per-row `UPDATE` plus existence probe (ADR 0002) |
 | `endpoint_rank::refresh` / `backfill_all` / `repair_missing` | raw id-inlined reads plus a bulk upsert (`RANK_CHUNK` = 400) | never binds ids, about 0.8 ms per bound parameter |
 | `upsert_links_bulk` | one multi-row upsert per chunk, SOURCE columns on conflict | the import path: 2,000 links about 44.3 ms against about 360 ms for the per-row typed upsert (ADR 0002) |

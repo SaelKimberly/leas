@@ -1262,22 +1262,19 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
         }
     }
     // Flush this pass's DNS-resolution writes as ONE spawned task: an
-    // enrichment flood previously spawned one DB task per event.
+    // enrichment flood previously spawned one DB task per event, and one
+    // transaction per endpoint. `update_endpoint_resolutions` chunks the batch.
     if !persist_batch.is_empty() {
         let db = state.db.clone();
+        let count = persist_batch.len();
         tokio::spawn(async move {
-            for (eid, resolved_ips, resolved_at) in persist_batch {
-                // The address set (`endpoint_ip`) + `resolved_at` are the
-                // ONLY owner of a DNS endpoint's resolutions.
-                if let Err(e) = db
-                    .update_endpoint_resolution(eid, resolved_ips, resolved_at)
-                    .await
-                {
-                    tracing::warn!(
-                        target: "tui::ops::events",
-                        "update_endpoint_resolution failed: {e}"
-                    );
-                }
+            // The address set (`endpoint_ip`) + `resolved_at` are the ONLY
+            // owner of a DNS endpoint's resolutions.
+            if let Err(e) = db.update_endpoint_resolutions(&persist_batch).await {
+                tracing::warn!(
+                    target: "tui::ops::events",
+                    "update_endpoint_resolutions reported an error for a batch of {count} endpoint(s) (earlier chunks may have committed): {e}"
+                );
             }
         });
     }

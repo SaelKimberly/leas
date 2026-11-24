@@ -787,6 +787,13 @@ impl Database {
 /// number is free to move.
 const LINK_STATEMENT_ROWS: usize = 400;
 
+/// Endpoints per transaction in [`Database::update_endpoint_resolutions`].
+/// One transaction carries the `resolved_at` update, the address-set rewrite
+/// (one delete + a country read + one insert per surviving address) and one
+/// rank refresh for the chunk — bounded enough that the plan read can
+/// interleave, wide enough to collapse the flush's per-endpoint commits.
+const RESOLUTION_CHUNK: usize = 64;
+
 /// A SQL TEXT literal: single quotes doubled, so a stored error message can
 /// never terminate the literal. The values come from our own rows, never from
 /// user input at this layer.
@@ -1757,6 +1764,96 @@ impl Database {
             5,
         )
         .await
+    }
+
+    /// Write a batch of DNS resolutions: `resolved_at`, the address set, and
+    /// the rank keys of every endpoint in one transaction per
+    /// [`RESOLUTION_CHUNK`] rows.
+    ///
+    /// The per-endpoint form is one transaction EACH, and the enrichment
+    /// flush calls it once per endpoint — 65 k endpoints × several statements
+    /// was the import's write volume against the same single-writer WAL the
+    /// UI reads through (2026-11-24 audit G2). Chunked so one statement
+    /// cannot hold the connection for a whole page of resolutions.
+    ///
+    /// Re-running a chunk after a busy retry is idempotent: `resolved_at` is
+    /// absolute and [`crate::endpoint_ip::replace`] replaces the set.
+    ///
+    /// A failing chunk does NOT abort the rest (the per-endpoint loop it
+    /// replaces isolated failures per endpoint): each chunk commits on its
+    /// own, a failed one is logged, and one error is returned once the batch
+    /// is done so the caller still sees the failure — the first BUSY error if
+    /// any chunk hit one (so the retry ladder retries the batch), else the
+    /// first error.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError`] (first busy, else first) when any chunk fails; the
+    /// other chunks' rows stay committed.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+    pub async fn update_endpoint_resolutions(
+        &self,
+        rows: &[(EndpointId, Vec<std::net::IpAddr>, i64)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let db = self;
+        let rows = rows.to_vec();
+        retry_on_busy(
+            move || {
+                let rows = rows.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    let mut first_err: Option<DatabaseError> = None;
+                    let mut busy_err: Option<DatabaseError> = None;
+                    for chunk in rows.chunks(RESOLUTION_CHUNK) {
+                        if let Err(err) = Self::write_resolution_chunk(&mut conn, chunk).await {
+                            tracing::warn!(
+                                target: "leas_db",
+                                "resolution chunk of {} endpoint(s) failed: {err}",
+                                chunk.len()
+                            );
+                            // A busy error is what the ladder retries, so it
+                            // must win over an earlier non-busy one: returning
+                            // the non-busy error would skip the retry and drop
+                            // every contended chunk in this batch.
+                            if crate::is_busy_error(&err) {
+                                busy_err.get_or_insert(err);
+                            } else {
+                                first_err.get_or_insert(err);
+                            }
+                        }
+                    }
+                    busy_err.or(first_err).map_or(Ok(()), Err)
+                }
+            },
+            5,
+        )
+        .await
+    }
+
+    /// One chunk of [`Self::update_endpoint_resolutions`] in its own
+    /// transaction: the stamp, the address set, and the rank keys move
+    /// together, or none of them do.
+    async fn write_resolution_chunk(
+        conn: &mut toasty::Connection,
+        chunk: &[(EndpointId, Vec<std::net::IpAddr>, i64)],
+    ) -> Result<()> {
+        let mut tx = conn.transaction().await?;
+        let mut ids = Vec::with_capacity(chunk.len());
+        for (endpoint_id, ips, at) in chunk {
+            Endpoint::filter_by_id(*endpoint_id)
+                .update()
+                .resolved_at(Some(*at))
+                .exec(&mut tx)
+                .await?;
+            crate::endpoint_ip::replace(&mut tx, *endpoint_id, ips).await?;
+            ids.push(*endpoint_id);
+        }
+        crate::endpoint_rank::refresh(&mut tx, &ids).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// The persisted resolved addresses of `ids` with their stored countries.
@@ -5641,6 +5738,179 @@ mod tests {
             vec![ip("1.1.1.1"), ip("3.3.3.3")],
             ts(200),
         )
+        .await
+        .expect("re-resolve");
+
+        let resolved = db
+            .endpoint_resolutions(&[EndpointId::new(1)])
+            .await
+            .expect("read");
+        assert_eq!(
+            resolved
+                .get(&EndpointId::new(1))
+                .cloned()
+                .unwrap_or_default(),
+            vec![
+                (ip("1.1.1.1"), Some("US".to_string())),
+                (ip("3.3.3.3"), None)
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn resolution_batch_writes_every_endpoint() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        for (id, host) in [
+            (1i64, "one.example"),
+            (2, "two.example"),
+            (3, "three.example"),
+        ] {
+            seed_endpoint(&mut conn, id, 1000 + id, host, HostType::Dns, 443, 10).await;
+        }
+
+        db.update_endpoint_resolutions(&[])
+            .await
+            .expect("empty batch is a no-op");
+
+        db.update_endpoint_resolutions(&[
+            (
+                EndpointId::new(1),
+                vec![ip("2.2.2.2"), ip("1.1.1.1")],
+                ts(100),
+            ),
+            (EndpointId::new(2), vec![ip("10.0.0.1")], ts(101)),
+            (EndpointId::new(3), vec![ip("2001:db8::1")], ts(102)),
+        ])
+        .await
+        .expect("batch");
+
+        for (id, at, ips) in [
+            (1i64, 100, vec![ip("1.1.1.1"), ip("2.2.2.2")]),
+            (2, 101, vec![ip("10.0.0.1")]),
+            (3, 102, vec![ip("2001:db8::1")]),
+        ] {
+            let ep = Endpoint::filter_by_id(EndpointId::new(id))
+                .first()
+                .exec(&mut conn)
+                .await
+                .expect("read")
+                .expect("row");
+            assert_eq!(
+                ep.resolved_at,
+                Some(ts(at)),
+                "endpoint {id} keeps its own stamp"
+            );
+            assert_eq!(
+                stored_ips(&mut conn, id).await,
+                ips,
+                "endpoint {id} keeps its own address set"
+            );
+        }
+    }
+
+    /// The address set is tier 5 of the ordering law, so the stored rank bin
+    /// must move when the resolution lands: 15 is the DNS-unresolved band,
+    /// 12 untested. Deleting the batch's rank refresh keeps every other
+    /// resolution test green.
+    #[tokio::test]
+    async fn resolution_batch_moves_the_rank_out_of_the_dns_band() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "dns.example", HostType::Dns, 443, 10).await;
+        // The seed writes no rank row; materialize one first so the batch is
+        // the only thing that can move it.
+        db.refresh_endpoint_ranks(&[EndpointId::new(1)])
+            .await
+            .expect("seed rank");
+
+        let before = bin_of(&mut conn, 1).await;
+        db.update_endpoint_resolutions(&[(EndpointId::new(1), vec![ip("1.1.1.1")], ts(100))])
+            .await
+            .expect("batch");
+        let after = bin_of(&mut conn, 1).await;
+
+        assert_eq!(before, 15, "no stored address = the DNS-unresolved band");
+        assert_eq!(after, 12, "the resolved address leaves that band");
+    }
+
+    async fn bin_of(conn: &mut toasty::Connection, id: i64) -> i64 {
+        EndpointRank::filter_by_endpoint_id(EndpointId::new(id))
+            .first()
+            .exec(conn)
+            .await
+            .expect("read")
+            .expect("rank row")
+            .bin
+    }
+
+    /// A batch past the chunk size must write its TAIL chunk too — the
+    /// chunk loop is the only thing standing between a 65-endpoint flush and
+    /// a silently dropped last endpoint.
+    #[tokio::test]
+    async fn resolution_batch_spans_the_chunk_size() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        let ids: Vec<i64> = (1..=65).collect();
+        for id in &ids {
+            seed_endpoint(
+                &mut conn,
+                *id,
+                1000 + id,
+                "dns.example",
+                HostType::Dns,
+                443,
+                10,
+            )
+            .await;
+        }
+
+        let rows: Vec<_> = ids
+            .iter()
+            .map(|id| (EndpointId::new(*id), vec![ip("1.1.1.1")], ts(*id)))
+            .collect();
+        db.update_endpoint_resolutions(&rows).await.expect("batch");
+
+        for id in &ids {
+            let ep = Endpoint::filter_by_id(EndpointId::new(*id))
+                .first()
+                .exec(&mut conn)
+                .await
+                .expect("read")
+                .expect("row");
+            assert_eq!(ep.resolved_at, Some(ts(*id)), "endpoint {id}");
+        }
+        assert_eq!(
+            stored_ips(&mut conn, 65).await,
+            vec![ip("1.1.1.1")],
+            "the tail chunk's address set lands too"
+        );
+    }
+
+    /// The bulk path must go through `endpoint_ip::replace` (not a plain
+    /// insert): a re-resolution keeps the country of an address that survives.
+    #[tokio::test]
+    async fn resolution_batch_keeps_stored_countries() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "dns.example", HostType::Dns, 443, 10).await;
+
+        db.update_endpoint_resolutions(&[(
+            EndpointId::new(1),
+            vec![ip("1.1.1.1"), ip("2.2.2.2")],
+            ts(100),
+        )])
+        .await
+        .expect("resolve");
+        db.set_endpoint_ip_country(EndpointId::new(1), ip("1.1.1.1"), "US")
+            .await
+            .expect("country");
+
+        db.update_endpoint_resolutions(&[(
+            EndpointId::new(1),
+            vec![ip("1.1.1.1"), ip("3.3.3.3")],
+            ts(200),
+        )])
         .await
         .expect("re-resolve");
 
