@@ -271,9 +271,9 @@ mod tests {
     }
 
     /// Serve two sequential resumable connections, echoing one byte each.
-    fn spawn_resumable_server() -> std::net::SocketAddr {
+    fn spawn_resumable_server(server_name: &str) -> std::net::SocketAddr {
         let certified =
-            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+            rcgen::generate_simple_self_signed(vec![server_name.to_string(), "127.0.0.1".into()])
                 .unwrap();
         let cfg = Arc::new(resumable_server_config(
             &certified.cert,
@@ -364,9 +364,9 @@ mod tests {
     /// rustls server, and round-trip application bytes.
     #[tokio::test]
     async fn resumption_reuses_a_ticket() {
-        let addr = spawn_resumable_server();
+        let addr = spawn_resumable_server("resume-a.local");
         let verifier: Arc<dyn ServerVerifier> = Arc::new(ResumableTestVerifier);
-        let mut config = TlsConfig::plain(None, verifier, "resume-test.local");
+        let mut config = TlsConfig::plain(None, verifier, "resume-a.local");
         config.resumption = true;
 
         let first = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -392,8 +392,8 @@ mod tests {
 
     #[tokio::test]
     async fn resumption_is_not_cached_for_an_untrusted_verifier() {
-        let addr = spawn_resumable_server();
-        let mut config = TlsConfig::plain(None, insecure_verifier(), "resume-test.local");
+        let addr = spawn_resumable_server("resume-b.local");
+        let mut config = TlsConfig::plain(None, insecure_verifier(), "resume-b.local");
         config.resumption = true;
         let first = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = connect(first, &config).await.unwrap();
