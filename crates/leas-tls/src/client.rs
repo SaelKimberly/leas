@@ -158,7 +158,7 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
             // Chromium permutes from Chrome 108 (Platform Status 5124606246518784),
             // Firefox's default build and Safari do not.
             let permute = permutes_extensions(&fp, &resolved.fingerprint);
-            let tls = handshake::connect_with_permutation(
+            let tls = handshake::engine::connect_state(
                 stream,
                 HandshakeParams {
                     spec,

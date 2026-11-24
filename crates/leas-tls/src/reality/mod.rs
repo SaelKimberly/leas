@@ -30,14 +30,15 @@ pub mod verify;
 
 use std::ops::Range;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::SecureRandom;
 use crate::crypto::X25519KeyPair;
 use crate::crypto::mlkem::Mlkem768;
 use crate::error::{Result, TlsError};
 use crate::fingerprints::Fingerprint;
-use crate::handshake::{AuthOutcome, ServerAuth, drive};
+use crate::handshake::state::Handshake;
+use crate::handshake::{AuthOutcome, ServerAuth};
 use crate::hello::{BuildParams, build_hello};
 use crate::record::stream::TlsStream;
 use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
@@ -398,7 +399,7 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
 }
 
 async fn connect_reality_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    stream: S,
+    mut stream: S,
     params: RealityParams<'_>,
 ) -> Result<TlsStream<S>> {
     // 1. Ephemeral X25519 key pair (the ClientHello keyshare). The
@@ -455,8 +456,7 @@ async fn connect_reality_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     //    a real certificate (transparent proxy / possible MITM or
     //    redirection) — which surfaces as [`AuthOutcome::RealityFallback`]
     //    rather than a hard error, matching xray's `!Verified` handling.
-    let (tls, outcome) = drive(
-        stream,
+    let mut state = Handshake::new(
         &hello.handshake_bytes,
         hello.session_id(),
         keypair,
@@ -473,8 +473,30 @@ async fn connect_reality_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         // REALITY owns the hello shape (its own session-id payload), so ECH
         // does not compose with it — the capability gate refuses the pair.
         None,
-    )
-    .await?;
+    );
+    state.feed(&[])?;
+    let mut out = Vec::new();
+    let (tls, outcome) = loop {
+        out.clear();
+        if state.poll_transmit(&mut out) {
+            stream.write_all(&out).await?;
+            continue;
+        }
+        if let Some(est) = state.take_established() {
+            let mut tls = TlsStream::new(stream, est.keys);
+            if let Some(secrets) = est.secrets {
+                tls.set_app_secrets(secrets);
+            }
+            tls.set_negotiated_alpn(est.alpn);
+            tls.set_negotiated_hybrid(est.hybrid);
+            break (tls, est.auth);
+        }
+        if state.take_handoff().is_some() {
+            return Err(TlsError::RealityFallback);
+        }
+        let record = crate::handshake::engine::read_one_record(&mut stream).await?;
+        state.feed(&record)?;
+    };
     match outcome {
         AuthOutcome::Ok => Ok(tls),
         AuthOutcome::RealityFallback => {

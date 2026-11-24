@@ -29,24 +29,32 @@
 //! traffic secrets are derived over `ClientHello..server Finished`
 //! (RFC 8446 §4.4.4, §7.1).
 
-use subtle::ConstantTimeEq as _;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use zeroize::Zeroizing;
+use tokio::io::{AsyncRead, AsyncWrite};
 
+pub mod engine;
+pub mod state;
 pub mod tls12;
 
 use crate::SecureRandom;
+#[cfg(test)]
+use crate::crypto::AeadKey;
 use crate::crypto::mlkem::{Ciphertext, Mlkem768, SecretKey as MlkemSecretKey};
-use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair, tls12::Tls12Suite};
+use crate::crypto::{CipherSuiteId, X25519KeyPair, tls12::Tls12Suite};
 use crate::error::{Result, TlsError};
+#[cfg(test)]
 use crate::hello::parse::parse_hello;
-use crate::hello::{BuildParams, build_hello_ordered, to_record};
-use crate::record::stream::{AppKeys, TlsStream};
+#[cfg(test)]
+use crate::hello::to_record;
+use crate::hello::{BuildParams, build_hello_ordered};
+use crate::record::stream::TlsStream;
+#[cfg(test)]
+use crate::record::{CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, aead_aad, skip_ccs};
 use crate::record::{
-    CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
-    HS_COMPRESSED_CERTIFICATE, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_MESSAGE_HASH,
-    HS_SERVER_HELLO, MAX_RECORD_PAYLOAD, aead_aad, parse_handshake_messages, skip_ccs,
+    HS_CERTIFICATE, HS_CERTIFICATE_VERIFY, HS_COMPRESSED_CERTIFICATE, HS_ENCRYPTED_EXTENSIONS,
+    HS_FINISHED, MAX_RECORD_PAYLOAD,
 };
+#[cfg(test)]
+use crate::record::{HS_MESSAGE_HASH, HS_SERVER_HELLO};
 use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup};
 
 pub(crate) mod flight;
@@ -54,6 +62,7 @@ pub(crate) mod server_hello;
 
 // The split is by subject, not visibility: the driver and the tests here use
 // these exactly as if they were in this file.
+#[cfg(test)]
 pub(crate) use flight::*;
 pub(crate) use server_hello::*;
 
@@ -336,353 +345,6 @@ impl RetrySupport<'_> {
     }
 }
 
-/// Performs the shared TLS 1.3 client handshake over `stream`: writes the
-/// `ClientHello` record, reads the `ServerHello` (skipping middlebox CCS
-/// records; a `HelloRetryRequest` magic random triggers ONE retry when
-/// `retry` is supplied — plain TLS only, see [`RetrySupport`] — and is a
-/// [`TlsError::HelloRetryRequest`] otherwise), derives the handshake traffic secrets
-/// with the *selected* suite, decrypts the server flight
-/// (`EncryptedExtensions`, `Certificate`, `CertificateVerify`, `Finished`),
-/// dispatches [`ServerAuth`], authenticates the server `Finished` MAC, sends
-/// the client `Finished` (sealed with the client handshake key), derives the
-/// application traffic secrets, and builds the [`TlsStream`].
-///
-/// The auth dispatch receives `Transcript-Hash(ClientHello .. Certificate)`
-/// (or, after a retry, `message_hash(ClientHello1) ‖ ClientHello2 ‖ …`); the
-/// key schedule holds the same transcript for the `Finished` MACs and the
-/// application traffic secrets. `offered_session_id` must be the legacy
-/// session id of the FIRST hello, which both `ServerHello` and
-/// `HelloRetryRequest` must echo exactly (RFC 8446 §4.1.3, §4.1.4).
-pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
-    stream: S,
-    hello: &[u8],
-    offered_session_id: &[u8],
-    mut keypair: X25519KeyPair,
-    // ML-KEM-768 secret key when the ClientHello offered a hybrid key
-    // share; decapsulation runs only if the server actually selected the
-    // hybrid group (its `key_share` then carries the ciphertext).
-    mut mlkem_sk: Option<MlkemSecretKey>,
-    server_name: &str,
-    auth: ServerAuth<'_>,
-    // `Some` when the caller can rebuild `ClientHello2` for one
-    // HelloRetryRequest (plain TLS only — see [`RetrySupport`]).
-    retry: Option<&RetrySupport<'_>>,
-    // `Some((wire, state))` for an ECH handshake: `wire` is the outer hello
-    // actually sent, `hello` above is the inner one that seeds the transcript.
-    ech: Option<(&[u8], &crate::ech::EchState)>,
-) -> Result<(TlsStream<S>, AuthOutcome)> {
-    let mut stream = stream;
-    // The bytes on the wire differ from the transcript seed only under ECH;
-    // a retried hello is written as rebuilt (the two coincide there).
-    let mut wire_hello = ech.map_or(hello, |(wire, _)| wire).to_vec();
-
-    // RFC 8446 §4.1.4: at most one retry. `first_hello` is kept because the
-    // post-retry transcript starts with `message_hash(ClientHello1)`.
-    let mut current_hello = hello.to_vec();
-    let mut current_sid = offered_session_id.to_vec();
-    let mut first_hello: Option<Vec<u8>> = None;
-    let mut retry_message: Option<Vec<u8>> = None;
-    let mut hrr_selected: Option<u16> = None;
-    let server_hello = loop {
-        // Parse the hello we are about to send ONCE: its extension types feed
-        // the RFC 8446 §4.2 offered-set check and its cipher suites feed the
-        // selected-suite check after the reply.
-        let sent_hello = parse_hello(&current_hello)?;
-        // Under ECH the server answers the OUTER hello actually written; the
-        // extension set it may echo is the outer one, while the suite choice
-        // is checked against the inner transcript hello.
-        let offered_exts: Vec<u16> = parse_hello(&wire_hello)?
-            .extensions
-            .iter()
-            .map(|(ty, _)| *ty)
-            .collect();
-        stream.write_all(&to_record(&wire_hello)).await?;
-        match read_server_hello(&mut stream, &current_sid, &offered_exts).await? {
-            ServerReply::Hello(sh) => {
-                // RFC 8446 §4.1.3 / RFC 5246 §7.4.1.2: the server MUST select
-                // a suite the client offered. Parse the hello we actually
-                // sent (GREASE values included as drawn), not the spec.
-                let selected = sh
-                    .suite12
-                    .map_or_else(|| sh.suite.to_u16(), Tls12Suite::to_u16);
-                ensure_offered_suite(&sent_hello.cipher_suites, selected)?;
-                break *sh;
-            }
-            ServerReply::Retry(hrr) => {
-                let Some(retry) = retry else {
-                    return Err(TlsError::HelloRetryRequest);
-                };
-                if matches!(auth, ServerAuth::Reality { .. }) {
-                    // REALITY authenticates the FIRST hello's sealed session
-                    // id; a retried hello has no defined server behaviour, so
-                    // this stays a typed error (documented non-goal).
-                    return Err(TlsError::HelloRetryRequest);
-                }
-                if first_hello.is_some() {
-                    return Err(TlsError::Handshake(
-                        "server sent a second HelloRetryRequest; RFC 8446 §4.1.4 allows one".into(),
-                    ));
-                }
-                hrr_selected = hrr.selected_group;
-                let (rebuilt, new_keypair, new_sk) = retry.rebuild(&hrr)?;
-                retry_message = Some(hrr.raw);
-                first_hello = Some(std::mem::take(&mut current_hello));
-                current_sid = rebuilt.session_id().to_vec();
-                wire_hello = rebuilt.handshake_bytes.clone();
-                current_hello = rebuilt.handshake_bytes;
-                // RFC 8446 §4.2.8.2: ClientHello2 carries a NEW share, so the
-                // key schedule must use the new private half.
-                if let Some(new_keypair) = new_keypair {
-                    keypair = new_keypair;
-                }
-                if new_sk.is_some() {
-                    mlkem_sk = new_sk;
-                }
-            }
-        }
-    };
-    // RFC 8446 §4.2.8: the selected `key_share` group must be one this hello
-    // offered (or exactly the HRR's choice). Checked before any key schedule
-    // work, so a non-conforming group can never be mixed in.
-    if let Some(wire) = server_hello.key_share_group {
-        ensure_offered_key_share(&current_hello, hrr_selected, wire)?;
-    }
-
-    // RFC 9849 §7.2.1: with ECH the server confirms acceptance by replacing
-    // the last 8 bytes of `ServerHello.random`. A mismatch means it decrypted
-    // nothing and answered the OUTER hello — the SNI the user asked to hide
-    // would have been sent in the clear, so this is a hard error, never a
-    // quiet fallback to the public name.
-    if let Some((_, state)) = ech {
-        let expected = state.confirm(server_hello.suite.digest(), &server_hello.raw)?;
-        let mut diff = 0u8;
-        for (a, b) in server_hello.server_random[24..32]
-            .iter()
-            .zip(expected.iter())
-        {
-            diff |= a ^ b;
-        }
-        if diff != 0 {
-            return Err(TlsError::Handshake(
-                "server rejected the encrypted client hello (ECH): it answered the public name \
-                 instead of the inner hello, so the real SNI would have leaked; the published \
-                 ECHConfig is stale"
-                    .into(),
-            ));
-        }
-    }
-
-    // RFC 7301 §3.1: a selected protocol must be one this hello offered.
-    // TLS 1.2 carries ALPN in the ServerHello; TLS 1.3 must not (see below).
-    ensure_offered_alpn(&current_hello, server_hello.alpn.as_deref())?;
-    if server_hello.version == TlsVersion::Tls13 && server_hello.alpn.is_some() {
-        return Err(TlsError::Handshake(
-            "TLS 1.3 ServerHello carried ALPN; RFC 7301 puts it in EncryptedExtensions".into(),
-        ));
-    }
-
-    // TLS 1.2: dispatch to the separate 1.2 handshake driver.
-    // REALITY (ServerAuth::Reality) is TLS 1.3 only — error if a REALITY
-    // server negotiates 1.2.
-    if server_hello.version == TlsVersion::Tls12 {
-        match auth {
-            ServerAuth::Reality { .. } => {
-                // REALITY's whole authentication surface (sealed session id,
-                // dual X25519 agreement, Ed25519 CertificateVerify) is TLS
-                // 1.3-only, so 1.2 can never authenticate. A 1.2 ServerHello
-                // to a REALITY hello is exactly the "real certificate"
-                // situation the fallback exists for (transparent proxy or
-                // redirected fronting host), so report it as such rather than
-                // as a generic handshake error — the caller then runs the
-                // Spider-X fallback instead of failing the dial.
-                return Err(TlsError::RealityFallback);
-            }
-            ServerAuth::Verifier(verifier) => {
-                let client_random: [u8; 32] = current_hello[6..38].try_into().expect("32 bytes");
-                let pre_buffer = server_hello.pre_buffer.clone();
-                let (mut tls, outcome) = tls12::drive12(
-                    stream,
-                    &current_hello,
-                    &client_random,
-                    &server_hello,
-                    pre_buffer,
-                    &keypair,
-                    server_name,
-                    verifier,
-                )
-                .await?;
-                tls.set_negotiated_alpn(server_hello.alpn.clone());
-                return Ok((tls, outcome));
-            }
-        }
-    }
-    let classical_shared = keypair.agree(&server_hello.peer_key.ok_or_else(|| {
-        TlsError::Handshake("TLS 1.3 ServerHello has no key_share extension".into())
-    })?)?;
-
-    // Hybrid key exchange (Go crypto/tls X25519MLKEM768): the key-schedule
-    // IKM is `mlkem_shared || classical_shared` — Go's
-    // handshake_client_tls13 appends the ECDH secret AFTER the ML-KEM
-    // shared secret (`sharedKey = append(mlkemShared, sharedKey...)`).
-    let shared: Zeroizing<Vec<u8>> =
-        match (mlkem_sk.as_ref(), server_hello.mlkem_ciphertext.as_ref()) {
-            (Some(sk), Some(ct)) => {
-                // The ciphertext was validated at parse; decapsulate it
-                // directly — no second copy through a temp `Vec`.
-                let pq_shared = Mlkem768::decapsulate(sk, ct);
-                let mut combined = Zeroizing::new(Vec::with_capacity(classical_shared.len() + 32));
-                combined.extend_from_slice(pq_shared.as_bytes());
-                combined.extend_from_slice(classical_shared.as_slice());
-                combined
-            }
-            _ => Zeroizing::new(classical_shared.to_vec()),
-        };
-
-    let hash_len = server_hello.suite.hash_len();
-    let mut ks = KeySchedule::new(server_hello.suite);
-    if let Some(ch1) = first_hello.as_deref() {
-        // RFC 8446 §4.4.1: after a retry the transcript is
-        //   message_hash(ClientHello1) || HelloRetryRequest || ClientHello2 || ...
-        // — the HRR message itself is included, and ClientHello1 is replaced by
-        // its synthetic hash. Omitting the HRR derives different traffic
-        // secrets and the server flight fails to decrypt.
-        let hash = ring::digest::digest(server_hello.suite.digest(), ch1);
-        ks.add_transcript(&make_hs_msg(HS_MESSAGE_HASH, hash.as_ref()));
-        let hrr = retry_message.as_deref().ok_or_else(|| {
-            TlsError::Handshake("retry happened without a HelloRetryRequest transcript".into())
-        })?;
-        ks.add_transcript(hrr);
-    }
-    ks.add_transcript(&current_hello);
-    ks.add_transcript(&server_hello.raw);
-    let hs_secret = ks.handshake_secret(&shared)?;
-    let (client_hs_ts, server_hs_ts) = ks.handshake_traffic_secrets(&hs_secret[..hash_len])?;
-    let server_hs_key = AeadKey::new(server_hello.suite, &server_hs_ts[..hash_len])?;
-    let client_hs_key = AeadKey::new(server_hello.suite, &client_hs_ts[..hash_len])?;
-
-    // RFC 8879 §4: the server may only compress its Certificate with an
-    // algorithm THIS ClientHello offered — so read it back from the hello we
-    // actually sent (the retried one), never from a caller's belief about it.
-    let offered_compress = compressed_algorithms(&current_hello);
-    let flight = read_server_hs_messages(&mut stream, &server_hs_key, &offered_compress).await?;
-    // RFC 7301: the ALPN choice rides EncryptedExtensions in TLS 1.3, and it
-    // must be one the hello offered.
-    ensure_offered_alpn(&current_hello, flight.negotiated_alpn.as_deref())?;
-
-    // The key schedule already accumulates `ClientHello .. Certificate`
-    // verbatim — feeding it here (before the auth dispatch) makes its
-    // arena the single transcript copy; the verifier below borrows it
-    // instead of a second `hello + sh + ee + cert` buffer. Ordering is
-    // unchanged (`ee, cert, cv, server Finished`), so the Finished MACs
-    // and app secrets derive exactly as before (RFC 8446 §4.4.4, §7.1).
-    ks.add_transcript(&flight.ee_raw);
-    ks.add_transcript(&flight.cert_raw);
-    // Transcript hash up to (excluding) CertificateVerify — the only thing
-    // the auth dispatch needs (RFC 8446 §4.4.3); the raw bytes are gone.
-    let (transcript_hash, transcript_hash_len) = ks.transcript_hash();
-
-    let outcome = match auth {
-        ServerAuth::Verifier(verifier) => {
-            // `CertificateVerify` body = scheme(2) || sig_len(2) || sig. The
-            // flight reader tolerates a missing CertificateVerify (empty
-            // body), so slice fallibly: an on-path party that completes the
-            // unauthenticated ECDH could otherwise panic the record loop.
-            let signature = flight.cert_verify_body.get(4..).ok_or_else(|| {
-                TlsError::Verify("server sent no CertificateVerify signature".into())
-            })?;
-            ensure_offered_sigalg(&current_hello, flight.signature_scheme)?;
-            verifier.verify(&VerifyContext {
-                chain: &flight.chain,
-                sni: server_name,
-                version: TlsVersion::Tls13,
-                suite: server_hello.suite,
-                signature_scheme: flight.signature_scheme,
-                signature,
-                signed: SignedData::Tls13Hash(&transcript_hash[..transcript_hash_len]),
-            })?;
-            AuthOutcome::Ok
-        }
-        ServerAuth::Reality { auth_key, mldsa65 } => {
-            let Some(cert_der) = flight.chain.first() else {
-                return Err(TlsError::Verify(
-                    "REALITY server sent no certificate".into(),
-                ));
-            };
-            // Go `reality.go:111-127`: the ML-DSA-65 signature covers
-            // HMAC-SHA512(auth_key, ed25519_pub ‖ ClientHello.Raw ‖
-            // ServerHello.Raw). The raws are the ones we sent and received —
-            // never a re-serialisation.
-            let mldsa = mldsa65.map(|public_key| crate::reality::verify::Mldsa65 {
-                public_key,
-                client_hello: &current_hello,
-                server_hello: &server_hello.raw,
-            });
-            match crate::reality::verify::verify_server(
-                cert_der,
-                &flight.cv_raw,
-                auth_key,
-                &transcript_hash[..transcript_hash_len],
-                mldsa.as_ref(),
-            ) {
-                Ok(()) => AuthOutcome::Ok,
-                // Any REALITY auth failure = a real certificate (transparent
-                // proxy / possible MITM or redirection), matching xray's
-                // `!Verified` handling.
-                Err(_) => AuthOutcome::RealityFallback,
-            }
-        }
-    };
-
-    ks.add_transcript(&flight.cv_raw);
-    let server_finished_key = ks.finished_key(&server_hs_ts[..hash_len])?;
-    if !bool::from(
-        ks.finished_mac(&server_finished_key[..hash_len])
-            .ct_eq(&flight.sf_verify_data),
-    ) {
-        return Err(TlsError::Handshake(
-            "server Finished MAC mismatch — possible MITM or wrong key".into(),
-        ));
-    }
-
-    let sf_raw = make_hs_msg(HS_FINISHED, &flight.sf_verify_data);
-    ks.add_transcript(&sf_raw);
-    let client_finished_key = ks.finished_key(&client_hs_ts[..hash_len])?;
-    let client_finished_mac = ks.finished_mac(&client_finished_key[..hash_len]);
-    // The client Finished record is framed in place: header placeholder,
-    // inner plaintext, tag — one buffer, one copy of the plaintext, with
-    // the seal happening inside the record buffer (no allocating twin,
-    // no `make_app_data_record` re-copy).
-    let cf_hs_msg = make_hs_msg(HS_FINISHED, &client_finished_mac);
-    let ct_len = cf_hs_msg.len() + 1 + AEAD_TAG_LEN;
-    let cf_aad = aead_aad(ct_len);
-    let mut cf_record = Vec::with_capacity(5 + ct_len);
-    cf_record.extend_from_slice(&[CONTENT_APPLICATION_DATA, 0x03, 0x03]);
-    cf_record.extend_from_slice(
-        &u16::try_from(ct_len)
-            .map_err(|_| TlsError::Handshake("client Finished record too long".into()))?
-            .to_be_bytes(),
-    );
-    cf_record.extend_from_slice(&cf_hs_msg);
-    cf_record.push(CONTENT_HANDSHAKE);
-    client_hs_key.seal_in_place(0, &cf_aad, &mut cf_record, 5)?;
-    stream.write_all(&cf_record).await?;
-
-    let master = ks.master_secret(&hs_secret[..hash_len])?;
-    let (client_app_ts, server_app_ts) = ks.app_traffic_secrets(&master[..hash_len])?;
-    let client_app_key = AeadKey::new(server_hello.suite, &client_app_ts[..hash_len])?;
-    let server_app_key = AeadKey::new(server_hello.suite, &server_app_ts[..hash_len])?;
-    let mut tls = TlsStream::new(stream, AppKeys::tls13(server_app_key, client_app_key));
-    // KeyUpdate needs the traffic secrets themselves, not just the keys.
-    tls.set_app_secrets(crate::record::stream::AppSecrets::new(
-        server_hello.suite,
-        &client_app_ts[..hash_len],
-        &server_app_ts[..hash_len],
-    ));
-    tls.set_negotiated_alpn(flight.negotiated_alpn);
-    tls.set_negotiated_hybrid(server_hello.mlkem_ciphertext.is_some());
-    Ok((tls, outcome))
-}
-
 /// Performs the full TLS 1.3 client handshake over `stream`, returning a
 /// record-framed application-data stream.
 ///
@@ -708,20 +370,26 @@ pub async fn connect_with_permutation<S: AsyncRead + AsyncWrite + Unpin + Send>(
     params: HandshakeParams<'_>,
     permute_extensions: bool,
 ) -> Result<TlsStream<S>> {
-    // The driver's future is large (it owns the flight buffers and the key
-    // schedule); box it once per connection so every `.await` site stays
-    // small (clippy::large_futures) at the cost of one allocation.
-    Box::pin(connect_inner(stream, params, permute_extensions)).await
+    engine::connect_state(stream, params, permute_extensions).await
 }
 
-async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
-    stream: S,
-    params: HandshakeParams<'_>,
+/// The hello material both handshake drivers start from.
+pub(crate) struct PreparedHello<'a> {
+    pub keypair: X25519KeyPair,
+    pub x25519_pub: [u8; 32],
+    pub recording: crate::hello::RecordingRng<'a>,
+    pub hello: crate::hello::BuiltHello,
+    pub ech: Option<(crate::hello::BuiltHello, crate::ech::EchState)>,
+    pub mlkem_sk: Option<MlkemSecretKey>,
+}
+
+/// Build the `ClientHello`, ECH context, key shares and replay RNG.
+pub(crate) fn connect_inner_hello<'a>(
+    params: &HandshakeParams<'a>,
     permute_extensions: bool,
-) -> Result<TlsStream<S>> {
+) -> Result<PreparedHello<'a>> {
     let keypair = X25519KeyPair::generate(params.rng)?;
     let x25519_pub = keypair.public_key();
-
     let offers_hybrid = params.spec.extensions.iter().any(|ext| {
         matches!(
             ext,
@@ -740,10 +408,6 @@ async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
     } else {
         (None, None)
     };
-
-    // Record every RNG byte the first hello draws: a HelloRetryRequest rebuild
-    // replays them so ClientHello2 differs only in `key_share`/`cookie`
-    // (RFC 8446 §4.1.2) — the random, GREASE and session id must not change.
     let recording = crate::hello::RecordingRng::new(params.rng);
     let build_params = BuildParams {
         server_name: params.server_name,
@@ -755,9 +419,6 @@ async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
             .map(crate::crypto::mlkem::PublicKey::as_bytes),
         rng: &recording,
     };
-    // RFC 9849: with an ECHConfig the real SNI rides inside a sealed inner
-    // hello and the wire carries the public name. `ech_ctx` keeps the state
-    // the acceptance check needs; `hello` stays the transcript seed.
     let ech_ctx = match params.ech {
         Some(list) => {
             let config = list.select()?;
@@ -767,37 +428,50 @@ async fn connect_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
         }
         None => None,
     };
-    let (hello, ech_ctx) = match ech_ctx {
+    let (hello, ech) = match ech_ctx {
         Some((outer, inner, state)) => (inner, Some((outer, state))),
         None => (
             build_hello_ordered(params.spec, &build_params, permute_extensions)?,
             None,
         ),
     };
-    let retry = RetrySupport {
-        permute_extensions,
-        spec: params.spec,
-        server_name: params.server_name,
-        alpn: params.alpn,
-        x25519_pub: &x25519_pub,
-        draws: &recording,
-        rng: params.rng,
-    };
-    let ech = ech_ctx
-        .as_ref()
-        .map(|(outer, state)| (outer.handshake_bytes.as_slice(), state));
-    let (tls, _) = drive(
-        stream,
-        &hello.handshake_bytes,
-        hello.session_id(),
+    Ok(PreparedHello {
         keypair,
-        mlkem.1,
-        params.server_name,
-        ServerAuth::Verifier(params.verifier),
-        Some(&retry),
+        x25519_pub,
+        recording,
+        hello,
         ech,
+        mlkem_sk: mlkem.1,
+    })
+}
+
+/// Finish a TLS 1.2 handoff through the existing 1.2 driver.
+pub(crate) async fn drive12_handoff<S>(
+    stream: S,
+    params: HandshakeParams<'_>,
+    handoff: state::Tls12Handoff,
+) -> Result<TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let client_random: [u8; 32] = handoff
+        .current_hello
+        .get(6..38)
+        .ok_or_else(|| TlsError::Handshake("client hello too short".into()))?
+        .try_into()
+        .expect("32 bytes");
+    let (mut tls, _) = tls12::drive12(
+        stream,
+        &handoff.current_hello,
+        &client_random,
+        &handoff.server_hello,
+        handoff.pre_buffer,
+        &handoff.keypair,
+        params.server_name,
+        params.verifier,
     )
     .await?;
+    tls.set_negotiated_alpn(handoff.server_hello.alpn.clone());
     Ok(tls)
 }
 
@@ -1351,7 +1025,6 @@ fn parse_server_hello(
             ));
         }
         return Ok(ParsedReply::Retry(HrrData {
-            raw: Vec::new(),
             selected_group: hrr_group,
             cookie: hrr_cookie,
         }));
@@ -1451,19 +1124,6 @@ fn u24(b: &[u8]) -> usize {
 }
 
 /// Remove TLS 1.3 record padding and extract the inner content type
-/// (RFC 8446 §5.4): `actual_content || type_byte || optional zero padding`.
-fn strip_padding(plaintext: &[u8]) -> Result<(u8, &[u8])> {
-    let mut end = plaintext.len();
-    while end > 0 && plaintext[end - 1] == 0 {
-        end -= 1;
-    }
-    if end == 0 {
-        return Err(TlsError::Handshake("all-zero TLSInnerPlaintext".into()));
-    }
-    let content_type = plaintext[end - 1];
-    Ok((content_type, &plaintext[..end - 1]))
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Write as _};
@@ -1478,11 +1138,10 @@ mod tests {
         ParsedServerHello, Tls12Suite, TlsVersion, connect, decompress_bounded,
         decompress_certificate_message, ensure_offered_alpn, ensure_offered_sigalg,
         ensure_offered_suite, make_hs_msg, parse_certificate_message, parse_certificate_verify,
-        parse_encrypted_extensions, parse_server_hello, read_server_hs_messages,
+        parse_encrypted_extensions, parse_hello, parse_server_hello, read_server_hs_messages,
     };
     use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
-    use crate::hello::parse::parse_hello;
     use crate::hello::{BuildParams, build_hello};
     use crate::record::{CONTENT_HANDSHAKE, aead_aad};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
@@ -2813,7 +2472,6 @@ mod tests {
     async fn hybrid_handshake_completes_against_fake_pq_server() {
         use crate::crypto::X25519KeyPair;
         use crate::crypto::mlkem::{Mlkem768, PublicKey as MlkemPublicKey};
-        use crate::hello::parse::parse_hello;
 
         let suite = CipherSuiteId::Aes128GcmSha256;
         let mut spec = test_spec();

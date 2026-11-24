@@ -1,11 +1,12 @@
 //! The encrypted server flight: `EncryptedExtensions`, `Certificate`,
 //! `CertificateVerify`, `Finished`, and RFC 8879 certificate decompression.
 
+#[cfg(test)]
+use super::{AeadKey, AsyncRead, CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, aead_aad, skip_ccs};
 use super::{
-    AeadKey, AsyncRead, CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, EXT_ALPN,
-    EXT_SUPPORTED_VERSIONS, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY, HS_COMPRESSED_CERTIFICATE,
-    HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, MAX_FLIGHT_BUFFER, MAX_RECORD_PAYLOAD, Result, TlsError,
-    aead_aad, make_hs_msg, skip_ccs, strip_padding, u24,
+    EXT_ALPN, EXT_SUPPORTED_VERSIONS, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
+    HS_COMPRESSED_CERTIFICATE, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, MAX_FLIGHT_BUFFER,
+    MAX_RECORD_PAYLOAD, Result, TlsError, make_hs_msg, u24,
 };
 
 // ── Encrypted server flight ────────────────────────────────────────────────
@@ -26,6 +27,8 @@ pub struct ServerFlight {
     /// The protocol the server selected in `EncryptedExtensions` (RFC 7301),
     /// if it sent ALPN at all.
     pub negotiated_alpn: Option<Vec<u8>>,
+    /// Server ALPS settings, when its EncryptedExtensions acknowledged ALPS.
+    pub server_alps: Option<Vec<u8>>,
 }
 
 /// Read and decrypt the encrypted server handshake records
@@ -39,6 +42,7 @@ pub struct ServerFlight {
 /// message is consumed only once its full `type(1) || length(3) || body` is
 /// present; a record may hold a partial message, several complete messages,
 /// or a message continuing into the next record.
+#[cfg(test)]
 pub async fn read_server_hs_messages<S>(
     stream: &mut S,
     server_hs_key: &AeadKey,
@@ -61,7 +65,7 @@ where
         let mut payload = rec.payload;
         let plain_len = server_hs_key.open_in_place(seq, &aad, &mut payload)?;
         seq += 1;
-        let (content_type, hs_data) = strip_padding(&payload[..plain_len])?;
+        let (content_type, hs_data) = crate::record::engine::strip_padding(&payload[..plain_len])?;
         if content_type != CONTENT_HANDSHAKE {
             continue;
         }
@@ -86,6 +90,7 @@ pub struct FlightAccumulator {
     signature_scheme: u16,
     cert_verify_body: Vec<u8>,
     offered_compress: Vec<u16>,
+    server_alps: Option<Vec<u8>>,
 }
 
 impl FlightAccumulator {
@@ -103,6 +108,7 @@ impl FlightAccumulator {
             signature_scheme: 0,
             cert_verify_body: Vec::new(),
             offered_compress: offered_compress.to_vec(),
+            server_alps: None,
         }
     }
 
@@ -128,6 +134,7 @@ impl FlightAccumulator {
             match msg_type {
                 HS_ENCRYPTED_EXTENSIONS => {
                     self.negotiated_alpn = parse_encrypted_extensions(body)?;
+                    self.server_alps = parse_ee_alps(body);
                     self.ee_raw = Some(raw);
                 }
                 HS_CERTIFICATE => {
@@ -169,12 +176,36 @@ impl FlightAccumulator {
                     signature_scheme: self.signature_scheme,
                     cert_verify_body: std::mem::take(&mut self.cert_verify_body),
                     negotiated_alpn: self.negotiated_alpn.take(),
+                    server_alps: self.server_alps.take(),
                 }));
             }
         }
         self.buf.drain(..consumed);
         Ok(None)
     }
+}
+
+/// The ALPS extension body a server echoed in EncryptedExtensions, if any.
+fn parse_ee_alps(body: &[u8]) -> Option<Vec<u8>> {
+    if body.len() < 2 {
+        return None;
+    }
+    let end = 2 + usize::from(u16::from_be_bytes([body[0], body[1]]));
+    if end > body.len() {
+        return None;
+    }
+    let mut pos = 2;
+    while pos + 4 <= end {
+        let ty = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let len = usize::from(u16::from_be_bytes([body[pos + 2], body[pos + 3]]));
+        pos += 4;
+        let data = body.get(pos..pos + len)?;
+        pos += len;
+        if ty == 0x4469 || ty == 0x44cd {
+            return Some(data.to_vec());
+        }
+    }
+    None
 }
 
 /// Parse an `EncryptedExtensions` body:

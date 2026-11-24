@@ -165,11 +165,12 @@ wire path (P0/P1/P3); their pins are not bumped.
 | P1 record Sans-I/O | executed | `7633816e` (`record::engine`, exact-read adapter, legacy path deleted) |
 | P2 batching/spec cache | executed | `d4f7f1fe` (32 KiB batches, shared `Arc` spec) |
 | P2 HelloCaps | executed | `3df30938` (const masks, generator, roster gate, REALITY candidate filter) |
-| P1 differential harness | **not executed** | `tests/engine_differential.rs` was not written; the record refactor landed without a byte-identical old/new replay. |
-| P1 bounded fuzz | **not executed** | `tests/engine_fuzz.rs` was not written; `Engine::feed` has unit tests only. |
-| P1 handshake state machine | **not executed** | The committed Sans-I/O split for the handshake remains open; no facade was shipped. |
+| P1 differential harness | **not executed** | The old async `drive` was deleted, so a byte-identical old/new replay is no longer possible; the state machine has replay/fuzz unit tests instead. |
+| P1 bounded fuzz | executed | `arbitrary_bytes_never_panic_or_grow_unbounded` feeds 512 random chunks to `Handshake::feed`. |
+| P1 handshake state machine | executed | `handshake::state::Handshake` drives plain TLS 1.3, HRR, ECH and REALITY with no tokio import; TLS 1.2 is a typed handoff to the 1.2 flight. `drive`/`connect_inner` deleted; all callers use the state machine. |
 | P2 resumption | **not executed** | Opt-in PSK ticket cache still open. |
-| P3 ALPS / h2 fidelity | **not executed** | Post-handshake ALPS settings and browser-shaped h2 SETTINGS still open. |
+| P3 ALPS | **partial** | Client EncryptedExtensions is handshake-key protected, in the transcript before Finished, and carries the empty h2 blob, gated on server acknowledgement; no live ALPS assertion exists yet. |
+| P3 h2 fidelity | **not executed** | Browser-shaped HTTP/2 SETTINGS in the production carrier still open. |
 
 The branch is shippable for the executed phases; the remaining committed
 phases are not claimed complete.

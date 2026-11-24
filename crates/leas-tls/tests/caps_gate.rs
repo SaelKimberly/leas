@@ -22,7 +22,7 @@ type HandRow = (
 struct FixedRng(std::sync::atomic::AtomicU8);
 
 impl FixedRng {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self(std::sync::atomic::AtomicU8::new(0))
     }
 }
@@ -104,7 +104,7 @@ const fn sig_bit(scheme: u16) -> u32 {
     kind.bit()
 }
 
-fn group_bit(group: u16) -> u64 {
+const fn group_bit(group: u16) -> u64 {
     let kind = match group {
         0x001d => GroupKind::X25519,
         0x0017 => GroupKind::P256,
@@ -195,7 +195,6 @@ fn every_generated_cap_matches_its_emitted_hello() {
     for entry in GENERATED {
         assert_eq!(compute(&(entry.spec_fn)()), entry.caps, "{}", entry.name);
     }
-    use leas_tls::profiles::hand_selected::{CHROME_130_CAPS, EDGE_106_CAPS, chrome_130, edge_106};
     let hand: [HandRow; 2] = [
         ("chrome_130", chrome_130, CHROME_130_CAPS),
         ("edge_106", edge_106, EDGE_106_CAPS),
@@ -217,4 +216,17 @@ fn hand_profiles_expose_caps_through_resolution() {
     assert!(chrome.caps.offers_group(GroupKind::X25519));
     assert!(chrome.caps.offers_tls13_aead());
     assert!(chrome.caps.offers_sigalg(SigKind::RsaPssSha256));
+}
+
+/// The REALITY filter's caps predicate must agree with the spec-level rule
+/// for every roster row, so the O(1) path cannot drift from the source.
+#[test]
+fn reality_caps_match_the_spec_rule() {
+    for entry in GENERATED {
+        let spec = (entry.spec_fn)();
+        let by_caps = entry.caps.offers_tls13_aead()
+            && entry.caps.session_id_len == 32
+            && entry.caps.shares_group(GroupKind::X25519);
+        assert_eq!(by_caps, spec.reality_eligible(), "{}", entry.name);
+    }
 }
