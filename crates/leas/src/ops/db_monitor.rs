@@ -540,8 +540,18 @@ mod tests {
         );
 
         let dump = monitor.dump(10).join("\n");
-        assert!(dump.contains("test_method"), "real query kept: {dump}");
-        assert!(!dump.contains("0.0ms"), "timing lines not folded: {dump}");
+        // Folded timing events would add two 0 ms samples: either a second
+        // n=3 under test_method, or a new UNATTRIBUTED bucket (the warns fire
+        // after the method span closes). Both are consumer-visible; the real
+        // query must be the ONLY sample.
+        assert!(
+            dump.contains("test_method: n=1"),
+            "exactly one real query: {dump}"
+        );
+        assert!(
+            !dump.contains(UNATTRIBUTED),
+            "no timing bucket created: {dump}"
+        );
     }
 
     #[tokio::test]
