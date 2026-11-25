@@ -752,14 +752,14 @@ async fn route(frame: Frame, sessions: &Mutex<HashMap<u16, mpsc::Sender<SessionE
             // arguably more correct, and both cores send session errors
             // as Keep+Error, so End+Error is a defensive branch.
             if frame.option & OPT_ERROR != 0 {
-                SessionEvent::Error(session_error())
+                SessionEvent::Error(session_error(&frame.payload))
             } else {
                 SessionEvent::End
             }
         }
         STATUS_KEEP => {
             if frame.option & OPT_ERROR != 0 {
-                SessionEvent::Error(session_error())
+                SessionEvent::Error(session_error(&frame.payload))
             } else if frame.option & OPT_DATA != 0 {
                 // The per-packet destination for UDP sessions (parsed
                 // from the frame metadata — frame.target is
@@ -807,11 +807,15 @@ async fn route(frame: Frame, sessions: &Mutex<HashMap<u16, mpsc::Sender<SessionE
 }
 
 /// The error surfaced on a session whose peer sent the `Error` option.
-fn session_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::ConnectionReset,
-        "vless mux: session terminated by peer",
-    )
+fn session_error(payload: &[u8]) -> io::Error {
+    let detail = String::from_utf8_lossy(payload);
+    let detail = detail.trim_matches('\0').trim();
+    let message = if detail.is_empty() {
+        "vless mux: session terminated by peer".to_string()
+    } else {
+        format!("vless mux: session terminated by peer: {detail}")
+    };
+    io::Error::new(io::ErrorKind::ConnectionReset, message)
 }
 
 /// Plaintext the writer hands the carrier in one call: batching stops once a
@@ -3716,5 +3720,15 @@ mod tests {
         let (got_dest, payload) = reader.recv().await.expect("recv").expect("datagram");
         assert_eq!(got_dest, dest);
         assert_eq!(&payload[..], b"r");
+    }
+
+    #[test]
+    fn mux_error_surfaces_peer_detail() {
+        assert_eq!(
+            session_error(b"").to_string(),
+            "vless mux: session terminated by peer"
+        );
+        let detail = session_error(b"dial destination: connection refused").to_string();
+        assert!(detail.contains("connection refused"), "{detail}");
     }
 }
