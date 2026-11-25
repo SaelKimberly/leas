@@ -15,6 +15,10 @@ remote = "https://github.com/anytls/anytls-go.git"
 ref = "main@fd6167acd6d7"
 sha = "fd6167acd6d73b9fa3e607659951847fbc9e6c50"
 shallow = true
+what = "AnyTLS proxy protocol reference implementation (Go)"
+domain = "proxy protocol"
+tags = "#anytls #tls-in-tls #go #reference"
+standards = "AnyTLS; TLS-in-TLS fingerprint mitigation; connection reuse"
 
 [[entry]]
 name = "anytls-rs"
@@ -26,6 +30,10 @@ remote = "https://github.com/jxo-me/anytls-rs.git"
 ref = "main@f09613e0102d"
 sha = "f09613e0102d611b1a850913e1269fe76dfc36cf"
 shallow = true
+what = "High-performance AnyTLS proxy in Rust, sing-box interop"
+domain = "proxy server"
+tags = "#anytls #rust #observability #socks5"
+standards = "AnyTLS; SOCKS5; HTTP CONNECT; TLS cert hot reload; sing-box outbound"
 
 [[entry]]
 name = "async-socks5"
@@ -37,6 +45,10 @@ remote = "https://github.com/ark0f/async-socks5.git"
 ref = "master@a6f55c11742c"
 sha = "a6f55c11742c23f0a9d62a050367c9b8c351957c"
 shallow = true
+what = "Async SOCKS5/4/4a client, Tokio, no unsafe"
+domain = "SOCKS client"
+tags = "#socks5 #rust #tokio #client"
+standards = "SOCKS5 (RFC 1928); SOCKS4/4a"
 
 [[entry]]
 name = "Bushuray-tui"
@@ -48,6 +60,10 @@ remote = "https://github.com/Keivan-sf/Bushuray-tui.git"
 ref = "v0.2.3"
 sha = "b89fe5514328bcf1009b50fe88a42e1a2ace9f82"
 shallow = true
+what = "Keyboard-driven Xray TUI (Go, bubbletea)"
+domain = "desktop TUI client"
+tags = "#tui #xray #go #bubbletea"
+standards = "Xray client; terminal UI"
 
 [[entry]]
 name = "craftls"
@@ -59,6 +75,10 @@ remote = "https://github.com/3andne/craftls"
 ref = "craft-0.22.0@4d1da98768af"
 sha = "4d1da98768af023411063a14db63a5cd10f595d7"
 shallow = true
+what = "rustls fork with customizable ClientHello fingerprint"
+domain = "TLS library"
+tags = "#tls #rustls #rust #fingerprint"
+standards = "TLS 1.3; ClientHello customization"
 
 [[entry]]
 name = "curl-impersonate"
@@ -70,6 +90,11 @@ remote = "https://github.com/lexiforest/curl-impersonate.git"
 ref = "main@ec2a2317f14f"
 sha = "ec2a2317f14f7b2d9fc0b364e474f31348d024ba"
 shallow = true
+notes = "replaced v2.1.1 / 86e5f1f822566827cc413de843acdac60057a37c (2026-08-20)"
+what = "curl fork impersonating Chrome/Edge/Safari/Firefox"
+domain = "HTTP/TLS client"
+tags = "#curl #tls #http2 #browser-fingerprint"
+standards = "TLS ClientHello; HTTP/2 SETTINGS + HPACK; browser profiles"
 
 [[entry]]
 name = "CycleTLS"
@@ -81,6 +106,10 @@ remote = "https://github.com/Danny-Dasilva/CycleTLS"
 ref = "main@9671e0488491"
 sha = "9671e0488491821ca7bb93051f32e69f673d505f"
 shallow = true
+what = "High-performance HTTP client with TLS fingerprint (Go)"
+domain = "HTTP client"
+tags = "#http-client #ja3 #go #fingerprint"
+standards = "JA3/JA4 TLS fingerprint impersonation; goroutine pool"
 
 [[entry]]
 name = "dnscrypt"
@@ -92,6 +121,10 @@ remote = "https://github.com/AdguardTeam/dnscrypt.git"
 ref = "master@4822c9b2045b"
 sha = "4822c9b2045b671d50710d2f5e302c4544dc4bab"
 shallow = true
+what = "DNSCrypt v2 implementation in Go (AdGuard)"
+domain = "encrypted DNS"
+tags = "#dns #dnscrypt #go #library"
+standards = "DNSCrypt v2; encrypted DNS"
 
 [[entry]]
 name = "DNSveil"
@@ -103,6 +136,10 @@ remote = "https://github.com/msasanmh/DNSveil.git"
 ref = "main@42ac542d081c"
 sha = "42ac542d081c978d2b52e3a30366fdec89ebd8e3"
 shallow = true
+what = "Secure DNS client for Windows"
+domain = "desktop DNS client"
+tags = "#dns #dnscrypt #doh #dot #windows"
+standards = "DNSCrypt; Anonymized DNSCrypt; DoH (RFC 8484); DoT (RFC 7858); plain DNS"
 
 [[entry]]
 name = "encrypted-dns-server"
@@ -114,6 +151,10 @@ remote = "https://github.com/DNSCrypt/encrypted-dns-server.git"
 ref = "master@2f2cc489ff88"
 sha = "2f2cc489ff8893c167b2eab7274292a699341d9c"
 shallow = true
+what = "High-performance encrypted DNS proxy server (Rust)"
+domain = "DNS server"
+tags = "#dns #dnscrypt #rust #server"
+standards = "DNSCrypt v2; post-quantum DNSCrypt (PQDNSCrypt); DoH; DoT"
 
 [[entry]]
 name = "fast-socks5"
@@ -125,6 +166,10 @@ remote = "https://github.com/dizda/fast-socks5.git"
 ref = "master@bae2fc05f993"
 sha = "bae2fc05f993d3a247b5435ba7da221f3fd80a3c"
 shallow = true
+what = "Async SOCKS5/4/4a Tokio client, no unsafe"
+domain = "SOCKS client"
+tags = "#socks5 #rust #tokio #client"
+standards = "SOCKS5 (RFC 1928); SOCKS4/4a; UDP ASSOCIATE"
 
 [[entry]]
 name = "ferrox"
@@ -136,6 +181,10 @@ remote = "https://github.com/ferroxdev/ferrox.git"
 ref = "main@0ec73b107891"
 sha = "0ec73b10789154c5c148bcd323bfc8456f23f0e6"
 shallow = true
+what = "From-scratch proxy core targeting bit-identical parity"
+domain = "proxy core"
+tags = "#proxy-core #rust #parity #tls"
+standards = "TLS engine; proxy wire parity; protocol transports"
 
 [[entry]]
 name = "geektls"
@@ -147,6 +196,10 @@ remote = "https://github.com/geekbyter/geektls.git"
 ref = "bindings/golang/v0.2.2"
 sha = "3b64bcf0b0a1b141b68454ba487a7fcd48480ffa"
 shallow = true
+what = "Multilingual TLS/HTTP full-stack fingerprint forge"
+domain = "fingerprint library"
+tags = "#tls #http2 #http3 #quic #ja3 #ja4"
+standards = "JA3/JA4; HTTP/2 Akamai fingerprint + HPACK; HTTP/3 + QUIC; TCP-layer fingerprint; Python/Node/Go APIs"
 
 [[entry]]
 name = "go-shadowsocks2"
@@ -158,6 +211,10 @@ remote = "https://github.com/shadowsocks/go-shadowsocks2.git"
 ref = "master@e1fe9ea73740"
 sha = "e1fe9ea737409e4d71efaa65e3caefa42a8fc188"
 shallow = true
+what = "Shadowsocks implementation in Go"
+domain = "proxy server"
+tags = "#shadowsocks #go #proxy"
+standards = "Shadowsocks; SOCKS5 UDP Associate; Linux netfilter TCP redirect"
 
 [[entry]]
 name = "goida-vpn-configs"
@@ -169,6 +226,10 @@ remote = "https://gitlab.com/avencores/goida-vpn-configs.git"
 ref = "main@c8858d9a19eb"
 sha = "c8858d9a19eb3a16b54fa789c59efc646c545c3a"
 shallow = true
+what = "Auto-updated public VPN config collection (GitLab)"
+domain = "subscription feed"
+tags = "#subscriptions #vpn-configs #gitlab"
+standards = "V2Ray/VLESS/Hysteria/Trojan/VMess/REALITY/Shadowsocks share links"
 
 [[entry]]
 name = "hashify"
@@ -180,6 +241,10 @@ remote = "https://github.com/stalwartlabs/hashify"
 ref = "v0.3.2"
 sha = "b6f1ab99609d4514c86df8d19f2c2a25ea3f67bb"
 shallow = true
+what = "Compile-time perfect hash macro crate (Rust)"
+domain = "compiler macro"
+tags = "#macro #hash #rust #no-alloc"
+standards = "Perfect hash lookups; no runtime deps; no unsafe"
 
 [[entry]]
 name = "hysteria"
@@ -191,6 +256,10 @@ remote = "https://github.com/apernet/hysteria.git"
 ref = "master@747a11182458"
 sha = "747a11182458a44538f7631b4e7e1cbb4ef811c8"
 shallow = true
+what = "Hysteria 2 QUIC-based proxy (Go)"
+domain = "proxy server"
+tags = "#hysteria2 #quic #go #proxy"
+standards = "Hysteria 2; QUIC; congestion control (Brutal)"
 
 [[entry]]
 name = "hysteria-legacy-v1"
@@ -202,6 +271,10 @@ remote = "https://github.com/apernet/hysteria.git"
 ref = "hy1@ac56271d0303"
 sha = "ac56271d030310e2c5f907e1d3329b6ef09b45f0"
 shallow = true
+what = "Hysteria v1 (hy1 branch), QUIC proxy"
+domain = "proxy server"
+tags = "#hysteria #quic #go #legacy"
+standards = "Hysteria v1; QUIC"
 
 [[entry]]
 name = "impersonator"
@@ -213,6 +286,10 @@ remote = "https://github.com/zhkl0228/impersonator.git"
 ref = "master@789ecd2bf522"
 sha = "789ecd2bf522bfb4e2d5a2ff8ec3d50ec42c84e9"
 shallow = true
+what = "BouncyCastle-bctls + okhttp fork for TLS/JA3 impersonation"
+domain = "HTTP/TLS client"
+tags = "#tls #ja3 #http2 #java #fingerprint"
+standards = "TLS/JA3 fingerprint; HTTP/2 fingerprint; Java/okhttp"
 
 [[entry]]
 name = "impit"
@@ -224,6 +301,10 @@ remote = "https://github.com/apify/impit.git"
 ref = "master@4fd6c3167c55"
 sha = "4fd6c3167c55d9d059a3e5872846e0b5c0a31e3b"
 shallow = true
+what = "Browser-impersonating HTTP client library (Rust)"
+domain = "HTTP client"
+tags = "#http-client #fingerprint #rust"
+standards = "HTTP/1.1; HTTP/2; HTTP/3; reqwest + rustls + tokio"
 
 [[entry]]
 name = "ja4db-export"
@@ -235,6 +316,10 @@ remote = "https://github.com/Niicolaa/ja4db-export.git"
 ref = "main@af1618e515f8"
 sha = "af1618e515f827216c9c0904821a6c0f2575ee3d"
 shallow = true
+what = "JA4DB export tooling (Python; public API defunct)"
+domain = "fingerprint data tool"
+tags = "#ja4 #python #fingerprint"
+standards = "JA4 fingerprint database export (API no longer reachable)"
 
 [[entry]]
 name = "jets"
@@ -246,6 +331,10 @@ remote = "https://github.com/zhangsan946/jets"
 ref = "v0.4.3"
 sha = "a144f3073e35b09ab79e841a789d6ac8801e846a"
 shallow = true
+what = "Rule-based tunnel in Rust"
+domain = "tunnel"
+tags = "#tunnel #rust #rules"
+standards = "Rule-based routing; secure network access"
 
 [[entry]]
 name = "leaf"
@@ -257,6 +346,10 @@ remote = "https://github.com/eycorsican/leaf.git"
 ref = "master@5e8d94759ce9"
 sha = "5e8d94759ce983eb8ac226c315024b55ff2bb7b0"
 shallow = true
+what = "Versatile proxy framework in Rust"
+domain = "proxy framework"
+tags = "#proxy-framework #rust #multi-protocol"
+standards = "Multiple proxy protocols; transports & security; transparent proxy; traffic control"
 
 [[entry]]
 name = "leaktracer"
@@ -268,6 +361,10 @@ remote = "https://github.com/veeso/leaktracer.git"
 ref = "main@28cf14b1dc5c"
 sha = "28cf14b1dc5c7a37fd49bc09e410616b5cc5c4af"
 shallow = true
+what = "Rust allocator tracing memory allocations"
+domain = "memory tooling"
+tags = "#allocator #memory #rust #tracing"
+standards = "GlobalAlloc; allocation tracing; heap stats"
 
 [[entry]]
 name = "matryoshka"
@@ -279,6 +376,10 @@ remote = "https://github.com/eledah/matryoshka"
 ref = "2026-09-07-153737"
 sha = "7dc16e9fef38a92666284917c80839df60546079"
 shallow = true
+what = "Terminal UI proxy manager for Xray (Python/Textual)"
+domain = "desktop TUI client"
+tags = "#tui #proxy-manager #python #textual"
+standards = "Gateway chaining; latency testing; subscription fetching; Xray configs"
 
 [[entry]]
 name = "microrm"
@@ -290,6 +391,10 @@ remote = "https://codeberg.org/flying-kestrel/microrm.git"
 ref = "main@5c4052363003"
 sha = "5c4052363003380e5130751c330175a72a4edc70"
 shallow = false
+what = "No-DSL ORM for SQLite in Rust"
+domain = "database"
+tags = "#orm #sqlite #rust #macro"
+standards = "SQLite; proc-macro schema from Rust types; sync + async"
 
 [[entry]]
 name = "mihomo"
@@ -301,6 +406,10 @@ remote = "https://github.com/MetaCubeX/mihomo"
 ref = "v1.19.33"
 sha = "3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8"
 shallow = true
+what = "Clash Meta (Mihomo) universal proxy platform (Go)"
+domain = "proxy core"
+tags = "#mihomo #clash #go #proxy-core"
+standards = "VMess/VLESS/SS/Trojan/Snell/TUIC/Hysteria; Clash YAML; DoH/DoT; fake-ip DNS"
 
 [[entry]]
 name = "outbound"
@@ -312,6 +421,10 @@ remote = "https://github.com/daeuniverse/outbound.git"
 ref = "main@cfd9e39fd5e0"
 sha = "cfd9e39fd5e024fe62c7ad68ffd09bb452b10df4"
 shallow = true
+what = "Dialer library built from share links (daeuniverse, Go)"
+domain = "dialer library"
+tags = "#dialer #share-link #go"
+standards = "Share-link parsing; dialer construction; VMess/VLESS/SS/Trojan"
 
 [[entry]]
 name = "purecrypto"
@@ -323,6 +436,10 @@ remote = "https://github.com/KarpelesLab/purecrypto.git"
 ref = "v0.10.6"
 sha = "c90ae979e9682de613fd490713e6a95aca35b282"
 shallow = true
+what = "Pure-Rust cryptography toolkit, no foreign code"
+domain = "cryptography"
+tags = "#crypto #rust #post-quantum #no-unsafe"
+standards = "Constant-time primitives; hashing; ciphers; bignum; classical + post-quantum asymmetric"
 
 [[entry]]
 name = "quic-go-v0.20.1"
@@ -334,6 +451,10 @@ remote = "https://github.com/quic-go/quic-go.git"
 ref = "v0.20.1"
 sha = "40b124d209d1a1bea3aeed95438f412e96b81bf8"
 shallow = true
+what = "Pure-Go QUIC implementation pinned at v0.20.1"
+domain = "QUIC library"
+tags = "#quic #go #pinned"
+standards = "QUIC IETF draft-29/32/34"
 
 [[entry]]
 name = "quirktiva"
@@ -345,6 +466,10 @@ remote = "https://github.com/yaling888/quirktiva.git"
 ref = "v1.91.0"
 sha = "1eac02b730b551496951d15cd12fbb7419127410"
 shallow = true
+what = "Mihomo fork (plus branch) with extra protocols"
+domain = "proxy core"
+tags = "#quirktiva #clash-fork #go"
+standards = "SS/VMess/VLESS/Trojan/WireGuard/Hysteria2; fake-ip DNS; SOCKS5/HTTP outbound"
 
 [[entry]]
 name = "ratatui-cheese"
@@ -356,6 +481,10 @@ remote = "https://github.com/shashanktomar/ratatui-cheese"
 ref = "v0.7.0"
 sha = "ef8464bd6a595b75b66620cbbdf4a739fd05c6a1"
 shallow = true
+what = "Bubbletea-inspired components for Ratatui"
+domain = "TUI widgets"
+tags = "#ratatui #tui #widgets #rust"
+standards = "TUI widget library (spinner, animation, inputs)"
 
 [[entry]]
 name = "ratatui-themes"
@@ -367,6 +496,10 @@ remote = "https://github.com/ricardodantas/ratatui-themes"
 ref = "main@909fa2b2ee13"
 sha = "909fa2b2ee135ecdf650810e8500d918eea17d49"
 shallow = true
+what = "Color themes for Ratatui apps"
+domain = "TUI themes"
+tags = "#ratatui #themes #tui #rust"
+standards = "15+ themes (Dracula, Nord, Catppuccin, Gruvbox)"
 
 [[entry]]
 name = "REALITY"
@@ -378,6 +511,10 @@ remote = "https://github.com/XTLS/REALITY.git"
 ref = "main@4a26e87788f5"
 sha = "4a26e87788f5e08cb9d433c1fab94bc15a8bf653"
 shallow = true
+what = "Server side of XTLS REALITY protocol (Go tls fork)"
+domain = "TLS server"
+tags = "#reality #xtls #tls #go #server"
+standards = "REALITY protocol; TLS 1.3"
 
 [[entry]]
 name = "roscomvpn-geoip"
@@ -389,6 +526,10 @@ remote = "https://github.com/hydraponique/roscomvpn-geoip.git"
 ref = "202611101104"
 sha = "8f0e50bad62029ccf87b29805b7df10d33440811"
 shallow = true
+what = "Generates geoip.dat + rulesets with RU/BY CIDR filtering"
+domain = "routing data"
+tags = "#geoip #routing #russia #dat"
+standards = "geoip.dat; CIDR routing (direct/whitelist/private)"
 
 [[entry]]
 name = "roscomvpn-geosite"
@@ -400,6 +541,10 @@ remote = "https://github.com/hydraponique/roscomvpn-geosite.git"
 ref = "master@300324058785"
 sha = "300324058785ffab06df8725e18969f835d73618"
 shallow = true
+what = "Generates geosite.dat + domain category lists"
+domain = "routing data"
+tags = "#geosite #routing #russia #dat"
+standards = "geosite.dat; domain-category routing"
 
 [[entry]]
 name = "roscomvpn-routing"
@@ -411,6 +556,10 @@ remote = "https://github.com/hydraponique/roscomvpn-routing.git"
 ref = "main@fcc084734ab4"
 sha = "fcc084734ab492014d52ad8ed6125c2715ecc8df"
 shallow = true
+what = "Ready routing configs for Happ/INCY/Mihomo"
+domain = "routing configs"
+tags = "#routing #clash #mihomo #russia"
+standards = "Clash/Mihomo routing rulesets"
 
 [[entry]]
 name = "russia-mobile-internet-whitelist"
@@ -422,6 +571,10 @@ remote = "https://github.com/hxehex/russia-mobile-internet-whitelist.git"
 ref = "main@fad3653ebd4b"
 sha = "fad3653ebd4b212643774a4d10af3eb33838e4ff"
 shallow = true
+what = "RU mobile operator CIDR/domain allowlists"
+domain = "routing data"
+tags = "#whitelist #russia #cidr #geo"
+standards = "CIDR allowlists; domain allowlists"
 
 [[entry]]
 name = "shadowsocks-rust"
@@ -433,6 +586,10 @@ remote = "https://github.com/shadowsocks/shadowsocks-rust.git"
 ref = "master@e697eb292b66"
 sha = "e697eb292b66e1e3977c4e7dbd2026ca7842ef1e"
 shallow = true
+what = "Shadowsocks port in Rust"
+domain = "proxy server"
+tags = "#shadowsocks #rust #proxy"
+standards = "Shadowsocks; AEAD ciphers; SIP002/2022"
 
 [[entry]]
 name = "shoes"
@@ -444,6 +601,10 @@ remote = "https://github.com/cfal/shoes.git"
 ref = "v0.3.7"
 sha = "ee44a397e6850193e86a1ae66639f037f963822d"
 shallow = true
+what = "High-performance multi-protocol proxy server (Rust)"
+domain = "proxy server"
+tags = "#proxy #rust #server #multi-protocol"
+standards = "Multi-protocol proxy; CLI/config examples"
 
 [[entry]]
 name = "sing-box"
@@ -455,6 +616,10 @@ remote = "https://github.com/SagerNet/sing-box"
 ref = "v1.15.0-alpha.13"
 sha = "824dbcfb4dd0a95921840b1737b950cde590241e"
 shallow = true
+what = "Universal proxy platform (SagerNet, Go)"
+domain = "proxy core"
+tags = "#singbox #proxy-core #go"
+standards = "VMess/VLESS/Trojan/SS/Hysteria/TUIC/Snell/WireGuard; TCP/WS/HTTP/gRPC/QUIC; DoH/DoT/fake-ip DNS"
 
 [[entry]]
 name = "sing-mux"
@@ -466,6 +631,10 @@ remote = "https://github.com/SagerNet/sing-mux"
 ref = "HEAD@caf09fe32475"
 sha = "caf09fe324752fe28d3b3fa2cef94bd8ebdcf305"
 shallow = false
+what = "Simple stream multiplex library (Go)"
+domain = "multiplexing"
+tags = "#mux #multiplex #go #singbox"
+standards = "Stream multiplexing; session management"
 
 [[entry]]
 name = "smux"
@@ -477,6 +646,10 @@ remote = "https://github.com/SagerNet/smux"
 ref = "v1.5.50-sing-box-mod.1"
 sha = "f373f1e706bf7400e9ce3d2e3b80363b75937872"
 shallow = true
+what = "Stream multiplexer for Go (sing-box mod)"
+domain = "multiplexing"
+tags = "#mux #multiplex #go"
+standards = "Stream-oriented multiplexing over TCP/UDS"
 
 [[entry]]
 name = "sniffnet"
@@ -488,6 +661,10 @@ remote = "https://github.com/GyulyVGC/sniffnet.git"
 ref = "main@a4655590f6fe"
 sha = "a4655590f6febbcfe53f47cd63f3296dcbbeaa64"
 shallow = true
+what = "Network traffic monitor (Rust)"
+domain = "network monitoring"
+tags = "#network-monitor #rust #tui"
+standards = "Packet capture; traffic stats; cross-platform"
 
 [[entry]]
 name = "soar"
@@ -499,6 +676,10 @@ remote = "https://github.com/getlantern/soar.git"
 ref = "v0.2.4"
 sha = "fea80aae6c60a9f27d7358e5f967cbc9b57bb37d"
 shallow = true
+what = "DNS tunnel for censored networks (Getlantern, Go)"
+domain = "DNS tunnel"
+tags = "#dns-tunnel #censorship #go #quic"
+standards = "DNS tunneling; QUIC; L1 obfuscation"
 
 [[entry]]
 name = "starrocks"
@@ -511,6 +692,10 @@ ref = "master@4d515dd4dd05"
 sha = "4d515dd4dd05a98b31199870456d3dd1e50e1b29"
 shallow = true
 notes = "Private/internal host; not probeable via public API."
+what = "Launcher/manager for StarRocks nodes (private internal)"
+domain = "internal tooling"
+tags = "#starrocks #internal #launcher"
+standards = "StarRocks node management (private GitLab)"
 
 [[entry]]
 name = "StormDNS"
@@ -522,6 +707,10 @@ remote = "https://github.com/nullroute1970/StormDNS.git"
 ref = "main@a9a8e92a51f0"
 sha = "a9a8e92a51f08c3030d7a1656cafd3bf07c9903b"
 shallow = true
+what = "TCP-over-DNS tunnel with local SOCKS5 (Go)"
+domain = "DNS tunnel"
+tags = "#dns-tunnel #tcp #socks5 #go"
+standards = "DNS query/response tunneling; SOCKS5; raw TCP listener"
 
 [[entry]]
 name = "sub-healer"
@@ -534,6 +723,10 @@ ref = "master@26e5f0631a5f"
 sha = "26e5f0631a5f228843dbdcd3a39abe3396940b93"
 shallow = false
 notes = "HEAD commit is not on upstream (local/rewritten); local edits present."
+what = "Local subscription-healing research (Rust)"
+domain = "local research"
+tags = "#subscription #local-research #rust"
+standards = "Subscription repair (local-only HEAD; not upstream)"
 
 [[entry]]
 name = "subconverter"
@@ -545,6 +738,10 @@ remote = "https://github.com/tindy2013/subconverter.git"
 ref = "master@a0d4eab28cb8"
 sha = "a0d4eab28cb8b6c782d4ce5c3a918de4829b4a72"
 shallow = true
+what = "Proxy subscription format converter (C++)"
+domain = "subscription tool"
+tags = "#subscriptions #converter #cpp"
+standards = "Multiple subscription formats; Clash/Surge/V2Ray output"
 
 [[entry]]
 name = "tls-fingerprint"
@@ -554,6 +751,10 @@ host = "local"
 frozen = true
 notes = "Rust crate source; ported into leas-tls (crypto/handshake/hello/http2/record)."
 path = "tls-fingerprint"
+what = "Rust TLS ClientHello/fingerprint crate (frozen source)"
+domain = "TLS library"
+tags = "#tls #fingerprint #rust #leas-source"
+standards = "ClientHello construction; TLS 1.3 secrets; HTTP/2 fingerprint; ported into leas-tls"
 
 [[entry]]
 name = "toasty"
@@ -565,6 +766,10 @@ remote = "https://github.com/tokio-rs/toasty.git"
 ref = "main@4f3ed1a351f9"
 sha = "4f3ed1a351f967cf90fb396185f161d808bfa979"
 shallow = true
+what = "Embedded database for Rust (tokio-rs)"
+domain = "database"
+tags = "#database #rust #embedded"
+standards = "Embedded SQL storage; derive APIs"
 
 [[entry]]
 name = "tracing_allocator"
@@ -576,6 +781,10 @@ remote = "https://github.com/Geal/tracing_allocator.git"
 ref = "master@dc29ba70ae5a"
 sha = "dc29ba70ae5a4ba8d5d0281bf931e510147a08e8"
 shallow = true
+what = "Rust global allocator logging allocations to file"
+domain = "memory tooling"
+tags = "#allocator #memory #rust #tracing"
+standards = "GlobalAlloc; allocation logging"
 
 [[entry]]
 name = "trojan"
@@ -587,6 +796,10 @@ remote = "https://github.com/trojan-gfw/trojan.git"
 ref = "master@3e7bb9aecdc6"
 sha = "3e7bb9aecdc694f9bcae8d646fae395f773d60f8"
 shallow = true
+what = "Trojan proxy over TLS (C++)"
+domain = "proxy server"
+tags = "#trojan #tls #cpp #proxy"
+standards = "Trojan protocol over TLS; unidentifiable proxy"
 
 [[entry]]
 name = "TrojanRust"
@@ -598,6 +811,10 @@ remote = "https://github.com/cty123/TrojanRust.git"
 ref = "main@06a32afcf759"
 sha = "06a32afcf759bae4b2885e78f7c7e88d3b9668af"
 shallow = true
+what = "High-performance Trojan proxy in Rust (tokio)"
+domain = "proxy server"
+tags = "#trojan #rust #tokio #proxy"
+standards = "Trojan protocol; TLS; performance focus"
 
 [[entry]]
 name = "tui-widgets"
@@ -609,6 +826,10 @@ remote = "https://github.com/ratatui/tui-widgets.git"
 ref = "main@dec872b2cb87"
 sha = "dec872b2cb87ffba488c30e978fe72b8ab918ac1"
 shallow = true
+what = "Widget collection for Ratatui"
+domain = "TUI widgets"
+tags = "#ratatui #widgets #tui #rust"
+standards = "Scrollview, QR code, scrollbar, popup, prompts, charts"
 
 [[entry]]
 name = "tuic"
@@ -620,6 +841,10 @@ remote = "https://github.com/Itsusinn/tuic.git"
 ref = "main@27e666ceee7d"
 sha = "27e666ceee7d0e4a9308b0960866d36b11eb1c10"
 shallow = true
+what = "QUIC-based low-latency proxy (Rust fork)"
+domain = "proxy server"
+tags = "#tuic #quic #rust #proxy"
+standards = "TUIC protocol; QUIC; low handshake overhead; routing/observability"
 
 [[entry]]
 name = "turso"
@@ -631,6 +856,10 @@ remote = "https://github.com/tursodatabase/turso"
 ref = "v0.9.0-pre.5"
 sha = "98dc77b9f79385d073ff1fefe2e81fa77919790e"
 shallow = false
+what = "In-process SQLite-compatible database (Rust)"
+domain = "database"
+tags = "#database #sqlite #rust #turso"
+standards = "SQLite file format; SQL; Postgres wire frontend"
 
 [[entry]]
 name = "unbihex"
@@ -642,6 +871,10 @@ remote = "https://github.com/crystalmasta/unbihex.git"
 ref = "v0.2.10"
 sha = "dd4ca980d6dc278854106d78f117c17ae20065bd"
 shallow = true
+what = "Russian VPN client on own Rust core, Xray-compatible"
+domain = "desktop VPN client"
+tags = "#vpn-client #rust #xray-compatible"
+standards = "VLESS (TLS/REALITY/Vision/XHTTP/WS/HTTPUpgrade/gRPC); VMess (TCP/TLS/WS/HTTPUpgrade)"
 
 [[entry]]
 name = "utls"
@@ -653,6 +886,11 @@ remote = "https://github.com/refraction-networking/utls.git"
 ref = "master@360383f893fb"
 sha = "360383f893fbe954ff12a701b87295406abbc156"
 shallow = true
+notes = "replaced a13c59ffe98bb01b2ca14143eb2e887664b1f138 (2026-11-08)"
+what = "uTLS fork of Go crypto/tls with ClientHello fingerprinting"
+domain = "TLS library"
+tags = "#tls #ja3 #ja4 #fingerprint #go #clienthello"
+standards = "TLS 1.2/1.3; ClientHello fingerprint resistance; fake session tickets; ECH; BoringSSL padding"
 
 [[entry]]
 name = "v2ray-configs"
@@ -665,6 +903,10 @@ ref = "main@333276ba1ca0"
 sha = "333276ba1ca03b6d1f729df2ee776334fbd0d86f"
 shallow = true
 notes = "Upstream GitHub repo returns 404; this is the only frozen copy."
+what = "Bulk V2Ray configs (GONE - upstream 404, frozen)"
+domain = "subscription feed"
+tags = "#vpn-configs #gone #frozen"
+standards = "V2Ray config collection"
 
 [[entry]]
 name = "v2ray-core"
@@ -676,6 +918,10 @@ remote = "https://github.com/v2fly/v2ray-core.git"
 ref = "master@ec5ce8ba78e8"
 sha = "ec5ce8ba78e8a70167b5b1f003287f1340ecc19a"
 shallow = true
+what = "V2Fly core (Go)"
+domain = "proxy core"
+tags = "#v2ray #vmess #go #proxy-core"
+standards = "VMess; VLESS; SOCKS/HTTP inbound; TCP/WS/gRPC transports"
 
 [[entry]]
 name = "v2ray-core-legacy"
@@ -687,6 +933,10 @@ remote = "https://github.com/v2ray/v2ray-core.git"
 ref = "master@d80440f3d57b"
 sha = "d80440f3d57b45c829dbf513306f7adf9a0f3f76"
 shallow = true
+what = "Original v2ray/v2ray-core, moved to v2fly"
+domain = "proxy core (legacy)"
+tags = "#v2ray #legacy #go"
+standards = "VMess; legacy V2Ray protocol suite"
 
 [[entry]]
 name = "v2ray-core-v4.38.3"
@@ -698,6 +948,10 @@ remote = "https://github.com/v2fly/v2ray-core.git"
 ref = "v4.38.3"
 sha = "ffc8887d79bcc769ff7a83975f4c82b0ee8729d3"
 shallow = true
+what = "V2Fly core pinned at v4.38.3"
+domain = "proxy core (pinned)"
+tags = "#v2ray #pinned-old #go"
+standards = "VMess/VLESS; legacy transports"
 
 [[entry]]
 name = "v2ray-plugin"
@@ -709,6 +963,10 @@ remote = "https://github.com/shadowsocks/v2ray-plugin.git"
 ref = "v1.3.2"
 sha = "ddd7ab46b4aeee0ca8b272efed9d7da3e3a6e52c"
 shallow = true
+what = "SIP003 Shadowsocks plugin based on v2ray (Go)"
+domain = "proxy plugin"
+tags = "#sip003 #shadowsocks #plugin #go"
+standards = "SIP003 plugin; WebSocket/QUIC plugin modes"
 
 [[entry]]
 name = "v2rayN"
@@ -720,6 +978,10 @@ remote = "https://github.com/2dust/v2rayN.git"
 ref = "master@f07e3dc41511"
 sha = "f07e3dc41511a196f8ab563bcd2a16d1310ca8dd"
 shallow = true
+what = "GUI client for Windows/Linux/macOS (C#)"
+domain = "desktop GUI client"
+tags = "#desktop-gui #csharp #client"
+standards = "Xray and sing-box cores; SOCKS/HTTP inbound"
 
 [[entry]]
 name = "v2rayNG"
@@ -731,6 +993,10 @@ remote = "https://github.com/2dust/v2rayNG.git"
 ref = "master@9397a9e4a17e"
 sha = "9397a9e4a17e060a9b6bd3d6b6d0f2f8ee11420b"
 shallow = true
+what = "Android V2Ray client (Kotlin)"
+domain = "mobile VPN client"
+tags = "#android #mobile-client"
+standards = "Xray/v2fly cores; VLESS/VMess/Trojan/SS"
 
 [[entry]]
 name = "vpn-configs-for-russia"
@@ -742,6 +1008,10 @@ remote = "https://github.com/igareck/vpn-configs-for-russia.git"
 ref = "main@229b9b04ef8f"
 sha = "229b9b04ef8f555db5a55c065eb0ff652857de14"
 shallow = true
+what = "Free VPN configs working in RU"
+domain = "subscription feed"
+tags = "#vpn-configs #russia"
+standards = "VLESS/VMess configs; subscription lists"
 
 [[entry]]
 name = "wireguard-go"
@@ -753,6 +1023,10 @@ remote = "https://github.com/WireGuard/wireguard-go.git"
 ref = "master@b3bc704ef0ee"
 sha = "b3bc704ef0ee21a36298601a9e1e5ff90377ac52"
 shallow = true
+what = "WireGuard implementation in Go"
+domain = "VPN"
+tags = "#wireguard #vpn #go"
+standards = "WireGuard protocol; Noise framework; UDP"
 
 [[entry]]
 name = "wreq-util"
@@ -764,6 +1038,10 @@ remote = "https://github.com/0x676e67/wreq-util.git"
 ref = "main@917d2581d676"
 sha = "917d2581d6761a94db66466caa6c2eb4d4cdbd43"
 shallow = true
+what = "Utilities for the wreq HTTP client (Rust)"
+domain = "HTTP client utils"
+tags = "#http-client #rust #wreq"
+standards = "HTTP client helpers; browser-impersonation adjacent"
 
 [[entry]]
 name = "xrat"
@@ -775,6 +1053,10 @@ remote = "https://github.com/mhyrzt/xrat.git"
 ref = "v0.35.1"
 sha = "055265c5cc06013e7b3b1999b4e795292f9e9756"
 shallow = true
+what = "Terminal CLI/TUI/Web UI proxy tester + subscription manager (Rust)"
+domain = "proxy manager"
+tags = "#tui #cli #proxy-tester #rust"
+standards = "Subscription import; proxy testing; saved results"
 
 [[entry]]
 name = "xray-checker"
@@ -786,6 +1068,10 @@ remote = "https://github.com/kutovoys/xray-checker.git"
 ref = "v1.3.1"
 sha = "f829c2b7d44670f4db0f7355f445771e7cde7158"
 shallow = true
+what = "Proxy availability monitoring with Prometheus (Go)"
+domain = "monitoring"
+tags = "#monitoring #xray #prometheus #go"
+standards = "VLESS/VMess/Trojan/SS probing; Prometheus metrics"
 
 [[entry]]
 name = "xray-config-toolkit"
@@ -797,6 +1083,10 @@ remote = "https://github.com/wuqb2i4f/xray-config-toolkit.git"
 ref = "main@bbbd28ae0b55"
 sha = "bbbd28ae0b55d4efcb7ccfbf729abd49a698a827"
 shallow = true
+what = "Xray config builder / Iranian-site bypass"
+domain = "config tool"
+tags = "#config-tool #xray #iran"
+standards = "Xray configs; subscription links; bypass rulesets"
 
 [[entry]]
 name = "Xray-core"
@@ -808,6 +1098,10 @@ remote = "https://github.com/XTLS/Xray-core.git"
 ref = "v26.11.9"
 sha = "676eaf66f8f05d4d558ee7a74b4736623d3feeb9"
 shallow = true
+what = "XTLS Xray-core network tools (Go)"
+domain = "proxy core"
+tags = "#xray #xtls #go #proxy-core"
+standards = "VLESS; VMess; Trojan; SS; REALITY; XTLS Vision; XHTTP; TCP/WS/gRPC/QUIC"
 
 [[entry]]
 name = "xray-rs-tls"
@@ -817,6 +1111,10 @@ host = "local"
 frozen = true
 notes = "Rust crate source; referenced by leas-native/src/crypto/salamander.rs."
 path = "xray-rs-tls"
+what = "Rust TLS/obfuscation experiment (frozen source)"
+domain = "TLS experiment"
+tags = "#tls #rust #xray #obfuscation"
+standards = "Referenced by leas-native salamander.rs"
 
 [[entry]]
 name = "yamux"
@@ -828,6 +1126,10 @@ remote = "https://github.com/hashicorp/yamux"
 ref = "v0.1.2"
 sha = "17017e907efcfb40ef55c8e52ca6149d676375c7"
 shallow = true
+what = "Yet Another Multiplexer for Go"
+domain = "multiplexing"
+tags = "#yamux #mux #go"
+standards = "Stream-oriented multiplexing over TCP/UDS"
 
 [[entry]]
 name = "zellij"
@@ -840,6 +1142,10 @@ ref = "main@9e7be20f5c15"
 sha = "9e7be20f5c150a748a27e5ace89dbe505fa6c137"
 shallow = true
 notes = "Uncommitted local changes; pinned sha is the committed HEAD."
+what = "Terminal workspace / multiplexer (Rust)"
+domain = "terminal multiplexer"
+tags = "#terminal #multiplexer #rust #tui"
+standards = "Panes/tabs; terminal multiplexing (local edits)"
 
 [[entry]]
 name = "ZeroNet"
@@ -852,3 +1158,7 @@ ref = "v0.3.6"
 sha = "29e7a95eaaf7e0158b96cba83d7118f5f3d87bfd"
 shallow = true
 notes = "Uncommitted local changes; pinned sha is the committed HEAD."
+what = "Persian VPN client on Rust 'Zray' core"
+domain = "VPN client"
+tags = "#vpn-client #rust #persian"
+standards = "VPN protocols; Zray core (local edits)"
