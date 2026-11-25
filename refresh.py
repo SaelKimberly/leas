@@ -514,27 +514,65 @@ def cmd_report(entries_manifest: list[Entry], do_probe: bool) -> int:
     return 1 if drift else 0
 
 
-def cmd_apply(entries: list[Entry]) -> int:
-    """Only destructive path: reconcile non-frozen git entries to their pinned sha."""
+# Paths inside a reference clone that are reference collections, not edit noise.
+# Never cleaned by --discard-local: sub-healer/thirdparty/ holds 607M of nested
+# reference repos (REALITY, StormDNS, SlipNet, ...). Use -e so git clean skips it.
+KEEP_UNTRACKED: dict[str, list[str]] = {"sub-healer": ["thirdparty/"]}
+
+
+def cmd_apply(entries: list[Entry], *, execute: bool, discard_local: bool = False) -> int:
+    """Only destructive path: reconcile git entries to their pinned sha.
+
+    With discard_local, also reset dirty reference clones to HEAD when the remote
+    is reachable, excluding KEEP_UNTRACKED paths. execute=False previews only.
+    """
     disk = {e.name: e for e in scan()}
     changed = 0
     for m in entries:
-        if m.frozen or m.kind != "git":
+        if m.kind != "git":
             continue
         d = disk.get(m.name)
         if not d:
-            print(f"[apply] SKIP missing {m.name} (dry-run policy: no re-clone). "
-                  "Clone manually or add it back.")
+            print(f"[apply] SKIP missing {m.name} (no re-clone; add it back manually)")
             continue
-        if m.sha and d.sha and m.sha != d.sha:
-            print(f"[apply] {m.name}: fetch + checkout {m.sha[:12]}")
-            sp.run(["git", "fetch", "--depth", "1", "origin", m.sha],
-                   cwd=THIRDPARTY / m.name, check=False)
-            r = sp.run(["git", "checkout", "--detach", m.sha],
-                       cwd=THIRDPARTY / m.name, capture_output=True, text=True)
-            print("   ", "ok" if r.returncode == 0 else r.stderr.strip()[:120])
+        repo = THIRDPARTY / m.name
+        dirty = bool(git(["status", "--porcelain"], repo))
+
+        if dirty and not (discard_local and d.frozen):
+            if not discard_local:
+                print(f"[apply] SKIP {m.name}: local edits present (preserved; "
+                      "pass --discard-local to reset)")
+            continue
+
+        if dirty and discard_local:
+            ok = sp.run(["git", "ls-remote", "--exit-code", "origin", "HEAD"],
+                        cwd=repo, capture_output=True, timeout=20).returncode == 0
+            if not ok:
+                print(f"[apply] SKIP {m.name}: remote unreachable; edits preserved")
+                continue
+            excludes = [f"-e{p}" for p in KEEP_UNTRACKED.get(m.name, [])]
+            print(f"[apply] {m.name}: reset --hard {d.sha[:12]} + clean -fd "
+                  f"(kept: {', '.join(KEEP_UNTRACKED.get(m.name, [])) or 'none'})")
+            if execute:
+                for args in (["reset", "--hard", d.sha], ["clean", "-fd", *excludes]):
+                    r = sp.run(["git", *args], cwd=repo, capture_output=True, text=True)
+                    print("   ", args[0], "ok" if r.returncode == 0 else r.stderr.strip()[:120])
             changed += 1
-    print(f"[apply] reconciled {changed} entr{'y' if changed == 1 else 'ies'}")
+            continue
+
+        if m.frozen or not m.sha or not d.sha or m.sha == d.sha:
+            continue
+        print(f"[apply] {m.name}: fetch + checkout {m.sha[:12]}")
+        if execute:
+            sp.run(["git", "fetch", "--depth", "1", "origin", m.sha],
+                   cwd=repo, check=False)
+            r = sp.run(["git", "checkout", "--detach", m.sha],
+                       cwd=repo, capture_output=True, text=True)
+            print("   ", "ok" if r.returncode == 0 else r.stderr.strip()[:120])
+        changed += 1
+
+    verb = "reconciled" if execute else "would reconcile (preview; pass --apply to execute)"
+    print(f"[apply] {changed} entr{'y' if changed == 1 else 'ies'} {verb}")
     return 0
 
 
@@ -546,7 +584,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--index", action="store_true",
                     help="regenerate INDEX.md from the committed manifest (not from disk)")
     ap.add_argument("--apply", action="store_true",
-                    help="reconcile non-frozen git entries to their pinned sha (destructive)")
+                    help="reconcile drift to pinned sha; with --discard-local also reset dirty clones")
+    ap.add_argument("--discard-local", action="store_true",
+                    help="with --apply: reset dirty reference clones to HEAD (keeps KEEP_UNTRACKED paths)")
     ap.add_argument("--probe", action="store_true",
                     help="also check upstream GitHub existence (read-only API)")
     args = ap.parse_args(argv)
@@ -554,13 +594,16 @@ def main(argv: list[str] | None = None) -> int:
     if sum((args.sync, args.index, args.apply)) > 1:
         print("error: --sync, --index and --apply are mutually exclusive", file=sys.stderr)
         return 2
+    if args.discard_local and not args.apply:
+        print("error: --discard-local requires --apply", file=sys.stderr)
+        return 2
     if args.sync:
         return cmd_sync()
     if args.index:
         return cmd_index()
     entries = load()
     if args.apply:
-        return cmd_apply(entries)
+        return cmd_apply(entries, execute=True, discard_local=args.discard_local)
     return cmd_report(entries, args.probe)
 
 

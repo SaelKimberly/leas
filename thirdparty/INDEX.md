@@ -120,7 +120,7 @@ committed manifest (`what` / `domain` / `tags` / `standards` per entry).
 
 ## Pins (exact tag / revision per entry)
 
-Total: 77 (gone: 1, frozen: 2, private-host: 1, ad-hoc-research: 3, pinned-tag: 22, reference: 48)
+Total: 77 (gone: 1, frozen: 2, private-host: 1, ad-hoc-research: 1, pinned-tag: 23, reference: 49)
 
 | folder | kind | status | host | ref | sha |
 | --- | --- | --- | --- | --- | --- |
@@ -199,8 +199,8 @@ Total: 77 (gone: 1, frozen: 2, private-host: 1, ad-hoc-research: 3, pinned-tag: 
 | `Xray-core` | git | pinned-tag | github | `v26.11.9` | `676eaf66f8f0` |
 | `xray-rs-tls` | artifact | frozen | local | `-` | `-` |
 | `yamux` | git | pinned-tag | github | `v0.1.2` | `17017e907efc` |
-| `zellij` | git | ad-hoc-research | github | `main@9e7be20f5c15` | `9e7be20f5c15` |
-| `ZeroNet` | git | ad-hoc-research | github | `v0.3.6` | `29e7a95eaaf7` |
+| `zellij` | git | reference | github | `main@9e7be20f5c15` | `9e7be20f5c15` |
+| `ZeroNet` | git | pinned-tag | github | `v0.3.6` | `29e7a95eaaf7` |
 
 ## Frozen / archival detail
 
@@ -209,8 +209,6 @@ Total: 77 (gone: 1, frozen: 2, private-host: 1, ad-hoc-research: 3, pinned-tag: 
 - **`tls-fingerprint`** (frozen) — Rust crate source; ported into leas-tls (crypto/handshake/hello/http2/record).
 - **`v2ray-configs`** (gone) — Upstream GitHub repo returns 404; this is the only frozen copy.
 - **`xray-rs-tls`** (frozen) — Rust crate source; referenced by leas-native/src/crypto/salamander.rs.
-- **`zellij`** (ad-hoc-research) — Uncommitted local changes; pinned sha is the committed HEAD.
-- **`ZeroNet`** (ad-hoc-research) — Uncommitted local changes; pinned sha is the committed HEAD.
 
 ## Conventions
 
