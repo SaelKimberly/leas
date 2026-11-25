@@ -225,13 +225,17 @@ pub(crate) const fn is_udp_dial_link(ctx: &LinkContext) -> bool {
 /// upgrade REPLACED by the QUIC connection — spec §5.2), then the protocol's
 /// own handshake over a QUIC stream.
 ///
-/// The only implemented member is Hysteria2; Hysteria1 and TUIC stay
-/// `NotImplemented` until their modules land.
+/// The implemented members are Hysteria2 and TUIC; Hysteria1 stays
+/// `NotImplemented` until its module lands.
 pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
     match &ctx.params.protocol {
         ProtocolConfig::Hysteria2(cfg) => hysteria2::connect(ctx, cfg).await,
         ProtocolConfig::Hysteria1(_) => not_impl("hysteria1 (QUIC)"),
-        ProtocolConfig::Tuic(cfg) => tuic::connect(ctx, cfg).await,
+        // One heap box per TUIC dial keeps this branch out of the routing
+        // future's stack image: the quinn/auth/stream state is large, and the
+        // Windows MSVC build otherwise crosses clippy's 16 KiB future lint in
+        // the local HTTP inbound.
+        ProtocolConfig::Tuic(cfg) => Box::pin(tuic::connect(ctx, cfg)).await,
         _ => Err(NativeError::Config(
             "connect_quic requires a QUIC-family protocol (Hysteria2/Hysteria1/Tuic)".into(),
         )),
