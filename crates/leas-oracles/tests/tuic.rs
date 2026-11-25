@@ -114,13 +114,26 @@ async fn tuic_zero_rtt_and_wrong_password(
     leas_native::transport::quic::set_test_ca(&certs.ca_der);
     let params = config::client_params_tuic(port, echo.addr, "native");
 
-    for attempt in 0..2 {
-        let mut tunnel = leas_native::connect(params.clone())
-            .await
-            .unwrap_or_else(|e| panic!("dial {attempt}: {e}"));
-        let (status, _) = probe(&mut tunnel).await;
-        assert_eq!(status, 200, "dial {attempt} through the TUIC tunnel");
-    }
+    let mut first = leas_native::connect(params.clone())
+        .await
+        .expect("first TUIC dial");
+    assert_eq!(probe(&mut first).await.0, 200, "first TUIC dial");
+    drop(first);
+
+    let base = leas_native::protocol::tuic::early_stats();
+    let mut second = leas_native::connect(params.clone())
+        .await
+        .expect("resumed TUIC dial");
+    assert_eq!(probe(&mut second).await.0, 200, "resumed TUIC dial");
+    let after = leas_native::protocol::tuic::early_stats();
+    assert!(
+        after.0 > base.0,
+        "the second dial must attempt 0-RTT: {base:?} -> {after:?}"
+    );
+    assert!(
+        after.1 > base.1,
+        "the zero_rtt_handshake server must accept early data: {base:?} -> {after:?}"
+    );
 
     let mut bad = params;
     let ProtocolConfig::Tuic(cfg) = &mut bad.protocol else {

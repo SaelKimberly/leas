@@ -121,7 +121,7 @@ Files: `docs/reference/native-core.md`, `docs/reference/protocols.md`, `docs/aeg
 
 ### T7 — Oracle: sing-box + mihomo TUIC inbound
 
-Files: `crates/leas-oracles/src/e2e/{case,config}.rs`, `crates/leas-oracles/src/oracle_adapters/config_builder/{singbox,mihomo}.rs`, `crates/leas-oracles/tests/tuic.rs`.
+Files: `crates/leas-oracles/src/e2e/{case,config}.rs` (mihomo `listeners:` YAML lives in `e2e/config.rs`), `crates/leas-oracles/src/oracle_adapters/config_builder/singbox.rs`, `crates/leas-oracles/tests/tuic.rs`.
 
 - Add `CaseSpec::tuic(udp_mode)` and `ProtocolKind::Tuic`, `client_params_tuic`, `tuic_inbound` (sing-box JSON + mihomo `listeners:` YAML), server users `{uuid: password}`, ALPN `h3`, harness cert/key.
 - Rows: TCP plain (domain/IPv4/IPv6 targets), UDP native, UDP quic, oversized datagram, idle heartbeat, wrong password (close, no cred verdict), 0-RTT sing-box true/false.

@@ -24,6 +24,26 @@ use crate::error::{NativeError, timeouts};
 use super::wire;
 
 const ALPN_H3: &[u8] = b"h3";
+#[cfg(any(test, feature = "e2e-support"))]
+static EARLY_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(test, feature = "e2e-support"))]
+static EARLY_ACCEPTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(test, feature = "e2e-support"))]
+static EARLY_REJECTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(attempts, accepted, rejected)` for the test/e2e harness. A retried dial
+/// proves the 0-RTT lane only when the counters move.
+#[cfg(any(test, feature = "e2e-support"))]
+#[must_use]
+pub fn early_stats() -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering;
+    (
+        EARLY_ATTEMPTS.load(Ordering::Relaxed),
+        EARLY_ACCEPTED.load(Ordering::Relaxed),
+        EARLY_REJECTED.load(Ordering::Relaxed),
+    )
+}
+
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_FRAME: [u8; 2] = wire::heartbeat_frame();
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -202,7 +222,11 @@ pub async fn dial(
 
     let (conn, accepted) = if allow_early {
         match connecting.into_0rtt() {
-            Ok((conn, accepted)) => (conn, Some(accepted)),
+            Ok((conn, accepted)) => {
+                #[cfg(any(test, feature = "e2e-support"))]
+                EARLY_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (conn, Some(accepted))
+            }
             Err(connecting) => (finish_handshake(connecting).await?, None),
         }
     } else {
@@ -244,8 +268,16 @@ fn spawn_auth(
             Some(accepted) => {
                 let limit = timeouts::DIAL;
                 match tokio::time::timeout(limit, accepted).await {
-                    Ok(true) => Phase::Accepted,
-                    Ok(false) => Phase::Rejected,
+                    Ok(true) => {
+                        #[cfg(any(test, feature = "e2e-support"))]
+                        EARLY_ACCEPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Phase::Accepted
+                    }
+                    Ok(false) => {
+                        #[cfg(any(test, feature = "e2e-support"))]
+                        EARLY_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Phase::Rejected
+                    }
                     Err(_) => {
                         phase.fail("tuic handshake timed out".into());
                         conn.close(0_u32.into(), b"tuic handshake timeout");

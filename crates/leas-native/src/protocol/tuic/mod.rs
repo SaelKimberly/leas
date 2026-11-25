@@ -10,3 +10,6 @@ pub(crate) mod wire;
 
 pub(crate) use stream::connect;
 pub(crate) use udp::connect_udp;
+
+#[cfg(any(test, feature = "e2e-support"))]
+pub use quic::early_stats;
