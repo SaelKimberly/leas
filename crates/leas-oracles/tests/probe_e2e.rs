@@ -304,17 +304,21 @@ async fn hysteria2_probe_auth_failure_carries_credential_evidence() {
         panic!("no sing-box binary found");
     };
     let certs = generate_certs();
-    CaseSpec::hysteria2(None).client_trust(&certs);
+    CaseSpec::hysteria2(config::Hy2Obfs::None).client_trust(&certs);
     let dir = tempfile::tempdir().expect("tempdir");
     let (target_port, _target) = spawn_http_target();
     let target = std::net::SocketAddr::from(([127, 0, 0, 1], target_port));
     let port = free_port();
     let env = stage_singbox_server(dir.path(), &certs, port, target);
     let config_path = dir.path().join("hysteria2.json");
-    std::fs::write(&config_path, config::hysteria2_inbound(&env, None)).expect("hysteria2 config");
+    std::fs::write(
+        &config_path,
+        config::hysteria2_inbound(&env, config::Hy2Obfs::None),
+    )
+    .expect("hysteria2 config");
     let _core = spawn_core(&bin.bin, CoreKind::SingBox, &config_path, port, true);
 
-    let mut params = config::client_params_hysteria2(port, target, None);
+    let mut params = config::client_params_hysteria2(port, target, config::Hy2Obfs::None);
     if let ProtocolConfig::Hysteria2(cfg) = &mut params.protocol {
         cfg.auth = "definitely-not-the-password".into();
     }

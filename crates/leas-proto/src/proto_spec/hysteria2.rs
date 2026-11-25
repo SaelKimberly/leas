@@ -22,8 +22,10 @@
 //!
 //! | Key            | Values                    | Purpose                          | Default   |
 //! |----------------|---------------------------|----------------------------------|-----------|
-//! | `obfs`         | salamander                | Obfuscation type                 | —         |
+//! | `obfs`         | salamander / gecko        | Obfuscation type                 | —         |
 //! | `obfs-password`| string (min 4 bytes)      | Obfuscation pre-shared key       | —         |
+//! | `minPacketSize`| u16                       | Gecko minimum datagram size      | 512       |
+//! | `maxPacketSize`| u16                       | Gecko maximum datagram size      | 1200      |
 //! | `insecure`     | 1/0, true/false           | Skip TLS verification            | `false`   |
 //! | `sni`          | domain                    | TLS SNI override                 | hostname  |
 //! | `up`           | bandwidth string          | Upload speed limit               | —         |
@@ -87,11 +89,128 @@ pub struct Hysteria2Config {
     pub security: SecurityConfig,
     pub obfs: Option<TinyText>,
     pub obfs_password: Option<TinyText>,
+    /// Gecko only: minimum on-wire datagram size (`geckoDefaultMinPacket`
+    /// 512). Absent, zero or an invalid pair normalizes to the defaults.
+    pub obfs_min_packet_size: Option<u16>,
+    /// Gecko only: maximum on-wire datagram size (`geckoDefaultMaxPacket`
+    /// 1200; the reference caps it at 2048).
+    pub obfs_max_packet_size: Option<u16>,
     pub up: Option<TinyText>,
     pub down: Option<TinyText>,
     pub hop_interval: Option<u32>,
     pub pin_sha256: Option<TinyText>,
     pub remarks: Option<TinyText>,
+}
+
+/// Gecko's default minimum on-wire datagram size (`geckoDefaultMinPacket`).
+pub const GECKO_DEFAULT_MIN_PACKET_SIZE: u16 = 512;
+/// Gecko's default maximum on-wire datagram size (`geckoDefaultMaxPacket`).
+pub const GECKO_DEFAULT_MAX_PACKET_SIZE: u16 = 1200;
+/// Gecko's hard ceiling (`geckoBufferSize`): a larger maximum is refused.
+pub const GECKO_MAX_PACKET_SIZE: u16 = 2048;
+/// Salamander's pre-shared-key floor (`smPSKMinLen`).
+pub const OBFS_PSK_MIN_LEN: usize = 4;
+
+/// The normalized obfuscation shape a Hysteria2 row dials with.
+///
+/// One owner for "what obfs is this": the dial, capability gate, identity and
+/// exporters all read it, so an obfs type can never be ignored by one consumer
+/// while another honours it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObfsSpec<'a> {
+    /// No obfuscation; size fields are inert.
+    None,
+    /// Salamander only: `psk` is the pre-shared key.
+    Salamander { psk: &'a [u8] },
+    /// Gecko: Salamander plus fragment/pad shaping; `min`/`max` are already
+    /// normalized (`512`/`1200` on absent or invalid input).
+    Gecko { psk: &'a [u8], min: u16, max: u16 },
+}
+
+/// Why an `obfs` block cannot be dialed. The messages are user-visible
+/// capability verdicts, so they are an interface, not log prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObfsShapeError {
+    /// The `obfs` name is neither `salamander` nor `gecko`.
+    UnknownType,
+    /// `obfs` is set but `obfs-password` is absent or empty.
+    MissingPassword,
+    /// The password is shorter than Salamander's 4-byte minimum.
+    ShortPassword,
+}
+
+impl ObfsShapeError {
+    /// The persisted, user-visible reason for a refused row.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownType => "hysteria2 obfs type is not implemented",
+            Self::MissingPassword => "hysteria2 obfs requires a password",
+            Self::ShortPassword => "hysteria2 obfs password is shorter than 4 bytes",
+        }
+    }
+}
+
+impl core::fmt::Display for ObfsShapeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl Hysteria2Config {
+    /// Normalized Gecko sizes: absent, zero, half-invalid (`min > max`) or
+    /// over-ceiling (`max > 2048`) pairs fall back to `512`/`1200`.
+    ///
+    /// Pure and password-independent so the identity writer and exporters can
+    /// use it without turning a missing password into a second rule.
+    #[must_use]
+    pub fn gecko_sizes(&self) -> (u16, u16) {
+        let min = self
+            .obfs_min_packet_size
+            .unwrap_or(GECKO_DEFAULT_MIN_PACKET_SIZE);
+        let max = self
+            .obfs_max_packet_size
+            .unwrap_or(GECKO_DEFAULT_MAX_PACKET_SIZE);
+        if min == 0 || min > max || max > GECKO_MAX_PACKET_SIZE {
+            (GECKO_DEFAULT_MIN_PACKET_SIZE, GECKO_DEFAULT_MAX_PACKET_SIZE)
+        } else {
+            (min, max)
+        }
+    }
+
+    /// Resolve the obfs block into the shape the dial honours.
+    ///
+    /// # Errors
+    ///
+    /// [`ObfsShapeError`] when the row names an unimplemented obfs, omits the
+    /// password, or carries a password shorter than Salamander's minimum.
+    pub fn obfs_spec(&self) -> Result<ObfsSpec<'_>, ObfsShapeError> {
+        let Some(name) = self.obfs.as_deref() else {
+            return Ok(ObfsSpec::None);
+        };
+        match name {
+            "salamander" | "gecko" => {}
+            _ => return Err(ObfsShapeError::UnknownType),
+        }
+        let psk = self.obfs_password.as_deref().unwrap_or("");
+        if psk.is_empty() {
+            return Err(ObfsShapeError::MissingPassword);
+        }
+        if psk.len() < OBFS_PSK_MIN_LEN {
+            return Err(ObfsShapeError::ShortPassword);
+        }
+        if name == "salamander" {
+            return Ok(ObfsSpec::Salamander {
+                psk: psk.as_bytes(),
+            });
+        }
+        let (min, max) = self.gecko_sizes();
+        Ok(ObfsSpec::Gecko {
+            psk: psk.as_bytes(),
+            min,
+            max,
+        })
+    }
 }
 
 impl Hysteria2Config {
@@ -134,10 +253,21 @@ impl Hysteria2Config {
         let query = utils::parse_query(raw.query);
         utils::reject_foreign_encryption(&query)?;
 
-        // obfs: obfuscation type (e.g., "salamander")
+        // obfs: obfuscation type (e.g., "salamander", "gecko")
         let obfs = utils::query_get(&query, "obfs").map(TinyText::from);
-        // obfs-password: pre-shared key for salamander obfuscation
+        // obfs-password: pre-shared key for the obfuscator
         let obfs_password = utils::query_get(&query, "obfs-password").map(TinyText::from);
+        // Gecko's unofficial link params (v2rayN's dialect). They matter only
+        // for gecko; a salamander row that carries them stays salamander and
+        // keeps them out of the typed config (and so out of identity/export).
+        let (obfs_min_packet_size, obfs_max_packet_size) = if obfs.as_deref() == Some("gecko") {
+            (
+                utils::query_get(&query, "minPacketSize").and_then(|v| v.parse().ok()),
+                utils::query_get(&query, "maxPacketSize").and_then(|v| v.parse().ok()),
+            )
+        } else {
+            (None, None)
+        };
         // up/down: bandwidth limits (canonical impl doesn't parse these from URL)
         let up = utils::query_get(&query, "up").map(TinyText::from);
         // pin_sha256: certificate SHA-256 pin (keys: pinSHA256, pin_sha256)
@@ -169,6 +299,8 @@ impl Hysteria2Config {
             security,
             obfs,
             obfs_password,
+            obfs_min_packet_size,
+            obfs_max_packet_size,
             up,
             down,
             hop_interval,
@@ -225,6 +357,17 @@ impl Hysteria2Config {
             if let Some(v) = &self.obfs_password {
                 parts.push(format!("obfs-password={}", urlencoding::encode(v)));
             }
+            if self.obfs.as_deref() == Some("gecko") {
+                let (min, max) = self.gecko_sizes();
+                // Defaults are the absent meaning; re-emitting them would make
+                // an explicit-default row differ from a stock link.
+                if min != GECKO_DEFAULT_MIN_PACKET_SIZE {
+                    parts.push(format!("minPacketSize={min}"));
+                }
+                if max != GECKO_DEFAULT_MAX_PACKET_SIZE {
+                    parts.push(format!("maxPacketSize={max}"));
+                }
+            }
             if let Some(v) = &self.up {
                 parts.push(format!("up={}", urlencoding::encode(v)));
             }
@@ -279,6 +422,12 @@ impl Hysteria2Config {
                 .obfs_password
                 .as_ref()
                 .map(std::string::ToString::to_string),
+            obfs_min_packet_size: (self.obfs.as_deref() == Some("gecko"))
+                .then(|| self.gecko_sizes().0)
+                .filter(|min| *min != GECKO_DEFAULT_MIN_PACKET_SIZE),
+            obfs_max_packet_size: (self.obfs.as_deref() == Some("gecko"))
+                .then(|| self.gecko_sizes().1)
+                .filter(|max| *max != GECKO_DEFAULT_MAX_PACKET_SIZE),
             skip_cert_verify: self.security.insecure(),
             servername: self.security.sni().map(std::string::ToString::to_string),
             alpn: alpn_str.map(|s| vec![s.to_string()]),
@@ -297,6 +446,8 @@ impl Hysteria2Config {
                     down: c.down.clone().map(TinyText::from),
                     obfs: c.obfs.clone().map(TinyText::from),
                     obfs_password: c.obfs_password.clone().map(TinyText::from),
+                    obfs_min_packet_size: c.obfs_min_packet_size,
+                    obfs_max_packet_size: c.obfs_max_packet_size,
                     security: clash_tls_to_security(
                         Some(true),
                         c.servername.as_deref(),
@@ -415,6 +566,8 @@ impl ProtoSpec for Hysteria2Config {
 const ID_OBFS: u8 = 0x50;
 const ID_UP_MBPS: u8 = 0x51;
 const ID_DOWN_MBPS: u8 = 0x52;
+const ID_GECKO_MIN_PACKET: u8 = 0x53;
+const ID_GECKO_MAX_PACKET: u8 = 0x54;
 
 /// Numeric Mbps prefix of a Hysteria bandwidth string, exactly as the
 /// sing-box builder reads it (`up`/`down` default to 100 Mbps when the prefix
@@ -444,6 +597,21 @@ impl ProtoIdentity for Hysteria2Config {
         w.kind("hysteria2");
         super::common::write_security_mandatory(w, &self.security);
         w.present_str(ID_OBFS, self.obfs.as_deref());
+        if self.obfs.as_deref() == Some("gecko") {
+            // Send-side shaping, normalized: absent and explicit-default
+            // collapse, so only a custom pair moves the sig.
+            let (min, max) = self.gecko_sizes();
+            w.opt_u64(
+                ID_GECKO_MIN_PACKET,
+                Some(u64::from(min)),
+                u64::from(GECKO_DEFAULT_MIN_PACKET_SIZE),
+            );
+            w.opt_u64(
+                ID_GECKO_MAX_PACKET,
+                Some(u64::from(max)),
+                u64::from(GECKO_DEFAULT_MAX_PACKET_SIZE),
+            );
+        }
         w.opt_u64(ID_UP_MBPS, self.up.as_deref().map(bandwidth_mbps), 100);
         w.opt_u64(ID_DOWN_MBPS, self.down.as_deref().map(bandwidth_mbps), 100);
         w.cred("auth", &self.auth);
@@ -558,6 +726,15 @@ impl Hysteria2Config {
             if let Some(pw) = &self.obfs_password {
                 obfs_json.insert("password".into(), json!(pw));
             }
+            if obfs.as_str() == "gecko" {
+                let (min, max) = self.gecko_sizes();
+                if min != GECKO_DEFAULT_MIN_PACKET_SIZE {
+                    obfs_json.insert("min_packet_size".into(), json!(min));
+                }
+                if max != GECKO_DEFAULT_MAX_PACKET_SIZE {
+                    obfs_json.insert("max_packet_size".into(), json!(max));
+                }
+            }
             out["obfs"] = json!(obfs_json);
         }
         out["tls"] = to_singbox_tls_or_default(&self.security, ep, opts.skip_cert_verify);
@@ -568,11 +745,13 @@ impl Hysteria2Config {
 
 #[cfg(test)]
 mod tests {
+    use super::super::common::SecurityConfig;
     use super::super::common::TlsConfig;
     use super::super::{
         CoreTarget, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
     };
-    use super::Hysteria2Config;
+    use super::{Hysteria2Config, ObfsShapeError, ObfsSpec};
+    use crate::clash::ClashProxy;
     use crate::urlx::{RawUrlX, SchemeX};
     use rstest::rstest;
 
@@ -752,6 +931,8 @@ mod tests {
             down: Some("100".into()),
             obfs: Some("salamander".into()),
             obfs_password: Some("password123".into()),
+            obfs_min_packet_size: None,
+            obfs_max_packet_size: None,
             skip_cert_verify: Some(true),
             servername: Some("jnir.pichondan.com".into()),
             alpn: None,
@@ -937,5 +1118,239 @@ mod tests {
         assert_eq!(conf["obfs"]["type"], "salamander");
         assert_eq!(conf["obfs"]["password"], "password123");
         assert_eq!(conf["tls"]["insecure"], true, "skip_cert_verify forces it");
+    }
+
+    // ── Gecko: obfs resolver, link params, identity, Clash ────────────────
+
+    #[test]
+    fn obfs_spec_resolves_the_three_shapes() {
+        let none = Hysteria2Config {
+            auth: "a".into(),
+            security: SecurityConfig::default(),
+            obfs: None,
+            obfs_password: None,
+            obfs_min_packet_size: Some(600),
+            obfs_max_packet_size: Some(1300),
+            up: None,
+            down: None,
+            hop_interval: None,
+            pin_sha256: None,
+            remarks: None,
+        };
+        assert_eq!(none.obfs_spec(), Ok(ObfsSpec::None), "sizes are inert");
+
+        let mut salamander = none;
+        salamander.obfs = Some("salamander".into());
+        salamander.obfs_password = Some("psk-1".into());
+        assert_eq!(
+            salamander.obfs_spec(),
+            Ok(ObfsSpec::Salamander { psk: b"psk-1" })
+        );
+
+        let mut gecko = salamander;
+        gecko.obfs = Some("gecko".into());
+        assert_eq!(
+            gecko.obfs_spec(),
+            Ok(ObfsSpec::Gecko {
+                psk: b"psk-1",
+                min: 600,
+                max: 1300,
+            })
+        );
+
+        let mut unknown = gecko.clone();
+        unknown.obfs = Some("xplus".into());
+        assert_eq!(unknown.obfs_spec(), Err(ObfsShapeError::UnknownType));
+        assert_eq!(
+            unknown.obfs_spec().unwrap_err().reason(),
+            "hysteria2 obfs type is not implemented"
+        );
+
+        let mut missing = gecko.clone();
+        missing.obfs_password = Some("".into());
+        assert_eq!(missing.obfs_spec(), Err(ObfsShapeError::MissingPassword));
+
+        let mut short = gecko;
+        short.obfs_password = Some("abc".into());
+        assert_eq!(short.obfs_spec(), Err(ObfsShapeError::ShortPassword));
+    }
+
+    #[test]
+    fn gecko_sizes_normalize_invalid_pairs() {
+        let mut cfg = config(parse(
+            "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret",
+        ));
+        assert_eq!(cfg.gecko_sizes(), (512, 1200), "absent sizes are defaults");
+
+        cfg.obfs_min_packet_size = Some(2000);
+        cfg.obfs_max_packet_size = Some(100);
+        assert_eq!(cfg.gecko_sizes(), (512, 1200), "min > max repairs");
+
+        cfg.obfs_min_packet_size = Some(600);
+        cfg.obfs_max_packet_size = Some(3000);
+        assert_eq!(cfg.gecko_sizes(), (512, 1200), "over ceiling repairs");
+
+        cfg.obfs_min_packet_size = Some(600);
+        cfg.obfs_max_packet_size = None;
+        assert_eq!(
+            cfg.gecko_sizes(),
+            (600, 1200),
+            "half pair keeps the valid side"
+        );
+    }
+
+    #[test]
+    fn gecko_link_roundtrips_custom_sizes_and_elides_defaults() {
+        let custom = parse(
+            "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret&minPacketSize=600&maxPacketSize=1300",
+        );
+        let cfg = config(custom.clone());
+        assert_eq!(cfg.obfs_min_packet_size, Some(600));
+        assert_eq!(cfg.obfs_max_packet_size, Some(1300));
+        let url = cfg.reconstruct_proto(&custom.endpoints[0]).unwrap();
+        assert!(url.contains("minPacketSize=600"), "{url}");
+        assert!(url.contains("maxPacketSize=1300"), "{url}");
+        assert_eq!(parse(&url), custom, "custom sizes round-trip");
+
+        // Explicit defaults are the absent meaning: re-emitted links omit them.
+        let defaults = config(parse(
+            "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret&minPacketSize=512&maxPacketSize=1200",
+        ));
+        let url = defaults.reconstruct_proto(&custom.endpoints[0]).unwrap();
+        assert!(!url.contains("minPacketSize"), "{url}");
+        assert!(!url.contains("maxPacketSize"), "{url}");
+        assert_eq!(config(parse(&url)).gecko_sizes(), (512, 1200));
+
+        // Invalid link sizes have no representation after normalization.
+        let repaired = config(parse(
+            "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret&minPacketSize=9&maxPacketSize=3",
+        ));
+        assert_eq!(repaired.gecko_sizes(), (512, 1200));
+        assert!(
+            !repaired
+                .reconstruct_proto(&custom.endpoints[0])
+                .unwrap()
+                .contains("minPacketSize")
+        );
+    }
+
+    #[test]
+    fn salamander_ignores_gecko_size_params() {
+        let cfg = config(parse(
+            "hysteria2://pw@example.com:443?obfs=salamander&obfs-password=secret&minPacketSize=600&maxPacketSize=1300",
+        ));
+        assert_eq!(cfg.obfs_min_packet_size, None);
+        assert_eq!(cfg.obfs_max_packet_size, None);
+        let url = cfg
+            .reconstruct_proto(&EndpointEssentials::new("example.com", 443))
+            .unwrap();
+        assert!(!url.contains("minPacketSize"), "{url}");
+    }
+
+    #[test]
+    fn gecko_identity_hashes_normalized_sizes_only() {
+        use super::super::ProtoIdentity;
+        use super::super::identity::IdentityWriter;
+
+        let sig = |cfg: &Hysteria2Config| {
+            let mut w = IdentityWriter::new();
+            cfg.write_identity(&mut w);
+            w.finish().sig
+        };
+        let base = config(parse(
+            "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret",
+        ));
+        let mut explicit_defaults = base.clone();
+        explicit_defaults.obfs_min_packet_size = Some(512);
+        explicit_defaults.obfs_max_packet_size = Some(1200);
+        assert_eq!(
+            sig(&base),
+            sig(&explicit_defaults),
+            "absent and explicit default share one identity"
+        );
+
+        let mut custom = base.clone();
+        custom.obfs_min_packet_size = Some(600);
+        custom.obfs_max_packet_size = Some(1300);
+        assert_ne!(sig(&base), sig(&custom), "custom shaping moves the sig");
+
+        // Salamander size fields never reach identity (they are not parsed,
+        // but a stored row may carry them after a type change).
+        let mut salamander = base;
+        salamander.obfs = Some("salamander".into());
+        let mut salamander_sized = salamander.clone();
+        salamander_sized.obfs_min_packet_size = Some(600);
+        assert_eq!(sig(&salamander), sig(&salamander_sized));
+    }
+
+    #[test]
+    fn gecko_singbox_inject_emits_custom_sizes_only() {
+        let custom = config(parse(
+            "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret&minPacketSize=600&maxPacketSize=1300",
+        ));
+        let mut conf = serde_json::json!({});
+        custom
+            .inject_to(
+                &mut conf,
+                CoreTarget::SingBox,
+                Some(&EndpointEssentials::new("example.com", 443)),
+                InjectOptions::default(),
+            )
+            .expect("inject");
+        assert_eq!(conf["obfs"]["type"], "gecko");
+        assert_eq!(conf["obfs"]["min_packet_size"], 600);
+        assert_eq!(conf["obfs"]["max_packet_size"], 1300);
+
+        let defaults = config(parse(
+            "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret",
+        ));
+        let mut conf = serde_json::json!({});
+        defaults
+            .inject_to(
+                &mut conf,
+                CoreTarget::SingBox,
+                Some(&EndpointEssentials::new("example.com", 443)),
+                InjectOptions::default(),
+            )
+            .expect("inject");
+        assert!(conf["obfs"].get("min_packet_size").is_none(), "{conf}");
+        assert!(conf["obfs"].get("max_packet_size").is_none(), "{conf}");
+    }
+
+    #[test]
+    fn clash_gecko_uses_kebab_keys_both_directions() {
+        let proxy: ClashProxy = serde_json::from_value(serde_json::json!({
+            "type": "hysteria2",
+            "name": "g",
+            "server": "example.com",
+            "port": 443,
+            "password": "auth",
+            "obfs": "gecko",
+            "obfs-password": "gecko-secret",
+            "obfs-min-packet-size": 600,
+            "obfs-max-packet-size": 1300,
+            "skip-cert-verify": true,
+        }))
+        .expect("mihomo-shaped proxy parses");
+        let parsed = Hysteria2Config::try_from_clash_proto(&proxy).expect("import");
+        let cfg = config(parsed);
+        assert_eq!(cfg.obfs.as_deref(), Some("gecko"));
+        assert_eq!(cfg.obfs_password.as_deref(), Some("gecko-secret"));
+        assert_eq!(cfg.obfs_min_packet_size, Some(600));
+        assert_eq!(cfg.obfs_max_packet_size, Some(1300));
+        assert_eq!(cfg.security.insecure(), Some(true));
+
+        let out = cfg
+            .to_clash_proto(&EndpointEssentials::new("example.com", 443))
+            .expect("export");
+        let json = serde_json::to_value(out).expect("serialize");
+        assert_eq!(json["obfs-password"], "gecko-secret", "{json}");
+        assert_eq!(json["obfs-min-packet-size"], 600, "{json}");
+        assert_eq!(json["obfs-max-packet-size"], 1300, "{json}");
+        assert_eq!(json["skip-cert-verify"], true, "{json}");
+        assert!(
+            json.get("obfs_password").is_none(),
+            "snake key leaked: {json}"
+        );
     }
 }

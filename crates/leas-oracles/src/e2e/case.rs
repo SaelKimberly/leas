@@ -149,8 +149,9 @@ pub struct CaseSpec {
     /// (post-quantum) key share — a PQ row that silently fell back to
     /// classical fails instead of passing.
     pq_assert: bool,
-    /// Hysteria2 Salamander obfuscation PSK (`Some` enables it).
-    obfs: Option<&'static str>,
+    /// Hysteria2 obfuscation (`None` = plain QUIC). Salamander and Gecko are
+    /// the two shapes the reference server offers.
+    obfs: config::Hy2Obfs,
     /// mKCP obfuscation `(header_type, seed)`; `""` means "absent". Emitted to
     /// the server as xray's `finalmask.udp` and to the client as the
     /// `KcpConfig` fields (`transport::kcp::mask` frames both).
@@ -189,7 +190,7 @@ impl CaseSpec {
             udp: None,
             vless_enc: None,
             pq_assert: false,
-            obfs: None,
+            obfs: config::Hy2Obfs::None,
             kcp_mask: None,
             single_core: None,
             ss_method: None,
@@ -215,7 +216,7 @@ impl CaseSpec {
             udp: None,
             vless_enc: None,
             pq_assert: false,
-            obfs: None,
+            obfs: config::Hy2Obfs::None,
             kcp_mask: None,
             single_core: None,
             ss_method: None,
@@ -243,7 +244,7 @@ impl CaseSpec {
             udp: None,
             vless_enc: None,
             pq_assert: false,
-            obfs: None,
+            obfs: config::Hy2Obfs::None,
             kcp_mask: None,
             single_core: None,
             ss_method: None,
@@ -253,9 +254,9 @@ impl CaseSpec {
     }
 
     /// A hysteria2 case (QUIC dial): always single-core sing-box (xray-core
-    /// has no hysteria2 inbound). `obfs` enables Salamander obfuscation.
+    /// has no hysteria2 inbound). `obfs` selects the obfuscator.
     #[must_use]
-    pub fn hysteria2(obfs: Option<&'static str>) -> Self {
+    pub fn hysteria2(obfs: config::Hy2Obfs) -> Self {
         Self {
             protocol: ProtocolKind::Hysteria2,
             security: None,
@@ -300,7 +301,7 @@ impl CaseSpec {
             udp: None,
             vless_enc: None,
             pq_assert: false,
-            obfs: None,
+            obfs: config::Hy2Obfs::None,
             kcp_mask: None,
             single_core: None,
             ss_method: None,
@@ -334,7 +335,7 @@ impl CaseSpec {
             udp: None,
             vless_enc: None,
             pq_assert: false,
-            obfs: None,
+            obfs: config::Hy2Obfs::None,
             kcp_mask: None,
             single_core: None,
             ss_method: Some(method),
@@ -625,11 +626,7 @@ impl E2eCase for CaseSpec {
             ),
         };
         let mux = if self.mux() { "/mux" } else { "" };
-        let obfs = if self.obfs.is_some() {
-            "/obfs-salamander"
-        } else {
-            ""
-        };
+        let obfs = self.obfs.label_suffix();
         let pq = if self.pq_assert { "/pq" } else { "" };
         let enc = if self.vless_enc.is_some() {
             "/pq-enc"
@@ -989,7 +986,7 @@ mod tests {
         // SS TCP rows never touch UDP: the readiness probe stays a TCP accept.
         assert!(!CaseSpec::shadowsocks("aes-128-gcm").is_udp_listener());
         // hysteria2 is a QUIC (UDP-only) listener regardless of `app`.
-        assert!(CaseSpec::hysteria2(None).is_udp_listener());
+        assert!(CaseSpec::hysteria2(config::Hy2Obfs::None).is_udp_listener());
         // The other protocols' listeners are TCP.
         assert!(!CaseSpec::trojan().is_udp_listener());
         assert!(

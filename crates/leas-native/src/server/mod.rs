@@ -310,6 +310,8 @@ mod tests {
             security: SecurityConfig::default(),
             obfs: None,
             obfs_password: None,
+            obfs_min_packet_size: None,
+            obfs_max_packet_size: None,
             up: None,
             down: None,
             hop_interval: None,

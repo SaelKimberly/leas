@@ -9,6 +9,7 @@
 //! with the fingerprint engine milestone; the `VMess` wire crypto lives here.
 
 pub mod aead;
+pub mod gecko;
 pub mod kdf;
 pub mod legacy_stream;
 pub mod salamander;

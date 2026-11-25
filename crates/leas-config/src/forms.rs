@@ -768,7 +768,7 @@ fn protocol_specific_fields(protocol: ProtocolKind) -> Vec<FormField> {
             field(
                 "obfs",
                 "Obfs",
-                FormFieldType::Select(&["", "salamander", "other"]),
+                FormFieldType::Select(&["", "salamander", "gecko", "other"]),
                 "",
                 false,
                 FieldSection::ProtocolSetting,
@@ -777,6 +777,22 @@ fn protocol_specific_fields(protocol: ProtocolKind) -> Vec<FormField> {
                 "obfs_password",
                 "Obfs Password",
                 FormFieldType::Password,
+                "",
+                false,
+                FieldSection::ProtocolSetting,
+            ),
+            field(
+                "obfs_min_packet_size",
+                "Gecko Min Packet Size",
+                FormFieldType::Number,
+                "",
+                false,
+                FieldSection::ProtocolSetting,
+            ),
+            field(
+                "obfs_max_packet_size",
+                "Gecko Max Packet Size",
+                FormFieldType::Number,
                 "",
                 false,
                 FieldSection::ProtocolSetting,
@@ -1489,6 +1505,14 @@ fn opt_u32(proto: &str, key: &str, v: Option<&Value>) -> Result<Option<u32>, Str
     }
 }
 
+fn opt_u16(proto: &str, key: &str, v: Option<&Value>) -> Result<Option<u16>, String> {
+    opt_u32(proto, key, v)?.map_or(Ok(None), |n| {
+        u16::try_from(n)
+            .map(Some)
+            .map_err(|_| format!("invalid setting {key} for {proto}: expected u16"))
+    })
+}
+
 /// Reject settings keys the form does not emit for `proto` — catches
 /// form/builder drift (a new form field T17 emits without a mapper here).
 fn check_keys(proto: &str, map: &SettingsMap, allowed: &[&str]) -> Result<(), String> {
@@ -2056,7 +2080,15 @@ fn hysteria2_from_form(
     check_keys(
         "hysteria2",
         ps,
-        &["ports", "hop", "obfs", "obfs_password", "insecure"],
+        &[
+            "ports",
+            "hop",
+            "obfs",
+            "obfs_password",
+            "obfs_min_packet_size",
+            "obfs_max_packet_size",
+            "insecure",
+        ],
     )?;
     // sni routes to stream_settings (producer exact-match arm).
     check_keys("hysteria2", ss, &["sni"])?;
@@ -2071,6 +2103,16 @@ fn hysteria2_from_form(
         },
         obfs: opt_text(ps.get("obfs")),
         obfs_password: opt_text(ps.get("obfs_password")),
+        obfs_min_packet_size: opt_u16(
+            "hysteria2",
+            "obfs_min_packet_size",
+            ps.get("obfs_min_packet_size"),
+        )?,
+        obfs_max_packet_size: opt_u16(
+            "hysteria2",
+            "obfs_max_packet_size",
+            ps.get("obfs_max_packet_size"),
+        )?,
         up: None,
         down: None,
         hop_interval,
@@ -2989,6 +3031,48 @@ mod tests {
             c.dns.as_deref(),
             Some(&["1.1.1.1".to_string(), "8.8.8.8".to_string()][..])
         );
+    }
+
+    #[test]
+    fn build_hysteria2_gecko_with_sizes() {
+        let parsed = built(
+            ProtocolKind::Hysteria2,
+            &producer_settings(&[
+                ("user_id", "token"),
+                ("obfs", "gecko"),
+                ("obfs_password", "gecko-secret"),
+                ("obfs_min_packet_size", "600"),
+                ("obfs_max_packet_size", "1300"),
+            ]),
+        );
+        let ProtocolConfig::Hysteria2(c) = &parsed.protocol.config else {
+            panic!("expected Hysteria2 config");
+        };
+        assert_eq!(c.obfs.as_deref(), Some("gecko"));
+        assert_eq!(c.obfs_password.as_deref(), Some("gecko-secret"));
+        assert_eq!(c.obfs_min_packet_size, Some(600));
+        assert_eq!(c.obfs_max_packet_size, Some(1300));
+        assert_eq!(c.gecko_sizes(), (600, 1300));
+    }
+
+    #[test]
+    fn build_hysteria2_gecko_without_sizes_uses_defaults() {
+        let parsed = built(
+            ProtocolKind::Hysteria2,
+            &producer_settings(&[
+                ("user_id", "token"),
+                ("obfs", "gecko"),
+                ("obfs_password", "gecko-secret"),
+                ("obfs_min_packet_size", ""),
+                ("obfs_max_packet_size", ""),
+            ]),
+        );
+        let ProtocolConfig::Hysteria2(c) = &parsed.protocol.config else {
+            panic!("expected Hysteria2 config");
+        };
+        assert_eq!(c.obfs_min_packet_size, None);
+        assert_eq!(c.obfs_max_packet_size, None);
+        assert_eq!(c.gecko_sizes(), (512, 1200));
     }
 
     #[test]

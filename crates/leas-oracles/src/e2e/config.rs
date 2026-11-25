@@ -1174,10 +1174,73 @@ pub fn client_params_trojan(
     )
 }
 
+/// Hysteria2 obfuscation for an oracle row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hy2Obfs {
+    /// No obfuscation.
+    None,
+    /// Salamander with this pre-shared key.
+    Salamander(&'static str),
+    /// Gecko with this pre-shared key and packet-size window.
+    Gecko {
+        psk: &'static str,
+        min: u16,
+        max: u16,
+    },
+}
+
+impl Hy2Obfs {
+    /// The label suffix for a row (stable across runs; sizes only when
+    /// explicit).
+    #[must_use]
+    pub fn label_suffix(self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Salamander(_) => "/obfs-salamander".to_owned(),
+            Self::Gecko { psk: _, min, max } => format!("/obfs-gecko-{min}x{max}"),
+        }
+    }
+
+    /// The typed config fields (client side).
+    fn apply_client(self, value: &mut serde_json::Value) {
+        match self {
+            Self::None => {}
+            Self::Salamander(psk) => {
+                value["obfs"] = serde_json::json!("salamander");
+                value["obfs_password"] = serde_json::json!(psk);
+            }
+            Self::Gecko { psk, min, max } => {
+                value["obfs"] = serde_json::json!("gecko");
+                value["obfs_password"] = serde_json::json!(psk);
+                value["obfs_min_packet_size"] = serde_json::json!(min);
+                value["obfs_max_packet_size"] = serde_json::json!(max);
+            }
+        }
+    }
+
+    /// The sing-box inbound `obfs` object (server side).
+    fn apply_server(self, inbound: &mut serde_json::Value) {
+        let mut obfs = match self {
+            Self::None => return,
+            Self::Salamander(psk) => serde_json::json!({ "type": "salamander", "password": psk }),
+            Self::Gecko { psk, .. } => serde_json::json!({ "type": "gecko", "password": psk }),
+        };
+        if let Self::Gecko { min, max, .. } = self {
+            if min != leas_proto::proto_spec::GECKO_DEFAULT_MIN_PACKET_SIZE {
+                obfs["min_packet_size"] = serde_json::json!(min);
+            }
+            if max != leas_proto::proto_spec::GECKO_DEFAULT_MAX_PACKET_SIZE {
+                obfs["max_packet_size"] = serde_json::json!(max);
+            }
+        }
+        inbound["obfs"] = obfs;
+    }
+}
+
 /// Hysteria2 inbound JSON — sing-box only (xray-core has no hysteria2
-/// inbound). `obfs` enables Salamander when `Some(password)`.
+/// inbound). `obfs` selects the obfuscator.
 #[must_use]
-pub fn hysteria2_inbound(env: &ServerEnv, obfs: Option<&str>) -> String {
+pub fn hysteria2_inbound(env: &ServerEnv, obfs: Hy2Obfs) -> String {
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
     let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
     let mut inbound = serde_json::json!({
@@ -1185,9 +1248,7 @@ pub fn hysteria2_inbound(env: &ServerEnv, obfs: Option<&str>) -> String {
         "users": [{ "password": HYSTERIA2_AUTH }],
         "tls": { "enabled": true, "certificate_path": cert_path, "key_path": key_path }
     });
-    if let Some(psk) = obfs {
-        inbound["obfs"] = serde_json::json!({ "type": "salamander", "password": psk });
-    }
+    obfs.apply_server(&mut inbound);
     let json = serde_json::json!({
         "log": { "level": "warn" },
         "inbounds": [inbound],
@@ -1197,22 +1258,19 @@ pub fn hysteria2_inbound(env: &ServerEnv, obfs: Option<&str>) -> String {
 }
 
 /// Native client params dialing a Hysteria2 listener (QUIC dial; requires
-/// TLS — hysteria2 has no no-TLS mode). `obfs` enables Salamander.
+/// TLS — hysteria2 has no no-TLS mode). `obfs` selects the obfuscator.
 #[must_use]
 pub fn client_params_hysteria2(
     port: u16,
     target: SocketAddr,
-    obfs: Option<&'static str>,
+    obfs: Hy2Obfs,
 ) -> NativeConnectParams {
     let mut protocol_value = serde_json::json!({
         "schema": "Hysteria2",
         "auth": HYSTERIA2_AUTH,
         "security": { "tls": { "enabled": true, "insecure": false } }
     });
-    if let Some(psk) = obfs {
-        protocol_value["obfs"] = serde_json::json!("salamander");
-        protocol_value["obfs_password"] = serde_json::json!(psk);
-    }
+    obfs.apply_client(&mut protocol_value);
     let protocol: ProtocolConfig =
         serde_json::from_value(protocol_value).expect("hysteria2 client config parses");
     let server = EndpointEssentials::new("127.0.0.1", port);

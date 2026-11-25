@@ -47,7 +47,10 @@ use crate::protocol::ss::resolve_method;
 /// Bump it in the same change as any `NATIVE_KINDS` or `support_reason` move:
 /// `app_meta.capability_version` clears the persisted "not testable" verdicts
 /// once per revision (`Database::clear_stale_capability_verdicts`).
-pub const SUPPORT_REVISION: i64 = 1;
+///
+/// Revision 2: Hysteria2 rows can now be refused by obfs shape (unknown name,
+/// missing/short password); revision 1 refused nothing for that kind.
+pub const SUPPORT_REVISION: i64 = 2;
 
 /// The protocols with a native implementation, in canonical order.
 ///
@@ -371,7 +374,7 @@ fn anytls_reason(cfg: &AnyTlsConfig) -> Option<&'static str> {
     None
 }
 
-/// Hysteria2 row: never refused — and it MUST stay that way.
+/// Hysteria2 row: refused only when the obfs block cannot be dialed.
 ///
 /// It is a self-contained QUIC dial (`protocol::hysteria2`, quinn's internal
 /// rustls), so there is no transport matrix and no fingerprint gate: the TLS
@@ -379,24 +382,19 @@ fn anytls_reason(cfg: &AnyTlsConfig) -> Option<&'static str> {
 /// `insecure` and never looks at `fp`, so an xray-only fingerprint id on a
 /// hysteria2 row is inert rather than fatal.
 ///
-/// A refusal here would not be fatal — xray-core DOES have a hysteria2
-/// outbound (`protocol: "hysteria"`, `version: 2`; see
-/// `Hysteria2Config::inject_xray` in leas-proto, unit-tested there), so a
-/// downgrade would serve the profile. The predicate stays reason-free because
-/// nothing in the typed config requests a feature native lacks:
-///
-/// Fields native reads: `auth`, `obfs_password` (Salamander — keyed off the
-/// password alone; the `obfs` TYPE string is never read), `down`
-/// (→ the `hysteria-cc-rx` auth header) and `security`'s `insecure`. Fields
-/// native ignores: `up` (the client advertises no send cap), `hop_interval`
-/// (no port hopping — the dial pins to the endpoint's base port) and
-/// `pin_sha256` (the QUIC dial carries no SPKI pin; only the plain-TLS path
-/// honours one). All of those are refinements: ignoring them still
-/// interoperates, so none of them gates. If a future config field DOES
-/// require xray semantics native lacks, return a reason for it — the Auto
-/// downgrade lands on xray-core, which can build the row.
-const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
-    None
+/// The obfs shape is resolved by `Hysteria2Config::obfs_spec` — the same owner
+/// the dial and every exporter use. An unknown obfs name, a missing password
+/// or a password below Salamander's 4-byte floor is refused with the
+/// resolver's persisted reason; invalid Gecko sizes are repaired, so they
+/// never gate. Fields native ignores: `up` (the client advertises no send
+/// cap), `hop_interval` (no port hopping — the dial pins to the endpoint's
+/// base port) and `pin_sha256` (the QUIC dial carries no SPKI pin; only the
+/// plain-TLS path honours one). All of those are refinements: ignoring them
+/// still interoperates, so none of them gates.
+fn hysteria2_reason(cfg: &Hysteria2Config) -> Option<&'static str> {
+    cfg.obfs_spec()
+        .err()
+        .map(leas_proto::proto_spec::ObfsShapeError::reason)
 }
 
 /// Shadowsocks row (both kinds share this payload type): a native method
@@ -650,6 +648,8 @@ mod tests {
             security: SecurityConfig::default(),
             obfs: None,
             obfs_password: None,
+            obfs_min_packet_size: None,
+            obfs_max_packet_size: None,
             up: None,
             down: None,
             hop_interval: None,
@@ -1398,6 +1398,30 @@ mod tests {
             ProtocolKind::Hysteria2,
             &ProtocolConfig::Hysteria2(cfg)
         ));
+    }
+
+    #[test]
+    fn hysteria2_obfs_shape_gates() {
+        let mut cfg = hysteria2_cfg();
+        cfg.obfs = Some(TinyText::from("gecko"));
+        cfg.obfs_password = Some(TinyText::from("gecko-secret"));
+        assert!(supported(
+            ProtocolKind::Hysteria2,
+            &ProtocolConfig::Hysteria2(cfg.clone())
+        ));
+
+        cfg.obfs = Some(TinyText::from("xplus"));
+        assert_eq!(
+            support_reason(ProtocolKind::Hysteria2, &ProtocolConfig::Hysteria2(cfg)).as_deref(),
+            Some("hysteria2 obfs type is not implemented")
+        );
+
+        let mut missing = hysteria2_cfg();
+        missing.obfs = Some(TinyText::from("gecko"));
+        assert_eq!(
+            support_reason(ProtocolKind::Hysteria2, &ProtocolConfig::Hysteria2(missing)).as_deref(),
+            Some("hysteria2 obfs requires a password")
+        );
     }
 
     #[test]

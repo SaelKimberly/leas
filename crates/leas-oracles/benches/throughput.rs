@@ -145,7 +145,7 @@ fn rows() -> Vec<Row> {
         // no byte-stream, no sink/source target.
         Row {
             name: "hysteria2/tcp",
-            build: || CaseSpec::hysteria2(None),
+            build: || CaseSpec::hysteria2(leas_oracles::e2e::config::Hy2Obfs::None),
             core: CoreKind::SingBox,
         },
     ]

@@ -251,6 +251,25 @@ pub fn validate_vless_shape(parsed: &ParsedProto) -> Result<()> {
     )))
 }
 
+/// Refuse a Hysteria2 row whose obfs block cannot be dialed.
+///
+/// The resolver owns the rule (unknown name, missing password, a password
+/// below Salamander's 4-byte floor); invalid Gecko sizes are repaired, never
+/// refused. Such rows are broken feeds: nothing would dial them, and the
+/// probe would spend a handshake timeout on each (ADR 0018 D-C).
+///
+/// # Errors
+///
+/// [`ImportError::Validation`] carrying the resolver's user-visible reason.
+pub fn validate_hysteria2_shape(parsed: &ParsedProto) -> Result<()> {
+    let ProtocolConfig::Hysteria2(cfg) = &parsed.protocol.config else {
+        return Ok(());
+    };
+    cfg.obfs_spec()
+        .map(|_| ())
+        .map_err(|e| ImportError::Validation(e.reason().to_owned()))
+}
+
 /// Parse a share URL into a typed [`ParsedProfile`].
 ///
 /// Splits the URL first (shape gate — garbage without a `://` gets a clean
@@ -277,6 +296,7 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Parse
     // note; the row must never reach the store.
     validate_ss_config(&parsed)?;
     validate_vless_shape(&parsed)?;
+    validate_hysteria2_shape(&parsed)?;
 
     let validation = validate_required_fields(&parsed);
 
@@ -1819,6 +1839,53 @@ mod ss_import_gate_tests {
     fn vless_flow_requires_a_tls_layer(#[case] url: &str, #[case] imports: bool) {
         let got = parse_share_url(url, &settings()).is_ok();
         assert_eq!(got, imports, "{url}");
+    }
+
+    /// A Hysteria2 obfs block no shipped codec can dial is refused at
+    /// ingestion; invalid Gecko sizes are repaired, so the row still imports.
+    #[rstest]
+    #[case::gecko_defaults(
+        "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret",
+        true
+    )]
+    #[case::gecko_custom_sizes(
+        "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret&minPacketSize=600&maxPacketSize=1300",
+        true
+    )]
+    #[case::gecko_invalid_sizes_repair(
+        "hysteria2://pw@example.com:443?obfs=gecko&obfs-password=gecko-secret&minPacketSize=2000&maxPacketSize=1",
+        true
+    )]
+    #[case::salamander(
+        "hysteria2://pw@example.com:443?obfs=salamander&obfs-password=obfs-secret",
+        true
+    )]
+    #[case::unknown_obfs(
+        "hysteria2://pw@example.com:443?obfs=xplus&obfs-password=obfs-secret",
+        false
+    )]
+    #[case::missing_password("hysteria2://pw@example.com:443?obfs=gecko", false)]
+    #[case::short_password("hysteria2://pw@example.com:443?obfs=gecko&obfs-password=abc", false)]
+    fn hysteria2_obfs_shape_is_gated_at_ingest(#[case] url: &str, #[case] imports: bool) {
+        let got = parse_share_url(url, &settings()).is_ok();
+        assert_eq!(got, imports, "{url}");
+    }
+
+    #[test]
+    fn hysteria2_ingest_error_names_the_shape() {
+        let err = parse_share_url(
+            "hysteria2://pw@example.com:443?obfs=xplus&obfs-password=obfs-secret",
+            &settings(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("obfs type is not implemented"),
+            "{err}"
+        );
+
+        let err =
+            parse_share_url("hysteria2://pw@example.com:443?obfs=gecko", &settings()).unwrap_err();
+        assert!(err.to_string().contains("requires a password"), "{err}");
     }
 
     /// `none` passes only when the outer layer is real TLS.

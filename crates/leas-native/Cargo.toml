@@ -151,6 +151,13 @@ harness = false
 name = "ss_codec"
 harness = false
 
+# `hysteria2_obfs` measures Salamander's per-datagram transform, the XOR slice
+# a SIMD engine would change, and Gecko's frame encoding: pure functions, no
+# socket, no core binary.
+[[bench]]
+name = "hysteria2_obfs"
+harness = false
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # serde_json/rcgen are used by lib unit tests in

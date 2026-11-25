@@ -259,7 +259,11 @@ pub struct ClashHysteria2 {
     pub password: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "hop-interval"
+    )]
     pub hop_interval: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up: Option<String>,
@@ -267,9 +271,33 @@ pub struct ClashHysteria2 {
     pub down: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obfs: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "obfs-password"
+    )]
     pub obfs_password: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Gecko only: minimum on-wire datagram size (mihomo
+    /// `obfs-min-packet-size`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "obfs-min-packet-size"
+    )]
+    pub obfs_min_packet_size: Option<u16>,
+    /// Gecko only: maximum on-wire datagram size (mihomo
+    /// `obfs-max-packet-size`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "obfs-max-packet-size"
+    )]
+    pub obfs_max_packet_size: Option<u16>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "skip-cert-verify"
+    )]
     pub skip_cert_verify: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub servername: Option<String>,

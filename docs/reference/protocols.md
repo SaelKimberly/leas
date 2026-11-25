@@ -398,8 +398,10 @@ sing-box only (`SINGBOX_ONLY_KINDS`, and the xray arm returns `UnsupportedProtoc
 |---|---|---|---|
 | `auth` | userinfo | `String` | Single token or `user:pass`, kept verbatim |
 | port | hostport | `EndpointEssentials` | `PortSpec`: single, list, range, mixed, capped at `MAX_PORTS` = 4096 |
-| `obfs` | `obfs` | `Option<TinyText>` | e.g. `salamander` |
-| `obfs_password` | `obfs-password` | `Option<TinyText>` | |
+| `obfs` | `obfs` | `Option<TinyText>` | `salamander` or `gecko` (exact, lowercase) |
+| `obfs_password` | `obfs-password` | `Option<TinyText>` | Required when `obfs` is set; ≥ 4 bytes |
+| `obfs_min_packet_size` | `minPacketSize` | `Option<u16>` | Gecko only; default 512, repaired when invalid |
+| `obfs_max_packet_size` | `maxPacketSize` | `Option<u16>` | Gecko only; default 1200, ceiling 2048 |
 | `up` | `up` | `Option<TinyText>` | Raw string |
 | `down` | `down` | `Option<TinyText>` | Raw string |
 | `hop_interval` | `mportHopInt`, `hop_interval` | `Option<u32>` | Seconds |
@@ -411,12 +413,24 @@ sing-box only (`SINGBOX_ONLY_KINDS`, and the xray arm returns `UnsupportedProtoc
 
 - `insecure` accepts `1`/`true`/`yes` and `0`/`false`/`no`.
 - `obfs-password` uses a hyphen, not an underscore.
+- `minPacketSize`/`maxPacketSize` are **not** part of the official URI scheme;
+  they match v2rayN's de facto spelling, are read/emitted for `obfs=gecko`
+  only, and are elided when equal to 512/1200. Absent means the defaults.
+  Invalid pairs (`0`, `min > max`, `max > 2048`) repair to the defaults.
+- `obfs` names match exactly: `salamander`, `gecko`. Any other name, or a
+  missing/short password, is undialable and refused at ingestion.
 - A multi-port hostport fills `endpoint.ports` with the flattened list.
 - A URL with no `@` splits the collapsed userinfo at the first `@`.
 
 ### Backend coverage
 
-Both subprocesses build. Clash imports and exports. Native serves it as a QUIC dial (`protocol/hysteria2/quic.rs`); it is not a stream protocol, so a stream chain refuses it. Salamander obfuscation is implemented in `leas-native/src/crypto/salamander.rs`.
+Both subprocesses build. Clash imports and exports (mihomo kebab keys,
+including the two Gecko size keys). Native serves it as a QUIC dial
+(`protocol/hysteria2/quic.rs`); it is not a stream protocol, so a stream chain
+refuses it. Salamander obfuscation is implemented in
+`leas-native/src/crypto/salamander.rs`; Gecko (fragment + pad, Salamander
+outermost) in `leas-native/src/crypto/gecko.rs` with the socket adapters in
+`protocol/hysteria2/quic.rs`.
 
 ---
 

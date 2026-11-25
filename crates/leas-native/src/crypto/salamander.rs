@@ -91,6 +91,24 @@ impl Salamander {
         payload.len() + SALT_LEN
     }
 
+    /// Deobfuscate `packet` in place: drop the 8-byte salt by moving the
+    /// ciphertext to the front, then XOR it where it lies. Returns the
+    /// plaintext length, or `None` when the packet is shorter than the salt.
+    ///
+    /// The receive adapter uses this to avoid a scratch buffer; the move is
+    /// unavoidable (QUIC wants the datagram at offset 0).
+    pub fn deobfuscate_in_place(&self, packet: &mut [u8]) -> Option<usize> {
+        if packet.len() <= SALT_LEN {
+            return None;
+        }
+        let salt: [u8; SALT_LEN] = packet[..SALT_LEN].try_into().expect("length checked");
+        let key = self.key(&salt);
+        let plain_len = packet.len() - SALT_LEN;
+        packet.copy_within(SALT_LEN.., 0);
+        xor_wide_in_place(key, &mut packet[..plain_len]);
+        Some(plain_len)
+    }
+
     /// Deobfuscate `packet` (salt-prefixed) into `out`
     /// (`out.len() >= packet.len() - SALT_LEN`). Returns the plaintext
     /// length, or `0` when the packet is shorter than the salt (a malformed
@@ -105,6 +123,20 @@ impl Salamander {
         let key = self.key(&salt);
         xor_wide(key, &packet[SALT_LEN..], &mut out[..plain_len]);
         plain_len
+    }
+}
+
+/// XOR `buf` with the keystream `key` in place, 32 bytes at a time.
+#[inline]
+fn xor_wide_in_place(key: u8x32, buf: &mut [u8]) {
+    let key_bytes = key.to_array();
+    let (full, tail) = buf.split_at_mut(buf.len() / KEY_LEN * KEY_LEN);
+    for chunk in full.as_chunks_mut::<32>().0 {
+        let src = u8x32::new(*chunk);
+        chunk.copy_from_slice(&(src ^ key).to_array());
+    }
+    for (b, k) in tail.iter_mut().zip(key_bytes.iter()) {
+        *b ^= *k;
     }
 }
 
@@ -191,6 +223,27 @@ mod tests {
         let ob = Salamander::new(b"valid-psk").unwrap();
         let mut out = [0u8; 16];
         assert_eq!(ob.deobfuscate_into(&[0u8; 4], &mut out), 0);
+        assert_eq!(ob.deobfuscate_in_place(&mut [0u8; 4]), None);
+    }
+
+    /// In-place deobfuscation yields the same plaintext the copying form does,
+    /// for payloads that do and do not fill whole 32-byte keystream blocks.
+    #[test]
+    fn deobfuscate_in_place_matches_the_copying_form() {
+        let ob = Salamander::new(b"psk-password-1234").unwrap();
+        for len in [1_usize, 7, 31, 32, 33, 1200] {
+            let payload: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            let mut wire = vec![0u8; len + SALT_LEN];
+            ob.obfuscate_into(&[0x3c; SALT_LEN], &payload, &mut wire);
+
+            let mut reference = vec![0u8; len];
+            assert_eq!(ob.deobfuscate_into(&wire, &mut reference), len);
+            assert_eq!(reference, payload);
+
+            let mut in_place = wire;
+            assert_eq!(ob.deobfuscate_in_place(&mut in_place), Some(len));
+            assert_eq!(&in_place[..len], payload);
+        }
     }
 
     /// Known-answer test: `blake2b256("psk" || 01*8)` keystream, first 8

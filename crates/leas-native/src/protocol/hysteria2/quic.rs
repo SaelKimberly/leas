@@ -18,18 +18,23 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use bytes::{BufMut, Bytes};
 use http::Request;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use leas_proto::proto_spec::Hysteria2Config;
+use leas_proto::proto_spec::{Hysteria2Config, ObfsSpec};
 
 use crate::addr::TargetAddr;
 use crate::context::LinkContext;
+use crate::crypto::gecko::{self, GeckoReassembler, Push};
 use crate::crypto::salamander::{SALT_LEN, Salamander};
 use crate::error::{NativeError, timeouts};
+use crate::rand::u32_below;
 
 use super::{ALPN_H3, FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LEN, TCP_RESPONSE_OK};
 
@@ -160,7 +165,10 @@ pub(super) async fn dial(
     cfg: &Hysteria2Config,
 ) -> Result<(quinn::Connection, AuthInfo), NativeError> {
     let server_addr = ctx.server_socket().await?;
-    let endpoint = client_endpoint(server_addr, cfg.obfs_password.as_deref())?;
+    let obfs = cfg
+        .obfs_spec()
+        .map_err(|e| NativeError::Config(e.reason().to_string()))?;
+    let endpoint = client_endpoint(server_addr, &obfs)?;
     let tls = crate::transport::quic::quic_tls_config(ctx, ALPN_H3)?;
     let quic_config = crate::transport::quic::quinn_client_config(tls);
     let conn = crate::transport::quic::connect(
@@ -286,11 +294,14 @@ async fn runtime_auth(
     })
 }
 
-/// Bind the QUIC client endpoint. With `obfs_password` the UDP socket is
-/// wrapped in a Salamander obfuscator; otherwise a plain socket.
+/// Bind the QUIC client endpoint for the resolved obfs shape.
+///
+/// No obfs keeps the shared per-address-family endpoint. Any obfs binds a
+/// per-dial socket: Salamander wraps the runtime socket, and Gecko wraps the
+/// Salamander socket (frames are shaped before each one is salt-wrapped).
 fn client_endpoint(
     server_addr: SocketAddr,
-    obfs_password: Option<&str>,
+    obfs: &ObfsSpec<'_>,
 ) -> Result<quinn::Endpoint, NativeError> {
     let bind: SocketAddr = if server_addr.is_ipv6() {
         "[::]:0".parse().expect("static ipv6 bind addr")
@@ -298,15 +309,21 @@ fn client_endpoint(
         "0.0.0.0:0".parse().expect("static ipv4 bind addr")
     };
 
-    let Some(obfs) = obfs_password else {
-        return Ok(crate::transport::quic::client_endpoint(server_addr));
+    let (psk, gecko) = match *obfs {
+        ObfsSpec::None => return Ok(crate::transport::quic::client_endpoint(server_addr)),
+        ObfsSpec::Salamander { psk } => (psk, None),
+        ObfsSpec::Gecko { psk, min, max } => (psk, Some((min, max))),
     };
-    let sal = Salamander::new(obfs.as_bytes())?;
+    let sal = Salamander::new(psk)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| NativeError::Dial("no quinn runtime configured".into()))?;
     let inner_u8 = std::net::UdpSocket::bind(bind)?;
     let inner = runtime.wrap_udp_socket(inner_u8)?;
-    let sock = Arc::new(SalamanderSocket { inner, sal });
+    let salamander: Arc<dyn quinn::AsyncUdpSocket> = Arc::new(SalamanderSocket { inner, sal });
+    let sock: Arc<dyn quinn::AsyncUdpSocket> = match gecko {
+        Some((min, max)) => Arc::new(GeckoSocket::new(salamander, min, max)),
+        None => salamander,
+    };
     Ok(quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         None,
@@ -367,25 +384,12 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
         if let Poll::Ready(Ok(n)) = ready {
             for i in 0..n {
                 let len = meta[i].len;
-                if len <= SALT_LEN {
-                    meta[i].len = 0;
-                    continue;
+                // Salt, move the payload left by 8, XOR in place: no scratch
+                // copy on the receive path.
+                match self.sal.deobfuscate_in_place(&mut bufs[i][..len]) {
+                    Some(plain) => meta[i].len = plain,
+                    None => meta[i].len = 0,
                 }
-                // Copy the datagram out first: source and destination alias
-                // the same `IoSliceMut`. The scratch is per thread — the
-                // endpoint driver is the only caller — so a live session does
-                // not allocate once per received datagram.
-                thread_local! {
-                    static RECV_SCRATCH: std::cell::RefCell<Vec<u8>> =
-                        const { std::cell::RefCell::new(Vec::new()) };
-                }
-                let plain = RECV_SCRATCH.with(|scratch| {
-                    let mut scratch = scratch.borrow_mut();
-                    scratch.resize(len, 0);
-                    scratch.copy_from_slice(&bufs[i][..len]);
-                    self.sal.deobfuscate_into(&scratch, &mut bufs[i][..])
-                });
-                meta[i].len = plain;
             }
         }
         ready
@@ -405,6 +409,199 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
 
     fn may_fragment(&self) -> bool {
         false
+    }
+}
+
+/// Shapes QUIC long-header datagrams into Gecko fragments above a Salamander
+/// socket; short headers (data phase) pass straight through.
+///
+/// Send: a long header becomes `2..=8` padded frames, each handed to the
+/// inner socket separately so every frame gets its own Salamander salt.
+/// Receive: unframed datagrams pass through; frames are reassembled by
+/// `(peer, msgID)` until one completes.
+struct GeckoSocket {
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    min: u16,
+    max: u16,
+    next_msg: AtomicU8,
+    reassembler: Mutex<GeckoReassembler>,
+}
+
+impl std::fmt::Debug for GeckoSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeckoSocket")
+            .field("inner", &self.inner)
+            .field("min", &self.min)
+            .field("max", &self.max)
+            .field("next_msg", &self.next_msg.load(Ordering::Relaxed))
+            .field("in_flight", &self.reassembler.lock().map(|r| r.in_flight()))
+            .finish()
+    }
+}
+
+impl GeckoSocket {
+    fn new(inner: Arc<dyn quinn::AsyncUdpSocket>, min: u16, max: u16) -> Self {
+        Self {
+            inner,
+            min,
+            max,
+            next_msg: AtomicU8::new(0),
+            reassembler: Mutex::new(GeckoReassembler::new()),
+        }
+    }
+}
+
+impl quinn::AsyncUdpSocket for GeckoSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        self.inner.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        let Some(&first) = transmit.contents.first() else {
+            return Ok(());
+        };
+        if first & gecko::FLAG_FRAGMENT == 0 {
+            // Short header (data phase): Salamander alone, as upstream.
+            return self.inner.try_send(transmit);
+        }
+        let total = gecko::fragment_count(u32_below(u32::from(
+            gecko::MAX_CHUNKS - gecko::MIN_CHUNKS + 1,
+        )));
+        // A fresh id per transmit attempt: a partial burst retransmits under a
+        // new id, and the orphan expires at the receiver's TTL.
+        let msg_id = self.next_msg.fetch_add(1, Ordering::Relaxed);
+        thread_local! {
+            static FRAME_SCRATCH: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        FRAME_SCRATCH.with(|scratch| {
+            let mut buf = scratch.borrow_mut();
+            for idx in 0..total {
+                let chunk =
+                    &transmit.contents[gecko::chunk_range(transmit.contents.len(), total, idx)];
+                let pad = gecko::pad_len(chunk.len(), self.min, self.max, u32_below(u32::MAX));
+                let header = gecko::FrameHeader {
+                    pad_len: pad,
+                    msg_id,
+                    chunk_idx: idx,
+                    total_chunks: total,
+                };
+                buf.resize(gecko::FRAME_HEADER_LEN + usize::from(pad) + chunk.len(), 0);
+                let frame_len = gecko::encode_frame_into(header, chunk, &mut buf, |pad| {
+                    crate::rand::fill_nonsecret(pad);
+                })
+                .map_err(|e| io::Error::other(format!("gecko frame: {e:?}")))?;
+                let frame = quinn::udp::Transmit {
+                    destination: transmit.destination,
+                    ecn: transmit.ecn,
+                    contents: &buf[..frame_len],
+                    // One datagram per transmit: the inner socket reports one
+                    // segment, so no GSO coalescing exists to split.
+                    segment_size: None,
+                    src_ip: transmit.src_ip,
+                };
+                self.inner.try_send(&frame)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            match self.inner.poll_recv(cx, bufs, meta) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(0)) => return Poll::Ready(Ok(0)),
+                Poll::Ready(Ok(n)) => {
+                    let kept = self.filter_batch(bufs, meta, n);
+                    if kept > 0 {
+                        return Poll::Ready(Ok(kept));
+                    }
+                    // Every datagram was consumed into reassembly; read on.
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    fn may_fragment(&self) -> bool {
+        false
+    }
+}
+
+impl GeckoSocket {
+    /// Keep pass-through and completed datagrams, drop buffered fragments,
+    /// compacting in place so no extra buffer is needed.
+    // The reassembler lock is held for the whole batch on purpose: chunks
+    // complete in arrival order, so dropping and retaking it between datagrams
+    // could reorder a message against itself.
+    #[allow(clippy::significant_drop_tightening)]
+    fn filter_batch(
+        &self,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+        n: usize,
+    ) -> usize {
+        let mut reassembler = self.reassembler.lock().expect("gecko reassembler lock");
+        let now = Instant::now();
+        let mut kept = 0;
+        let mut assembled = [0_u8; gecko::MAX_PACKET];
+        for i in 0..n {
+            let len = meta[i].len;
+            if len == 0 {
+                continue;
+            }
+            if bufs[i][0] & gecko::FLAG_FRAGMENT == 0 {
+                if kept != i {
+                    let (dst, src) = bufs.split_at_mut(i);
+                    if dst[kept].len() < len {
+                        // The earlier slot cannot hold this datagram; drop it
+                        // rather than panic. quinn's buffers are uniform, so
+                        // this is a defensive branch.
+                        continue;
+                    }
+                    dst[kept][..len].copy_from_slice(&src[0][..len]);
+                    meta[kept] = meta[i];
+                }
+                kept += 1;
+                continue;
+            }
+            let Ok((header, payload)) = gecko::decode_frame(&bufs[i][..len]) else {
+                continue;
+            };
+            let Push::Complete(plain_len) =
+                reassembler.push(meta[i].addr, header, payload, now, &mut assembled)
+            else {
+                continue;
+            };
+            if plain_len > bufs[kept].len() {
+                // The destination cannot hold a reassembled packet; QUIC's
+                // read buffer stays the ceiling.
+                continue;
+            }
+            bufs[kept][..plain_len].copy_from_slice(&assembled[..plain_len]);
+            meta[kept] = meta[i];
+            meta[kept].len = plain_len;
+            meta[kept].stride = plain_len;
+            kept += 1;
+        }
+        kept
     }
 }
 
@@ -637,6 +834,7 @@ impl AsyncWrite for H2Stream {
 mod tests {
     use super::*;
     use crate::addr::Host;
+    use quinn::AsyncUdpSocket;
 
     #[test]
     fn varint_encoding() {
@@ -730,5 +928,279 @@ mod tests {
         assert!(p.bytes().all(|b| b.is_ascii_alphanumeric()));
         let p = random_padding(64, 512);
         assert!((64..512).contains(&p.len()));
+    }
+
+    // ── Gecko adapter (fake AsyncUdpSocket; no runtime, no sockets) ────────
+
+    #[derive(Debug)]
+    struct ReadyPoller;
+
+    impl quinn::UdpPoller for ReadyPoller {
+        fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeSocket {
+        sent: Mutex<Vec<Vec<u8>>>,
+        queued: Mutex<std::collections::VecDeque<(SocketAddr, Vec<u8>)>>,
+        sends_left: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeSocket {
+        fn armed() -> Self {
+            Self {
+                sends_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl quinn::AsyncUdpSocket for FakeSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+            Box::pin(ReadyPoller)
+        }
+
+        fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+            if self
+                .sends_left
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.sent.lock().unwrap().push(transmit.contents.to_vec());
+            Ok(())
+        }
+
+        // The queue lock is held across the drain on purpose: the fake has no
+        // producer, so tightening it would only add churn.
+        #[allow(clippy::significant_drop_tightening)]
+        fn poll_recv(
+            &self,
+            _cx: &mut Context<'_>,
+            bufs: &mut [io::IoSliceMut<'_>],
+            meta: &mut [quinn::udp::RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            let n = {
+                let mut queued = self.queued.lock().unwrap();
+                let mut n = 0;
+                while let Some((addr, bytes)) = queued.pop_front() {
+                    if n == bufs.len() || bytes.len() > bufs[n].len() {
+                        queued.push_front((addr, bytes));
+                        break;
+                    }
+                    bufs[n][..bytes.len()].copy_from_slice(&bytes);
+                    meta[n] = quinn::udp::RecvMeta {
+                        addr,
+                        len: bytes.len(),
+                        stride: bytes.len(),
+                        ecn: None,
+                        dst_ip: None,
+                    };
+                    n += 1;
+                }
+                n
+            };
+            if n == 0 {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(n))
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 443)))
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            1
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            1
+        }
+
+        fn may_fragment(&self) -> bool {
+            false
+        }
+    }
+
+    const PEER: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 443);
+
+    fn transmit(contents: &[u8]) -> quinn::udp::Transmit<'_> {
+        quinn::udp::Transmit {
+            destination: PEER,
+            ecn: None,
+            contents,
+            segment_size: None,
+            src_ip: None,
+        }
+    }
+
+    #[test]
+    fn gecko_short_header_sends_one_datagram() {
+        let fake = Arc::new(FakeSocket::armed());
+        let geo = GeckoSocket::new(fake.clone(), 512, 1200);
+        let data = [0x40_u8, 1, 2, 3, 4];
+        geo.try_send(&transmit(&data)).expect("send");
+        let sent = fake.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], data, "short header is not framed");
+    }
+
+    fn reassemble_sent(sent: &[Vec<u8>]) -> Vec<u8> {
+        let mut total: Option<u8> = None;
+        let mut msg: Option<u8> = None;
+        let mut chunks: Vec<(u8, Vec<u8>)> = Vec::new();
+        for frame in sent {
+            let (h, body) = gecko::decode_frame(frame).expect("frame decodes");
+            assert_eq!(
+                h.total_chunks,
+                u8::try_from(sent.len()).expect("frame count fits u8")
+            );
+            assert_eq!(h.msg_id, *msg.get_or_insert(h.msg_id));
+            assert_eq!(*total.get_or_insert(h.total_chunks), h.total_chunks);
+            chunks.push((h.chunk_idx, body.to_vec()));
+        }
+        chunks.sort_by_key(|(idx, _)| *idx);
+        chunks.iter().flat_map(|(_, b)| b.iter().copied()).collect()
+    }
+
+    #[test]
+    fn gecko_long_header_fragments_within_bounds() {
+        let fake = Arc::new(FakeSocket::armed());
+        let geo = GeckoSocket::new(fake.clone(), 512, 1200);
+        let mut packet = vec![0xc0_u8; 1200];
+        packet[1..5].copy_from_slice(&1_u32.to_be_bytes());
+        for (i, byte) in packet.iter_mut().enumerate().skip(5) {
+            *byte = u8::try_from(i % 251).expect("mod 251 fits u8");
+        }
+        geo.try_send(&transmit(&packet)).expect("send");
+        let sent: Vec<Vec<u8>> = fake.sent.lock().unwrap().clone();
+        assert!(
+            (usize::from(gecko::MIN_CHUNKS)..=usize::from(gecko::MAX_CHUNKS)).contains(&sent.len()),
+            "frames {}",
+            sent.len()
+        );
+        for frame in &sent {
+            let (h, body) = gecko::decode_frame(frame).expect("frame decodes");
+            assert_eq!(
+                gecko::FRAME_HEADER_LEN + usize::from(h.pad_len) + body.len(),
+                frame.len()
+            );
+            let base = 8 + gecko::FRAME_HEADER_LEN + body.len();
+            if base <= 1200 {
+                // The simulated salted size (the fake sits under Gecko, so
+                // the 8-byte salt is not on these bytes).
+                assert!(
+                    (512..=1200).contains(&(8 + frame.len())),
+                    "salted size {}",
+                    8 + frame.len()
+                );
+            }
+        }
+        let joined = reassemble_sent(&sent);
+        assert_eq!(joined, packet, "chunks reassemble to the original packet");
+
+        // A second transmit uses a fresh msgID.
+        geo.try_send(&transmit(&packet)).expect("send");
+        let second_msg = {
+            let all = fake.sent.lock().unwrap();
+            gecko::decode_frame(&all[sent.len()])
+                .expect("second burst decodes")
+                .0
+                .msg_id
+        };
+        assert_ne!(gecko::decode_frame(&sent[0]).unwrap().0.msg_id, second_msg);
+    }
+
+    #[test]
+    fn gecko_send_would_block_propagates() {
+        let fake = Arc::new(FakeSocket::armed());
+        fake.sends_left
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let geo = GeckoSocket::new(fake.clone(), 512, 1200);
+        let mut packet = vec![0xc0_u8; 1200];
+        packet[0] = 0xc0;
+        let err = geo.try_send(&transmit(&packet)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fake.sent.lock().unwrap().len(), 1, "one frame landed");
+    }
+
+    fn poll_once(
+        geo: &GeckoSocket,
+        buf: &mut [u8],
+        meta: &mut quinn::udp::RecvMeta,
+    ) -> Poll<io::Result<usize>> {
+        let mut bufs = [io::IoSliceMut::new(buf)];
+        let metas = std::slice::from_mut(meta);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        geo.poll_recv(&mut cx, &mut bufs, metas)
+    }
+
+    #[test]
+    fn gecko_recv_passes_short_headers_and_reassembles_frames() {
+        let fake = Arc::new(FakeSocket::armed());
+        let geo = GeckoSocket::new(fake.clone(), 512, 1200);
+        // Out-of-order three-chunk message, then an unframed datagram.
+        let mut frames = Vec::new();
+        for (idx, payload) in [
+            (0_u8, b"aa".to_vec()),
+            (1, b"bb".to_vec()),
+            (2, b"cc".to_vec()),
+        ] {
+            let mut frame = [0u8; 16];
+            let h = gecko::FrameHeader {
+                pad_len: 0,
+                msg_id: 9,
+                chunk_idx: idx,
+                total_chunks: 3,
+            };
+            let n = gecko::encode_frame_into(h, &payload, &mut frame, |_| {}).unwrap();
+            frames.push(frame[..n].to_vec());
+        }
+        {
+            let mut q = fake.queued.lock().unwrap();
+            q.push_back((PEER, frames[2].clone()));
+            q.push_back((PEER, frames[0].clone()));
+            q.push_back((PEER, frames[1].clone()));
+            q.push_back((PEER, vec![0x40, 9, 9]));
+        }
+        let mut buf = [0u8; 2048];
+        let mut meta = quinn::udp::RecvMeta::default();
+        let n = match poll_once(&geo, &mut buf, &mut meta) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("poll: {other:?}"),
+        };
+        assert_eq!(n, 1, "only the completed packet is delivered");
+        assert_eq!(&buf[..6], b"aabbcc");
+        assert_eq!(meta.len, 6);
+        // The unframed datagram follows on the next poll.
+        let n = match poll_once(&geo, &mut buf, &mut meta) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("poll: {other:?}"),
+        };
+        assert_eq!(n, 1);
+        assert_eq!(&buf[..3], &[0x40, 9, 9]);
+    }
+
+    #[test]
+    fn gecko_recv_drops_malformed_frames_and_reports_pending() {
+        let fake = Arc::new(FakeSocket::armed());
+        let geo = GeckoSocket::new(fake.clone(), 512, 1200);
+        fake.queued
+            .lock()
+            .unwrap()
+            .push_back((PEER, vec![0x80, 0, 0, 0, 0]));
+        let mut buf = [0u8; 2048];
+        let mut meta = quinn::udp::RecvMeta::default();
+        assert!(matches!(
+            poll_once(&geo, &mut buf, &mut meta),
+            Poll::Pending
+        ));
     }
 }

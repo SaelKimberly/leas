@@ -41,6 +41,7 @@ pub fn is_undialable_shape(config: &ProtocolConfig) -> bool {
         ProtocolConfig::Ss(cfg) => {
             !ss_method_support::native_supports_ss_method(cfg.method.as_str())
         }
+        ProtocolConfig::Hysteria2(cfg) => cfg.obfs_spec().is_err(),
         _ => false,
     }
 }
@@ -135,6 +136,10 @@ pub use error::SupportError;
 pub use http_client::HttpClientConfig;
 pub use hysteria1::Hysteria1Config;
 pub use hysteria2::Hysteria2Config;
+pub use hysteria2::{
+    GECKO_DEFAULT_MAX_PACKET_SIZE, GECKO_DEFAULT_MIN_PACKET_SIZE, GECKO_MAX_PACKET_SIZE,
+    OBFS_PSK_MIN_LEN, ObfsShapeError, ObfsSpec,
+};
 pub use kinds::{ParseProtocolKindError, ProtocolKind, SecurityType, TransportType};
 pub use naive::NaiveConfig;
 pub use security_rank::protocol_security_rank;

@@ -476,7 +476,10 @@ impl Database {
         // Version 2 added the unrepresentable transport host (the audit's
         // `invalid uri character` class). An existing DB stamped 1 re-runs
         // the scan once; the key stays the same, so no schema change.
-        const MARKER_VERSION: i64 = 2;
+        // Version 3 added the Hysteria2 obfs shape (unknown name / missing
+        // password). An existing DB stamped 1 or 2 re-runs the scan once; the
+        // key stays the same, so no schema change.
+        const MARKER_VERSION: i64 = 3;
         let mut conn = self.conn().await?;
         if crate::schema::rekey::marker_value(&mut conn, MARKER).await? >= MARKER_VERSION {
             return Ok(());
@@ -4325,6 +4328,19 @@ mod tests {
                     5001,
                     serde_json::json!({"schema": "Vless", "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d", "transport": {"type": "ws", "path": "/?ed=2560 PuLaFreeBOT", "host": "example.com"}}),
                 ),
+                // Hysteria2 with an unknown obfs name: nothing dials it.
+                (
+                    6,
+                    6001,
+                    serde_json::json!({"schema": "Hysteria2", "auth": "pw", "obfs": "xplus", "obfs_password": "obfs-secret"}),
+                ),
+                // Gecko with a valid password (and repaired default sizes):
+                // dialable, must stay live.
+                (
+                    7,
+                    7001,
+                    serde_json::json!({"schema": "Hysteria2", "auth": "pw", "obfs": "gecko", "obfs_password": "gecko-secret", "obfs_min_packet_size": 2000, "obfs_max_packet_size": 1}),
+                ),
             ] {
                 // The endpoint only: this fixture owns the protocol row (it
                 // carries the shape under test), so `seed_endpoint` would
@@ -4344,10 +4360,10 @@ mod tests {
                     created_at: 0,
                     id: ProtocolId::new(pid),
                     sig: pid,
-                    proto_kind: if config["schema"] == "Ss" {
-                        ProtocolKind::Shadowsocks
-                    } else {
-                        ProtocolKind::Vless
+                    proto_kind: match config["schema"].as_str() {
+                        Some("Ss") => ProtocolKind::Shadowsocks,
+                        Some("Hysteria2") => ProtocolKind::Hysteria2,
+                        _ => ProtocolKind::Vless,
                     },
                     transport: tcp_transport(),
                     security: no_security(),
@@ -4378,11 +4394,11 @@ mod tests {
         {
             let db = Database::open(&path).await.expect("seed-state open");
             let mut conn = db.connection().await.expect("connection");
-            // An existing DB from before the host rule: stamped version 1.
+            // An existing DB from before the Hysteria2 obfs rule: stamped 2.
             // The step must treat it as stale and re-scan.
             toasty::sql::query(
-                "INSERT INTO app_meta (key, value) VALUES ('invalid_shapes_purged', '1') \
-                 ON CONFLICT(key) DO UPDATE SET value = '1'",
+                "INSERT INTO app_meta (key, value) VALUES ('invalid_shapes_purged', '2') \
+                 ON CONFLICT(key) DO UPDATE SET value = '2'",
             )
             .exec(&mut conn)
             .await
@@ -4398,6 +4414,8 @@ mod tests {
             (3, None),
             (4, Some("config_invalid")),
             (5, None),
+            (6, Some("config_invalid")),
+            (7, None),
         ] {
             let rows = toasty::sql::query(
                 "SELECT endpoint_id, purge_reason FROM profile_stats ORDER BY endpoint_id",
@@ -4446,7 +4464,7 @@ mod tests {
         });
         assert_eq!(
             stamped.as_deref(),
-            Some("2"),
+            Some("3"),
             "the step stamps the version that makes a second open a no-op"
         );
     }
