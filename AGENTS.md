@@ -4,6 +4,8 @@
 
 This file is auto-detected project context: commands, structure, conventions. The wiki is [`docs/INDEX.md`](docs/INDEX.md); architecture decisions are [`docs/architecture/decisions.md`](docs/architecture/decisions.md).
 
+**For any agentic research/task that consults vendored reference code:** start at [`thirdparty/INDEX.md`](thirdparty/INDEX.md). It lists every `thirdparty/` entry, its exact tag/revision pin and frozen status; the committed pin manifest is `thirdparty.toml` (`git log -p -- thirdparty.toml` = full referencing history; `python3 refresh.py` drift-checks, `--sync` regenerates). Never modify a frozen/gone entry; never build or link anything under `thirdparty/`.
+
 ## Package Manager & Toolchain
 - Rust 2024 workspace; `cargo` only (no JS toolchain). Toolchain declared in `rust-toolchain.toml` — the channel floats on `stable` (see the gate note below).
 - Lint config: root `Cargo.toml` `[workspace.lints.clippy]`, opted in per crate. Format: `rustfmt.toml`.
@@ -98,4 +100,5 @@ This file is auto-detected project context: commands, structure, conventions. Th
 | Protocol specs | `docs/reference/protocols.md`; Clash YAML: `docs/reference/clash.md` |
 | Glossary | `docs/reference/glossary.md` |
 | Aegis specs / plans / ADRs index | `docs/aegis/INDEX.md` |
-| Reference repos (read-only) | `thirdparty/Xray-core`, `thirdparty/sing-box`, `thirdparty/v2rayN` |
+| Thirdparty reference index (start here for ANY agentic research/task that consults vendored refs) | `thirdparty/INDEX.md` (pins + history: root `thirdparty.toml`, regenerate with `python3 refresh.py --sync`) |
+| Reference repos (read-only) | `thirdparty/Xray-core`, `thirdparty/sing-box`, `thirdparty/v2rayN` — see `thirdparty/INDEX.md` for the full inventory, exact tags/revisions and frozen status |

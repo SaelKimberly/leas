@@ -1,0 +1,854 @@
+# thirdparty pin manifest -- committed; `git log -p -- thirdparty.toml` is the
+# full history of which tag / revision each reference pointed at, and when.
+# Regenerate from disk with: python3 refresh.py --sync
+# generated: 2026-11-25
+
+schema = 1
+
+[[entry]]
+name = "anytls-go"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/anytls/anytls-go.git"
+ref = "main@fd6167acd6d7"
+sha = "fd6167acd6d73b9fa3e607659951847fbc9e6c50"
+shallow = true
+
+[[entry]]
+name = "anytls-rs"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/jxo-me/anytls-rs.git"
+ref = "main@f09613e0102d"
+sha = "f09613e0102d611b1a850913e1269fe76dfc36cf"
+shallow = true
+
+[[entry]]
+name = "async-socks5"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/ark0f/async-socks5.git"
+ref = "master@a6f55c11742c"
+sha = "a6f55c11742c23f0a9d62a050367c9b8c351957c"
+shallow = true
+
+[[entry]]
+name = "Bushuray-tui"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/Keivan-sf/Bushuray-tui.git"
+ref = "v0.2.3"
+sha = "b89fe5514328bcf1009b50fe88a42e1a2ace9f82"
+shallow = true
+
+[[entry]]
+name = "craftls"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/3andne/craftls"
+ref = "craft-0.22.0@4d1da98768af"
+sha = "4d1da98768af023411063a14db63a5cd10f595d7"
+shallow = true
+
+[[entry]]
+name = "curl-impersonate"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/lexiforest/curl-impersonate.git"
+ref = "main@ec2a2317f14f"
+sha = "ec2a2317f14f7b2d9fc0b364e474f31348d024ba"
+shallow = true
+
+[[entry]]
+name = "CycleTLS"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/Danny-Dasilva/CycleTLS"
+ref = "main@9671e0488491"
+sha = "9671e0488491821ca7bb93051f32e69f673d505f"
+shallow = true
+
+[[entry]]
+name = "dnscrypt"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/AdguardTeam/dnscrypt.git"
+ref = "master@4822c9b2045b"
+sha = "4822c9b2045b671d50710d2f5e302c4544dc4bab"
+shallow = true
+
+[[entry]]
+name = "DNSveil"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/msasanmh/DNSveil.git"
+ref = "main@42ac542d081c"
+sha = "42ac542d081c978d2b52e3a30366fdec89ebd8e3"
+shallow = true
+
+[[entry]]
+name = "encrypted-dns-server"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/DNSCrypt/encrypted-dns-server.git"
+ref = "master@2f2cc489ff88"
+sha = "2f2cc489ff8893c167b2eab7274292a699341d9c"
+shallow = true
+
+[[entry]]
+name = "fast-socks5"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/dizda/fast-socks5.git"
+ref = "master@bae2fc05f993"
+sha = "bae2fc05f993d3a247b5435ba7da221f3fd80a3c"
+shallow = true
+
+[[entry]]
+name = "ferrox"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/ferroxdev/ferrox.git"
+ref = "main@0ec73b107891"
+sha = "0ec73b10789154c5c148bcd323bfc8456f23f0e6"
+shallow = true
+
+[[entry]]
+name = "geektls"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/geekbyter/geektls.git"
+ref = "bindings/golang/v0.2.2"
+sha = "3b64bcf0b0a1b141b68454ba487a7fcd48480ffa"
+shallow = true
+
+[[entry]]
+name = "go-shadowsocks2"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/shadowsocks/go-shadowsocks2.git"
+ref = "master@e1fe9ea73740"
+sha = "e1fe9ea737409e4d71efaa65e3caefa42a8fc188"
+shallow = true
+
+[[entry]]
+name = "goida-vpn-configs"
+kind = "git"
+status = "reference"
+host = "gitlab"
+frozen = false
+remote = "https://gitlab.com/avencores/goida-vpn-configs.git"
+ref = "main@c8858d9a19eb"
+sha = "c8858d9a19eb3a16b54fa789c59efc646c545c3a"
+shallow = true
+
+[[entry]]
+name = "hashify"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/stalwartlabs/hashify"
+ref = "v0.3.2"
+sha = "b6f1ab99609d4514c86df8d19f2c2a25ea3f67bb"
+shallow = true
+
+[[entry]]
+name = "hysteria"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/apernet/hysteria.git"
+ref = "master@747a11182458"
+sha = "747a11182458a44538f7631b4e7e1cbb4ef811c8"
+shallow = true
+
+[[entry]]
+name = "hysteria-legacy-v1"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/apernet/hysteria.git"
+ref = "hy1@ac56271d0303"
+sha = "ac56271d030310e2c5f907e1d3329b6ef09b45f0"
+shallow = true
+
+[[entry]]
+name = "impersonator"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/zhkl0228/impersonator.git"
+ref = "master@789ecd2bf522"
+sha = "789ecd2bf522bfb4e2d5a2ff8ec3d50ec42c84e9"
+shallow = true
+
+[[entry]]
+name = "impit"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/apify/impit.git"
+ref = "master@4fd6c3167c55"
+sha = "4fd6c3167c55d9d059a3e5872846e0b5c0a31e3b"
+shallow = true
+
+[[entry]]
+name = "ja4db-export"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/Niicolaa/ja4db-export.git"
+ref = "main@af1618e515f8"
+sha = "af1618e515f827216c9c0904821a6c0f2575ee3d"
+shallow = true
+
+[[entry]]
+name = "jets"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/zhangsan946/jets"
+ref = "v0.4.3"
+sha = "a144f3073e35b09ab79e841a789d6ac8801e846a"
+shallow = true
+
+[[entry]]
+name = "leaf"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/eycorsican/leaf.git"
+ref = "master@5e8d94759ce9"
+sha = "5e8d94759ce983eb8ac226c315024b55ff2bb7b0"
+shallow = true
+
+[[entry]]
+name = "leaktracer"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/veeso/leaktracer.git"
+ref = "main@28cf14b1dc5c"
+sha = "28cf14b1dc5c7a37fd49bc09e410616b5cc5c4af"
+shallow = true
+
+[[entry]]
+name = "matryoshka"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/eledah/matryoshka"
+ref = "2026-09-07-153737"
+sha = "7dc16e9fef38a92666284917c80839df60546079"
+shallow = true
+
+[[entry]]
+name = "microrm"
+kind = "git"
+status = "reference"
+host = "codeberg"
+frozen = false
+remote = "https://codeberg.org/flying-kestrel/microrm.git"
+ref = "main@5c4052363003"
+sha = "5c4052363003380e5130751c330175a72a4edc70"
+shallow = false
+
+[[entry]]
+name = "mihomo"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/MetaCubeX/mihomo"
+ref = "v1.19.33"
+sha = "3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8"
+shallow = true
+
+[[entry]]
+name = "outbound"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/daeuniverse/outbound.git"
+ref = "main@cfd9e39fd5e0"
+sha = "cfd9e39fd5e024fe62c7ad68ffd09bb452b10df4"
+shallow = true
+
+[[entry]]
+name = "purecrypto"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/KarpelesLab/purecrypto.git"
+ref = "v0.10.6"
+sha = "c90ae979e9682de613fd490713e6a95aca35b282"
+shallow = true
+
+[[entry]]
+name = "quic-go-v0.20.1"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/quic-go/quic-go.git"
+ref = "v0.20.1"
+sha = "40b124d209d1a1bea3aeed95438f412e96b81bf8"
+shallow = true
+
+[[entry]]
+name = "quirktiva"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/yaling888/quirktiva.git"
+ref = "v1.91.0"
+sha = "1eac02b730b551496951d15cd12fbb7419127410"
+shallow = true
+
+[[entry]]
+name = "ratatui-cheese"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/shashanktomar/ratatui-cheese"
+ref = "v0.7.0"
+sha = "ef8464bd6a595b75b66620cbbdf4a739fd05c6a1"
+shallow = true
+
+[[entry]]
+name = "ratatui-themes"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/ricardodantas/ratatui-themes"
+ref = "main@909fa2b2ee13"
+sha = "909fa2b2ee135ecdf650810e8500d918eea17d49"
+shallow = true
+
+[[entry]]
+name = "REALITY"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/XTLS/REALITY.git"
+ref = "main@4a26e87788f5"
+sha = "4a26e87788f5e08cb9d433c1fab94bc15a8bf653"
+shallow = true
+
+[[entry]]
+name = "roscomvpn-geoip"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/hydraponique/roscomvpn-geoip.git"
+ref = "202611101104"
+sha = "8f0e50bad62029ccf87b29805b7df10d33440811"
+shallow = true
+
+[[entry]]
+name = "roscomvpn-geosite"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/hydraponique/roscomvpn-geosite.git"
+ref = "master@300324058785"
+sha = "300324058785ffab06df8725e18969f835d73618"
+shallow = true
+
+[[entry]]
+name = "roscomvpn-routing"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/hydraponique/roscomvpn-routing.git"
+ref = "main@fcc084734ab4"
+sha = "fcc084734ab492014d52ad8ed6125c2715ecc8df"
+shallow = true
+
+[[entry]]
+name = "russia-mobile-internet-whitelist"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/hxehex/russia-mobile-internet-whitelist.git"
+ref = "main@fad3653ebd4b"
+sha = "fad3653ebd4b212643774a4d10af3eb33838e4ff"
+shallow = true
+
+[[entry]]
+name = "shadowsocks-rust"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/shadowsocks/shadowsocks-rust.git"
+ref = "master@e697eb292b66"
+sha = "e697eb292b66e1e3977c4e7dbd2026ca7842ef1e"
+shallow = true
+
+[[entry]]
+name = "shoes"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/cfal/shoes.git"
+ref = "v0.3.7"
+sha = "ee44a397e6850193e86a1ae66639f037f963822d"
+shallow = true
+
+[[entry]]
+name = "sing-box"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/SagerNet/sing-box"
+ref = "v1.15.0-alpha.13"
+sha = "824dbcfb4dd0a95921840b1737b950cde590241e"
+shallow = true
+
+[[entry]]
+name = "sing-mux"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/SagerNet/sing-mux"
+ref = "HEAD@caf09fe32475"
+sha = "caf09fe324752fe28d3b3fa2cef94bd8ebdcf305"
+shallow = false
+
+[[entry]]
+name = "smux"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/SagerNet/smux"
+ref = "v1.5.50-sing-box-mod.1"
+sha = "f373f1e706bf7400e9ce3d2e3b80363b75937872"
+shallow = true
+
+[[entry]]
+name = "sniffnet"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/GyulyVGC/sniffnet.git"
+ref = "main@a4655590f6fe"
+sha = "a4655590f6febbcfe53f47cd63f3296dcbbeaa64"
+shallow = true
+
+[[entry]]
+name = "soar"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/getlantern/soar.git"
+ref = "v0.2.4"
+sha = "fea80aae6c60a9f27d7358e5f967cbc9b57bb37d"
+shallow = true
+
+[[entry]]
+name = "starrocks"
+kind = "git"
+status = "private-host"
+host = "private"
+frozen = true
+remote = "git@gitlab.spectrumdata.tech:spectrum-internal/skb/dwh/starrocks"
+ref = "master@4d515dd4dd05"
+sha = "4d515dd4dd05a98b31199870456d3dd1e50e1b29"
+shallow = true
+notes = "Private/internal host; not probeable via public API."
+
+[[entry]]
+name = "StormDNS"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/nullroute1970/StormDNS.git"
+ref = "main@a9a8e92a51f0"
+sha = "a9a8e92a51f08c3030d7a1656cafd3bf07c9903b"
+shallow = true
+
+[[entry]]
+name = "sub-healer"
+kind = "git"
+status = "ad-hoc-research"
+host = "github"
+frozen = true
+remote = "https://github.com/SaelKimberly/sub-healer.git"
+ref = "master@26e5f0631a5f"
+sha = "26e5f0631a5f228843dbdcd3a39abe3396940b93"
+shallow = false
+notes = "HEAD commit is not on upstream (local/rewritten); local edits present."
+
+[[entry]]
+name = "subconverter"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/tindy2013/subconverter.git"
+ref = "master@a0d4eab28cb8"
+sha = "a0d4eab28cb8b6c782d4ce5c3a918de4829b4a72"
+shallow = true
+
+[[entry]]
+name = "tls-fingerprint"
+kind = "artifact"
+status = "frozen"
+host = "local"
+frozen = true
+notes = "Rust crate source; ported into leas-tls (crypto/handshake/hello/http2/record)."
+path = "tls-fingerprint"
+
+[[entry]]
+name = "toasty"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/tokio-rs/toasty.git"
+ref = "main@4f3ed1a351f9"
+sha = "4f3ed1a351f967cf90fb396185f161d808bfa979"
+shallow = true
+
+[[entry]]
+name = "tracing_allocator"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/Geal/tracing_allocator.git"
+ref = "master@dc29ba70ae5a"
+sha = "dc29ba70ae5a4ba8d5d0281bf931e510147a08e8"
+shallow = true
+
+[[entry]]
+name = "trojan"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/trojan-gfw/trojan.git"
+ref = "master@3e7bb9aecdc6"
+sha = "3e7bb9aecdc694f9bcae8d646fae395f773d60f8"
+shallow = true
+
+[[entry]]
+name = "TrojanRust"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/cty123/TrojanRust.git"
+ref = "main@06a32afcf759"
+sha = "06a32afcf759bae4b2885e78f7c7e88d3b9668af"
+shallow = true
+
+[[entry]]
+name = "tui-widgets"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/ratatui/tui-widgets.git"
+ref = "main@dec872b2cb87"
+sha = "dec872b2cb87ffba488c30e978fe72b8ab918ac1"
+shallow = true
+
+[[entry]]
+name = "tuic"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/Itsusinn/tuic.git"
+ref = "main@27e666ceee7d"
+sha = "27e666ceee7d0e4a9308b0960866d36b11eb1c10"
+shallow = true
+
+[[entry]]
+name = "turso"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/tursodatabase/turso"
+ref = "v0.9.0-pre.5"
+sha = "98dc77b9f79385d073ff1fefe2e81fa77919790e"
+shallow = false
+
+[[entry]]
+name = "unbihex"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/crystalmasta/unbihex.git"
+ref = "v0.2.10"
+sha = "dd4ca980d6dc278854106d78f117c17ae20065bd"
+shallow = true
+
+[[entry]]
+name = "utls"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/refraction-networking/utls.git"
+ref = "master@360383f893fb"
+sha = "360383f893fbe954ff12a701b87295406abbc156"
+shallow = true
+
+[[entry]]
+name = "v2ray-configs"
+kind = "git"
+status = "gone"
+host = "github"
+frozen = true
+remote = "https://github.com/Epodonios/v2ray-configs.git"
+ref = "main@333276ba1ca0"
+sha = "333276ba1ca03b6d1f729df2ee776334fbd0d86f"
+shallow = true
+notes = "Upstream GitHub repo returns 404; this is the only frozen copy."
+
+[[entry]]
+name = "v2ray-core"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/v2fly/v2ray-core.git"
+ref = "master@ec5ce8ba78e8"
+sha = "ec5ce8ba78e8a70167b5b1f003287f1340ecc19a"
+shallow = true
+
+[[entry]]
+name = "v2ray-core-legacy"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/v2ray/v2ray-core.git"
+ref = "master@d80440f3d57b"
+sha = "d80440f3d57b45c829dbf513306f7adf9a0f3f76"
+shallow = true
+
+[[entry]]
+name = "v2ray-core-v4.38.3"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/v2fly/v2ray-core.git"
+ref = "v4.38.3"
+sha = "ffc8887d79bcc769ff7a83975f4c82b0ee8729d3"
+shallow = true
+
+[[entry]]
+name = "v2ray-plugin"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/shadowsocks/v2ray-plugin.git"
+ref = "v1.3.2"
+sha = "ddd7ab46b4aeee0ca8b272efed9d7da3e3a6e52c"
+shallow = true
+
+[[entry]]
+name = "v2rayN"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/2dust/v2rayN.git"
+ref = "master@f07e3dc41511"
+sha = "f07e3dc41511a196f8ab563bcd2a16d1310ca8dd"
+shallow = true
+
+[[entry]]
+name = "v2rayNG"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/2dust/v2rayNG.git"
+ref = "master@9397a9e4a17e"
+sha = "9397a9e4a17e060a9b6bd3d6b6d0f2f8ee11420b"
+shallow = true
+
+[[entry]]
+name = "vpn-configs-for-russia"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/igareck/vpn-configs-for-russia.git"
+ref = "main@229b9b04ef8f"
+sha = "229b9b04ef8f555db5a55c065eb0ff652857de14"
+shallow = true
+
+[[entry]]
+name = "wireguard-go"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/WireGuard/wireguard-go.git"
+ref = "master@b3bc704ef0ee"
+sha = "b3bc704ef0ee21a36298601a9e1e5ff90377ac52"
+shallow = true
+
+[[entry]]
+name = "wreq-util"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/0x676e67/wreq-util.git"
+ref = "main@917d2581d676"
+sha = "917d2581d6761a94db66466caa6c2eb4d4cdbd43"
+shallow = true
+
+[[entry]]
+name = "xrat"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/mhyrzt/xrat.git"
+ref = "v0.35.1"
+sha = "055265c5cc06013e7b3b1999b4e795292f9e9756"
+shallow = true
+
+[[entry]]
+name = "xray-checker"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/kutovoys/xray-checker.git"
+ref = "v1.3.1"
+sha = "f829c2b7d44670f4db0f7355f445771e7cde7158"
+shallow = true
+
+[[entry]]
+name = "xray-config-toolkit"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/wuqb2i4f/xray-config-toolkit.git"
+ref = "main@bbbd28ae0b55"
+sha = "bbbd28ae0b55d4efcb7ccfbf729abd49a698a827"
+shallow = true
+
+[[entry]]
+name = "Xray-core"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/XTLS/Xray-core.git"
+ref = "v26.11.9"
+sha = "676eaf66f8f05d4d558ee7a74b4736623d3feeb9"
+shallow = true
+
+[[entry]]
+name = "xray-rs-tls"
+kind = "artifact"
+status = "frozen"
+host = "local"
+frozen = true
+notes = "Rust crate source; referenced by leas-native/src/crypto/salamander.rs."
+path = "xray-rs-tls"
+
+[[entry]]
+name = "yamux"
+kind = "git"
+status = "pinned-tag"
+host = "github"
+frozen = false
+remote = "https://github.com/hashicorp/yamux"
+ref = "v0.1.2"
+sha = "17017e907efcfb40ef55c8e52ca6149d676375c7"
+shallow = true
+
+[[entry]]
+name = "zellij"
+kind = "git"
+status = "ad-hoc-research"
+host = "github"
+frozen = true
+remote = "https://github.com/zellij-org/zellij.git"
+ref = "main@9e7be20f5c15"
+sha = "9e7be20f5c150a748a27e5ace89dbe505fa6c137"
+shallow = true
+notes = "Uncommitted local changes; pinned sha is the committed HEAD."
+
+[[entry]]
+name = "ZeroNet"
+kind = "git"
+status = "ad-hoc-research"
+host = "github"
+frozen = true
+remote = "https://github.com/zeghostwriter/ZeroNet.git"
+ref = "v0.3.6"
+sha = "29e7a95eaaf7e0158b96cba83d7118f5f3d87bfd"
+shallow = true
+notes = "Uncommitted local changes; pinned sha is the committed HEAD."
