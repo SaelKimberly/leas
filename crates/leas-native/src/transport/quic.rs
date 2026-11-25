@@ -72,9 +72,19 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
 // clobber each other's trust store. Production builds use webpki-roots and
 // carry no test state.
 #[cfg(any(test, feature = "e2e-support"))]
+type TlsCacheKey = (bool, Vec<Vec<u8>>, Option<Vec<u8>>);
+
+#[cfg(any(test, feature = "e2e-support"))]
 std::thread_local! {
     static TEST_CA: std::cell::RefCell<Option<rustls::pki_types::CertificateDer<'static>>> =
         const { std::cell::RefCell::new(None) };
+    /// Per-test-thread TLS configs, so a second dial in the same test reuses
+    /// the rustls session store and can actually attempt 0-RTT. The harness
+    /// CA is part of the key: a test that installs a different anchor must
+    /// not inherit the previous ticket store.
+    static TEST_TLS_CACHE: std::cell::RefCell<
+        std::collections::HashMap<TlsCacheKey, rustls::ClientConfig>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Install a test-only QUIC trust anchor trusting exactly `ca_der`
@@ -95,6 +105,20 @@ pub fn quic_tls_config(
     ctx: &LinkContext,
     alpn: &[u8],
 ) -> Result<rustls::ClientConfig, NativeError> {
+    quic_tls_config_alpns(ctx, &[alpn.to_vec()])
+}
+
+/// [`quic_tls_config`] with the complete ALPN list (TUIC may carry more than
+/// one protocol id). The cache key is the full list.
+pub fn quic_tls_config_alpns(
+    ctx: &LinkContext,
+    alpns: &[Vec<u8>],
+) -> Result<rustls::ClientConfig, NativeError> {
+    if alpns.iter().any(|alpn| alpn.is_empty() || alpn.len() > 255) {
+        return Err(NativeError::Config(
+            "QUIC ALPN protocol ids must be 1..=255 bytes".into(),
+        ));
+    }
     let insecure = ctx
         .tls_opts()
         .ok()
@@ -110,7 +134,7 @@ pub fn quic_tls_config(
     // Test/e2e builds keep the per-call build: the harness CA is a
     // thread-local that changes between tests.
     #[cfg(not(any(test, feature = "e2e-support")))]
-    let key = (insecure, alpn.to_vec());
+    let key = (insecure, alpns.to_vec());
     #[cfg(not(any(test, feature = "e2e-support")))]
     if let Some(cached) = tls_cache()
         .lock()
@@ -118,6 +142,16 @@ pub fn quic_tls_config(
         .get(&key)
     {
         return Ok(cached.clone());
+    }
+    #[cfg(any(test, feature = "e2e-support"))]
+    let key = (
+        insecure,
+        alpns.to_vec(),
+        TEST_CA.with(|ca| ca.borrow().as_ref().map(|der| der.as_ref().to_vec())),
+    );
+    #[cfg(any(test, feature = "e2e-support"))]
+    if let Some(cached) = TEST_TLS_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        return Ok(cached);
     }
     let mut tls = if insecure {
         let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
@@ -140,22 +174,27 @@ pub fn quic_tls_config(
             .with_root_certificates(roots)
             .with_no_client_auth()
     };
-    tls.alpn_protocols = vec![alpn.to_vec()];
+    tls.alpn_protocols = alpns.to_vec();
     tls.enable_early_data = true;
     #[cfg(not(any(test, feature = "e2e-support")))]
     tls_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key, tls.clone());
+    #[cfg(any(test, feature = "e2e-support"))]
+    TEST_TLS_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, tls.clone());
+    });
     Ok(tls)
 }
 
 /// Build-once cache behind [`quic_tls_config`].
 #[cfg(not(any(test, feature = "e2e-support")))]
 fn tls_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<(bool, Vec<u8>), rustls::ClientConfig>> {
+-> &'static std::sync::Mutex<std::collections::HashMap<(bool, Vec<Vec<u8>>), rustls::ClientConfig>>
+{
     static CACHE: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashMap<(bool, Vec<u8>), rustls::ClientConfig>>,
+        std::sync::Mutex<std::collections::HashMap<(bool, Vec<Vec<u8>>), rustls::ClientConfig>>,
     > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     &CACHE
 }

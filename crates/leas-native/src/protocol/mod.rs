@@ -231,7 +231,7 @@ pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
     match &ctx.params.protocol {
         ProtocolConfig::Hysteria2(cfg) => hysteria2::connect(ctx, cfg).await,
         ProtocolConfig::Hysteria1(_) => not_impl("hysteria1 (QUIC)"),
-        ProtocolConfig::Tuic(_) => not_impl("tuic (QUIC)"),
+        ProtocolConfig::Tuic(cfg) => tuic::connect(ctx, cfg).await,
         _ => Err(NativeError::Config(
             "connect_quic requires a QUIC-family protocol (Hysteria2/Hysteria1/Tuic)".into(),
         )),
@@ -262,6 +262,7 @@ pub enum PacketTunnel {
     Hysteria2(hysteria2::udp::UdpConn),
     Ss(ss::udp::SsUdpTunnel),
     AnyTls(anytls::udp::UdpConn),
+    Tuic(tuic::udp::UdpConn),
     /// A sing-box/mihomo sbox UDP association (length-prefixed datagrams on a
     /// session stream).
     Sbox(crate::transport::sbox::udp::SboxUdpTunnel),
@@ -293,6 +294,7 @@ impl PacketTunnel {
             Self::Hysteria2(c) => c.send(dest, payload).await,
             Self::Ss(c) => c.send(dest, payload).await,
             Self::AnyTls(c) => c.send(dest, payload).await,
+            Self::Tuic(c) => c.send(dest, payload).await,
             Self::Sbox(c) => c.send(dest, payload).await,
         }
     }
@@ -312,6 +314,7 @@ impl PacketTunnel {
             Self::Hysteria2(c) => to_bytes(c.recv().await),
             Self::Ss(c) => to_bytes(c.recv().await),
             Self::AnyTls(c) => to_bytes(c.recv().await),
+            Self::Tuic(c) => c.recv().await,
             Self::Sbox(c) => c.recv().await,
         }
     }
@@ -327,6 +330,7 @@ pub enum PacketReader {
     Hysteria2(hysteria2::udp::UdpReader),
     Ss(ss::udp::SsUdpReader),
     AnyTls(anytls::udp::UdpReader),
+    Tuic(tuic::udp::UdpReader),
     /// sbox UDP association reader.
     Sbox(crate::transport::sbox::udp::SboxUdpReader),
 }
@@ -341,6 +345,7 @@ pub enum PacketWriter {
     Hysteria2(hysteria2::udp::UdpWriter),
     Ss(ss::udp::SsUdpWriter),
     AnyTls(anytls::udp::UdpWriter),
+    Tuic(tuic::udp::UdpWriter),
     /// sbox UDP association writer.
     Sbox(crate::transport::sbox::udp::SboxUdpWriter),
 }
@@ -388,6 +393,10 @@ impl PacketTunnel {
                 let (r, w) = c.split()?;
                 Ok((PacketReader::AnyTls(r), PacketWriter::AnyTls(w)))
             }
+            Self::Tuic(c) => {
+                let (r, w) = c.split();
+                Ok((PacketReader::Tuic(r), PacketWriter::Tuic(w)))
+            }
             Self::Sbox(c) => {
                 let (r, w) = c.split();
                 Ok((PacketReader::Sbox(r), PacketWriter::Sbox(w)))
@@ -413,6 +422,7 @@ impl PacketReader {
             Self::Hysteria2(r) => to_bytes(r.recv().await),
             Self::Ss(r) => to_bytes(r.recv().await),
             Self::AnyTls(r) => to_bytes(r.recv().await),
+            Self::Tuic(r) => r.recv().await,
             Self::Sbox(r) => r.recv().await,
         }
     }
@@ -457,6 +467,7 @@ impl PacketWriter {
             Self::Hysteria2(w) => w.send(dest, payload).await,
             Self::Ss(w) => w.send(dest, payload).await,
             Self::AnyTls(w) => w.send(dest, payload).await,
+            Self::Tuic(w) => w.send(dest, payload).await,
             Self::Sbox(w) => w.send(dest, payload).await,
         }
     }

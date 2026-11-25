@@ -31,7 +31,8 @@ use std::borrow::Cow;
 use leas_proto::proto_spec::common::{KcpConfig, TransportConfig};
 use leas_proto::proto_spec::{
     AnyTlsConfig, Hysteria2Config, MuxSetting, PluginFamily, PluginMode, PluginSpec,
-    ProtocolConfig, ProtocolKind, SsConfig, TrojanConfig, VlessConfig, VlessMux, VmessConfig,
+    ProtocolConfig, ProtocolKind, SsConfig, TrojanConfig, TuicConfig, VlessConfig, VlessMux,
+    VmessConfig,
 };
 use leas_proto::proto_spec::{
     SecurityConfig, TlsConfig,
@@ -48,9 +49,9 @@ use crate::protocol::ss::resolve_method;
 /// `app_meta.capability_version` clears the persisted "not testable" verdicts
 /// once per revision (`Database::clear_stale_capability_verdicts`).
 ///
-/// Revision 2: Hysteria2 rows can now be refused by obfs shape (unknown name,
-/// missing/short password); revision 1 refused nothing for that kind.
-pub const SUPPORT_REVISION: i64 = 2;
+/// Revision 3: TUIC v5 rows are native (TCP + both UDP lanes); revision 2
+/// added Hysteria2 obfs-shape refusal.
+pub const SUPPORT_REVISION: i64 = 3;
 
 /// The protocols with a native implementation, in canonical order.
 ///
@@ -67,6 +68,7 @@ pub const NATIVE_KINDS: &[ProtocolKind] = &[
     ProtocolKind::Shadowsocks,
     ProtocolKind::Shadowsocks2022,
     ProtocolKind::AnyTls,
+    ProtocolKind::Tuic,
 ];
 
 /// True when the protocol kind has a native implementation at all.
@@ -85,6 +87,9 @@ pub const fn kind_supported(kind: ProtocolKind) -> bool {
             | ProtocolKind::Shadowsocks
             | ProtocolKind::Shadowsocks2022
             | ProtocolKind::AnyTls
+            // TUIC v5: QUIC dial, exporter auth, TCP CONNECT and both UDP
+            // lanes. Config-level refusals live in `tuic_reason`.
+            | ProtocolKind::Tuic
             // The SOCKS5 client shipped with the kind excluded; the oracle row
             // `socks5_client_oracle` proved the wire end to end before this
             // flip (spec `2026-11-19-probe-truth` S8). TCP CONNECT only: the
@@ -159,6 +164,7 @@ pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow
         (ProtocolKind::AnyTls, ProtocolConfig::AnyTls(cfg)) => {
             anytls_reason(cfg).map(Cow::Borrowed)
         }
+        (ProtocolKind::Tuic, ProtocolConfig::Tuic(cfg)) => tuic_reason(cfg).map(Cow::Borrowed),
         // The SOCKS5 client dials TCP CONNECT only; nothing in the config can
         // make the row undialable (spec `2026-11-19-probe-truth` S8 — the
         // oracle row proves the wire before the gate admits the kind).
@@ -175,6 +181,7 @@ fn security_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow<'s
         (_, ProtocolConfig::Vmess(c)) => &c.security,
         (_, ProtocolConfig::Trojan(c)) => &c.security,
         (_, ProtocolConfig::AnyTls(c)) => &c.security,
+        (_, ProtocolConfig::Tuic(c)) => &c.security,
         _ => return None,
     };
     if let Some(ech) = security.ech() {
@@ -395,6 +402,41 @@ fn hysteria2_reason(cfg: &Hysteria2Config) -> Option<&'static str> {
     cfg.obfs_spec()
         .err()
         .map(leas_proto::proto_spec::ObfsShapeError::reason)
+}
+
+/// TUIC v5 row: the values native can honour. A value outside the reference
+/// enums is refused by name so the row falls back to sing-box instead of
+/// silently running a different behaviour.
+fn tuic_reason(cfg: &TuicConfig) -> Option<&'static str> {
+    if uuid::Uuid::parse_str(&cfg.uuid).is_err() {
+        return Some("tuic uuid is not a valid UUID");
+    }
+    match cfg.security.tls {
+        Some(leas_proto::proto_spec::TlsConfig::Tls(_)) => {}
+        Some(leas_proto::proto_spec::TlsConfig::Reality(_)) => {
+            return Some("tuic: REALITY security does not apply (TLS only)");
+        }
+        None => return Some("tuic requires TLS"),
+    }
+    if let Some(control) = cfg.congestion_control.as_deref()
+        && !matches!(control, "cubic" | "new_reno" | "bbr")
+    {
+        return Some("tuic congestion control is not implemented");
+    }
+    if let Some(mode) = cfg.udp_relay_mode.as_deref()
+        && !matches!(mode, "native" | "quic")
+    {
+        return Some("tuic udp_relay_mode is not implemented");
+    }
+    if let Some(alpn) = cfg.security.alpn() {
+        for token in alpn.split(',') {
+            let token = token.trim();
+            if !token.is_empty() && token.len() > 255 {
+                return Some("tuic ALPN protocol id exceeds 255 bytes");
+            }
+        }
+    }
+    None
 }
 
 /// Shadowsocks row (both kinds share this payload type): a native method
@@ -642,6 +684,20 @@ mod tests {
         }
     }
 
+    fn tuic_cfg() -> TuicConfig {
+        TuicConfig {
+            uuid: "36106e0f-4d9a-470b-a3fd-535f3b7a1e92".into(),
+            password: "secret".into(),
+            congestion_control: None,
+            udp_relay_mode: None,
+            security: SecurityConfig {
+                tls: Some(TlsConfig::Tls(TlsOpts::default())),
+                enc: None,
+            },
+            remarks: None,
+        }
+    }
+
     fn hysteria2_cfg() -> Hysteria2Config {
         Hysteria2Config {
             auth: "secret".into(),
@@ -784,6 +840,49 @@ mod tests {
     }
 
     #[test]
+    fn tuic_values_are_gated_by_name() {
+        assert!(supported(
+            ProtocolKind::Tuic,
+            &ProtocolConfig::Tuic(tuic_cfg())
+        ));
+
+        let mut control = tuic_cfg();
+        control.congestion_control = Some("bbr3".into());
+        assert_eq!(
+            support_reason(ProtocolKind::Tuic, &ProtocolConfig::Tuic(control)).as_deref(),
+            Some("tuic congestion control is not implemented")
+        );
+
+        let mut mode = tuic_cfg();
+        mode.udp_relay_mode = Some("uot".into());
+        assert_eq!(
+            support_reason(ProtocolKind::Tuic, &ProtocolConfig::Tuic(mode)).as_deref(),
+            Some("tuic udp_relay_mode is not implemented")
+        );
+
+        let mut uuid = tuic_cfg();
+        uuid.uuid = "not-a-uuid".into();
+        assert_eq!(
+            support_reason(ProtocolKind::Tuic, &ProtocolConfig::Tuic(uuid)).as_deref(),
+            Some("tuic uuid is not a valid UUID")
+        );
+
+        let mut reality = tuic_cfg();
+        reality.security = reality_security();
+        assert_eq!(
+            support_reason(ProtocolKind::Tuic, &ProtocolConfig::Tuic(reality)).as_deref(),
+            Some("tuic: REALITY security does not apply (TLS only)")
+        );
+
+        let mut no_tls = tuic_cfg();
+        no_tls.security = SecurityConfig::default();
+        assert_eq!(
+            support_reason(ProtocolKind::Tuic, &ProtocolConfig::Tuic(no_tls)).as_deref(),
+            Some("tuic requires TLS")
+        );
+    }
+
+    #[test]
     fn native_kinds_exact_order() {
         assert_eq!(
             NATIVE_KINDS,
@@ -795,6 +894,7 @@ mod tests {
                 ProtocolKind::Shadowsocks,
                 ProtocolKind::Shadowsocks2022,
                 ProtocolKind::AnyTls,
+                ProtocolKind::Tuic,
             ]
         );
     }
@@ -1201,6 +1301,7 @@ mod tests {
                 ProtocolKind::Hysteria2,
                 ProtocolConfig::Hysteria2(hysteria2_cfg()),
             ),
+            (ProtocolKind::Tuic, ProtocolConfig::Tuic(tuic_cfg())),
             (
                 ProtocolKind::Shadowsocks,
                 ProtocolConfig::Ss(ss_cfg("aes-256-gcm", "secret")),
@@ -1260,7 +1361,6 @@ mod tests {
             ProtocolKind::Dns,
             ProtocolKind::Loopback,
             ProtocolKind::Custom,
-            ProtocolKind::Tuic,
             ProtocolKind::Hysteria,
             ProtocolKind::Naive,
             ProtocolKind::ShadowTls,
@@ -1272,7 +1372,7 @@ mod tests {
             ProtocolKind::TProxy,
             ProtocolKind::Mixed,
         ];
-        assert_eq!(non_native.len(), 19);
+        assert_eq!(non_native.len(), 18);
         let fallback = ProtocolConfig::Vless(vless_cfg());
         for kind in non_native {
             assert!(!kind_supported(kind), "{kind:?}");

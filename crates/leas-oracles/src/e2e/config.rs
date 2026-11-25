@@ -2099,6 +2099,9 @@ mod tests {
 
 /// The AnyTLS password shared by the server configs and the client params.
 pub const ANYTLS_PASSWORD: &str = "anytls-test-password";
+/// TUIC v5 user identity shared by the server config and client params.
+pub const TUIC_UUID: &str = "36106e0f-4d9a-470b-a3fd-535f3b7a1e92";
+pub const TUIC_PASSWORD: &str = "tuic-test-password";
 
 /// AnyTLS inbound for `core`.
 ///
@@ -2146,6 +2149,83 @@ pub fn anytls_inbound(core: CoreKind, env: &ServerEnv) -> String {
         }
         CoreKind::TrojanGo => panic!("anytls rows do not run on trojan-go"),
     }
+}
+
+/// TUIC v5 inbound for `core` (sing-box JSON or mihomo `listeners:` YAML).
+/// The harness cert is the server identity; ALPN is `h3`. `zero_rtt` is
+/// sing-box-only (mihomo's listener surface has no early-data switch).
+#[must_use]
+pub fn tuic_inbound(core: CoreKind, env: &ServerEnv, zero_rtt: bool) -> String {
+    let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
+    let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
+    match core {
+        CoreKind::SingBox => {
+            let mut inbound = serde_json::json!({
+                "type": "tuic", "listen": "127.0.0.1", "listen_port": env.port,
+                "users": [{ "uuid": TUIC_UUID, "password": TUIC_PASSWORD }],
+                "congestion_control": "cubic",
+                "tls": {
+                    "enabled": true,
+                    "certificate_path": cert_path,
+                    "key_path": key_path,
+                    "alpn": ["h3"]
+                }
+            });
+            if zero_rtt {
+                inbound["zero_rtt_handshake"] = serde_json::json!(true);
+            }
+            let json = serde_json::json!({
+                "log": { "level": "warn" },
+                "inbounds": [inbound],
+                "outbounds": [{ "type": "direct" }]
+            });
+            serde_json::to_string(&json).expect("tuic server config serializes")
+        }
+        CoreKind::Mihomo => {
+            assert!(
+                !zero_rtt,
+                "mihomo TUIC listener exposes no zero_rtt_handshake switch"
+            );
+            let mut listener = mihomo_listener("tuic", "tuic", env);
+            let mut users = yaml_rust2::yaml::Hash::new();
+            users.insert(
+                Yaml::String(TUIC_UUID.into()),
+                Yaml::String(TUIC_PASSWORD.into()),
+            );
+            listener.insert(Yaml::String("users".into()), Yaml::Hash(users));
+            listener.insert(Yaml::String("certificate".into()), Yaml::String(cert_path));
+            listener.insert(Yaml::String("private-key".into()), Yaml::String(key_path));
+            listener.insert(
+                Yaml::String("alpn".into()),
+                Yaml::Array(vec![Yaml::String("h3".into())]),
+            );
+            mihomo_config(vec![listener])
+        }
+        CoreKind::Xray => panic!("xray-core has no TUIC inbound — keep the row on sing-box/mihomo"),
+        CoreKind::TrojanGo => panic!("tuic rows do not run on trojan-go"),
+    }
+}
+
+/// Native client params dialing a TUIC listener. `mode` is the row's
+/// `udp_relay_mode` (`native` or `quic`); TCP rows carry `native`.
+#[must_use]
+pub fn client_params_tuic(port: u16, target: SocketAddr, mode: &str) -> NativeConnectParams {
+    let protocol_value = serde_json::json!({
+        "schema": "Tuic",
+        "uuid": TUIC_UUID,
+        "password": TUIC_PASSWORD,
+        "congestion_control": "cubic",
+        "udp_relay_mode": mode,
+        "security": { "tls": { "enabled": true, "insecure": false, "alpn": "h3" } }
+    });
+    let protocol: ProtocolConfig =
+        serde_json::from_value(protocol_value).expect("tuic client config parses");
+    let server = EndpointEssentials::new("127.0.0.1", port);
+    NativeConnectParams::new(
+        protocol,
+        server,
+        TargetAddr::new(Host::Ip(target.ip()), target.port()),
+    )
 }
 
 /// Native client params dialing an AnyTLS listener.

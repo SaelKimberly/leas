@@ -29,7 +29,7 @@ Legend: build = the backend can produce a valid outbound for the config; Clash =
 | 6 | ShadowsocksR | `ssr` | `SsrConfig` | no | yes | yes | no | `ssr://base64(host:port:proto:method:obfs:base64(pass)/?params)` |
 | 7 | SOCKS5 | `socks` | `Socks5Config` | yes | yes | yes | no (see 7) | `socks://user:pass@host:port` |
 | 8 | HTTP | `http` | `HttpClientConfig` | yes | yes | yes | no | `http://user:pass@host:port?security=tls` |
-| 9 | TUIC | `tuic` | `TuicConfig` | no | yes | yes | no | `tuic://uuid:pass@host:port?query` |
+| 9 | TUIC | `tuic` | `TuicConfig` | yes | yes | yes | no | `tuic://uuid:pass@host:port?query` |
 | 10 | Hysteria2 | `hy2` | `Hysteria2Config` | yes | yes | yes | yes | `hysteria2://auth@host:port?query` |
 | 11 | Hysteria v1 | `hy` | `Hysteria1Config` | no | yes | yes | no | `hysteria://host:port?query` |
 | 12 | WireGuard | `wireguard` | `WireguardConfig` | yes | yes | yes | no | `wireguard://key@host:port?query` |
@@ -371,7 +371,7 @@ xray-core and sing-box build. Clash imports and exports. Native has a placeholde
 |---|---|---|---|
 | `uuid` | userinfo | `String` | Parsed and validated as a UUID |
 | `password` | userinfo | `String` | Everything after the first `:` |
-| `congestion_control` | `congestion_control` | `Option<TinyText>` | No default applied at parse |
+| `congestion_control` | `congestion_control` | `Option<TinyText>` | No default applied at parse; native dials absent as `cubic` (sing-box parity), accepts `cubic`/`new_reno`/`bbr`, refuses anything else by capability |
 | `udp_relay_mode` | `udp_relay_mode` | `Option<TinyText>` | |
 | `security` | `sni`, `alpn`, verification aliases | `SecurityConfig` | TLS is always present |
 
@@ -382,7 +382,7 @@ xray-core and sing-box build. Clash imports and exports. Native has a placeholde
 
 ### Backend coverage
 
-sing-box only (`SINGBOX_ONLY_KINDS`, and the xray arm returns `UnsupportedProtocol`). Clash imports and exports. Native has a placeholder module and the gate refuses the kind. QUIC dialing in the native engine exists only for Hysteria2.
+sing-box (`SINGBOX_ONLY_KINDS`, and the xray arm returns `UnsupportedProtocol`); mihomo serves the server side in the oracle. Clash imports and exports. Native serves v5: QUIC dial with ALPN `h3`, TLS-exporter auth, TCP CONNECT, and both UDP lanes (`native` DATAGRAM and `quic` uni streams); 0-RTT is opportunistic with a staged first write and a transparent retry. TUIC v4/v6 stay out of scope.
 
 ---
 

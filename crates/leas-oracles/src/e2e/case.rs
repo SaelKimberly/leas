@@ -22,6 +22,7 @@ pub enum ProtocolKind {
     Hysteria2,
     Shadowsocks,
     AnyTls,
+    Tuic,
 }
 
 impl ProtocolKind {
@@ -35,6 +36,7 @@ impl ProtocolKind {
             Self::Hysteria2 => leas_proto::proto_spec::ProtocolKind::Hysteria2,
             Self::Shadowsocks => leas_proto::proto_spec::ProtocolKind::Shadowsocks,
             Self::AnyTls => leas_proto::proto_spec::ProtocolKind::AnyTls,
+            Self::Tuic => leas_proto::proto_spec::ProtocolKind::Tuic,
         }
     }
 }
@@ -101,6 +103,12 @@ pub enum AppKind {
 /// `security` are private invariants (a vmess case always carries a variant).
 /// `tls` defaults to [`StandardTls`]; add fingerprint/REALITY variants with
 /// [`CaseSpec::with_tls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuicCase {
+    pub udp_mode: &'static str,
+    pub zero_rtt: bool,
+}
+
 pub struct CaseSpec {
     protocol: ProtocolKind,
     security: Option<Box<dyn SecurityVariant>>,
@@ -170,6 +178,8 @@ pub struct CaseSpec {
     /// Trojan-Go's extra SS layer `(method, password)`; `None` for a plain
     /// Trojan row. Only the TrojanGo oracle serves it.
     trojan_enc: Option<(&'static str, &'static str)>,
+    /// TUIC row options (`None` for every other protocol).
+    tuic: Option<TuicCase>,
 }
 
 impl CaseSpec {
@@ -196,6 +206,7 @@ impl CaseSpec {
             ss_method: None,
             ss_user: None,
             trojan_enc: None,
+            tuic: None,
         }
     }
 
@@ -222,6 +233,7 @@ impl CaseSpec {
             ss_method: None,
             ss_user: None,
             trojan_enc: None,
+            tuic: None,
         }
     }
 
@@ -250,6 +262,7 @@ impl CaseSpec {
             ss_method: None,
             ss_user: None,
             trojan_enc: None,
+            tuic: None,
         }
     }
 
@@ -278,6 +291,38 @@ impl CaseSpec {
             ss_method: None,
             ss_user: None,
             trojan_enc: None,
+            tuic: None,
+        }
+    }
+
+    /// A TUIC v5 case: TLS/QUIC is implicit, `udp_mode` selects the UDP lane
+    /// (`native` or `quic`), and `zero_rtt` asks the sing-box server to accept
+    /// early data. Served by sing-box and mihomo; xray-core has no TUIC
+    /// inbound, and mihomo has no early-data switch.
+    #[must_use]
+    pub fn tuic(udp_mode: &'static str, zero_rtt: bool) -> Self {
+        Self {
+            protocol: ProtocolKind::Tuic,
+            security: None,
+            tls: None,
+            network: "tcp",
+            xhttp_mode: None,
+            flow: None,
+            app: AppKind::Plain,
+            mux: false,
+            mux_wire: None,
+            mux_padding: false,
+            ws_early_data: None,
+            udp: None,
+            vless_enc: None,
+            pq_assert: false,
+            obfs: config::Hy2Obfs::None,
+            kcp_mask: None,
+            single_core: Some(CoreKind::SingBox),
+            ss_method: None,
+            ss_user: None,
+            trojan_enc: None,
+            tuic: Some(TuicCase { udp_mode, zero_rtt }),
         }
     }
 
@@ -307,6 +352,7 @@ impl CaseSpec {
             ss_method: None,
             ss_user: None,
             trojan_enc: None,
+            tuic: None,
         }
     }
 
@@ -341,6 +387,7 @@ impl CaseSpec {
             ss_method: Some(method),
             ss_user: None,
             trojan_enc: None,
+            tuic: None,
         }
     }
 
@@ -579,7 +626,7 @@ impl CaseSpec {
     #[must_use]
     pub const fn is_udp_listener(&self) -> bool {
         match self.protocol {
-            ProtocolKind::Hysteria2 => true,
+            ProtocolKind::Hysteria2 | ProtocolKind::Tuic => true,
             ProtocolKind::Shadowsocks => matches!(self.app, AppKind::Udp),
             _ => false,
         }
@@ -595,6 +642,7 @@ impl E2eCase for CaseSpec {
             ProtocolKind::Hysteria2 => "hysteria2",
             ProtocolKind::Shadowsocks => "ss",
             ProtocolKind::AnyTls => "anytls",
+            ProtocolKind::Tuic => "tuic",
         };
         // The SS method is the row's identity: two SS rows differ only by it.
         let meth = self.ss_method.map_or(String::new(), |m| {
@@ -627,6 +675,10 @@ impl E2eCase for CaseSpec {
         };
         let mux = if self.mux() { "/mux" } else { "" };
         let obfs = self.obfs.label_suffix();
+        let tuic = self.tuic.map_or(String::new(), |tuic| {
+            let rtt = if tuic.zero_rtt { "/0rtt" } else { "" };
+            format!("/{}{rtt}", tuic.udp_mode)
+        });
         let pq = if self.pq_assert { "/pq" } else { "" };
         let enc = if self.vless_enc.is_some() {
             "/pq-enc"
@@ -634,7 +686,7 @@ impl E2eCase for CaseSpec {
             ""
         };
         format!(
-            "{proto}{meth}/{flow}{}/{tls}{sec}{app}{mux}{obfs}{pq}{enc}",
+            "{proto}{meth}/{flow}{}/{tls}{sec}{app}{mux}{obfs}{tuic}{pq}{enc}",
             self.network
         )
     }
@@ -681,6 +733,10 @@ impl E2eCase for CaseSpec {
                 ),
             },
             ProtocolKind::AnyTls => config::anytls_inbound(core, env),
+            ProtocolKind::Tuic => {
+                let tuic = self.tuic.expect("tuic case requires its options");
+                config::tuic_inbound(core, env, tuic.zero_rtt)
+            }
         };
         match self.kcp_mask {
             Some((header, seed)) => config::apply_kcp_mask(&json, header, seed),
@@ -739,6 +795,10 @@ impl E2eCase for CaseSpec {
                 ),
             },
             ProtocolKind::AnyTls => config::client_params_anytls(port, target),
+            ProtocolKind::Tuic => {
+                let tuic = self.tuic.expect("tuic case requires its options");
+                config::client_params_tuic(port, target, tuic.udp_mode)
+            }
         };
         // pq-enc rows: the VLESS outbound carries the mlkem768x25519plus
         // account `encryption` (the client-side PUBLIC key segments).
@@ -985,8 +1045,9 @@ mod tests {
         );
         // SS TCP rows never touch UDP: the readiness probe stays a TCP accept.
         assert!(!CaseSpec::shadowsocks("aes-128-gcm").is_udp_listener());
-        // hysteria2 is a QUIC (UDP-only) listener regardless of `app`.
+        // hysteria2 and tuic are QUIC (UDP-only) listeners regardless of `app`.
         assert!(CaseSpec::hysteria2(config::Hy2Obfs::None).is_udp_listener());
+        assert!(CaseSpec::tuic("native", false).is_udp_listener());
         // The other protocols' listeners are TCP.
         assert!(!CaseSpec::trojan().is_udp_listener());
         assert!(

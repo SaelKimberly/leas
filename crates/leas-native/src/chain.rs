@@ -302,8 +302,11 @@ async fn connect_chain_udp_inner(
                         crate::protocol::hysteria2::connect_udp(&ctx, cfg).await?,
                     ))
                 }
+                leas_proto::proto_spec::ProtocolConfig::Tuic(cfg) => Ok(PacketTunnel::Tuic(
+                    crate::protocol::tuic::connect_udp(&ctx, cfg).await?,
+                )),
                 _ => Err(NativeError::NotImplemented {
-                    feature: "udp over a QUIC-family protocol (only hysteria2 implemented)".into(),
+                    feature: "udp over a QUIC-family protocol".into(),
                 }),
             };
         }
