@@ -13,7 +13,9 @@ so `git log -p -- thirdparty.toml` is the full history of referencing.
 | `python3 refresh.py --probe` | + upstream existence via GitHub API (`UV_GITHUB_TOKEN`) |
 | `python3 refresh.py --sync` | rebuild manifest AND index **from disk** — overwrites hand edits |
 | `python3 refresh.py --index` | regenerate only this INDEX **from the manifest** (safe after a hand edit) |
-| `python3 refresh.py --apply` | reconcile non-frozen drifts to pinned sha (destructive; never touches frozen) |
+| `python3 refresh.py --apply` | reconcile drift to pinned sha; preserves dirty/frozen clones |
+| `python3 refresh.py --discard-local` | preview reset of dirty frozen clones (no changes) |
+| `python3 refresh.py --apply --discard-local` | execute: remote-reachable gate, `reset --hard` to pin, `clean -fd` excluding `KEEP_UNTRACKED` (opt-in, irreversible) |
 
 `.gitignore` ignores `thirdparty/**` but whitelists `*.md`, so this INDEX is
 tracked and the repo contents are not.
@@ -24,13 +26,15 @@ tracked and the repo contents are not.
 | --- | --- |
 | `reference` | normal upstream-tracked git repo, pinned to a branch HEAD sha |
 | `pinned-tag` | pinned to an exact release tag |
-| `ad-hoc-research` | local work or origin drift; kept frozen, never refreshed |
+| `ad-hoc-research` | local work or origin drift; frozen unless `--discard-local` is used |
 | `frozen` | non-git local snapshot; no upstream, never refreshed |
 | `gone` | upstream vanished (GitHub 404); only frozen copy |
 | `private-host` | private/internal git host, not probeable via public API |
 
-Frozen, gone, private-host and ad-hoc-research entries are **never** modified
-by `--apply`. Treat them as archival.
+Plain `--apply` never modifies frozen/gone/private-host/ad-hoc-research entries.
+`--apply --discard-local` resets dirty *frozen* clones to their pinned sha only
+when the remote is reachable, keeping `KEEP_UNTRACKED` paths. Preview with
+`--discard-local` first; the reset + clean is irreversible.
 
 ## What each folder is (purpose · domain · tags · standards)
 

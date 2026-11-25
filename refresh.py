@@ -269,7 +269,9 @@ def render_index(entries: list[Entry]) -> str:
         "| `python3 refresh.py --probe` | + upstream existence via GitHub API (`UV_GITHUB_TOKEN`) |",
         "| `python3 refresh.py --sync` | rebuild manifest AND index **from disk** — overwrites hand edits |",
         "| `python3 refresh.py --index` | regenerate only this INDEX **from the manifest** (safe after a hand edit) |",
-        "| `python3 refresh.py --apply` | reconcile non-frozen drifts to pinned sha (destructive; never touches frozen) |",
+        "| `python3 refresh.py --apply` | reconcile drift to pinned sha; preserves dirty/frozen clones |",
+        "| `python3 refresh.py --discard-local` | preview reset of dirty frozen clones (no changes) |",
+        "| `python3 refresh.py --apply --discard-local` | execute: remote-reachable gate, `reset --hard` to pin, `clean -fd` excluding `KEEP_UNTRACKED` (opt-in, irreversible) |",
         "",
         "`.gitignore` ignores `thirdparty/**` but whitelists `*.md`, so this INDEX is",
         "tracked and the repo contents are not.",
@@ -280,13 +282,15 @@ def render_index(entries: list[Entry]) -> str:
         "| --- | --- |",
         "| `reference` | normal upstream-tracked git repo, pinned to a branch HEAD sha |",
         "| `pinned-tag` | pinned to an exact release tag |",
-        "| `ad-hoc-research` | local work or origin drift; kept frozen, never refreshed |",
+        "| `ad-hoc-research` | local work or origin drift; frozen unless `--discard-local` is used |",
         "| `frozen` | non-git local snapshot; no upstream, never refreshed |",
         "| `gone` | upstream vanished (GitHub 404); only frozen copy |",
         "| `private-host` | private/internal git host, not probeable via public API |",
         "",
-        "Frozen, gone, private-host and ad-hoc-research entries are **never** modified",
-        "by `--apply`. Treat them as archival.",
+        "Plain `--apply` never modifies frozen/gone/private-host/ad-hoc-research entries.",
+        "`--apply --discard-local` resets dirty *frozen* clones to their pinned sha only",
+        "when the remote is reachable, keeping `KEEP_UNTRACKED` paths. Preview with",
+        "`--discard-local` first; the reset + clean is irreversible.",
         "",
         "## What each folder is (purpose · domain · tags · standards)",
         "",
@@ -538,23 +542,31 @@ def cmd_apply(entries: list[Entry], *, execute: bool, discard_local: bool = Fals
         repo = THIRDPARTY / m.name
         dirty = bool(git(["status", "--porcelain"], repo))
 
-        if dirty and not (discard_local and d.frozen):
-            if not discard_local:
-                print(f"[apply] SKIP {m.name}: local edits present (preserved; "
-                      "pass --discard-local to reset)")
-            continue
-
-        if dirty and discard_local:
+        if dirty and discard_local and d.frozen:
+            # Frozen dirty clone: remote gate, then hard reset to the MANIFEST pin.
             ok = sp.run(["git", "ls-remote", "--exit-code", "origin", "HEAD"],
                         cwd=repo, capture_output=True, timeout=20).returncode == 0
-            if not ok:
-                print(f"[apply] SKIP {m.name}: remote unreachable; edits preserved")
+            if not ok and m.sha != d.sha:
+                print(f"[apply] SKIP {m.name}: remote unreachable and pin differs "
+                      f"({d.sha[:8]} -> {m.sha[:8]}); edits preserved")
                 continue
-            excludes = [f"-e{p}" for p in KEEP_UNTRACKED.get(m.name, [])]
-            print(f"[apply] {m.name}: reset --hard {d.sha[:12]} + clean -fd "
-                  f"(kept: {', '.join(KEEP_UNTRACKED.get(m.name, [])) or 'none'})")
+            kept = KEEP_UNTRACKED.get(m.name, [])
+            excludes = [x for p in kept for x in ("-e", p)]
+            target = m.sha or d.sha
+            if m.sha != d.sha:
+                print(f"[apply] {m.name}: fetch {m.sha[:12]} then reset --hard "
+                      f"(kept: {', '.join(kept) or 'none'})")
+                if execute:
+                    fr = sp.run(["git", "fetch", "--depth", "1", "origin", m.sha],
+                                cwd=repo, capture_output=True, text=True)
+                    if fr.returncode != 0:
+                        print("    fetch failed; edits preserved:", fr.stderr.strip()[:120])
+                        continue
+            else:
+                print(f"[apply] {m.name}: reset --hard {target[:12]} "
+                      f"(kept: {', '.join(kept) or 'none'})")
             if execute:
-                for args in (["reset", "--hard", d.sha], ["clean", "-fd", *excludes]):
+                for args in (["reset", "--hard", target], ["clean", "-fd", *excludes]):
                     r = sp.run(["git", *args], cwd=repo, capture_output=True, text=True)
                     print("   ", args[0], "ok" if r.returncode == 0 else r.stderr.strip()[:120])
             changed += 1
@@ -564,13 +576,15 @@ def cmd_apply(entries: list[Entry], *, execute: bool, discard_local: bool = Fals
             continue
         print(f"[apply] {m.name}: fetch + checkout {m.sha[:12]}")
         if execute:
-            sp.run(["git", "fetch", "--depth", "1", "origin", m.sha],
-                   cwd=repo, check=False)
+            fr = sp.run(["git", "fetch", "--depth", "1", "origin", m.sha],
+                        cwd=repo, capture_output=True, text=True)
+            if fr.returncode != 0:
+                print("    fetch failed; HEAD unchanged:", fr.stderr.strip()[:120])
+                continue
             r = sp.run(["git", "checkout", "--detach", m.sha],
                        cwd=repo, capture_output=True, text=True)
             print("   ", "ok" if r.returncode == 0 else r.stderr.strip()[:120])
         changed += 1
-
     verb = "reconciled" if execute else "would reconcile (preview; pass --apply to execute)"
     print(f"[apply] {changed} entr{'y' if changed == 1 else 'ies'} {verb}")
     return 0
@@ -594,16 +608,15 @@ def main(argv: list[str] | None = None) -> int:
     if sum((args.sync, args.index, args.apply)) > 1:
         print("error: --sync, --index and --apply are mutually exclusive", file=sys.stderr)
         return 2
-    if args.discard_local and not args.apply:
-        print("error: --discard-local requires --apply", file=sys.stderr)
-        return 2
     if args.sync:
         return cmd_sync()
     if args.index:
         return cmd_index()
     entries = load()
+    if args.discard_local:
+        return cmd_apply(entries, execute=args.apply, discard_local=True)
     if args.apply:
-        return cmd_apply(entries, execute=True, discard_local=args.discard_local)
+        return cmd_apply(entries, execute=True)
     return cmd_report(entries, args.probe)
 
 
