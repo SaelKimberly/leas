@@ -211,7 +211,10 @@ impl HttpInbound {
             let shutdown = config.shutdown.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let handle = handle_conn(config, conn, peer);
+                // Windows MSVC measures this future at clippy's 16 KiB
+                // `large_futures` limit; the box is one allocation per
+                // connection, matching the relay/dial boxes in this layer.
+                let handle = Box::pin(handle_conn(config, conn, peer));
                 match shutdown {
                     Some(rx) => {
                         let mut rx = rx;

@@ -161,6 +161,6 @@ async fn handle_conn(
     if first[0] == socks5::VERSION {
         super::handle_conn(socks, conn, peer).await
     } else {
-        http::handle_conn(http, conn, peer).await
+        Box::pin(http::handle_conn(http, conn, peer)).await
     }
 }
