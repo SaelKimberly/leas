@@ -1,7 +1,7 @@
 # TUIC v5 client — native design
 
 Date: 2026-11-25
-Status: **approved 2026-11-25 — implementation in progress**; plan [`../plans/2026-11-25-tuic-v5-client.md`](../plans/2026-11-25-tuic-v5-client.md).
+Status: **implemented 2026-11-25** — plan [`../plans/2026-11-25-tuic-v5-client.md`](../plans/2026-11-25-tuic-v5-client.md); commit `46058d9f`.
 Origin: user request “implement TUIC in `leas-native`; sans-I/O where possible; grill the details.”
 Evidence: `sing-quic` v0.6.0-beta.13 (`tuic/{protocol,client,service,packet,service_packet}.go`), the pinned sing-box v1.15.0-alpha.13 (`protocol/tuic`, `go.mod` → sing-quic v0.7.2 commit `7e0a5869a5f4`), `thirdparty/mihomo` v1.19.33 (`transport/tuic/v5/{protocol,packet,frag}.go` — the on-disk wire codec — plus `adapter/outbound/tuic.go`, `listener/inbound/tuic.go`), and `thirdparty/ferrox/crates/ferrox-core/src/tuic.rs`. The pinned sing-quic client source at `7e0a5869a5f4` agrees with the cached v0.6.0-beta.13, and mihomo's independent v5 codec, on every frame below. `thirdparty/tuic` HEAD is the v6 rewrite; its `tuic-tests` bytes are not used as the v5 authority.
 

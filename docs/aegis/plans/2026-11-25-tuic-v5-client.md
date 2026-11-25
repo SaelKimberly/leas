@@ -2,7 +2,7 @@
 
 Date: 2026-11-25
 Spec: [`../specs/2026-11-25-tuic-v5-client-design.md`](../specs/2026-11-25-tuic-v5-client-design.md)
-Status: **ready to execute**
+Status: **executed 2026-11-25** — commit `46058d9f`, follow-up `82a041ad`. Verification: `leas-native` 927/927, workspace 3063/3063 (12 skipped), `leas-oracles tuic` 12/12 against sing-box and mihomo (0-RTT resume; the reject/retry lane is covered by the one-shot guard but not asserted separately), clippy workspace `-D warnings` clean, fmt clean. Live DB sweep: 10 TUIC links all handshake-timeout; pinned sing-box also times out on a representative row.
 
 ## Goal
 
