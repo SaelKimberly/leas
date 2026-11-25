@@ -5848,7 +5848,7 @@ mod tests {
         // A kind with no native implementation. The plan-time gate reads the
         // in-memory `proto_kind` only — the config is never loaded for it.
         for proto in rows[0].protocols.values_mut() {
-            proto.proto_kind = leas_proto::proto_spec::ProtocolKind::Tuic;
+            proto.proto_kind = leas_proto::proto_spec::ProtocolKind::Hysteria;
         }
         let mut h = harness(rows.clone()).await;
         let plan = plan_from_rows(&rows);
