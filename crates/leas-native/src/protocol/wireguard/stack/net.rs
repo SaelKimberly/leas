@@ -392,7 +392,6 @@ async fn run<L: PacketLink>(
                 continue;
             }
             let socket = sockets.get_mut::<tcp::Socket>(*handle);
-            let before = pending_write.data.len();
             let written = write_pending(socket, &mut pending_write.data);
             if written > 0 {
                 pending_write
@@ -401,7 +400,6 @@ async fn run<L: PacketLink>(
                 pending_write.wake.notify_one();
                 wrote = true;
             }
-            let _ = before;
         }
         pending.retain(|_, write| !write.data.is_empty());
         if wrote {
