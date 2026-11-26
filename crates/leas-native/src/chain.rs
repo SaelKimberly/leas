@@ -53,6 +53,24 @@ fn quic_guard(
     Ok(())
 }
 
+/// A `WireGuard` link dials its own UDP socket and owns an IP stack: it cannot
+/// ride a base tunnel (it needs the raw socket and its own interface) and it
+/// cannot carry a later link (it is not a byte stream), so it is the whole
+/// chain (`spec 2026-11-26 §3.4`).
+fn wireguard_guard(
+    links: &[NativeConnectParams],
+    i: usize,
+    base: Option<&BoxStream>,
+) -> Result<(), NativeError> {
+    if links.len() != 1 || i + 1 != links.len() || base.is_some() {
+        return Err(NativeError::Config(
+            "a WireGuard link dials its own UDP socket and IP stack; it must be the only link"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// An SS UDP link dials its own UDP socket straight to the server, so it must
 /// be the only link: there is no base tunnel for it to ride and no way to
 /// carry it through a chain (mirrors [`quic_guard`]).
@@ -114,6 +132,21 @@ pub async fn dial_transport(
     link: &NativeConnectParams,
     target: TargetAddr,
 ) -> Result<BoxStream, NativeError> {
+    // A WireGuard row's "transport" is the device handshake plus the flow to
+    // the target the stack dials — there is no TCP dial to the server's UDP
+    // port. This is also the probe's transport span for such a row.
+    if matches!(
+        link.protocol,
+        leas_proto::proto_spec::ProtocolConfig::Wireguard(_)
+    ) {
+        let proxy = crate::inbound::outbound::ProxyOutbound {
+            protocol: link.protocol.clone(),
+            kind: leas_proto::proto_spec::ProtocolKind::WireGuard,
+            server: link.server.clone(),
+            resolved_ip: link.resolved_ip,
+        };
+        return crate::protocol::wireguard::pool::open(&proxy, &target).await;
+    }
     let ctx = LinkContext::new(link.clone(), target);
     if protocol::is_quic_link(&ctx) {
         // A QUIC-family protocol replaces dial + security + upgrade with one
@@ -132,6 +165,14 @@ pub async fn dial_transport(
 /// [`connect_chain`]'s body, split at the boundary the probe's two budgets
 /// need.
 pub async fn finish_chain(ctx: &LinkContext, dialed: BoxStream) -> Result<BoxStream, NativeError> {
+    // The WireGuard dial already produced the stream to the TARGET (the device
+    // opened a flow through its stack), so the protocol phase must not run.
+    if matches!(
+        ctx.params.protocol,
+        leas_proto::proto_spec::ProtocolConfig::Wireguard(_)
+    ) {
+        return Ok(dialed);
+    }
     let upgraded = secured_upgraded(ctx, dialed).await?;
     protocol::connect(ctx, upgraded).await
 }
@@ -214,6 +255,16 @@ async fn connect_chain_inner(
             base = Some(protocol::connect(&ctx, upgraded).await?);
             continue;
         }
+        if matches!(
+            ctx.params.protocol,
+            leas_proto::proto_spec::ProtocolConfig::Wireguard(_)
+        ) {
+            wireguard_guard(links, i, base.as_ref())?;
+            return Err(NativeError::Config(
+                "a WireGuard link is dialled by the outbound dispatcher, not the stream chain"
+                    .into(),
+            ));
+        }
         if protocol::is_quic_link(&ctx) {
             // QUIC-family protocols (Hysteria2/Hysteria1/TUIC) are a
             // divergent dial: `protocol::connect_quic` performs the QUIC dial
@@ -275,6 +326,21 @@ async fn connect_chain_udp_inner(
     links: &[NativeConnectParams],
     target: TargetAddr,
 ) -> Result<PacketTunnel, NativeError> {
+    // A WireGuard association is the device's own UDP flow: no transport dial,
+    // no stream phase, and the placement rule makes it the only link. The guard
+    // runs for EVERY shape, so `[WireGuard, X]` fails as a placement error
+    // instead of dialling the endpoint's UDP port as TCP.
+    if links.iter().any(|link| {
+        matches!(
+            link.protocol,
+            leas_proto::proto_spec::ProtocolConfig::Wireguard(_)
+        )
+    }) {
+        wireguard_guard(links, 0, None)?;
+        return crate::protocol::wireguard::pool::open_udp(&links[0])
+            .await
+            .map(PacketTunnel::WireGuard);
+    }
     let mut base: Option<BoxStream> = None;
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
@@ -432,6 +498,118 @@ mod tests {
             TargetAddr::new(Host::Domain("b.example".into()), 20)
         );
         assert_eq!(next_target(&links, 1, &final_target), final_target);
+    }
+
+    /// The probe's transport dial for a `WireGuard` row opens the device flow
+    /// (the handshake IS the transport), so it never dials the server's UDP
+    /// port as TCP.
+    #[tokio::test]
+    async fn a_wireguard_transport_dial_reaches_the_device_pool() {
+        use leas_proto::proto_spec::WireguardConfig;
+        let cfg = WireguardConfig {
+            private_key: "not-a-key".into(),
+            security: SecurityConfig::default(),
+            address: "172.16.0.2/32".into(),
+            public_key: "not-a-key".into(),
+            preshared_key: None,
+            reserved: None,
+            mtu: None,
+            persistent_keepalive: None,
+            dns: None,
+            remote_dns_resolve: None,
+            remarks: None,
+        };
+        let mut link = NativeConnectParams::new(
+            ProtocolConfig::Wireguard(cfg),
+            EndpointEssentials::new("127.0.0.1", 9),
+            TargetAddr::new(Host::Ip(std::net::IpAddr::from([192, 0, 2, 1])), 443),
+        );
+        link.resolved_ip = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9)));
+        let target = link.target.clone();
+        let error = super::dial_transport(&link, target)
+            .await
+            .err()
+            .expect("a bad key cannot open a flow");
+        let text = error.to_string();
+        assert!(
+            text.contains("wireguard key"),
+            "the device pool owns the refusal, got: {text}"
+        );
+        assert!(
+            !text.contains("connection refused"),
+            "the server's UDP port must not be dialled as TCP: {text}"
+        );
+    }
+
+    /// A multi-link UDP chain containing `WireGuard` is a placement error, not
+    /// a TCP dial to the endpoint's UDP port.
+    #[tokio::test]
+    async fn a_wireguard_udp_chain_is_refused_by_the_placement_rule() {
+        use leas_proto::proto_spec::WireguardConfig;
+        let cfg = WireguardConfig {
+            private_key: "not-a-key".into(),
+            security: SecurityConfig::default(),
+            address: "172.16.0.2/32".into(),
+            public_key: "not-a-key".into(),
+            preshared_key: None,
+            reserved: None,
+            mtu: None,
+            persistent_keepalive: None,
+            dns: None,
+            remote_dns_resolve: None,
+            remarks: None,
+        };
+        let wg = NativeConnectParams::new(
+            ProtocolConfig::Wireguard(cfg),
+            EndpointEssentials::new("127.0.0.1", 9),
+            TargetAddr::new(Host::Domain("ignored".into()), 1),
+        );
+        let links = [wg, params("b.example", 20)];
+        let target = TargetAddr::new(Host::Domain("www.example.com".into()), 443);
+        let error = super::connect_chain_udp(&links, target)
+            .await
+            .err()
+            .expect("a WireGuard link cannot ride a chain");
+        assert!(
+            error.to_string().contains("only link"),
+            "the placement rule must own the refusal, got: {error}"
+        );
+    }
+
+    /// A single `WireGuard` link's UDP association is opened by the device
+    /// pool before any transport is dialled: a row with an undecodable key
+    /// fails on the key (the pool), never on a dial or the stream phase.
+    #[tokio::test]
+    async fn a_wireguard_udp_link_reaches_the_device_pool() {
+        use leas_proto::proto_spec::WireguardConfig;
+        let cfg = WireguardConfig {
+            private_key: "not-a-key".into(),
+            security: SecurityConfig::default(),
+            address: "172.16.0.2/32".into(),
+            public_key: "not-a-key".into(),
+            preshared_key: None,
+            reserved: None,
+            mtu: None,
+            persistent_keepalive: None,
+            dns: None,
+            remote_dns_resolve: None,
+            remarks: None,
+        };
+        let mut link = NativeConnectParams::new(
+            ProtocolConfig::Wireguard(cfg),
+            EndpointEssentials::new("127.0.0.1", 9),
+            TargetAddr::new(Host::Domain("ignored".into()), 1),
+        );
+        link.resolved_ip = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9)));
+        let target = TargetAddr::new(Host::Ip(std::net::IpAddr::from([10, 66, 0, 1])), 53);
+        let error = super::connect_chain_udp(std::slice::from_ref(&link), target)
+            .await
+            .err()
+            .expect("a bad key cannot open an association");
+        assert!(
+            error.to_string().contains("wireguard key"),
+            "the device pool owns the refusal, got: {error}"
+        );
     }
 
     #[test]

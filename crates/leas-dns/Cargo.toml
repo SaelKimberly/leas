@@ -32,6 +32,9 @@ zeroize.workspace = true
 # ============ Async Runtime & I/O ============
 tokio = { workspace = true, features = ["sync", "fs", "io-util", "net", "time", "macros", "rt"] }
 
+# One WARN when the permitted local fallback is taken (policy lives here).
+tracing.workspace = true
+
 # ============ Networking ============
 reqwest.workspace = true
 url.workspace = true

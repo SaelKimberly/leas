@@ -14,8 +14,11 @@
 //! becomes a candidate.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
@@ -403,6 +406,50 @@ fn build_system_resolver() -> Option<Arc<Resolver<dnscrypt::DnsCryptProvider>>> 
         .map(Arc::new)
 }
 
+/// How long an answer counts as proof that its resolver is still alive.
+///
+/// A tunnel resolver that answered inside this window is "alive" even if the
+/// next lookup fails; a resolver that has not answered for longer is not, and
+/// only then may a lookup fall back to the local pool (the one leak the policy
+/// permits).
+pub const RESOLVER_ALIVE_WINDOW: Duration = Duration::from_secs(600);
+
+/// Where a lookup's answer came from, so a caller can log the one permitted
+/// fallback and a test can assert which path ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsScope {
+    /// The caller-supplied transport (a `WireGuard` tunnel), or an IP literal.
+    Tunnel,
+    /// The user's measured stamp pool.
+    Pool,
+    /// The OS resolver configuration.
+    System,
+}
+
+/// Resolution over a transport `leas-dns` does not own (a userspace tunnel, a
+/// test double).
+///
+/// Policy, liveness and the local fallback stay here; the implementation owns
+/// the wire and its servers. `lookup` reports failure by error; it must not
+/// apply a fallback of its own.
+pub trait PlainResolver: Send + Sync {
+    /// Resolve `hostname`. `ipv6` widens the answer set.
+    fn lookup<'a>(
+        &'a self,
+        hostname: &'a str,
+        ipv6: bool,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<IpAddr>>> + Send + 'a>>;
+}
+
+struct PlainEntry {
+    resolver: Arc<dyn PlainResolver>,
+    last_success: Mutex<Option<Instant>>,
+    /// The local fallback is permitted once per installed resolver, with one
+    /// WARN: a silently repeated fallback is the leak the policy exists to
+    /// bound (`spec 2026-11-26 §3.7`).
+    fallback_used: AtomicBool,
+}
+
 /// The live resolver pool. Reads are one atomic load; a swap is rare and sync.
 ///
 /// `ArcSwapOption` (not a lock): the read side is every lookup, and
@@ -415,6 +462,8 @@ pub struct DnsResolver {
     /// when no candidates are installed. `None` caches an unreadable
     /// configuration instead of panicking on every lookup.
     system: OnceLock<Option<Arc<Resolver<dnscrypt::DnsCryptProvider>>>>,
+    /// A caller-owned transport (a tunnel) that takes precedence over the pool.
+    plain: ArcSwapOption<PlainEntry>,
 }
 
 impl DnsResolver {
@@ -423,6 +472,7 @@ impl DnsResolver {
         Self {
             resolver: ArcSwapOption::empty(),
             system: OnceLock::new(),
+            plain: ArcSwapOption::empty(),
         }
     }
 
@@ -444,6 +494,36 @@ impl DnsResolver {
         self.resolver.load().is_some()
     }
 
+    /// Install a caller-owned transport (a tunnel) that takes precedence.
+    pub fn set_plain_resolver(&self, resolver: Arc<dyn PlainResolver>) {
+        self.plain.store(Some(Arc::new(PlainEntry {
+            resolver,
+            last_success: Mutex::new(None),
+            fallback_used: AtomicBool::new(false),
+        })));
+    }
+
+    /// Remove the caller-owned transport (session end).
+    pub fn clear_plain_resolver(&self) {
+        self.plain.store(None);
+    }
+
+    /// Whether a caller-owned transport is installed.
+    #[must_use]
+    pub fn has_plain_resolver(&self) -> bool {
+        self.plain.load().is_some()
+    }
+
+    /// Mark the plain transport as freshly successful (tests and the
+    /// `WireGuard` session's first answer).
+    #[cfg(test)]
+    fn force_plain_last_success(&self, ago: Duration) {
+        if let Some(entry) = self.plain.load_full() {
+            *entry.last_success.lock().expect("plain liveness lock") =
+                Instant::now().checked_sub(ago);
+        }
+    }
+
     /// Resolves `hostname`, returning all addresses as a boxed slice — one
     /// contiguous allocation, no growth headroom, so cache and callers hold
     /// exactly the answer. IPv6 results are included when `allow_ipv6`.
@@ -452,13 +532,65 @@ impl DnsResolver {
         hostname: &str,
         allow_ipv6: bool,
     ) -> anyhow::Result<Box<[IpAddr]>> {
+        self.lookup_ip_scoped(hostname, allow_ipv6)
+            .await
+            .map(|(ips, _)| ips)
+    }
+
+    /// Resolve `hostname` and report which path answered.
+    ///
+    /// The caller-owned transport wins while it is alive: a resolver that
+    /// answered inside [`RESOLVER_ALIVE_WINDOW`] keeps its errors (a broken
+    /// tunnel is an error, not a silent local lookup). Only a transport with
+    /// no answer inside the window falls through to the pool or the system
+    /// resolver — the one fallback the policy allows.
+    pub async fn lookup_ip_scoped(
+        &self,
+        hostname: &str,
+        allow_ipv6: bool,
+    ) -> anyhow::Result<(Box<[IpAddr]>, DnsScope)> {
         if let Ok(ip) = hostname.parse::<IpAddr>() {
-            return Ok(vec![ip].into_boxed_slice());
+            return Ok((vec![ip].into_boxed_slice(), DnsScope::Tunnel));
         }
-        let Some(resolver) = self
-            .resolver
-            .load_full()
-            .or_else(|| self.system.get_or_init(build_system_resolver).clone())
+        if let Some(entry) = self.plain.load_full() {
+            let last_success = *entry.last_success.lock().expect("plain liveness lock");
+            match entry.resolver.lookup(hostname, allow_ipv6).await {
+                Ok(mut ips) => {
+                    if !allow_ipv6 {
+                        ips.retain(IpAddr::is_ipv4);
+                    }
+                    if ips.is_empty() {
+                        anyhow::bail!("{hostname}: the tunnel resolver returned no address");
+                    }
+                    *entry.last_success.lock().expect("plain liveness lock") = Some(Instant::now());
+                    return Ok((ips.into_boxed_slice(), DnsScope::Tunnel));
+                }
+                Err(error) => {
+                    let alive = last_success.is_some_and(|at| at.elapsed() < RESOLVER_ALIVE_WINDOW);
+                    if alive {
+                        return Err(error);
+                    }
+                    // No answer inside the window: the transport is not alive,
+                    // so the local pool takes this lookup — once per installed
+                    // resolver, and never silently (the leak is bounded and
+                    // reported, `spec 2026-11-26 §3.7`).
+                    if !entry.fallback_used.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            host = hostname,
+                            "dns: no tunnel resolver alive; resolving locally"
+                        );
+                    }
+                }
+            }
+        }
+        let pool = self.resolver.load_full();
+        let scope = if pool.is_some() {
+            DnsScope::Pool
+        } else {
+            DnsScope::System
+        };
+        let Some(resolver) =
+            pool.or_else(|| self.system.get_or_init(build_system_resolver).clone())
         else {
             anyhow::bail!(
                 "no resolver pool installed and the OS resolver configuration is unreadable"
@@ -470,7 +602,7 @@ impl DnsResolver {
             .iter()
             .filter(|ip| allow_ipv6 || ip.is_ipv4())
             .collect();
-        Ok(ips.into_boxed_slice())
+        Ok((ips.into_boxed_slice(), scope))
     }
 }
 
@@ -482,6 +614,111 @@ impl Default for DnsResolver {
 
 #[cfg(test)]
 mod tests {
+    use super::{DnsResolver, DnsScope, PlainResolver, RESOLVER_ALIVE_WINDOW};
+    use std::future::Future;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A plain transport whose answer is scripted, so each policy branch is
+    /// reachable without a tunnel or a network.
+    struct FakePlain {
+        answer: Mutex<Result<Vec<IpAddr>, String>>,
+    }
+
+    impl FakePlain {
+        fn new(answer: Result<Vec<IpAddr>, &str>) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Mutex::new(answer.map_err(str::to_string)),
+            })
+        }
+
+        fn set(&self, answer: Result<Vec<IpAddr>, &str>) {
+            *self.answer.lock().unwrap() = answer.map_err(str::to_string);
+        }
+    }
+
+    impl PlainResolver for FakePlain {
+        fn lookup<'a>(
+            &'a self,
+            _hostname: &'a str,
+            _ipv6: bool,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<IpAddr>>> + Send + 'a>> {
+            Box::pin(async move {
+                match &*self.answer.lock().unwrap() {
+                    Ok(ips) => Ok(ips.clone()),
+                    Err(error) => anyhow::bail!("{error}"),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_tunnel_answers_and_new_answers_refresh_its_liveness() {
+        let resolver = DnsResolver::new();
+        let plain = FakePlain::new(Ok(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]));
+        resolver.set_plain_resolver(plain.clone());
+        let (ips, scope) = resolver
+            .lookup_ip_scoped("example.com", true)
+            .await
+            .unwrap();
+        assert_eq!(ips.as_ref(), &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]);
+        assert_eq!(scope, DnsScope::Tunnel);
+
+        // The stamp pool is empty, so a failure AFTER a success cannot be a
+        // fallback: it is a live tunnel's error.
+        plain.set(Err("tunnel down"));
+        let error = resolver.lookup_ip("example.com", true).await.unwrap_err();
+        assert!(error.to_string().contains("tunnel down"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_with_no_answer_in_the_window_falls_back_locally() {
+        let resolver = DnsResolver::new();
+        let plain = FakePlain::new(Err("never answered"));
+        resolver.set_plain_resolver(plain);
+        // No success was ever stamped, so the local path runs. A host with a
+        // usable resolv.conf resolves (System scope); one without reports the
+        // missing pool. Either way the answer is not the tunnel's.
+        match resolver.lookup_ip_scoped("example.com", true).await {
+            Ok((_, scope)) => assert_ne!(scope, DnsScope::Tunnel),
+            Err(error) => assert!(
+                !error.to_string().contains("never answered"),
+                "the local path must be attempted, got the tunnel's error: {error}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_success_is_not_liveness() {
+        let resolver = DnsResolver::new();
+        let plain = FakePlain::new(Err("stale"));
+        resolver.set_plain_resolver(plain);
+        resolver.force_plain_last_success(RESOLVER_ALIVE_WINDOW + Duration::from_secs(1));
+        // Stale stamp + failure => the local path, not the tunnel's error.
+        match resolver.lookup_ip_scoped("example.com", true).await {
+            Ok((_, scope)) => assert_ne!(scope, DnsScope::Tunnel),
+            Err(error) => assert!(
+                !error.to_string().contains("stale"),
+                "a stale stamp must not surface the tunnel's error: {error}"
+            ),
+        }
+
+        // A fresh stamp makes the same failure the tunnel's own.
+        resolver.force_plain_last_success(Duration::from_secs(1));
+        let error = resolver.lookup_ip("example.com", true).await.unwrap_err();
+        assert!(error.to_string().contains("stale"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_ip_literal_never_leaves_the_tunnel_scope() {
+        let resolver = DnsResolver::new();
+        let (ips, scope) = resolver.lookup_ip_scoped("192.0.2.7", false).await.unwrap();
+        assert_eq!(ips.as_ref(), &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))]);
+        assert_eq!(scope, DnsScope::Tunnel);
+    }
+
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

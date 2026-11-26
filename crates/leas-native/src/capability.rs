@@ -49,17 +49,19 @@ use crate::protocol::ss::resolve_method;
 /// `app_meta.capability_version` clears the persisted "not testable" verdicts
 /// once per revision (`Database::clear_stale_capability_verdicts`).
 ///
-/// Revision 3: TUIC v5 rows are native (TCP + both UDP lanes); revision 2
-/// added Hysteria2 obfs-shape refusal.
-pub const SUPPORT_REVISION: i64 = 3;
+/// Revision 4: `WireGuard` rows are native (an L3 outbound: the device owns a
+/// userspace stack, spec `2026-11-26-wireguard-native`); revision 3 made TUIC
+/// v5 rows native, revision 2 added the Hysteria2 obfs-shape refusal.
+pub const SUPPORT_REVISION: i64 = 4;
 
-/// The protocols with a native implementation, in canonical order.
+/// The protocols with a native implementation, in canonical display order.
 ///
-/// Must stay exactly `[Vless, Vmess, Trojan, Hysteria2, Shadowsocks,
-/// Shadowsocks2022, AnyTls]` — the e2e-verified protocols the TUI may
-/// Auto-resolve onto native. The two Shadowsocks kinds are separate entries because the
-/// typed kind carries the cipher family (`2022-blake3-*` → `Shadowsocks2022`)
-/// even though both share one [`SsConfig`].
+/// The connect-time authority is [`kind_supported`] plus [`support_reason`];
+/// this list is the ordered roster other agents read (and the TUI sorts by).
+/// The two Shadowsocks kinds are separate entries because the typed kind
+/// carries the cipher family (`2022-blake3-*` → `Shadowsocks2022`) even though
+/// both share one [`SsConfig`]; `Socks` is admitted by the gate but is a
+/// proxy inbound kind, not a tunnel to advertise here.
 pub const NATIVE_KINDS: &[ProtocolKind] = &[
     ProtocolKind::Vless,
     ProtocolKind::Vmess,
@@ -69,6 +71,7 @@ pub const NATIVE_KINDS: &[ProtocolKind] = &[
     ProtocolKind::Shadowsocks2022,
     ProtocolKind::AnyTls,
     ProtocolKind::Tuic,
+    ProtocolKind::WireGuard,
 ];
 
 /// True when the protocol kind has a native implementation at all.
@@ -95,6 +98,9 @@ pub const fn kind_supported(kind: ProtocolKind) -> bool {
             // flip (spec `2026-11-19-probe-truth` S8). TCP CONNECT only: the
             // proxy UDP leg is not implemented, as the module docs say.
             | ProtocolKind::Socks
+            // WireGuard: a device tunnel (spec `2026-11-26-wireguard-native`).
+            // Config-level refusals live in `wireguard_reason`.
+            | ProtocolKind::WireGuard
     )
 }
 
@@ -169,8 +175,44 @@ pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow
         // make the row undialable (spec `2026-11-19-probe-truth` S8 — the
         // oracle row proves the wire before the gate admits the kind).
         (ProtocolKind::Socks, ProtocolConfig::Socks(_)) => None,
+        (ProtocolKind::WireGuard, ProtocolConfig::Wireguard(cfg)) => wireguard_reason(cfg),
         _ => Some(Cow::Borrowed("protocol kind and config type do not match")),
     }
+}
+
+/// A `WireGuard` row the device cannot build: keys that do not decode, no
+/// usable interface address, or a `dns` entry that is not an address.
+///
+/// The MTU is clamped, never refused (the reference clamps too).
+fn wireguard_reason(cfg: &leas_proto::proto_spec::WireguardConfig) -> Option<Cow<'static, str>> {
+    if let Err(error) = crate::protocol::wireguard::keys::decode_private(&cfg.private_key) {
+        return Some(Cow::Owned(format!("wireguard private key: {error}")));
+    }
+    if let Err(error) = crate::protocol::wireguard::keys::decode_public(&cfg.public_key) {
+        return Some(Cow::Owned(format!("wireguard public key: {error}")));
+    }
+    if let Some(psk) = cfg
+        .preshared_key
+        .as_deref()
+        .filter(|psk| !psk.trim().is_empty())
+        && let Err(error) = crate::protocol::wireguard::keys::decode_preshared(psk)
+    {
+        return Some(Cow::Owned(format!("wireguard preshared key: {error}")));
+    }
+    if crate::protocol::wireguard::pool::parse_addresses_for_gate(&cfg.address).is_err() {
+        return Some(Cow::Borrowed(
+            "wireguard address is empty or not an interface address",
+        ));
+    }
+    if let Some(dns) = &cfg.dns
+        && dns
+            .iter()
+            .filter(|entry| !entry.trim().is_empty())
+            .any(|entry| entry.trim().parse::<std::net::IpAddr>().is_err())
+    {
+        return Some(Cow::Borrowed("wireguard dns entry is not an IP address"));
+    }
+    None
 }
 
 /// TLS/REALITY knobs the native engine cannot honour. Every arm is a named
@@ -899,6 +941,7 @@ mod tests {
                 ProtocolKind::Shadowsocks2022,
                 ProtocolKind::AnyTls,
                 ProtocolKind::Tuic,
+                ProtocolKind::WireGuard,
             ]
         );
     }
@@ -1354,11 +1397,67 @@ mod tests {
         );
     }
 
+    /// The `WireGuard` gate is value-bearing: a decodable row with an
+    /// interface address is served; a bad key or address is refused by name.
+    #[test]
+    fn a_wireguard_row_is_gated_on_its_own_shape() {
+        use base64::Engine as _;
+        let encode = |bytes: [u8; 32]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let key = encode([7u8; 32]);
+        let mut cfg = leas_proto::proto_spec::WireguardConfig {
+            private_key: key.clone(),
+            security: leas_proto::proto_spec::SecurityConfig::default(),
+            address: "172.16.0.2/32".into(),
+            public_key: encode([9u8; 32]),
+            preshared_key: None,
+            reserved: None,
+            mtu: None,
+            persistent_keepalive: None,
+            dns: None,
+            remote_dns_resolve: None,
+            remarks: None,
+        };
+        assert_eq!(
+            support_reason(
+                ProtocolKind::WireGuard,
+                &ProtocolConfig::Wireguard(cfg.clone())
+            )
+            .map(std::borrow::Cow::into_owned),
+            None,
+            "a decodable row with an address must reach the dial"
+        );
+
+        cfg.private_key = "not-a-key".into();
+        let reason = support_reason(
+            ProtocolKind::WireGuard,
+            &ProtocolConfig::Wireguard(cfg.clone()),
+        )
+        .map(std::borrow::Cow::into_owned)
+        .expect("a bad key is refused");
+        assert!(reason.contains("wireguard private key"), "{reason}");
+
+        cfg.private_key = key;
+        cfg.address = leas_proto::urlx::TinyText::from("");
+        let reason = support_reason(
+            ProtocolKind::WireGuard,
+            &ProtocolConfig::Wireguard(cfg.clone()),
+        )
+        .map(std::borrow::Cow::into_owned)
+        .expect("no address is refused");
+        assert!(reason.contains("wireguard address"), "{reason}");
+
+        cfg.address = leas_proto::urlx::TinyText::from("172.16.0.2/32");
+        cfg.dns = Some(vec!["tls://1.1.1.1".into()]);
+        let reason = support_reason(ProtocolKind::WireGuard, &ProtocolConfig::Wireguard(cfg))
+            .map(std::borrow::Cow::into_owned)
+            .expect("a non-IP dns entry is refused");
+        assert!(reason.contains("wireguard dns"), "{reason}");
+    }
+
     #[test]
     fn non_native_kinds_unsupported() {
         let non_native = [
             ProtocolKind::Http,
-            ProtocolKind::WireGuard,
             ProtocolKind::DokodemoDoor,
             ProtocolKind::Freedom,
             ProtocolKind::Blackhole,
@@ -1376,7 +1475,7 @@ mod tests {
             ProtocolKind::TProxy,
             ProtocolKind::Mixed,
         ];
-        assert_eq!(non_native.len(), 18);
+        assert_eq!(non_native.len(), 17);
         let fallback = ProtocolConfig::Vless(vless_cfg());
         for kind in non_native {
             assert!(!kind_supported(kind), "{kind:?}");

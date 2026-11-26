@@ -118,6 +118,11 @@ pub(crate) async fn dial(
             if let Some(reason) = crate::capability::support_reason(proxy.kind, &proxy.protocol) {
                 return Err(NativeError::Config(reason.into_owned()));
             }
+            // A layer-3 row has no stream to dial: it opens a flow on the
+            // profile's shared device instead (spec 2026-11-26 §3.4).
+            if proxy.kind == leas_proto::proto_spec::ProtocolKind::WireGuard {
+                return crate::protocol::wireguard::pool::open(proxy, target).await;
+            }
             // ONE predicate for both families, so VLESS and a plugin row cannot
             // drift: effective mux → a pooled carrier session (the row's
             // request wins; otherwise the profile default applies to VLESS);
@@ -592,6 +597,48 @@ mod tests {
     ///
     /// So this drives `dial` itself, against accept-and-record listeners: the
     /// mismatched kind must be refused by the family's own rule and open no
+    /// A `WireGuard` row is refused by its own value-bearing gate and never by
+    /// `KIND_UNSUPPORTED_REASON` / `protocol::connect`'s `not_impl` arm.
+    #[tokio::test]
+    async fn a_wireguard_row_is_dispatched_to_the_device_pool() {
+        use leas_proto::proto_spec::{ProtocolKind, WireguardConfig};
+
+        let mut cfg = WireguardConfig {
+            private_key: "not-a-key".into(),
+            security: SecurityConfig::default(),
+            address: leas_proto::urlx::TinyText::from("172.16.0.2/32"),
+            public_key: "not-a-key".into(),
+            preshared_key: None,
+            reserved: None,
+            mtu: None,
+            persistent_keepalive: None,
+            dns: None,
+            remote_dns_resolve: None,
+            remarks: None,
+        };
+        // A decodable public key keeps the gate on the private key's error.
+        cfg.public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into();
+        let outbound = super::OutboundKind::Proxy(Box::new(super::ProxyOutbound {
+            protocol: ProtocolConfig::Wireguard(cfg),
+            kind: ProtocolKind::WireGuard,
+            server: EndpointEssentials::new("127.0.0.1", 9),
+            resolved_ip: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9))),
+        }));
+        let target = TargetAddr::new(Host::Domain("example.com".into()), 80);
+        let pool = crate::mux_pool::MuxPool::new();
+        let policy = crate::mux_pool::MuxPolicy::default();
+        let Err(error) = super::dial(&outbound, &target, &pool, &policy).await else {
+            panic!("a bad key cannot produce a stream");
+        };
+        let text = error.to_string();
+        assert!(
+            text.contains("wireguard private key"),
+            "the wireguard gate must own the refusal, got: {text}"
+        );
+        assert!(!text.contains("no native implementation"), "{text}");
+        assert!(!text.contains("not implemented"), "{text}");
+    }
+
     /// socket; the matching kind must get all the way to connecting.
     #[tokio::test]
     async fn the_outbound_kind_is_what_the_gate_actually_reads() {

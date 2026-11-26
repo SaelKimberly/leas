@@ -159,7 +159,7 @@ The xray-core and sing-box columns describe the pinned reference trees under `th
 | SOCKS (client) | yes | yes | done | n/a | n/a | no (tier 1) |
 | HTTP (client) | yes | yes | planned | n/a | n/a | planned |
 | ShadowsocksR | no | yes | planned | n/a | n/a | planned |
-| WireGuard | yes | yes | planned | n/a | n/a | planned |
+| WireGuard | yes | yes | done | n/a | n/a | done (`protocol/wireguard/`; ADR 0019) |
 | Hysteria2 | yes | yes | done | blocked (QUIC) | n/a | done |
 | Hysteria1 | no | yes | planned | blocked (QUIC) | n/a | planned |
 | TUIC | no | yes | done | blocked (QUIC) | n/a | done |
@@ -180,7 +180,7 @@ Matrix notes:
 - **Shadowsocks** has no transport dimension: `SsConfig` carries no transport field, so the row is a plain TCP dial plus the `security` layer the chain applies outside the protocol. The accessor is `SsConfig::security()` in `crates/leas-proto/src/proto_spec/ss.rs`; while it was missing, the trait default (`None`) silently dropped a requested TLS layer and the handshake went out in the clear to a TLS listener.
 - **Redirect, TProxy and Mixed** are outbound-only kinds: kernel or port forwarding with no client handshake of their own. The native `connect` is trivially a dial, but the `ConnectShape` path must exist first. The mixed *listener* is separate and implemented (`inbound/mixed.rs`).
 - **Tor** is a full onion-routing stack (circuits, cell crypto, directory protocol). It stays out of the in-process core: a Tor profile remains visible and refuses connect with `support_reason`, never a hidden row or a silent fallback.
-- **SSH, Tailscale and WireGuard** are device-tunnel or own-handshake shapes: divergent `connect()` paths, not the uniform pipeline.
+- **SSH, Tailscale and WireGuard** are device-tunnel or own-handshake shapes: divergent `connect()` paths, not the uniform pipeline. WireGuard is implemented that way: `ConnectShape::DeviceTunnel` dispatches to `protocol/wireguard/pool`, which owns a `smoltcp` device per profile identity (ADR 0019).
 
 ### Per-protocol detail
 
@@ -263,7 +263,7 @@ Matrix notes:
 |------|-------|--------|
 | HTTP client | Uniform pipeline over TCP | planned: `protocol/http/mod.rs` is a placeholder; the HTTP *inbound* is implemented |
 | ShadowsocksR | Uniform pipeline plus obfs and auth plugins | planned: sing-box only; the plugin matrix is the bulk |
-| WireGuard | Device tunnel | planned: needs a TUN or userspace device abstraction; `ConnectShape` is divergent |
+| WireGuard | Device tunnel | done: sans-I/O `core/` + `smoltcp 0.14` (`Medium::Ip`) driver + `WgPool`; single-link chains only (ADR 0019) |
 | Hysteria1 | QUIC dial | planned: sing-box only; blocked on a general QUIC client transport |
 | Naive | HTTP/2 CONNECT with Chromium semantics | planned: the TLS engine is ready; needs a full HTTP/2 client (the current `http2/` layer is grader-minimal) |
 | ShadowTLS | Uniform pipeline over TLS | planned: the TLS engine is ready |

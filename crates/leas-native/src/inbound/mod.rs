@@ -1557,15 +1557,19 @@ async fn run_proxy_leg(
     mut queue: mpsc::Receiver<ProxyDatagram>,
 ) {
     let mut params = outbound::proxy_udp_params(&proxy, &session_target);
-    // Resolved once, for reply headers from a carrier that reports no
-    // per-packet address (and for the sbox UDP destination check). A domain
-    // that will not resolve costs only those replies (the tunnel itself
-    // carries the domain).
-    let session_addr = resolve_cached(&dns_cache, &session_target).await;
     // A VLESS row with effective mux rides a pooled carrier (A12): XUDP on the
     // mux.cool wire, a UDP stream on an sbox wire. The lease holds the carrier
     // for this association's lifetime. A plugin row's mux is TCP-only.
     let pooled = crate::mux_pool::effective_udp_mux(&params, &mux_policy);
+    // Only the pooled carrier needs the target's address before its tunnel
+    // exists (it names the destination on the wire). Every other carrier is
+    // resolved after the tunnel opens, through its own resolver when it has
+    // one — a `WireGuard` association must never ask the host for the name.
+    let session_addr = if pooled {
+        resolve_cached(&dns_cache, &session_target).await
+    } else {
+        None
+    };
     // The mux tunnel only carries XUDP; the raw tunnel only Raw. One mode,
     // chosen by the same predicate that chose the carrier (`connect_mux`
     // refuses a mismatched mode rather than silently dropping it).
@@ -1597,6 +1601,21 @@ async fn run_proxy_leg(
         Err(error) => {
             tracing::debug!(%error, "socks5 inbound: proxy udp tunnel cannot be split");
             return;
+        }
+    };
+    // Resolved once, for reply headers from a carrier that reports no
+    // per-packet address (and for the sbox UDP destination check). The
+    // carrier's own resolver wins: a WireGuard association resolves through
+    // the tunnel, never through the host.
+    let carrier_resolver = writer.resolver();
+    let session_addr = if carrier_resolver.is_some() {
+        // Tunnel-only: an unresolvable target drops the association rather
+        // than leaking the name to the host resolver.
+        resolve_via_resolver(carrier_resolver, &dns_cache, &session_target).await
+    } else {
+        match session_addr {
+            Some(addr) => Some(addr),
+            None => resolve_cached(&dns_cache, &session_target).await,
         }
     };
 
@@ -1669,7 +1688,9 @@ async fn run_proxy_leg(
         let per_packet = if datagram.dest == session_target {
             None
         } else {
-            let Some(addr) = resolve_cached(&dns_cache, &datagram.dest).await else {
+            let Some(addr) =
+                resolve_via_resolver(writer.resolver(), &dns_cache, &datagram.dest).await
+            else {
                 tracing::debug!(?datagram.dest, "socks5 inbound: proxy udp dest unresolvable");
                 if let Some(trace) = &trace {
                     trace.telemetry.udp_dropped(Some(&host), len);
@@ -1734,6 +1755,54 @@ type DnsCache = parking_lot::Mutex<Vec<(Box<str>, u16, Vec<SocketAddr>, Instant)
 
 /// Cache entries kept per association; the oldest is dropped when full.
 const DNS_CACHE_MAX: usize = 64;
+
+/// Resolve a destination, preferring the carrier's own resolver.
+///
+/// A `WireGuard` association answers through its tunnel resolver; every other
+/// carrier sends the name to the proxy, so this falls back to the association
+/// cache exactly as before.
+async fn resolve_via_resolver(
+    resolver: Option<std::sync::Arc<leas_dns::DnsResolver>>,
+    cache: &DnsCache,
+    target: &TargetAddr,
+) -> Option<SocketAddr> {
+    if let Host::Domain(domain) = &target.host
+        && let Some(dns) = resolver
+    {
+        // A SOCKS5 UDP client may name a destination on every datagram: cache
+        // the tunnel answer like a local one, or each datagram costs a full
+        // resolution through the tunnel.
+        if let Some(cached) = cached_domain(cache, domain, target.port) {
+            return Some(cached);
+        }
+        // The carrier has its own resolver: take its answer, never a host
+        // lookup. `leas-dns` returns the tunnel's error while it is alive and
+        // applies the permitted local fallback only when it is not.
+        let addrs: Vec<SocketAddr> = dns
+            .lookup_ip_scoped(domain, true)
+            .await
+            .ok()?
+            .0
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, target.port))
+            .collect();
+        let first = *addrs.first()?;
+        {
+            let mut entries = cache.lock();
+            if entries.len() >= DNS_CACHE_MAX {
+                entries.remove(0);
+            }
+            entries.push((
+                Box::from(domain.as_str()),
+                target.port,
+                addrs,
+                Instant::now(),
+            ));
+        }
+        return Some(first);
+    }
+    resolve_cached(cache, target).await
+}
 
 /// Resolve a datagram destination. `None` = unresolvable.
 async fn resolve_cached(cache: &DnsCache, target: &TargetAddr) -> Option<SocketAddr> {

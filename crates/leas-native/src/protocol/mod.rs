@@ -270,6 +270,9 @@ pub enum PacketTunnel {
     /// A sing-box/mihomo sbox UDP association (length-prefixed datagrams on a
     /// session stream).
     Sbox(crate::transport::sbox::udp::SboxUdpTunnel),
+    /// A `WireGuard` association: each datagram is a full inner IP/UDP packet
+    /// over the profile's device (`spec 2026-11-26 §3.6`).
+    WireGuard(crate::protocol::wireguard::stack::WgUdpConn),
 }
 
 impl PacketTunnel {
@@ -300,6 +303,7 @@ impl PacketTunnel {
             Self::AnyTls(c) => c.send(dest, payload).await,
             Self::Tuic(c) => c.send(dest, payload).await,
             Self::Sbox(c) => c.send(dest, payload).await,
+            Self::WireGuard(c) => c.send(dest, payload),
         }
     }
 
@@ -320,6 +324,7 @@ impl PacketTunnel {
             Self::AnyTls(c) => to_bytes(c.recv().await),
             Self::Tuic(c) => c.recv().await,
             Self::Sbox(c) => c.recv().await,
+            Self::WireGuard(c) => c.recv().await,
         }
     }
 }
@@ -337,6 +342,8 @@ pub enum PacketReader {
     Tuic(tuic::udp::UdpReader),
     /// sbox UDP association reader.
     Sbox(crate::transport::sbox::udp::SboxUdpReader),
+    /// `WireGuard` association reader.
+    WireGuard(crate::protocol::wireguard::stack::WgUdpReader),
 }
 
 /// The write half of a split [`PacketTunnel`] — see [`PacketTunnel::split`].
@@ -352,6 +359,8 @@ pub enum PacketWriter {
     Tuic(tuic::udp::UdpWriter),
     /// sbox UDP association writer.
     Sbox(crate::transport::sbox::udp::SboxUdpWriter),
+    /// `WireGuard` association writer.
+    WireGuard(crate::protocol::wireguard::stack::WgUdpWriter),
 }
 
 impl PacketTunnel {
@@ -405,6 +414,10 @@ impl PacketTunnel {
                 let (r, w) = c.split();
                 Ok((PacketReader::Sbox(r), PacketWriter::Sbox(w)))
             }
+            Self::WireGuard(c) => {
+                let (r, w) = c.split();
+                Ok((PacketReader::WireGuard(r), PacketWriter::WireGuard(w)))
+            }
         }
     }
 }
@@ -428,6 +441,7 @@ impl PacketReader {
             Self::AnyTls(r) => to_bytes(r.recv().await),
             Self::Tuic(r) => r.recv().await,
             Self::Sbox(r) => r.recv().await,
+            Self::WireGuard(r) => r.recv().await,
         }
     }
 }
@@ -440,13 +454,28 @@ fn to_bytes(
 }
 
 impl PacketWriter {
+    /// The carrier's own resolver, when it has one.
+    ///
+    /// Only the `WireGuard` device carries a resolver; every stream carrier
+    /// sends the name to the proxy, so the host never needs to resolve it. The
+    /// Arc is handed out instead of a borrow so the resolve future stays
+    /// `Send` even though `PacketWriter` itself is not `Sync` (the stream
+    /// carrier halves are not).
+    #[must_use]
+    pub fn resolver(&self) -> Option<std::sync::Arc<leas_dns::DnsResolver>> {
+        match self {
+            Self::WireGuard(w) => w.resolver(),
+            _ => None,
+        }
+    }
+
     /// Whether this carrier needs an explicit destination on every datagram.
     ///
     /// XUDP's first `New` frame names the association, so the relay's `None`
     /// shortcut (same destination as the session) is not valid there.
     #[must_use]
     pub const fn requires_destination(&self) -> bool {
-        matches!(self, Self::VlessXudp(_))
+        matches!(self, Self::VlessXudp(_) | Self::WireGuard(_))
     }
 
     /// Send one datagram — the same contract as [`PacketTunnel::send`].
@@ -473,6 +502,7 @@ impl PacketWriter {
             Self::AnyTls(w) => w.send(dest, payload).await,
             Self::Tuic(w) => w.send(dest, payload).await,
             Self::Sbox(w) => w.send(dest, payload).await,
+            Self::WireGuard(w) => w.send(dest, payload),
         }
     }
 }
@@ -532,6 +562,11 @@ pub async fn connect_udp(
         ProtocolConfig::AnyTls(cfg) => Ok(PacketTunnel::AnyTls(
             anytls::connect_udp(ctx, stream, cfg).await?,
         )),
+        // WireGuard is a device tunnel: `connect_chain_udp` opens the
+        // association on the device before any transport is dialled.
+        ProtocolConfig::Wireguard(_) => Err(NativeError::NotImplemented {
+            feature: "wireguard udp under the stream phase (use connect_chain_udp)".into(),
+        }),
         // SOCKS5 UDP (ASSOCIATE) datagrams ride a raw UDP socket to the proxy,
         // not this byte stream — a divergent shape with no PacketTunnel here.
         ProtocolConfig::Socks(_) => Err(NativeError::NotImplemented {

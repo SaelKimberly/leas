@@ -74,6 +74,30 @@ zeroize.workspace = true
 # CSPRNG for per-connection VMess session material (same provider rustls uses)
 ring.workspace = true
 
+# WireGuard: the X25519 agreement the handshake is built on (workspace pin:
+# static_secrets + zeroize). No new primitive — BLAKE2s, ChaCha20-Poly1305 and
+# HMAC are already dependencies, and base64 above serves the key encoding too.
+x25519-dalek.workspace = true
+
+# WireGuard target DNS: leas-dns owns the policy and the liveness window, the
+# tunnel supplies the transport (its own UDP flow over smoltcp). The seam is
+# `anyhow`-typed by its owner, so this crate takes `anyhow` for that trait only.
+leas-dns = { version = "0.1", path = "../leas-dns" }
+anyhow.workspace = true
+
+# WireGuard's inner IP stack. `#![deny(unsafe_code)]` in the crate; the
+# `phy-sys` (TUN/raw socket) features stay off, so the unsafe surface is not
+# compiled. `medium-ip` = no Ethernet framing, which is what an L3 tunnel is.
+smoltcp = { version = "0.14.0", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+    "iface-max-addr-count-2",
+] }
+
 # WebSocket transport framing (RFC 6455) over the engine stream — no TLS
 tokio-tungstenite = "0.30.0"
 futures-core = "0.3.34"
@@ -159,6 +183,9 @@ name = "hysteria2_obfs"
 harness = false
 
 [dev-dependencies]
+# The WireGuard end-to-end row's real peer (`tests/wireguard_e2e.rs`): a
+# responder without a TUN device or CAP_NET_ADMIN. Test-only by ADR 0019.
+boringtun = { version = "0.7.1", default-features = false }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # serde_json/rcgen are used by lib unit tests in
 # security/transport/context/chain; dev-deps make them available to lib unit

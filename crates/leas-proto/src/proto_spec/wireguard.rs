@@ -600,7 +600,11 @@ fn wg_endpoint(host: &str, port: u16) -> String {
 /// rejects any other length at config load
 /// (`infra/conf/wireguard.go`: `"reserved" should be empty or 3 bytes`), so a
 /// malformed value is skipped rather than hard-failing the whole outbound.
-fn parse_reserved_bytes(raw: &str) -> Option<Vec<u8>> {
+///
+/// Shared with the native dialler: a value of any other length is `None` (the
+/// reference rejects it too), never truncated.
+#[must_use]
+pub fn parse_reserved_bytes(raw: &str) -> Option<Vec<u8>> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;

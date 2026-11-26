@@ -198,7 +198,7 @@ pub use vless::{
 };
 pub use vless::{MuxWire, VlessMux};
 pub use vmess::VmessConfig;
-pub use wireguard::WireguardConfig;
+pub use wireguard::{WireguardConfig, parse_reserved_bytes};
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error("invalid host: {0}")]

@@ -165,7 +165,7 @@ wire path (P0/P1/P3); their pins are not bumped.
 | P1 record Sans-I/O | executed | `7633816e` (`record::engine`, exact-read adapter, legacy path deleted) |
 | P2 batching/spec cache | executed | `d4f7f1fe` (32 KiB batches, shared `Arc` spec) |
 | P2 HelloCaps | executed | `3df30938` (const masks, generator, roster gate, REALITY candidate filter) |
-| P1 differential harness | **not executed** | The old async `drive` was deleted, so a byte-identical old/new replay is not possible; coverage is state replay tests (HRR, TLS 1.2 handoff, ECH reject, ALPS) plus one bounded fuzz test. |
+| P1 differential harness | **not executed** | The old async `drive` was deleted, so a byte-identical old/new replay is no longer possible; the state machine has replay/fuzz unit tests instead. |
 | P1 bounded fuzz | executed | `arbitrary_bytes_never_panic_or_grow_unbounded` feeds 512 random chunks to `Handshake::feed`. |
 | P1 handshake state machine | executed | `handshake::state::Handshake` drives plain TLS 1.3, HRR, ECH and REALITY with no tokio import; TLS 1.2 is a typed handoff to the 1.2 flight. `drive`/`connect_inner` deleted; all callers use the state machine. |
 | P2 resumption | executed (opt-in) | Bounded ticket cache keyed by SNI+ALPN; TLS 1.3 PSK/binder offered only when `resumption` is on; resumed handshake skips the certificate flight. REALITY and ECH bypass resumption. Local rustls resumption test passes; the resumed JA4 is not roster-gated (opt-in changes the hello). |

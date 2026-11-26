@@ -190,12 +190,13 @@ pub fn quic_tls_config_alpns(
 
 /// Build-once cache behind [`quic_tls_config`].
 #[cfg(not(any(test, feature = "e2e-support")))]
-fn tls_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<(bool, Vec<Vec<u8>>), rustls::ClientConfig>>
-{
-    static CACHE: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashMap<(bool, Vec<Vec<u8>>), rustls::ClientConfig>>,
-    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+type TlsCache =
+    std::sync::Mutex<std::collections::HashMap<(bool, Vec<Vec<u8>>), rustls::ClientConfig>>;
+
+#[cfg(not(any(test, feature = "e2e-support")))]
+fn tls_cache() -> &'static TlsCache {
+    static CACHE: std::sync::LazyLock<TlsCache> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     &CACHE
 }
 
