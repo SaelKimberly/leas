@@ -856,6 +856,20 @@ fn test_cell_content(facts: &RealCellFacts<'_>, theme: &opaline::Theme) -> (Stri
     if facts.dns.is_dns && !facts.dns.resolved && !facts.transport_measured {
         return (format!("[{}]", center_cell("name", 4)), bad);
     }
+    if let Some(label) = facts.purged {
+        // Only reachable when every link of the endpoint is purged (the Active
+        // view does not load a purged link beside a live one), so this is the
+        // Purgatory/All row: the verdict is what the row IS.
+        //
+        // This outranks `untestable` (ADR 0003 amendment, 2026-11-26): a
+        // retired row keeps the marker text its refusal wrote — the purge step
+        // sets `purge_reason` and leaves `error_text` intact — so checking
+        // `untestable` first made every retired row wear `[n-a]` and hid the
+        // stronger, later verdict. 84 of the 160 marker rows in the 2026-11-26
+        // audit were already `config_invalid`; `[n-a]` is for a LIVE row the
+        // engine cannot serve.
+        return (format!("[{}]", center_cell(label, 4)), bad);
+    }
     if facts.untestable {
         // The native engine cannot test this row: the marker is a status about
         // the row, not a failed attempt, so it outranks a stored delay the same
@@ -873,12 +887,6 @@ fn test_cell_content(facts: &RealCellFacts<'_>, theme: &opaline::Theme) -> (Stri
         // applicable" state — the two say the same thing about the same row,
         // and one vocabulary for the concept is the point.
         return (format!("[{}]", center_cell("n-a", 4)), bad);
-    }
-    if let Some(label) = facts.purged {
-        // Only reachable when every link of the endpoint is purged (the Active
-        // view does not load a purged link beside a live one), so this is the
-        // Purgatory/All row: the verdict is what the row IS.
-        return (format!("[{}]", center_cell(label, 4)), bad);
     }
     if facts.dest {
         // The server accepted the config and the destination never answered
@@ -3218,6 +3226,39 @@ mod tests {
             &theme,
         );
         assert_eq!(t, " 12 ");
+    }
+
+    /// A retired row that also carries an untestable marker shows the verdict:
+    /// the purge verdict is later and stronger than the refusal it superseded
+    /// (ADR 0003 amendment, 2026-11-26). `[n-a]` stays for a live row.
+    #[test]
+    fn purge_label_outranks_the_untestable_marker() {
+        let theme = crate::ui::theme::load("tokyo-night").unwrap();
+        let (t, _) = test_cell_content(
+            &RealCellFacts {
+                dns: DnsFacts {
+                    is_dns: false,
+                    resolved: true,
+                },
+                untestable: true,
+                purged: Some("mitm"),
+                failure: Some(TestFailure::Real),
+                active_delay: None,
+                transport_measured: false,
+                dest: false,
+            },
+            &theme,
+        );
+        assert_eq!(t, "[mitm]", "the retirement is what the row IS");
+        let (t, _) = test_cell_content(
+            &RealCellFacts {
+                untestable: true,
+                purged: None,
+                ..Default::default()
+            },
+            &theme,
+        );
+        assert_eq!(t, "[ n-a]", "a live row keeps the refusal status");
     }
 
     #[test]

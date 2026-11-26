@@ -148,6 +148,11 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             rekey::rekey_once(conn).await?;
             // One-time VLESS encryption normalisation (spec D15 = A).
             rekey::normalize_encryption_once(conn).await?;
+            // One-time VLESS `flow` normalisation (`xtls-rprx-vision` with
+            // repeated `-udp443` suffixes, the `none` alias). Runs BEFORE
+            // `Database::open`'s purge steps, so a doubled suffix is repaired
+            // rather than retired by the deprecation scan.
+            rekey::normalize_flow_once(conn).await?;
             Ok(())
         }
         0 => {
@@ -185,6 +190,7 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
                 .await?;
             rekey::stamp(conn).await?;
             rekey::stamp_encryption_normalized(conn).await?;
+            rekey::stamp_flow_normalized(conn).await?;
             Ok(())
         }
         other => {
@@ -206,6 +212,7 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
                     ensure_raw_ddl(conn).await?;
                     rekey::rekey_once(conn).await?;
                     rekey::normalize_encryption_once(conn).await?;
+                    rekey::normalize_flow_once(conn).await?;
                     return Ok(());
                 }
             }

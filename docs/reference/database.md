@@ -339,11 +339,16 @@ routing engine must resolve.
 endpoints), `stability_seeded_v2` (the day-one stability seed has run), and one
 `tg_watermark:<group id>:<channel>` row per Telegram-channel group — the lowest message id
 that group has imported, which bounds the next crawl
-(`crates/leas/src/ops/telegram.rs`). Two one-time DATA steps stamp here too:
-`invalid_shapes_purged` (version 2, the ingest-gate sweep) and
+(`crates/leas/src/ops/telegram.rs`). One-time DATA steps stamp here too:
+`invalid_shapes_purged` (now version 4: the ingest-gate sweep, latest arm the VLESS
+`encryption` value), `deprecated_flows_purged` (version 1: the retired non-vision VLESS
+flows, a verdict of its own so the two lists stay separately reversible) and
 `capability_version` (`leas-native::capability::SUPPORT_REVISION`, which clears
 the persisted `not testable by the native engine:` verdicts once per revision).
-`identity_version` is the re-key marker, documented under the identity steps below.
+`identity_version` is the re-key marker, documented under the identity steps below;
+`vless_encryption_normalized` and `vless_flow_normalized` are the two marker-guarded
+config-normalisation re-keys (`schema::rekey`), which run before the two purge steps so a
+feed-junk suffix is repaired rather than retired.
 
 ### Derived state
 

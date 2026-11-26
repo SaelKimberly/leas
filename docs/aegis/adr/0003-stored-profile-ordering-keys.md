@@ -306,3 +306,22 @@ DNS endpoint is proven like an IP-literal one), because the flag's premise —
 `STAB_VERSION` 2 → 3: the band law is an input to the stored keys, so every
 stored `rank_bin` re-derives on the first open. The amendment to ADR 0001
 below and to `docs/reference/ordering-law.md` §6 carry the same correction.
+
+## Amendment — 2026-11-26: a purged row shows its verdict, not `[n-a]`
+
+The 2026-09-18 precedence — `[name]` > **untestable** > **purge** > marker >
+delay > blank — inverted the two status verdicts. A retired row (`purge_reason`
+set) keeps the `not testable by the native engine:` text its refusal wrote,
+because the purge step only sets `purge_reason`; with `untestable` checked
+first, every retired row rendered `[n-a]` and hid the stronger, later verdict.
+The 2026-11-26 audit found 84 of 160 marker rows in that state (the 58
+`ss://null:null` rows among them), which is what made the badge look like it was
+never acted on.
+
+The law is now `[name]` > **purge** > **untestable** > marker > delay > blank:
+`[n-a]` is the status of a **live** row the engine cannot serve, and a row the
+database has retired is described by its retirement. `[name]` stays first — an
+endpoint whose name does not resolve has not been measured, retired or not, and
+the DNS band is the ordering law's own statement about it.
+
+Spec: `2026-11-26-undialable-shape-boundary-second-pass` D3.

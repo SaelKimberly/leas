@@ -447,13 +447,18 @@ impl Database {
             direct,
             dirty_ranks: Arc::new(dashmap::DashSet::new()),
         };
-        // One-time: retire the stored shapes no codec can dial (S5). A failure
-        // here must not block the open — the next open retries, and the marker
-        // only advances when the work committed.
-        if std::env::var("LEAS_SKIP_INVALID_PURGE").is_err()
-            && let Err(e) = db.purge_invalid_shapes_once().await
-        {
-            tracing::warn!(target: "leas_db", "invalid-shape purge: {e}");
+        // One-time: retire the stored shapes no codec can dial (S5) and the
+        // retired flow variants (ADR 0018). A failure here must not block the
+        // open — the next open retries, and a marker only advances when the
+        // work committed. Both run AFTER `schema::migrate`, so the flow
+        // normalisation has already repaired a doubled `-udp443` suffix.
+        if std::env::var("LEAS_SKIP_INVALID_PURGE").is_err() {
+            if let Err(e) = db.purge_invalid_shapes_once().await {
+                tracing::warn!(target: "leas_db", "invalid-shape purge: {e}");
+            }
+            if let Err(e) = db.purge_deprecated_flows_once().await {
+                tracing::warn!(target: "leas_db", "deprecated-flow purge: {e}");
+            }
         }
         Ok(db)
     }
@@ -470,7 +475,7 @@ impl Database {
     ///
     /// Marker-gated (`app_meta.invalid_shapes_purged`): the scan runs once per
     /// database, never on a normal open. Rows are classified with the SAME
-    /// validators the ingest gate uses, never by a second JSON reading here.
+    /// predicates the ingest gate uses, never by a second JSON reading here.
     async fn purge_invalid_shapes_once(&self) -> Result<()> {
         const MARKER: &str = "invalid_shapes_purged";
         // Version 2 added the unrepresentable transport host (the audit's
@@ -479,9 +484,51 @@ impl Database {
         // Version 3 added the Hysteria2 obfs shape (unknown name / missing
         // password). An existing DB stamped 1 or 2 re-runs the scan once; the
         // key stays the same, so no schema change.
-        const MARKER_VERSION: i64 = 3;
+        // Version 4 added the VLESS `encryption` value (spec
+        // `2026-11-26-undialable-shape-boundary-second-pass` U1): a value no
+        // VLESS implementation dials stops re-earning an untestable marker on
+        // every probe and earns `config_invalid` instead.
+        const MARKER_VERSION: i64 = 4;
+        self.purge_shapes_once(
+            MARKER,
+            MARKER_VERSION,
+            leas_proto::proto_spec::is_undialable_shape,
+        )
+        .await
+    }
+
+    /// One-time retirement of the rows carrying a **retired variant**
+    /// (ADR 0018): a VLESS `flow` outside the canonical vision pair, which
+    /// every pinned core refuses today and xray ≤ 1.7 dialed.
+    ///
+    /// A separate marker from the invalid-shape step on purpose: "this never
+    /// was a config" (`config_invalid`) and "this was a config no shipped core
+    /// dials any more" are different verdicts, and the lists must stay
+    /// separately reversible. The verdict value is the same (`config_invalid`
+    /// is the only reason the frozen CHECK admits for a shape verdict).
+    async fn purge_deprecated_flows_once(&self) -> Result<()> {
+        const MARKER: &str = "deprecated_flows_purged";
+        const MARKER_VERSION: i64 = 1;
+        self.purge_shapes_once(
+            MARKER,
+            MARKER_VERSION,
+            leas_proto::proto_spec::is_deprecated_shape,
+        )
+        .await
+    }
+
+    /// One purge step: scan the live links, classify each row's stored config
+    /// with `predicate`, stamp the marker version and refresh the affected
+    /// endpoints' ranks. Idempotent through `marker_version`; a failure leaves
+    /// the marker unadvanced so the next open retries.
+    async fn purge_shapes_once(
+        &self,
+        marker: &str,
+        marker_version: i64,
+        predicate: fn(&leas_proto::proto_spec::ProtocolConfig) -> bool,
+    ) -> Result<()> {
         let mut conn = self.conn().await?;
-        if crate::schema::rekey::marker_value(&mut conn, MARKER).await? >= MARKER_VERSION {
+        if crate::schema::rekey::marker_value(&mut conn, marker).await? >= marker_version {
             return Ok(());
         }
         let rows = toasty::sql::query(
@@ -507,13 +554,13 @@ impl Database {
             else {
                 continue;
             };
-            if !leas_proto::proto_spec::is_undialable_shape(&parsed) {
+            if !predicate(&parsed) {
                 continue;
             }
             hits.push((*protocol, *endpoint));
         }
         if hits.is_empty() {
-            crate::schema::rekey::stamp_marker(&mut conn, MARKER, MARKER_VERSION).await?;
+            crate::schema::rekey::stamp_marker(&mut conn, marker, marker_version).await?;
             return Ok(());
         }
         let mut endpoints: Vec<EndpointId> = Vec::new();
@@ -535,7 +582,7 @@ impl Database {
         drop(conn);
         let _ = self.refresh_endpoint_ranks(&endpoints).await;
         let mut conn = self.conn().await?;
-        crate::schema::rekey::stamp_marker(&mut conn, MARKER, MARKER_VERSION).await?;
+        crate::schema::rekey::stamp_marker(&mut conn, marker, marker_version).await?;
         Ok(())
     }
 
@@ -4341,6 +4388,30 @@ mod tests {
                     7001,
                     serde_json::json!({"schema": "Hysteria2", "auth": "pw", "obfs": "gecko", "obfs_password": "gecko-secret", "obfs_min_packet_size": 2000, "obfs_max_packet_size": 1}),
                 ),
+                // A VLESS `encryption` value no VLESS implementation dials
+                // (spec 2026-11-26 U1): the parser refuses it at import, so a
+                // stored row earns the verdict instead of a permanent `[n-a]`.
+                (
+                    8,
+                    8001,
+                    serde_json::json!({"schema": "Vless", "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d", "transport": {"type": "tcp"}, "encryption": "aes-128-gcm"}),
+                ),
+                // Canonical vision flow with a DOUBLED `-udp443` suffix: feed
+                // junk the parser repairs (mihomo serves the shape by
+                // truncating it), so the normalisation must reach it before
+                // either purge and it must NOT take the retired-flow verdict.
+                (
+                    9,
+                    9001,
+                    serde_json::json!({"schema": "Vless", "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d", "transport": {"type": "tcp"}, "security": {"type": "tls", "sni": "example.com"}, "flow": "xtls-rprx-vision-udp443-udp443"}),
+                ),
+                // A retired non-vision flow over TLS: a working config on
+                // xray<=1.7, refused by all three pins today (D2).
+                (
+                    10,
+                    10001,
+                    serde_json::json!({"schema": "Vless", "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d", "transport": {"type": "tcp"}, "security": {"type": "tls", "sni": "example.com"}, "flow": "xtls-rprx-origin"}),
+                ),
             ] {
                 // The endpoint only: this fixture owns the protocol row (it
                 // carries the shape under test), so `seed_endpoint` would
@@ -4390,7 +4461,9 @@ mod tests {
         }
 
         // Model "rows imported before this build": the first open stamped the
-        // step (no rows existed yet), so clear the marker and reopen.
+        // step (no rows existed yet), so clear the markers and reopen. The flow
+        // normalisation runs from `schema::migrate`, so its marker must go too,
+        // or the reopened database would skip the repair.
         {
             let db = Database::open(&path).await.expect("seed-state open");
             let mut conn = db.connection().await.expect("connection");
@@ -4403,6 +4476,13 @@ mod tests {
             .exec(&mut conn)
             .await
             .expect("seed stale marker");
+            toasty::sql::query(
+                "DELETE FROM app_meta WHERE key IN \
+                 ('vless_flow_normalized', 'deprecated_flows_purged')",
+            )
+            .exec(&mut conn)
+            .await
+            .expect("un-stamp the flow steps");
         }
 
         // Reopen: the one-time step runs and stamps.
@@ -4416,6 +4496,12 @@ mod tests {
             (5, None),
             (6, Some("config_invalid")),
             (7, None),
+            // U1: the encryption value no implementation dials.
+            (8, Some("config_invalid")),
+            // U6: repaired by the normalisation, so not retired.
+            (9, None),
+            // D2: a retired variant.
+            (10, Some("config_invalid")),
         ] {
             let rows = toasty::sql::query(
                 "SELECT endpoint_id, purge_reason FROM profile_stats ORDER BY endpoint_id",
@@ -4443,17 +4529,17 @@ mod tests {
                 "endpoint {ep}: the invalid-shape verdict"
             );
         }
-        drop(conn);
 
-        // Second open: the marker makes it a no-op (re-stamp, no rewrite).
-        let db = Database::open(&path).await.expect("second reopen");
-        let mut conn = db.connection().await.expect("connection");
-        let rows =
-            toasty::sql::query("SELECT value FROM app_meta WHERE key = 'invalid_shapes_purged'")
-                .exec(&mut conn)
-                .await
-                .expect("marker");
-        let stamped = rows.first().and_then(|row| {
+        // U6 + ordering: the doubled suffix was repaired, and the repaired row
+        // is the one the deprecated-flow purge did NOT claim.
+        let rows = toasty::sql::query(
+            "SELECT p.config FROM profile_stats ps JOIN protocols p ON p.id = ps.protocol_id \
+             WHERE ps.endpoint_id = 9",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("read repaired config");
+        let config = rows.first().and_then(|row| {
             let toasty_core::stmt::Value::Record(f) = row else {
                 return None;
             };
@@ -4462,11 +4548,46 @@ mod tests {
                 _ => None,
             }
         });
-        assert_eq!(
-            stamped.as_deref(),
-            Some("3"),
-            "the step stamps the version that makes a second open a no-op"
+        let config = config.expect("the repaired row still exists");
+        assert!(
+            config.contains("\"xtls-rprx-vision-udp443\""),
+            "the doubled suffix must be collapsed: {config}"
         );
+        assert!(
+            !config.contains("udp443-udp443"),
+            "the stored value must not keep the repetition: {config}"
+        );
+
+        drop(conn);
+
+        // Second open: the markers make it a no-op (re-stamp, no rewrite).
+        let db = Database::open(&path).await.expect("second reopen");
+        let mut conn = db.connection().await.expect("connection");
+        for (key, want) in [
+            ("invalid_shapes_purged", "4"),
+            ("deprecated_flows_purged", "1"),
+            ("vless_flow_normalized", "1"),
+        ] {
+            let rows =
+                toasty::sql::query(format!("SELECT value FROM app_meta WHERE key = '{key}'"))
+                    .exec(&mut conn)
+                    .await
+                    .expect("marker");
+            let stamped = rows.first().and_then(|row| {
+                let toasty_core::stmt::Value::Record(f) = row else {
+                    return None;
+                };
+                match f.first() {
+                    Some(toasty_core::stmt::Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                }
+            });
+            assert_eq!(
+                stamped.as_deref(),
+                Some(want),
+                "{key} stamps the version that makes a second open a no-op"
+            );
+        }
     }
 
     /// S4: a resolved host drops its name-class marker, and ONLY that. A real

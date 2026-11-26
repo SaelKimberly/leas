@@ -232,7 +232,12 @@ fn ss_row_has_tls_layer(cfg: &leas_proto::proto_spec::SsConfig) -> bool {
 /// # Errors
 ///
 /// [`ImportError::Validation`] naming the flow when the row carries one without
-/// a TLS/REALITY layer.
+/// a TLS/REALITY layer, or one outside the canonical vision pair (a retired
+/// variant: xray ≤ 1.7 dialed `xtls-rprx-direct`/`-origin`, and every pinned
+/// core refuses them now — `thirdparty/Xray-core/proxy/vless/inbound/inbound.go:550-588`
+/// answers "unknown request flow", mihomo truncates the value to 16 bytes and
+/// compares it to `xtls-rprx-vision`, and sing-box's unvendored
+/// `sing-vmess/vless` `NewClient` accepts only `""`/`xtls-rprx-vision`).
 pub fn validate_vless_shape(parsed: &ParsedProto) -> Result<()> {
     let ProtocolConfig::Vless(cfg) = &parsed.protocol.config else {
         return Ok(());
@@ -243,12 +248,22 @@ pub fn validate_vless_shape(parsed: &ParsedProto) -> Result<()> {
     let layered = cfg.security.type_str().is_some_and(|kind| {
         kind.eq_ignore_ascii_case("tls") || kind.eq_ignore_ascii_case("reality")
     });
-    if layered {
-        return Ok(());
+    if !layered {
+        return Err(ImportError::Validation(format!(
+            "vless flow `{flow}` requires a TLS or REALITY layer; the row carries neither, \
+             so no core can dial it"
+        )));
     }
-    Err(ImportError::Validation(format!(
-        "vless flow `{flow}` requires a TLS or REALITY layer; the row carries neither, so no          core can dial it"
-    )))
+    // ADR 0018's retirement class, not D-C's invalid shape: the value was a
+    // working flow on older cores and no pinned core dials it today. The
+    // predicate is `leas-proto`'s — the SAME one the database's retirement step
+    // reads — so ingest and purge cannot disagree about which flows retire.
+    if leas_proto::proto_spec::is_deprecated_shape(&parsed.protocol.config) {
+        return Err(ImportError::Validation(format!(
+            "vless flow `{flow}` is a retired variant: no pinned core dials it"
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse a Hysteria2 row whose obfs block cannot be dialed.
@@ -1811,20 +1826,36 @@ mod ss_import_gate_tests {
         assert_eq!(got, imports, "{url}");
     }
 
-    /// A `flow` has nothing to run over without a TLS/REALITY layer, so the
-    /// shape is refused at ingestion (ADR 0018 D-C; report §3.4: 85 such rows,
-    /// none ever worked, both cores refuse the config).
+    /// A `flow` is refused at ingestion in two cases: no TLS/REALITY layer to
+    /// run over (no core dials the bare shape), or a value outside the
+    /// canonical vision pair (a retired variant — every pinned core refuses
+    /// `direct`/`origin` today). `flow=none` is the alias for absent and is a
+    /// plain row.
     #[rstest]
     #[case::flow_without_a_layer(
         "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=xtls-rprx-direct",
         false
     )]
-    #[case::flow_over_tls(
+    #[case::retired_flow_over_tls(
         "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=xtls-rprx-direct&security=tls&sni=example.com",
-        true
+        false
+    )]
+    #[case::retired_flow_over_reality(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=xtls-rprx-origin&security=reality&sni=example.com&pbk=e2RLf57Li_-MDZGE9ss1BWPgP54mqRb5PfXhW2jcVVg&sid=c39cc7310a",
+        false
     )]
     #[case::flow_over_reality(
         "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=xtls-rprx-vision&security=reality&sni=example.com&pbk=e2RLf57Li_-MDZGE9ss1BWPgP54mqRb5PfXhW2jcVVg&sid=c39cc7310a",
+        true
+    )]
+    #[case::vision_udp443_over_tls(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=xtls-rprx-vision-udp443&security=tls&sni=example.com",
+        true
+    )]
+    // The doubled suffix is feed junk the parser repairs, so the row imports as
+    // the canonical value rather than being refused.
+    #[case::doubled_suffix_is_repaired(
+        "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?encryption=none&type=tcp&flow=xtls-rprx-vision-udp443-udp443&security=tls&sni=example.com",
         true
     )]
     #[case::no_flow_without_a_layer(

@@ -85,6 +85,73 @@ async fn normalize_encryption_in(tx: &mut impl toasty::Executor) -> Result<()> {
     stamp_marker(tx, ENCRYPTION_MARKER, 1).await
 }
 
+/// Marker for the one-time VLESS `flow` normalisation (repeated `-udp443`).
+const FLOW_MARKER: &str = "vless_flow_normalized";
+
+/// Rewrite stored VLESS `flow` values the parser now canonicalises — the
+/// `vision` prefix with repeated `-udp443` suffixes collapses to the single
+/// suffix, and the `none`/empty alias becomes absent — then re-key the
+/// identities they touch. A marker-guarded DATA step: no DDL, no cursor bump.
+///
+/// Runs BEFORE both purge steps (`schema::migrate` is called before
+/// `Database::open`'s purges): a doubled suffix must be repaired, not retired,
+/// and mihomo serves exactly that shape by truncating it to 16 bytes.
+///
+/// Values the normaliser does not recognise (`xtls-rprx-direct`, `-visi`) are
+/// left in place — `capability` and `is_deprecated_shape` judge them.
+pub(super) async fn normalize_flow_once(conn: &mut toasty::Connection) -> Result<()> {
+    if marker_value(conn, FLOW_MARKER).await? >= 1 {
+        return Ok(());
+    }
+    let mut tx = conn
+        .transaction_builder()
+        .mode(TransactionMode::Immediate)
+        .begin()
+        .await?;
+    match normalize_flow_in(&mut tx).await {
+        Ok(()) => {
+            tx.commit().await?;
+            tracing::info!(target: "leas_db",
+                "protocols: normalised stored VLESS flow values");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Stamp a freshly created database (no rows to normalise).
+pub(super) async fn stamp_flow_normalized(conn: &mut toasty::Connection) -> Result<()> {
+    if marker_value(conn, FLOW_MARKER).await? >= 1 {
+        return Ok(());
+    }
+    stamp_marker(conn, FLOW_MARKER, 1).await
+}
+
+async fn normalize_flow_in(tx: &mut impl toasty::Executor) -> Result<()> {
+    for (id, _kind, config) in read_protocols(tx).await? {
+        let leas_proto::proto_spec::ProtocolConfig::Vless(mut vless) = config else {
+            continue;
+        };
+        let Some(value) = vless.flow.as_deref() else {
+            continue;
+        };
+        // One normaliser for the parser and this step: a rule spelled twice is
+        // the defect this whole spec exists to remove.
+        let normalized = leas_proto::proto_spec::normalize_vless_flow(value);
+        if normalized.as_deref() == Some(value) {
+            continue;
+        }
+        vless.flow = normalized;
+        crate::models_toasty::Protocol::filter_by_id(ProtocolId::new(id))
+            .update()
+            .config(Json(leas_proto::proto_spec::ProtocolConfig::Vless(vless)))
+            .exec(&mut *tx)
+            .await?;
+    }
+    rebuild_identities(tx).await?;
+    stamp_marker(tx, FLOW_MARKER, 1).await
+}
+
 /// Re-key once, stamped in the same transaction. A no-op when the marker
 /// already equals [`IDENTITY_VERSION`].
 pub(super) async fn rekey_once(conn: &mut toasty::Connection) -> Result<()> {

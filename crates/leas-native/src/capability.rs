@@ -344,9 +344,13 @@ fn vless_reason(cfg: &VlessConfig) -> Option<Cow<'static, str>> {
 /// Native maps `security.enc` to the header security byte
 /// (`protocol::vmess::security_byte`): absent/`auto`/`aes-128-gcm`/
 /// `chacha20-poly1305` only. Legacy `none`/`zero`/`aes-128-cfb`/bare
-/// `chacha20` are xray-only (rejected server-side by xray 26.x too, but
-/// native has no arm at all), refused as `"legacy vmess payload security is
-/// not implemented"`. A non-zero `alter_id` selects the legacy pre-AEAD
+/// `chacha20` are refused as `"legacy vmess payload security is not
+/// implemented"` — this is OUR engine's gap, not an invalid config: the pinned
+/// xray 26.11.9 rejects them (`common/protocol/headers.pb.go` has no
+/// `NONE`/`ZERO`), but sing-box still declares them (`option/vmess.go`) and
+/// mihomo dials `none` outright (`transport/vmess/vmess.go`), so they must
+/// stay out of `is_undialable_shape` and keep their `[n-a]` badge. A non-zero
+/// `alter_id` selects the legacy pre-AEAD
 /// session scheme, which native dials (CFB header + four-byte response peel,
 /// `protocol::vmess::legacy`), so it is NOT refused. A transport refusal
 /// appends the [`transport_reason`] string.

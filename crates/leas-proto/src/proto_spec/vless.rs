@@ -41,6 +41,8 @@
 //! - v2rayN: `VLESSFmt.cs`
 //! - outbound: `dialer/v2ray/v2ray.go` `ParseVlessURL`
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -273,15 +275,55 @@ impl VlessMux {
     }
 }
 
-/// Normalise a VLESS `flow` value: `None` and the empty string are the "no
-/// flow" spelling, `none` (any case) is the alias some panels emit for it, and
-/// everything else is kept verbatim for the capability gate to judge.
-fn normalize_flow(raw: &str) -> Option<TinyText> {
+/// Normalise a VLESS `flow` value at parse.
+///
+/// `None` and the empty string are the "no flow" spelling, `none` (any case) is
+/// the alias some panels emit for it, a canonical `xtls-rprx-vision` prefix
+/// carrying repeated `-udp443` suffixes collapses to the single-suffix
+/// spelling, and everything else is kept verbatim for
+/// `capability`/`is_deprecated_shape` to judge.
+///
+/// The repetition is feed junk, not a variant: mihomo truncates the value to
+/// 16 bytes and compares it to `xtls-rprx-vision`
+/// (`adapter/outbound/vless.go:464-470`), so a doubled suffix describes no
+/// wire any core reads. Collapsing it here is what keeps such a row dialable
+/// instead of refusing it.
+#[must_use]
+pub fn normalize_flow(raw: &str) -> Option<TinyText> {
     let value = raw.trim();
     if value.is_empty() || value.eq_ignore_ascii_case("none") {
         return None;
     }
-    Some(TinyText::from(value))
+    Some(match collapse_vision_suffixes(value) {
+        Cow::Borrowed(_) => TinyText::from(value),
+        Cow::Owned(canonical) => TinyText::from(canonical),
+    })
+}
+
+/// `xtls-rprx-vision[-udp443]+` → the canonical single-suffix spelling.
+///
+/// Zero-copy unless a repetition exists: the common values (`vision`,
+/// `vision-udp443`, and everything this function does not recognise) are
+/// returned borrowed, so the parse path allocates nothing new.
+fn collapse_vision_suffixes(value: &str) -> Cow<'_, str> {
+    const BASE: &str = "xtls-rprx-vision";
+    const SUFFIX: &str = "-udp443";
+    let Some(head) = value.get(..BASE.len()) else {
+        return Cow::Borrowed(value);
+    };
+    if !head.eq_ignore_ascii_case(BASE) {
+        return Cow::Borrowed(value);
+    }
+    let mut rest = &value[BASE.len()..];
+    let mut suffixes = 0usize;
+    while let Some(tail) = rest.strip_prefix(SUFFIX) {
+        suffixes += 1;
+        rest = tail;
+    }
+    if !rest.is_empty() || suffixes <= 1 {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(format!("{BASE}{SUFFIX}"))
 }
 
 impl VlessConfig {
@@ -2326,6 +2368,33 @@ mod tests {
 
     fn key1184() -> String {
         base64::prelude::BASE64_URL_SAFE_NO_PAD.encode([9u8; 1184])
+    }
+
+    /// A canonical `xtls-rprx-vision` prefix carrying repeated `-udp443`
+    /// suffixes is feed junk (mihomo truncates the value to 16 bytes and
+    /// compares, so the repetition describes no wire) — collapsed at parse, so
+    /// the row stays dialable instead of being refused by `capability`.
+    #[rstest]
+    #[case::vision("xtls-rprx-vision", Some("xtls-rprx-vision"))]
+    #[case::vision_udp443("xtls-rprx-vision-udp443", Some("xtls-rprx-vision-udp443"))]
+    #[case::doubled("xtls-rprx-vision-udp443-udp443", Some("xtls-rprx-vision-udp443"))]
+    #[case::tripled(
+        "xtls-rprx-vision-udp443-udp443-udp443",
+        Some("xtls-rprx-vision-udp443")
+    )]
+    #[case::prefix_case_is_kept("XTLS-RPRX-VISION", Some("XTLS-RPRX-VISION"))]
+    #[case::direct_is_untouched("xtls-rprx-direct", Some("xtls-rprx-direct"))]
+    #[case::direct_udp443_is_untouched("xtls-rprx-direct-udp443", Some("xtls-rprx-direct-udp443"))]
+    #[case::truncated_is_untouched("xtls-rprx-visi", Some("xtls-rprx-visi"))]
+    #[case::trailing_junk_is_untouched(
+        "xtls-rprx-vision-udp443-x",
+        Some("xtls-rprx-vision-udp443-x")
+    )]
+    #[case::none_alias("none", None)]
+    #[case::empty("", None)]
+    fn normalize_flow_collapses_repeated_udp443(#[case] raw: &str, #[case] want: Option<&str>) {
+        let got = super::normalize_flow(raw);
+        assert_eq!(got.as_deref(), want, "{raw}");
     }
 
     #[test]

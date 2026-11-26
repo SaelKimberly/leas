@@ -18,13 +18,17 @@ pub mod ss_method_support;
 /// Two owners, one rule: the ingest gate (`leas-config`) refuses these rows
 /// before they are stored, and the database's one-time step gives the rows
 /// that arrived earlier the `config_invalid` verdict. The transport-host rule
-/// is shared verbatim ([`transport_host_unrepresentable`]); the flow and
-/// SS-method shapes are the same predicates the ingest validators apply first.
+/// is shared verbatim ([`transport_host_unrepresentable`]); the flow, SS-method
+/// and VLESS-`encryption` shapes are the same predicates the ingest validator
+/// and `capability` (`VlessConfig::validate`) apply.
 ///
-/// What it is NOT: a deprecation list. A variant some pinned oracle still
-/// serves (non-vision flows over TLS, legacy SS stream ciphers, the `quic`
-/// transport) is never "undialable" — the flow gate below only fires when the
-/// row has no layer for XTLS to run over, which no core accepts.
+/// What it is NOT: a deprecation list. A variant a pinned oracle still serves
+/// is never "undialable" — the flow gate below only fires when the row has no
+/// layer for XTLS to run over, which no core accepts. The shape every pin
+/// refuses *today* while an older core dialed it (`xtls-rprx-direct`/
+/// `-origin`, once XTLS existed) is a retirement, not an invalid shape, and it
+/// lives in [`is_deprecated_shape`]; legacy SS stream ciphers stay out of both
+/// predicates because native and mihomo dial them.
 #[must_use]
 pub fn is_undialable_shape(config: &ProtocolConfig) -> bool {
     if transport_host_unrepresentable(config) {
@@ -36,12 +40,47 @@ pub fn is_undialable_shape(config: &ProtocolConfig) -> bool {
             let layered = cfg.security.type_str().is_some_and(|kind| {
                 kind.eq_ignore_ascii_case("tls") || kind.eq_ignore_ascii_case("reality")
             });
-            flow.is_some() && !layered
+            // A non-empty `flow` needs a layer to run over (no core accepts the
+            // bare shape), and an `encryption` value outside the restore cases
+            // and valid mlkem is dialable by no VLESS implementation: xray's
+            // client, mihomo's factory and this crate's parser all refuse it
+            // (`thirdparty/Xray-core/proxy/vless/outbound/outbound.go:85`,
+            // `thirdparty/mihomo/transport/vless/encryption/factory.go:12-16`;
+            // sing-box has no such field). Same predicate as `capability`.
+            (flow.is_some() && !layered) || cfg.validate().is_err()
         }
         ProtocolConfig::Ss(cfg) => {
             !ss_method_support::native_supports_ss_method(cfg.method.as_str())
         }
         ProtocolConfig::Hysteria2(cfg) => cfg.obfs_spec().is_err(),
+        _ => false,
+    }
+}
+
+/// A **retired variant**, not an invalid shape: a config every pinned core
+/// refuses today, that a former one dialed (ADR 0018's deprecation class).
+///
+/// Kept out of [`is_undialable_shape`] on purpose: that predicate feeds the
+/// `config_invalid` verdict, which says "this never was a config", while a
+/// non-vision flow *was* one — xray ≤ 1.7 dialed `xtls-rprx-direct`/`-origin`.
+/// The pins agree it is dead (`thirdparty/Xray-core/proxy/vless/inbound/inbound.go:550-588`
+/// returns "unknown request flow"; mihomo truncates the value to 16 bytes and
+/// compares it to `xtls-rprx-vision`, `adapter/outbound/vless.go:464-470`;
+/// sing-box's `sing-vmess/vless` `NewClient` accepts only `""`/
+/// `xtls-rprx-vision`, verified at the pinned module revision
+/// `a0c58542bd9d`), so the row is retired through its own marker
+/// (`deprecated_flows_purged`) and its own ingest refusal
+/// (`validate_vless_shape`), never silently.
+///
+/// A canonical `xtls-rprx-vision` prefix carrying repeated `-udp443` suffixes
+/// is NOT deprecated: that value descends from feed junk and is normalised at
+/// parse (`normalize_flow`), so it never reaches this predicate.
+#[must_use]
+pub fn is_deprecated_shape(config: &ProtocolConfig) -> bool {
+    match config {
+        ProtocolConfig::Vless(cfg) => cfg.flow.as_deref().is_some_and(|flow| {
+            !flow.is_empty() && flow != "xtls-rprx-vision" && flow != "xtls-rprx-vision-udp443"
+        }),
         _ => false,
     }
 }
@@ -154,8 +193,8 @@ pub use tor::TorConfig;
 pub use trojan::{TrojanConfig, TrojanEncryption, TrojanSsMethod};
 pub use tuic::TuicConfig;
 pub use vless::{
-    MlkemEncryption, MlkemKey, MlkemMode, VlessConfig, normalize_vless_encryption,
-    parse_mlkem_encryption, parse_padding_spec,
+    MlkemEncryption, MlkemKey, MlkemMode, VlessConfig, normalize_flow as normalize_vless_flow,
+    normalize_vless_encryption, parse_mlkem_encryption, parse_padding_spec,
 };
 pub use vless::{MuxWire, VlessMux};
 pub use vmess::VmessConfig;
@@ -933,6 +972,76 @@ mod tests {
         // These fixtures carry no flow and no SS method, so the host rule is
         // the only verdict in play.
         assert_eq!(is_undialable_shape(&config), bad);
+    }
+
+    /// The encryption arm: a value outside the restore cases and valid mlkem
+    /// is dialable by no VLESS implementation (xray's client, mihomo's
+    /// factory; sing-box has no field), so the row must earn `config_invalid`
+    /// instead of a permanent `[n-a]`.
+    #[rstest]
+    #[case::foreign_stream_cipher("aes-128-gcm", true, true)]
+    #[case::foreign_aead("chacha20-poly1305", true, true)]
+    #[case::truncated_alias("non", true, true)]
+    #[case::shifted_param("ure=0", true, true)]
+    #[case::security_word("tls", true, true)]
+    #[case::empty_is_refused("", true, true)]
+    #[case::absent_is_plain("", false, false)]
+    #[case::valid_mlkem(
+        "mlkem768x25519plus.native.0rtt.100-111-1111.75-0-111.50-0-3333.ptjHQxBQxTJ9MWr2cd5qWIflBSACHOevTauCQwa_71U",
+        true,
+        false
+    )]
+    fn vless_encryption_verdict(
+        #[case] encryption: &str,
+        #[case] present: bool,
+        #[case] bad: bool,
+    ) {
+        let mut value = serde_json::json!({
+            "schema": "Vless",
+            "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d",
+            "transport": {"type": "tcp"},
+        });
+        if present {
+            value["encryption"] = encryption.into();
+        }
+        let config: ProtocolConfig = serde_json::from_value(value).expect("config parses");
+        assert_eq!(is_undialable_shape(&config), bad);
+        // One owner: the predicate IS the capability's rule for this field.
+        let ProtocolConfig::Vless(cfg) = &config else {
+            panic!("vless fixture");
+        };
+        assert_eq!(cfg.validate().is_err(), bad);
+    }
+
+    /// The deprecated-flow class stays out of the invalid-shape predicate: a
+    /// non-vision flow was a real config on xray ≤ 1.7 and retires through its
+    /// own marker.
+    #[rstest]
+    #[case::vision("xtls-rprx-vision", true, false)]
+    #[case::vision_udp443("xtls-rprx-vision-udp443", true, false)]
+    #[case::absent("", false, false)]
+    #[case::legacy_direct("xtls-rprx-direct", true, true)]
+    #[case::legacy_origin("xtls-rprx-origin", true, true)]
+    #[case::truncated_feed_value("xtls-rprx-visi", true, true)]
+    fn deprecated_flow_verdict(
+        #[case] flow: &str,
+        #[case] present: bool,
+        #[case] deprecated: bool,
+    ) {
+        let mut value = serde_json::json!({
+            "schema": "Vless",
+            "uuid": "6202b230-417c-4d8e-b624-0f71afa9c75d",
+            "transport": {"type": "tcp"},
+            "security": {"type": "tls", "sni": "example.com"},
+        });
+        if present {
+            value["flow"] = flow.into();
+        }
+        let config: ProtocolConfig = serde_json::from_value(value).expect("config parses");
+        assert_eq!(is_deprecated_shape(&config), deprecated);
+        // The two predicates are disjoint: a deprecated flow is not "invalid",
+        // because the TLS layer is present and the value is well-formed.
+        assert!(!is_undialable_shape(&config));
     }
 
     #[test]
