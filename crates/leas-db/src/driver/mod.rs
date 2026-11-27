@@ -6,10 +6,10 @@
 //! writers inline their literals (the engine charges ~0.8 ms per bound
 //! parameter), so every window is a new text — a compiled program cached
 //! forever. Owning the driver is what lets us route the cache at its
-//! boundary, and it pins `turso` directly (0.8) instead of waiting on a
+//! boundary, and it pins `turso` directly (0.9) instead of waiting on a
 //! toasty release.
 //!
-//! Vendored from `thirdparty/toasty` (dev `main`, already on `turso = "0.8"`)
+//! Vendored from `thirdparty/toasty` (dev `main` at the time, on `turso = "0.8"`)
 //! and reduced to the LOCAL engine only: the sync (`turso::sync`) and
 //! serverless (`turso_serverless`) arms are dropped. This crate is a file/
 //! in-memory database; nothing here talks to a remote.
@@ -21,7 +21,7 @@
 //! `toasty_core::driver` trait impls compiling. The consequence to weigh before
 //! a `toasty-core` bump: `Driver`/`Connection` are the seam the engine calls, so
 //! a bump can break these impls and the fix is ours. `turso` itself is pinned
-//! directly (currently 0.8.2) and bumped when we want it.
+//! directly (currently 0.9.0-pre.6) and bumped when we want it.
 //!
 //! Where a line matches upstream it costs nothing and helps a reader diff a
 //! puzzling spot against `thirdparty/toasty`; where our needs differ, ours win.

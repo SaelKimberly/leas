@@ -2854,12 +2854,17 @@ impl Database {
     ///
     /// **One statement, raw, and `NOT EXISTS` on purpose.** The typed form
     /// (`links().all(FALSE)`) lowers to `id NOT IN (SELECT protocol_id FROM
-    /// profile_stats)`, which turso 0.9.0-pre.5 serves as a per-row subquery
-    /// loop: measured at 74k protocols it costs **5.37 s**, against **23 ms**
+    /// profile_stats)`; turso 0.9.0-pre.5 served that as a per-row subquery
+    /// loop: measured at 74k protocols it cost **5.37 s**, against **23 ms**
     /// for this anti-join (and 29 ms for the DELETE), in every journal mode —
     /// `docs/research/2026-11-16-turso-0.9-delta.md` §3. The purge runs once
     /// per merged endpoint inside the merge transaction, where that 5 s is
     /// what the 2026-11-16 production dump's 556 s compact pass was made of.
+    /// At 0.9.0-pre.6 the IN-list NULL walk was removed and the same statement
+    /// answers in **~60 ms** on the same lab
+    /// (`docs/research/2026-11-27-turso-0.9.0-pre.6-delta.md` §5.3), so this
+    /// rewrite is no longer a 230× cliff — it is still ~2.4× faster and, unlike
+    /// `NOT IN`, does not depend on a planner choice.
     /// The same convention as `purge_expired_once`'s candidate scan.
     /// Remove links whose endpoint no longer exists, for the endpoints a
     /// flush touched. Same anti-join as the purge; ids inlined like every
