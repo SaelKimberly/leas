@@ -183,9 +183,6 @@ name = "hysteria2_obfs"
 harness = false
 
 [dev-dependencies]
-# The WireGuard end-to-end row's real peer (`tests/wireguard_e2e.rs`): a
-# responder without a TUN device or CAP_NET_ADMIN. Test-only by ADR 0019.
-boringtun = { version = "0.7.1", default-features = false }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # serde_json/rcgen are used by lib unit tests in
 # security/transport/context/chain; dev-deps make them available to lib unit

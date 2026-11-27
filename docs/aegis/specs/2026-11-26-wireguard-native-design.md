@@ -219,11 +219,32 @@ Implementation (**amended 2026-11-26 during T6**): `leas-dns` owns the policy, t
 - reserved bytes: a message with `reserved = [1,2,3]` verifies `mac1` only after zeroing (the stamp-after-MAC rule) and parses to type 1/2/4;
 - timers: with injected `now`, a lost response retransmits at 5 s, gives up after 90 s, rekeys at 120 s and refuses sends at 180 s.
 
-### 5.2 E2E (delivered in `crates/leas-native/tests/wireguard_e2e.rs`)
+### 5.2 E2E (delivered in `crates/leas-oracles/tests/wireguard.rs`)
 
 The delivered oracle is a **`boringtun 0.7.1` responder as a dev-dependency** (ADR 0019 permits it: test-only, never a runtime dependency) with a `smoltcp` interface and a TCP echo listener, all on loopback — no core binary, no TUN, no `CAP_NET_ADMIN`. The sing-box `wireguard` endpoint was rejected as the oracle because a peer's TCP connection to the endpoint's own interface address needs host routing (or `system: true`) to reach a local echo, which makes the harness depend on the host's network stack rather than on our client.
 
-Rows delivered and passing (3/3, 3.5 s): the responder accepts our initiation (handshake transcript + MACs), a TCP echo round trip through the stack, and an 8 KiB echo while every 5th datagram is dropped in each direction — the `smoltcp` loss-recovery gate. UDP ASSOCIATE and tunnel DNS remain unit/policy-tested (§5.1) rather than e2e, because both need a second responder-side TCP/UDP service that adds nothing the two passing rows do not already prove about the wire.
+The rows now live in `crates/leas-oracles/tests/wireguard.rs` (the repo's rule is
+that every e2e row lives in `leas-oracles`), and two **real-core** rows live in
+`crates/leas-oracles/tests/wireguard_oracle.rs`:
+
+- **sing-box** `wireguard` endpoint (`system: false`, so gVisor, no TUN/root): the
+  client dials the endpoint's own tunnel address (`10.66.0.1:80` — any other
+  destination is dropped by the userspace netstack), and a 1.11 route action
+  (`action: route`, `override_address: 127.0.0.1`, `override_port: <echo>`)
+  lands it on a loopback HTTP echo.
+- **xray-core** `wireguard` **inbound** (`noKernelTun: true`) — xray registers the
+  protocol for inbounds too (`infra/conf/xray.go`, `IsClient: false`). Its
+  `freedom` outbound applies `defaultBlockPrivateRule` to a wireguard inbound's
+  traffic, so the row routes into a local SOCKS5 stub instead.
+- **mihomo** has no wireguard listener (`listener/` has none), so it cannot be a
+  server oracle; it stays a client-only reference.
+
+Both rows pass in ~0.3 s; they need the pinned cores and are `#[ignore]`d, so a
+machine without binaries stays green. No privileges, containers, or
+testcontainers are involved: the pinned binaries are spawned as child processes
+and both servers terminate the tunnel in user space.
+
+Hermetic rows (10/10, 11 s): the responder accepts our initiation (handshake transcript + MACs), a TCP echo round trip through the stack, and an 8 KiB echo while every 5th datagram is dropped in each direction — the `smoltcp` loss-recovery gate. UDP ASSOCIATE and tunnel DNS remain unit/policy-tested (§5.1) rather than e2e, because both need a second responder-side TCP/UDP service that adds nothing the two passing rows do not already prove about the wire.
 
 ### 5.3 Gate
 

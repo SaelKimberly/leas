@@ -3716,7 +3716,6 @@ dependencies = [
  "base64 0.23.1",
  "blake2 0.11.0",
  "blake3",
- "boringtun",
  "bytes",
  "chacha20 0.10.2",
  "chacha20poly1305 0.11.0",
@@ -3776,6 +3775,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "boringtun",
  "criterion",
  "flate2",
  "futures-core",
@@ -3799,6 +3799,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "smoltcp",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -3814,6 +3815,7 @@ dependencies = [
  "ureq",
  "x25519-dalek 3.0.0",
  "yaml-rust2",
+ "zeroize",
  "zip",
 ]
 
