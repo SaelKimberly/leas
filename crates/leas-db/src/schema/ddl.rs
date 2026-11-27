@@ -27,8 +27,13 @@
 /// `endpoint_ip`'s covering index: the address-ordered read path
 /// (`PageSort::Ip`'s `min(ip_key)` and the IP/CIDR search range).
 ///
-/// Cause C2 — the sort wants `(ip_key, endpoint_id)` together, which toasty's
-/// per-field `#[index]` cannot express. Additive, so it is re-run safely.
+/// Cause C2 — the sort wants `(ip_key, endpoint_id)` together. A field-level
+/// `#[index]` is one column; a struct-level `#[index(name = "endpoint_ip_by_key",
+/// ip_key, endpoint_id)]` can express this order (it exists at toasty 0.11 and
+/// predates 0.10), but the raw statement is kept on purpose: `ensure_raw_ddl`
+/// re-applies it on every open, so it heals a database that lost the index,
+/// while `push_schema` would create it only at cursor 0. Additive, so it is
+/// re-run safely.
 pub const ENDPOINT_IP_BY_KEY: &str =
     "CREATE INDEX IF NOT EXISTS endpoint_ip_by_key ON endpoint_ip (ip_key, endpoint_id)";
 
