@@ -106,7 +106,7 @@ crates/leas-native/src/protocol/wireguard/
 ### 3.2 Dependencies
 
 - `smoltcp = "0.14.0"`, `default-features = false`, features `std`, `medium-ip`, `proto-ipv4`, `proto-ipv6`, `socket-tcp`, `socket-udp`, `iface-max-addr-count-2` (all present in 0.14.0's manifest; `socket-tcp-cubic` exists too and is a follow-up knob, not needed for the first slice). 0.14.0 is the project's latest-major/minor convention and the version `ferrox-app` and `shadowsocks-rust` run; `ZeroNet`'s 0.12 pin is a reference choice, not a constraint.
-- No `boringtun`/`gotatun`: their tree pulls `aead 0.5.0-pre`, `chacha20poly1305 0.10.0-pre`, `blake2 0.10` against our 0.11 line, and `Tunn` reads `Instant::now()` itself. Test-only fallback allowed if the sing-box oracle cannot serve (§5.2).
+- No `boringtun`/`gotatun` at all: their tree pulls `aead 0.5.0-pre`, `chacha20poly1305 0.10.0-pre`, `blake2 0.10` against our 0.11 line, and `Tunn` reads `Instant::now()` itself. A `boringtun` dev-dependency was used during the first e2e cut and **removed** once the pinned sing-box/xray oracles proved interop (§5.2).
 - No new crypto: `chacha20poly1305 0.11` (ChaCha20-Poly1305 for records, XChaCha20-Poly1305 for cookie replies), `blake2 0.11` (BLAKE2s-256/128, keyed), `x25519-dalek` for DH — all present with `zeroize`.
 - `#![forbid(unsafe_code)]` survives: `smoltcp 0.14.0` is `#![deny(unsafe_code)]` (`src/lib.rs:2`); its `unsafe` lives only in `phy/sys/*` behind `phy-sys` features we do not enable.
 
@@ -203,7 +203,7 @@ Implementation (**amended 2026-11-26 during T6**): `leas-dns` owns the policy, t
 | --- | --- | --- |
 | Q1 | scope | **B** — full parity outbound (not codec-only) |
 | Q2 | target DNS | tunnel via `dns`; local only when no configured resolver is alive |
-| Q3 | codec owner | **own** sans-I/O core; boringtun only as a last-resort test oracle |
+| Q3 | codec owner | **own** sans-I/O core; the pinned real cores are the test peers (no `boringtun`) |
 | Q4 | DNS seam owner | **extend `leas-dns`** (plain-IP arm + injected sockets), not a second resolver |
 | Q5 | acceptance bar | **A** — TCP + UDP ASSOCIATE + tunneled DNS + `reserved`, v4 and v6, badge flips |
 | — | peers | single peer, `0/0` + `::/0` (config has one `public_key`) |
@@ -221,7 +221,19 @@ Implementation (**amended 2026-11-26 during T6**): `leas-dns` owns the policy, t
 
 ### 5.2 E2E (delivered in `crates/leas-oracles/tests/wireguard.rs`)
 
-The delivered oracle is a **`boringtun 0.7.1` responder as a dev-dependency** (ADR 0019 permits it: test-only, never a runtime dependency) with a `smoltcp` interface and a TCP echo listener, all on loopback — no core binary, no TUN, no `CAP_NET_ADMIN`. The sing-box `wireguard` endpoint was rejected as the oracle because a peer's TCP connection to the endpoint's own interface address needs host routing (or `system: true`) to reach a local echo, which makes the harness depend on the host's network stack rather than on our client.
+The delivered oracles are the **pinned real cores**, not a test double: no
+`boringtun`, no `smoltcp` peer and no separate server implementation remain in
+the test tree. Two files carry the rows (`crates/leas-oracles/tests/`):
+
+- `wireguard_oracle.rs` — the interop proof, one request each through our
+  `probe::fetch`: sing-box's `wireguard` endpoint and xray-core's `wireguard`
+  inbound.
+- `wireguard.rs` — the driver rows against the same sing-box endpoint: TCP echo,
+  128 KiB and chunked transfers, UDP round trip, 20 % datagram loss, half-close,
+  periodic and passive keepalives, and a silent-tunnel handshake retransmit.
+  A datagram-counting UDP relay sits in front of the core for the loss/keepalive
+  rows, because a link-level wrapper counts inner packets, not WireGuard
+  datagrams.
 
 The rows now live in `crates/leas-oracles/tests/wireguard.rs` (the repo's rule is
 that every e2e row lives in `leas-oracles`), and two **real-core** rows live in

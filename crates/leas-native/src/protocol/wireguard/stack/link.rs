@@ -102,7 +102,18 @@ impl PacketLink for WgLink {
                 } = self;
                 tokio::select! {
                     received = socket.recv(scratch) => {
-                        let len = received?;
+                        let len = match received {
+                            Ok(len) => len,
+                            // A connected UDP socket reports ICMP
+                            // port-unreachable as `ConnectionRefused`. The peer
+                            // may simply not be listening yet (a restarted
+                            // server); the handshake retry handles that, so this
+                            // must not tear the device down.
+                            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         let mut events = Vec::new();
                         tunnel.receive(unix_secs(), &mut scratch[..len], &mut events);
                         for event in events {

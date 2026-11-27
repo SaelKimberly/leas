@@ -50,9 +50,11 @@ resolution inside a tunnel lives.
    `DnsRequestSender` for a wire the tunnel already owns.
 4. **The codec is ours, sans-I/O.** `protocol/wireguard/core/{kdf,handshake,transport,device}`
    takes `now: u64` and emits events; nothing in it opens a socket or reads a clock.
-   `boringtun`/`gotatun` are not production dependencies: their tree pulls pre-release
+   `boringtun`/`gotatun` are not dependencies at all: their tree pulls pre-release
    `aead`/`chacha20poly1305` versions against our 0.11 line, and `Tunn` reads
-   `Instant::now()` itself.
+   `Instant::now()` itself. The test peers are the pinned real cores (sing-box's
+   `wireguard` endpoint, xray-core's `wireguard` inbound), which also removed the
+   temporary `boringtun` dev-dependency the first e2e cut needed.
 
 ## Consequences
 

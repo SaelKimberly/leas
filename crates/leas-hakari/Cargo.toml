@@ -19,7 +19,6 @@ publish = false
 
 ### BEGIN HAKARI SECTION
 [dependencies]
-aead = { version = "0.5", features = ["alloc", "getrandom"] }
 aes = { version = "0.9", default-features = false, features = ["zeroize"] }
 base64 = { version = "0.23" }
 bit-set = { version = "0.11", features = ["serde"] }
@@ -30,15 +29,13 @@ bumpalo = { version = "3", features = ["collections"] }
 bytemuck = { version = "1", default-features = false, features = ["derive"] }
 byteorder = { version = "1" }
 chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
-cipher-9fbad63c4bcf4a8f = { package = "cipher", version = "0.4", default-features = false, features = ["zeroize"] }
-cipher-d8f496e17d97b5cb = { package = "cipher", version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
+cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 compact_str = { version = "0.10", features = ["serde"] }
 crc32fast = { version = "1" }
 criterion = { version = "0.8", features = ["async_tokio"] }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
-crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
-crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["getrandom", "std"] }
+crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 data-encoding = { version = "2" }
 digest = { version = "0.11", features = ["alloc", "mac", "oid", "zeroize"] }
 either = { version = "1", features = ["use_std"] }
@@ -133,9 +130,9 @@ bitflags = { version = "2", default-features = false, features = ["serde", "std"
 block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
 bumpalo = { version = "3", features = ["collections"] }
 cc = { version = "1", default-features = false, features = ["parallel"] }
-cipher-d8f496e17d97b5cb = { package = "cipher", version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
+cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crc32fast = { version = "1" }
-crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
+crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 digest = { version = "0.11", features = ["alloc", "mac", "oid", "zeroize"] }
 either = { version = "1", features = ["use_std"] }
 fastrand = { version = "2" }
@@ -190,7 +187,6 @@ bytemuck = { version = "1", default-features = false, features = ["extern_crate_
 http-body-util = { version = "0.1", features = ["channel"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
-libc = { version = "0.2", default-features = false, features = ["extra_traits"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 miniz_oxide = { version = "0.9", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
@@ -203,7 +199,6 @@ tower-http = { version = "0.6", default-features = false, features = ["decompres
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 chacha20 = { version = "0.10", features = ["rng", "xchacha", "zeroize"] }
-libc = { version = "0.2", default-features = false, features = ["extra_traits"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 miniz_oxide = { version = "0.9", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
