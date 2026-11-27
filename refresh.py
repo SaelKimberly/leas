@@ -93,6 +93,7 @@ CURATION: dict[str, str] = {
     "sing-mux": "Simple stream multiplex library (Go) | multiplexing | #mux #multiplex #go #singbox | Stream multiplexing; session management",
     "smux": "Stream multiplexer for Go (sing-box mod) | multiplexing | #mux #multiplex #go | Stream-oriented multiplexing over TCP/UDS",
     "sniffnet": "Network traffic monitor (Rust) | network monitoring | #network-monitor #rust #tui | Packet capture; traffic stats; cross-platform",
+    "sqlx-turso": "SQLx adapter for the Turso engine (reference; migration deferred) | database adapter | #sqlx #turso #adapter | SQLx backend; migrations; checked-query macros",
     "soar": "DNS tunnel for censored networks (Getlantern, Go) | DNS tunnel | #dns-tunnel #censorship #go #quic | DNS tunneling; QUIC; L1 obfuscation",
     "starrocks": "Launcher/manager for StarRocks nodes (private internal) | internal tooling | #starrocks #internal #launcher | StarRocks node management (private GitLab)",
     "StormDNS": "TCP-over-DNS tunnel with local SOCKS5 (Go) | DNS tunnel | #dns-tunnel #tcp #socks5 #go | DNS query/response tunneling; SOCKS5; raw TCP listener",

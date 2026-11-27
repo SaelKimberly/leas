@@ -89,6 +89,7 @@ committed manifest (`what` / `domain` / `tags` / `standards` per entry).
 | `smux` | Stream multiplexer for Go (sing-box mod) | multiplexing | #mux #multiplex #go | Stream-oriented multiplexing over TCP/UDS |
 | `sniffnet` | Network traffic monitor (Rust) | network monitoring | #network-monitor #rust #tui | Packet capture; traffic stats; cross-platform |
 | `soar` | DNS tunnel for censored networks (Getlantern, Go) | DNS tunnel | #dns-tunnel #censorship #go #quic | DNS tunneling; QUIC; L1 obfuscation |
+| `sqlx-turso` | SQLx adapter for the Turso engine (reference; migration deferred) | database adapter | #sqlx #turso #adapter | SQLx backend; migrations; checked-query macros |
 | `starrocks` | Launcher/manager for StarRocks nodes (private internal) | internal tooling | #starrocks #internal #launcher | StarRocks node management (private GitLab) |
 | `StormDNS` | TCP-over-DNS tunnel with local SOCKS5 (Go) | DNS tunnel | #dns-tunnel #tcp #socks5 #go | DNS query/response tunneling; SOCKS5; raw TCP listener |
 | `sub-healer` | Local subscription-healing research (Rust) | local research | #subscription #local-research #rust | Subscription repair (local-only HEAD; not upstream) |
@@ -124,7 +125,7 @@ committed manifest (`what` / `domain` / `tags` / `standards` per entry).
 
 ## Pins (exact tag / revision per entry)
 
-Total: 77 (gone: 1, frozen: 2, private-host: 1, ad-hoc-research: 1, pinned-tag: 23, reference: 49)
+Total: 78 (gone: 1, frozen: 2, private-host: 1, ad-hoc-research: 1, pinned-tag: 23, reference: 50)
 
 | folder | kind | status | host | ref | sha |
 | --- | --- | --- | --- | --- | --- |
@@ -173,18 +174,19 @@ Total: 77 (gone: 1, frozen: 2, private-host: 1, ad-hoc-research: 1, pinned-tag: 
 | `smux` | git | pinned-tag | github | `v1.5.50-sing-box-mod.1` | `f373f1e706bf` |
 | `sniffnet` | git | reference | github | `main@a4655590f6fe` | `a4655590f6fe` |
 | `soar` | git | pinned-tag | github | `v0.2.4` | `fea80aae6c60` |
+| `sqlx-turso` | git | reference | github | `master@b7e5fab909f5` | `b7e5fab909f5` |
 | `starrocks` | git | private-host | private | `master@4d515dd4dd05` | `4d515dd4dd05` |
 | `StormDNS` | git | reference | github | `main@a9a8e92a51f0` | `a9a8e92a51f0` |
 | `sub-healer` | git | ad-hoc-research | github | `master@26e5f0631a5f` | `26e5f0631a5f` |
 | `subconverter` | git | reference | github | `master@a0d4eab28cb8` | `a0d4eab28cb8` |
 | `tls-fingerprint` | artifact | frozen | local | `-` | `-` |
-| `toasty` | git | reference | github | `main@4f3ed1a351f9` | `4f3ed1a351f9` |
+| `toasty` | git | reference | github | `toasty-driver-integration-suite-v0.11.0` | `d71114e4101c` |
 | `tracing_allocator` | git | reference | github | `master@dc29ba70ae5a` | `dc29ba70ae5a` |
 | `trojan` | git | reference | github | `master@3e7bb9aecdc6` | `3e7bb9aecdc6` |
 | `TrojanRust` | git | reference | github | `main@06a32afcf759` | `06a32afcf759` |
 | `tui-widgets` | git | reference | github | `main@dec872b2cb87` | `dec872b2cb87` |
 | `tuic` | git | reference | github | `main@27e666ceee7d` | `27e666ceee7d` |
-| `turso` | git | pinned-tag | github | `v0.9.0-pre.5` | `98dc77b9f793` |
+| `turso` | git | pinned-tag | github | `v0.9.0-pre.6` | `8f00aace1146` |
 | `unbihex` | git | pinned-tag | github | `v0.2.10` | `dd4ca980d6dc` |
 | `utls` | git | reference | github | `master@360383f893fb` | `360383f893fb` |
 | `v2ray-configs` | git | gone | github | `main@333276ba1ca0` | `333276ba1ca0` |

@@ -1,7 +1,7 @@
 # thirdparty pin manifest -- committed; `git log -p -- thirdparty.toml` is the
 # full history of which tag / revision each reference pointed at, and when.
 # Regenerate from disk with: python3 refresh.py --sync
-# generated: 2026-11-25
+# generated: 2026-11-27
 
 schema = 1
 
@@ -682,6 +682,21 @@ tags = "#dns-tunnel #censorship #go #quic"
 standards = "DNS tunneling; QUIC; L1 obfuscation"
 
 [[entry]]
+name = "sqlx-turso"
+kind = "git"
+status = "reference"
+host = "github"
+frozen = false
+remote = "https://github.com/avencera/sqlx-turso.git"
+ref = "master@b7e5fab909f5"
+sha = "b7e5fab909f5403f67f69d69d621f8f72e472a1f"
+shallow = false
+what = "SQLx adapter for the Turso engine (reference; migration deferred)"
+domain = "database adapter"
+tags = "#sqlx #turso #adapter"
+standards = "SQLx backend; migrations; checked-query macros"
+
+[[entry]]
 name = "starrocks"
 kind = "git"
 status = "private-host"
@@ -762,9 +777,9 @@ kind = "git"
 status = "reference"
 host = "github"
 frozen = false
-remote = "https://github.com/tokio-rs/toasty.git"
-ref = "main@4f3ed1a351f9"
-sha = "4f3ed1a351f967cf90fb396185f161d808bfa979"
+remote = "https://github.com/tokio-rs/toasty"
+ref = "toasty-driver-integration-suite-v0.11.0"
+sha = "d71114e4101ce33ee5272ef2bd69ac6d5a6d749a"
 shallow = true
 what = "Embedded database for Rust (tokio-rs)"
 domain = "database"
@@ -853,9 +868,9 @@ status = "pinned-tag"
 host = "github"
 frozen = false
 remote = "https://github.com/tursodatabase/turso"
-ref = "v0.9.0-pre.5"
-sha = "98dc77b9f79385d073ff1fefe2e81fa77919790e"
-shallow = false
+ref = "v0.9.0-pre.6"
+sha = "8f00aace1146d6f215183511b86f10a11ba20d7e"
+shallow = true
 what = "In-process SQLite-compatible database (Rust)"
 domain = "database"
 tags = "#database #sqlite #rust #turso"
