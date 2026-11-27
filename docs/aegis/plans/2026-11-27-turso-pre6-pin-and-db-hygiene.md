@@ -245,7 +245,7 @@ A2–A6 before/after lines, the `plan_sweep` diff result, and the final
 | T5 | width **61.7 / 59.6 ms** (86–89× vs baseline) with `not_exists` 24.8 / 24.2 ms; import WAL **1.61 s / 1 980 ms / 67 MiB** (−17 % wall), MVCC **2.34 s / 3 770 ms / 173 MiB** (−6 %); single WAL 282.0 ms (+3 %), MVCC 120.8 ms (+7 %); contention WAL 5.7× (max 1.27 ms), MVCC 13.0× (max 4.47 ms); **PLAN2 diff empty** |
 | T6 | `in_memory_db_has_full_schema_and_roundtrips` + `mvcc_checkpoint_succeeds_on_the_open_path` pass; real-DB copies (82 016 endpoints, `user_version` 23) open at pre.6 in WAL, and an MVCC-requested open of a WAL copy falls back to WAL as designed |
 | T7 | anti-join note now records 5.37 s (pre.5) → ~60 ms (pre.6) and why `NOT EXISTS` stays; driver header says 0.9/pre.6; tantivy note says pre.6 |
-| T8 | reference clone at `v0.9.0-pre.6` (`8f00aac`); toasty ref → `toasty-driver-integration-suite-v0.11.0` (`d71114e`); `sqlx-turso` entry added via a `CURATION` line; `python3 refresh.py` → `[report] clean` |
+| T8 | reference clone at `v0.9.0-pre.6` (`8f00aac`); toasty ref → `toasty-driver-integration-suite-v0.11.0` (`d71114e`, one of several tags at the same commit — `describe --exact-match` picks one); `sqlx-turso` entry added via a `CURATION` line; `python3 refresh.py` → `[report] clean` |
 | T9 | `cargo fmt --check` clean; `cargo nextest run -p leas-db` **294 passed, 1 skipped**; `just quality-gate code` result recorded below |
 
 **Deviations.** A3/A4's absolute targets were derived from the study's quieter
